@@ -1,6 +1,8 @@
 use nescript::analyzer;
 use nescript::codegen::CodeGen;
+use nescript::ir;
 use nescript::linker::Linker;
+use nescript::optimizer;
 use nescript::rom;
 
 /// Compile a `NEScript` source string into a .nes ROM.
@@ -19,6 +21,10 @@ fn compile(source: &str) -> Vec<u8> {
         analysis.diagnostics
     );
 
+    // Run IR lowering and optimization (validates the pipeline works)
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+
     let codegen = CodeGen::new(&analysis.var_allocations, &program.constants);
     let instructions = codegen.generate(&program);
 
@@ -26,18 +32,17 @@ fn compile(source: &str) -> Vec<u8> {
     linker.link(&instructions)
 }
 
+// ── M1 Tests ──
+
 #[test]
 fn hello_sprite_compiles_to_valid_rom() {
     let source = include_str!("integration/hello_sprite.ne");
     let rom_data = compile(source);
 
-    // Validate iNES format
     let info = rom::validate_ines(&rom_data).expect("should be valid iNES");
     assert_eq!(info.prg_banks, 1, "should be 1 PRG bank (16 KB)");
     assert_eq!(info.chr_banks, 1, "should have CHR ROM");
     assert_eq!(info.mapper, 0, "should be NROM (mapper 0)");
-
-    // ROM should be 16 header + 16 KB PRG + 8 KB CHR
     assert_eq!(rom_data.len(), 16 + 16384 + 8192);
 }
 
@@ -46,7 +51,6 @@ fn hello_sprite_has_correct_vectors() {
     let source = include_str!("integration/hello_sprite.ne");
     let rom_data = compile(source);
 
-    // Vector table at the end of PRG ROM
     let prg_end = 16 + 16384;
     let nmi = u16::from_le_bytes([rom_data[prg_end - 6], rom_data[prg_end - 5]]);
     let reset = u16::from_le_bytes([rom_data[prg_end - 4], rom_data[prg_end - 3]]);
@@ -109,6 +113,131 @@ fn program_with_constants() {
     rom::validate_ines(&rom_data).expect("should be valid iNES");
 }
 
+// ── M2 Tests ──
+
+#[test]
+fn program_with_functions() {
+    let source = r#"
+        game "Functions" { mapper: NROM }
+        var x: u8 = 0
+
+        fun add_ten(val: u8) -> u8 {
+            return val + 10
+        }
+
+        on frame {
+            x = add_ten(5)
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_while_loop() {
+    let source = r#"
+        game "Loops" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            while x < 10 {
+                x += 1
+            }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_fast_slow_vars() {
+    let source = r#"
+        game "Placement" { mapper: NROM }
+        fast var hot: u8 = 0
+        slow var cold: u8 = 0
+        on frame {
+            hot += 1
+            cold += 1
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_multi_state_transitions() {
+    let source = r#"
+        game "Multi" { mapper: NROM }
+
+        state Menu {
+            on enter { wait_frame }
+            on frame {
+                if button.start { transition Level1 }
+            }
+        }
+
+        state Level1 {
+            var timer: u8 = 0
+            on frame {
+                timer += 1
+                if timer > 60 {
+                    transition Level2
+                }
+            }
+        }
+
+        state Level2 {
+            on frame {
+                if button.select { transition Menu }
+            }
+        }
+
+        start Menu
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn coin_cavern_compiles() {
+    let source = include_str!("../examples/coin_cavern.ne");
+    let rom_data = compile(source);
+    let info = rom::validate_ines(&rom_data).expect("should be valid iNES");
+    assert_eq!(info.mapper, 0);
+}
+
+#[test]
+fn ir_pipeline_produces_ir() {
+    let source = r#"
+        game "IR" { mapper: NROM }
+        const SPEED: u8 = 2
+        var x: u8 = 0
+        fun double(n: u8) -> u8 { return n + n }
+        on frame {
+            x += SPEED
+            if x > 100 { x = 0 }
+        }
+        start Main
+    "#;
+    let (program, diags) = nescript::parser::parse(source);
+    assert!(diags.is_empty());
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    assert!(analysis.diagnostics.iter().all(|d| !d.is_error()));
+
+    let mut ir_program = ir::lower(&program, &analysis);
+    let before_ops = ir_program.op_count();
+    optimizer::optimize(&mut ir_program);
+    let after_ops = ir_program.op_count();
+
+    // Optimizer should reduce or maintain op count (not increase)
+    assert!(after_ops <= before_ops, "optimizer should not increase ops");
+    // Should have functions for the user function + frame handler
+    assert!(ir_program.functions.len() >= 2);
+}
+
 #[test]
 fn error_test_missing_game() {
     let source = "var x: u8 = 0\nstart Main";
@@ -137,5 +266,25 @@ fn error_test_undefined_transition() {
             .iter()
             .any(nescript::errors::Diagnostic::is_error),
         "should detect undefined transition target"
+    );
+}
+
+#[test]
+fn error_test_recursion_detected() {
+    let source = r#"
+        game "T" { mapper: NROM }
+        fun loop_forever() { loop_forever() }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (program, parse_diags) = nescript::parser::parse(source);
+    assert!(parse_diags.is_empty());
+    let analysis = analyzer::analyze(&program.unwrap());
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.code == nescript::errors::ErrorCode::E0402),
+        "should detect recursion"
     );
 }

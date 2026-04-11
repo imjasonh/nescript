@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use nescript::analyzer;
 use nescript::codegen::CodeGen;
 use nescript::errors::render_diagnostics;
+use nescript::ir;
 use nescript::linker::Linker;
+use nescript::optimizer;
 
 #[derive(Parser)]
 #[command(name = "nescript", about = "NEScript compiler — NES game development")]
@@ -87,7 +89,11 @@ fn compile(input: &PathBuf) -> Result<Vec<u8>, ()> {
         return Err(());
     }
 
-    // Code generation
+    // IR lowering and optimization
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+
+    // Code generation (still AST-based for M2; IR codegen comes in M3)
     let codegen = CodeGen::new(&analysis.var_allocations, &program.constants);
     let instructions = codegen.generate(&program);
 
