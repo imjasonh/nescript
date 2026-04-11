@@ -28,9 +28,7 @@ pub enum ErrorCode {
     E0301, // zero-page overflow
 
     // E04xx: Control flow errors
-    #[allow(dead_code)]
     E0401, // call depth exceeded
-    #[allow(dead_code)]
     E0402, // recursion detected
     #[allow(dead_code)]
     E0403, // unreachable state
@@ -39,7 +37,6 @@ pub enum ErrorCode {
     // E05xx: Declaration errors
     E0501, // duplicate declaration
     E0502, // undefined variable
-    #[allow(dead_code)]
     E0503, // undefined function
     E0504, // missing start declaration
     #[allow(dead_code)]

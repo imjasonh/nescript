@@ -133,7 +133,7 @@ pub enum IrOp {
 pub enum IrTerminator {
     /// Unconditional jump to a label.
     Jump(String),
-    /// Conditional branch: if temp != 0 goto true_label else goto false_label.
+    /// Conditional branch: if temp != 0 goto `true_label` else goto `false_label`.
     Branch(IrTemp, String, String),
     /// Return from function, optionally with a value.
     Return(Option<IrTemp>),

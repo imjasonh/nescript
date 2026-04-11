@@ -42,7 +42,11 @@ fn lower_var_assignment() {
         start Main
     "#,
     );
-    let frame_fn = ir.functions.iter().find(|f| f.name.contains("frame")).unwrap();
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
     // Should have a StoreVar op
     let has_store = frame_fn
         .blocks
@@ -62,7 +66,11 @@ fn lower_plus_assign() {
         start Main
     "#,
     );
-    let frame_fn = ir.functions.iter().find(|f| f.name.contains("frame")).unwrap();
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
     let has_add = frame_fn
         .blocks
         .iter()
@@ -83,12 +91,19 @@ fn lower_if_creates_branch() {
         start Main
     "#,
     );
-    let frame_fn = ir.functions.iter().find(|f| f.name.contains("frame")).unwrap();
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
     let has_branch = frame_fn
         .blocks
         .iter()
         .any(|b| matches!(&b.terminator, IrTerminator::Branch(..)));
-    assert!(has_branch, "if statement should produce a Branch terminator");
+    assert!(
+        has_branch,
+        "if statement should produce a Branch terminator"
+    );
 }
 
 #[test]
@@ -103,7 +118,11 @@ fn lower_while_creates_loop() {
         start Main
     "#,
     );
-    let frame_fn = ir.functions.iter().find(|f| f.name.contains("frame")).unwrap();
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
     // A while loop needs at least 3 blocks: condition check, body, and exit
     assert!(
         frame_fn.blocks.len() >= 3,
@@ -124,7 +143,11 @@ fn lower_button_read() {
         start Main
     "#,
     );
-    let frame_fn = ir.functions.iter().find(|f| f.name.contains("frame")).unwrap();
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
     let has_input = frame_fn
         .blocks
         .iter()
@@ -144,7 +167,11 @@ fn lower_draw_sprite() {
         start Main
     "#,
     );
-    let frame_fn = ir.functions.iter().find(|f| f.name.contains("frame")).unwrap();
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
     let has_draw = frame_fn
         .blocks
         .iter()
@@ -164,7 +191,11 @@ fn lower_constants_become_immediates() {
         start Main
     "#,
     );
-    let frame_fn = ir.functions.iter().find(|f| f.name.contains("frame")).unwrap();
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
     // SPEED should be lowered to LoadImm(_, 3)
     let has_imm3 = frame_fn
         .blocks
@@ -232,7 +263,11 @@ fn lower_wait_frame() {
         start Main
     "#,
     );
-    let frame_fn = ir.functions.iter().find(|f| f.name.contains("frame")).unwrap();
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
     let has_wait = frame_fn
         .blocks
         .iter()

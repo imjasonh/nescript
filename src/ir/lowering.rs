@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use super::*;
-use crate::analyzer::{AnalysisResult, VarAllocation};
+use crate::analyzer::AnalysisResult;
 use crate::parser::ast::*;
 
 /// Lower a parsed & analyzed program into IR.
@@ -334,7 +334,9 @@ impl LoweringContext {
                 let idx = self.lower_expr(index);
                 let val = self.lower_expr(expr);
                 // For compound assignment on arrays, load first
-                if op != AssignOp::Assign {
+                if op == AssignOp::Assign {
+                    self.emit(IrOp::ArrayStore(var_id, idx, val));
+                } else {
                     let current = self.fresh_temp();
                     self.emit(IrOp::ArrayLoad(current, var_id, idx));
                     let result = self.fresh_temp();
@@ -348,8 +350,6 @@ impl LoweringContext {
                     };
                     self.emit(ir_op);
                     self.emit(IrOp::ArrayStore(var_id, idx, result));
-                } else {
-                    self.emit(IrOp::ArrayStore(var_id, idx, val));
                 }
             }
         }
@@ -496,9 +496,7 @@ impl LoweringContext {
                 self.emit(IrOp::ArrayLoad(t, var_id, idx));
                 t
             }
-            Expr::BinaryOp(left, op, right, _) => {
-                self.lower_binop(left, *op, right)
-            }
+            Expr::BinaryOp(left, op, right, _) => self.lower_binop(left, *op, right),
             Expr::UnaryOp(op, inner, _) => {
                 let val = self.lower_expr(inner);
                 let t = self.fresh_temp();
