@@ -329,6 +329,7 @@ impl Analyzer {
                     _ => None,
                 })
             }
+            Expr::ArrayLiteral(_, _) => Some(NesType::U8), // element type inferred from context
         }
     }
 }

@@ -109,6 +109,7 @@ impl Parser {
         let mut game = None;
         let mut globals = Vec::new();
         let mut constants = Vec::new();
+        let mut functions = Vec::new();
         let mut states = Vec::new();
         let mut start_state = None;
         let mut on_frame = None;
@@ -119,8 +120,14 @@ impl Parser {
                 TokenKind::KwGame => {
                     game = Some(self.parse_game_decl()?);
                 }
+                TokenKind::KwFast | TokenKind::KwSlow => {
+                    globals.push(self.parse_var_decl()?);
+                }
                 TokenKind::KwVar => {
                     globals.push(self.parse_var_decl()?);
+                }
+                TokenKind::KwFun | TokenKind::KwInline => {
+                    functions.push(self.parse_fun_decl()?);
                 }
                 TokenKind::KwConst => {
                     constants.push(self.parse_const_decl()?);
@@ -178,7 +185,7 @@ impl Parser {
             game,
             globals,
             constants,
-            functions: Vec::new(),
+            functions,
             states,
             start_state,
             span,
@@ -266,6 +273,17 @@ impl Parser {
 
     fn parse_var_decl(&mut self) -> Result<VarDecl, Diagnostic> {
         let start = self.current_span();
+        let placement = match self.peek() {
+            TokenKind::KwFast => {
+                self.advance();
+                Placement::Fast
+            }
+            TokenKind::KwSlow => {
+                self.advance();
+                Placement::Slow
+            }
+            _ => Placement::Auto,
+        };
         self.expect(&TokenKind::KwVar)?;
         let (name, _) = self.expect_ident()?;
         self.expect(&TokenKind::Colon)?;
@@ -282,7 +300,7 @@ impl Parser {
             name,
             var_type,
             init,
-            placement: Placement::Auto,
+            placement,
             span: Span::new(start.file_id, start.start, self.current_span().start),
         })
     }
@@ -306,6 +324,54 @@ impl Parser {
         })
     }
 
+    // ── Function declaration ──
+
+    fn parse_fun_decl(&mut self) -> Result<FunDecl, Diagnostic> {
+        let start = self.current_span();
+        let is_inline = if *self.peek() == TokenKind::KwInline {
+            self.advance();
+            true
+        } else {
+            false
+        };
+        self.expect(&TokenKind::KwFun)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LParen)?;
+
+        let mut params = Vec::new();
+        while *self.peek() != TokenKind::RParen && *self.peek() != TokenKind::Eof {
+            let (pname, _) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let ptype = self.parse_type()?;
+            params.push(Param {
+                name: pname,
+                param_type: ptype,
+            });
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+
+        let return_type = if *self.peek() == TokenKind::Arrow {
+            self.advance();
+            Some(self.parse_type()?)
+        } else {
+            None
+        };
+
+        let body = self.parse_block()?;
+
+        Ok(FunDecl {
+            name,
+            params,
+            return_type,
+            body,
+            is_inline,
+            span: Span::new(start.file_id, start.start, self.current_span().start),
+        })
+    }
+
     // ── State declaration ──
 
     fn parse_state_decl(&mut self) -> Result<StateDecl, Diagnostic> {
@@ -322,7 +388,7 @@ impl Parser {
 
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             match self.peek().clone() {
-                TokenKind::KwVar => {
+                TokenKind::KwFast | TokenKind::KwSlow | TokenKind::KwVar => {
                     locals.push(self.parse_var_decl()?);
                 }
                 TokenKind::KwOn => {
@@ -406,7 +472,7 @@ impl Parser {
 
     fn parse_statement(&mut self) -> Result<Statement, Diagnostic> {
         match self.peek().clone() {
-            TokenKind::KwVar => {
+            TokenKind::KwFast | TokenKind::KwSlow | TokenKind::KwVar => {
                 let decl = self.parse_var_decl()?;
                 Ok(Statement::VarDecl(decl))
             }
@@ -684,28 +750,47 @@ impl Parser {
     // ── Type parsing ──
 
     fn parse_type(&mut self) -> Result<NesType, Diagnostic> {
-        match self.peek().clone() {
+        let base = match self.peek().clone() {
             TokenKind::KwU8 => {
                 self.advance();
-                Ok(NesType::U8)
+                NesType::U8
             }
             TokenKind::KwI8 => {
                 self.advance();
-                Ok(NesType::I8)
+                NesType::I8
             }
             TokenKind::KwU16 => {
                 self.advance();
-                Ok(NesType::U16)
+                NesType::U16
             }
             TokenKind::KwBool => {
                 self.advance();
-                Ok(NesType::Bool)
+                NesType::Bool
             }
-            _ => Err(Diagnostic::error(
-                ErrorCode::E0201,
-                format!("expected type, found '{}'", self.peek()),
-                self.current_span(),
-            )),
+            _ => {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!("expected type, found '{}'", self.peek()),
+                    self.current_span(),
+                ));
+            }
+        };
+        // Check for array suffix [N]
+        if *self.peek() == TokenKind::LBracket {
+            self.advance();
+            if let TokenKind::IntLiteral(size) = self.peek().clone() {
+                self.advance();
+                self.expect(&TokenKind::RBracket)?;
+                Ok(NesType::Array(Box::new(base), size))
+            } else {
+                Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    "expected array size",
+                    self.current_span(),
+                ))
+            }
+        } else {
+            Ok(base)
         }
     }
 
@@ -905,6 +990,19 @@ impl Parser {
                 }
 
                 Ok(Expr::Ident(name, span))
+            }
+            TokenKind::LBracket => {
+                let span = self.current_span();
+                self.advance();
+                let mut elements = Vec::new();
+                while *self.peek() != TokenKind::RBracket && *self.peek() != TokenKind::Eof {
+                    elements.push(self.parse_expr()?);
+                    if *self.peek() == TokenKind::Comma {
+                        self.advance();
+                    }
+                }
+                self.expect(&TokenKind::RBracket)?;
+                Ok(Expr::ArrayLiteral(elements, span))
             }
             TokenKind::LParen => {
                 self.advance();

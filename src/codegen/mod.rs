@@ -395,7 +395,7 @@ impl CodeGen {
                 self.emit(LDA, AM::ZeroPage(self.input_addr));
                 self.emit(AND, AM::Immediate(mask));
             }
-            Expr::Call(_, _, _) | Expr::ArrayIndex(_, _, _) => {
+            Expr::Call(_, _, _) | Expr::ArrayIndex(_, _, _) | Expr::ArrayLiteral(_, _) => {
                 // TODO: implement for later milestones
             }
         }

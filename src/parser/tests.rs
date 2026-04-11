@@ -364,3 +364,121 @@ fn parse_full_m1_program() {
     let frame = prog.states[0].on_frame.as_ref().unwrap();
     assert_eq!(frame.statements.len(), 5); // 4 ifs + 1 draw
 }
+
+// ── Milestone 2: Functions ──
+
+#[test]
+fn parse_function_decl() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        fun add(a: u8, b: u8) -> u8 {
+            return a + b
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.functions.len(), 1);
+    let f = &prog.functions[0];
+    assert_eq!(f.name, "add");
+    assert!(!f.is_inline);
+    assert_eq!(f.params.len(), 2);
+    assert_eq!(f.params[0].name, "a");
+    assert_eq!(f.params[0].param_type, NesType::U8);
+    assert_eq!(f.params[1].name, "b");
+    assert_eq!(f.params[1].param_type, NesType::U8);
+    assert_eq!(f.return_type, Some(NesType::U8));
+    assert_eq!(f.body.statements.len(), 1);
+}
+
+#[test]
+fn parse_inline_function() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        inline fun double(x: u8) -> u8 {
+            return x + x
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.functions.len(), 1);
+    let f = &prog.functions[0];
+    assert_eq!(f.name, "double");
+    assert!(f.is_inline);
+    assert_eq!(f.params.len(), 1);
+    assert_eq!(f.params[0].name, "x");
+    assert_eq!(f.return_type, Some(NesType::U8));
+}
+
+#[test]
+fn parse_array_type() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var buf: u8[16] = [0, 0, 0]
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.globals.len(), 1);
+    assert_eq!(
+        prog.globals[0].var_type,
+        NesType::Array(Box::new(NesType::U8), 16)
+    );
+    assert!(prog.globals[0].init.is_some());
+}
+
+#[test]
+fn parse_array_literal() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            x = [1, 2, 3]
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    match &frame.statements[0] {
+        Statement::Assign(_, _, Expr::ArrayLiteral(elems, _), _) => {
+            assert_eq!(elems.len(), 3);
+        }
+        other => panic!("expected assignment with ArrayLiteral, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_fast_var() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        fast var x: u8 = 0
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.globals.len(), 1);
+    assert_eq!(prog.globals[0].name, "x");
+    assert_eq!(prog.globals[0].placement, Placement::Fast);
+}
+
+#[test]
+fn parse_function_call_expr() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            x = add(1, 2)
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    match &frame.statements[0] {
+        Statement::Assign(_, _, Expr::Call(name, args, _), _) => {
+            assert_eq!(name, "add");
+            assert_eq!(args.len(), 2);
+        }
+        other => panic!("expected assignment with Call, got {other:?}"),
+    }
+}

@@ -76,9 +76,7 @@ pub struct ConstDecl {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Placement {
-    #[allow(dead_code)]
     Fast,
-    #[allow(dead_code)]
     Slow,
     Auto,
 }
@@ -89,7 +87,6 @@ pub enum NesType {
     I8,
     U16,
     Bool,
-    #[allow(dead_code)]
     Array(Box<NesType>, u16),
 }
 
@@ -121,6 +118,7 @@ pub enum Expr {
     UnaryOp(UnaryOp, Box<Expr>, Span),
     Call(String, Vec<Expr>, Span),
     ButtonRead(Option<Player>, String, Span),
+    ArrayLiteral(Vec<Expr>, Span),
 }
 
 impl Expr {
@@ -133,7 +131,8 @@ impl Expr {
             | Self::BinaryOp(_, _, _, s)
             | Self::UnaryOp(_, _, s)
             | Self::Call(_, _, s)
-            | Self::ButtonRead(_, _, s) => *s,
+            | Self::ButtonRead(_, _, s)
+            | Self::ArrayLiteral(_, s) => *s,
         }
     }
 }
