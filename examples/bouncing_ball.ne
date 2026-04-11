@@ -2,6 +2,10 @@
 //
 // Build:  cargo run -- build examples/bouncing_ball.ne
 // Output: examples/bouncing_ball.nes
+//
+// Note: In M1 the sprite name in `draw` is parsed but not resolved.
+// All sprites use tile 0 from the built-in CHR data (a smiley face).
+// Custom sprite declarations come in M3.
 
 game "Bouncing Ball" {
     mapper: NROM

@@ -49,3 +49,31 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --all-targets
+
+  examples:
+    name: Build Examples
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release
+      - name: Compile all .ne examples
+        run: |
+          for f in examples/*.ne; do
+            echo "==> Compiling $f"
+            cargo run --release -- build "$f"
+          done
+      - name: Verify ROMs are valid iNES
+        run: |
+          for f in examples/*.nes; do
+            echo "==> Checking $f"
+            # iNES magic: first 4 bytes must be "NES\x1a"
+            header=$(od -A n -t x1 -N 4 "$f" | tr -d ' ')
+            if [ "$header" != "4e45531a" ]; then
+              echo "FAIL: $f is not a valid iNES ROM (header: $header)"
+              exit 1
+            fi
+            size=$(stat -c%s "$f")
+            echo "    OK: $size bytes"
+          done

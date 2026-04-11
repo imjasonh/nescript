@@ -1,8 +1,12 @@
 // Hello Sprite — the simplest NEScript program.
 //
-// Displays a smiley-face sprite on screen and moves it with the d-pad.
+// Displays a sprite on screen and moves it with the d-pad.
 // Build:  cargo run -- build examples/hello_sprite.ne
 // Output: examples/hello_sprite.nes (open in any NES emulator)
+//
+// Note: In M1 the sprite name in `draw` is parsed but not resolved.
+// All sprites use tile 0 from the built-in CHR data (a smiley face).
+// Sprite declarations with custom tile data come in M3.
 
 game "Hello Sprite" {
     mapper: NROM

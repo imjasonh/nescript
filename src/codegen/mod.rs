@@ -540,7 +540,10 @@ impl CodeGen {
     fn gen_draw(&mut self, draw: &DrawStmt) {
         // OAM buffer is at $0200-$02FF
         // Each sprite entry: Y, tile, attributes, X
-        // For M1: use OAM slot 0 (bytes $0200-$0203)
+        // For M1: sprite name (draw.sprite_name) is parsed but ignored —
+        // all draws use OAM slot 0 with tile index 0 (the built-in CHR tile).
+        // Sprite name resolution and multiple OAM slots come in M2/M3.
+        let _ = &draw.sprite_name;
         // Y position (stored at $0200)
         self.gen_expr(&draw.y);
         self.emit(STA, AM::Absolute(0x0200));

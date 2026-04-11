@@ -35,9 +35,17 @@ Use the d-pad (arrow keys in most emulators) to move the sprite.
 
 ## What you'll see
 
-The ROM displays a small smiley-face sprite (an 8x8 tile built into the
-compiler's default CHR data). In `hello_sprite`, you control it with the d-pad.
+The ROM displays a small 8x8 smiley-face sprite. This is a default tile built
+into the compiler's CHR data. In `hello_sprite`, you control it with the d-pad.
 In `bouncing_ball`, it moves on its own and bounces off the screen edges.
+
+### About sprite names
+
+In Milestone 1, the name in `draw Smiley at: (x, y)` is parsed but not
+resolved to a specific tile — all draws use CHR tile 0 (the built-in smiley).
+The `draw` syntax is forward-compatible: when `sprite` declarations and the
+asset pipeline arrive in M3, names like `Smiley` will reference actual
+sprite definitions with custom tile data from PNGs.
 
 ## Emulator controls
 
