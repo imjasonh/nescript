@@ -138,6 +138,18 @@ impl Analyzer {
             if let Some(block) = &state.on_frame {
                 self.check_block(block, &state_names);
             }
+            // `on scanline(N)` is only valid with mappers that have a
+            // scanline-counting IRQ source (currently only MMC3).
+            if !state.on_scanline.is_empty() && program.game.mapper != Mapper::MMC3 {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    "`on scanline` requires the MMC3 mapper",
+                    state.span,
+                ));
+            }
+            for (_, block) in &state.on_scanline {
+                self.check_block(block, &state_names);
+            }
         }
 
         // Type-check function bodies. Parameters are registered as

@@ -414,7 +414,7 @@ impl Parser {
         let mut on_enter = None;
         let mut on_exit = None;
         let mut on_frame = None;
-        let on_scanline = Vec::new();
+        let mut on_scanline: Vec<(u8, Block)> = Vec::new();
 
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             match self.peek().clone() {
@@ -423,7 +423,7 @@ impl Parser {
                 }
                 TokenKind::KwOn => {
                     self.advance();
-                    let (event, _) = self.expect_ident()?;
+                    let (event, event_span) = self.expect_ident()?;
                     match event.as_str() {
                         "enter" => {
                             on_enter = Some(self.parse_block()?);
@@ -434,11 +434,35 @@ impl Parser {
                         "frame" => {
                             on_frame = Some(self.parse_block()?);
                         }
+                        "scanline" => {
+                            // Syntax: `on scanline(N) { ... }`
+                            self.expect(&TokenKind::LParen)?;
+                            let line = if let TokenKind::IntLiteral(v) = self.peek().clone() {
+                                self.advance();
+                                if v > 239 {
+                                    return Err(Diagnostic::error(
+                                        ErrorCode::E0201,
+                                        format!("scanline value {v} out of range (0-239)"),
+                                        self.current_span(),
+                                    ));
+                                }
+                                v as u8
+                            } else {
+                                return Err(Diagnostic::error(
+                                    ErrorCode::E0201,
+                                    "expected integer scanline number",
+                                    self.current_span(),
+                                ));
+                            };
+                            self.expect(&TokenKind::RParen)?;
+                            let body = self.parse_block()?;
+                            on_scanline.push((line, body));
+                        }
                         _ => {
                             return Err(Diagnostic::error(
                                 ErrorCode::E0201,
                                 format!("unknown event handler 'on {event}'"),
-                                self.current_span(),
+                                event_span,
                             ));
                         }
                     }

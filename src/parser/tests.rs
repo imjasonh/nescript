@@ -666,6 +666,40 @@ fn parse_mmc3_mapper() {
 }
 
 #[test]
+fn parse_on_scanline_handler() {
+    let src = r#"
+        game "Test" { mapper: MMC3 }
+        state Main {
+            on frame { wait_frame }
+            on scanline(120) { scroll(0, 0) }
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let state = prog.states.iter().find(|s| s.name == "Main").unwrap();
+    assert_eq!(state.on_scanline.len(), 1);
+    assert_eq!(state.on_scanline[0].0, 120);
+}
+
+#[test]
+fn parse_multiple_on_scanline_handlers() {
+    let src = r#"
+        game "Test" { mapper: MMC3 }
+        state Main {
+            on frame { wait_frame }
+            on scanline(64) { scroll(0, 0) }
+            on scanline(192) { scroll(8, 0) }
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let state = prog.states.iter().find(|s| s.name == "Main").unwrap();
+    assert_eq!(state.on_scanline.len(), 2);
+    assert_eq!(state.on_scanline[0].0, 64);
+    assert_eq!(state.on_scanline[1].0, 192);
+}
+
+#[test]
 fn parse_bank_decl() {
     let src = r#"
         game "Test" { mapper: NROM }

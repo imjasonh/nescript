@@ -299,6 +299,38 @@ fn analyze_return_wrong_type() {
 }
 
 #[test]
+fn analyze_on_scanline_requires_mmc3() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        state Main {
+            on frame { wait_frame }
+            on scanline(120) { scroll(0, 0) }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0203),
+        "on scanline without MMC3 should produce E0203, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_on_scanline_mmc3_ok() {
+    analyze_ok(
+        r#"
+        game "Test" { mapper: MMC3 }
+        state Main {
+            on frame { wait_frame }
+            on scanline(120) { scroll(0, 0) }
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
 fn analyze_loop_without_exit_warns() {
     let errors = analyze_errors(
         r#"
