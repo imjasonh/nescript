@@ -581,6 +581,50 @@ fn program_with_scroll_and_cast() {
     rom::validate_ines(&rom_data).expect("should be valid iNES");
 }
 
+#[test]
+fn program_with_u16_arithmetic_and_compare() {
+    // Exercises the full u16 path: literal > 255 initializer,
+    // u16 += u8, u16 > u16 comparison. The old codegen truncated
+    // all u16 operations to their low byte, so `big = 1000`
+    // landed as 232 and `big += 1` never carried into the high
+    // byte. This test just asserts the ROM builds cleanly — the
+    // unit tests in `codegen/ir_codegen.rs` verify the actual
+    // instruction shape.
+    let source = r#"
+        game "U16 Arith" { mapper: NROM }
+        var big: u16 = 1000
+        var flag: u8 = 0
+        on frame {
+            big = big + 1
+            if big > 1050 {
+                flag = 1
+            }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_audio_driver() {
+    // Exercises the minimal audio driver: play, start_music,
+    // stop_music all lowering into APU register writes plus the
+    // NMI audio tick splice. The linker must include the driver
+    // body and wire up the JSR from NMI.
+    let source = r#"
+        game "Audio" { mapper: NROM }
+        on frame {
+            if button.a { play coin }
+            if button.b { start_music theme }
+            if button.start { stop_music }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
 // ── M3 Tests ──
 
 #[test]

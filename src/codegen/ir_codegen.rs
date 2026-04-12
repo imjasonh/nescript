@@ -35,6 +35,12 @@ const TEMP_BASE: u8 = 0x80;
 /// Zero-page addresses (shared with AST codegen).
 const ZP_FRAME_FLAG: u8 = 0x00;
 const ZP_CURRENT_STATE: u8 = 0x03;
+/// Per-frame scanline step counter, reset to 0 by the NMI reload
+/// helper. Each time the MMC3 IRQ fires, the dispatcher looks at
+/// this byte to pick the right handler for multi-scanline states,
+/// then bumps it so the next IRQ hits the next handler. States
+/// with only a single scanline handler ignore the counter.
+const ZP_SCANLINE_STEP: u8 = 0x0C;
 
 /// Emulator debug output port. Writes to this address are logged by
 /// Mesen / fceux when the debugger is attached. Used by `debug.log`
@@ -48,8 +54,22 @@ pub struct IrCodeGen<'a> {
     var_addrs: HashMap<VarId, u16>,
     /// Map from `IrTemp` to zero-page slot within the current function.
     temp_slots: HashMap<IrTemp, u8>,
-    /// Next available temp slot for the current function.
+    /// Next unused temp slot (monotonic within a function — grows
+    /// only when there are no recyclable slots in `free_slots`).
     next_temp_slot: u8,
+    /// Free list of slots that held now-dead temps. Populated by
+    /// `retire_dead_temps` when a temp's use count drops to zero.
+    /// New allocations pull from this list before growing the
+    /// monotonic counter, which keeps functions with many short-
+    /// lived temps (e.g. long arithmetic chains on u8 flags) from
+    /// blowing past the 128-slot TEMP region.
+    free_slots: Vec<u8>,
+    /// Remaining use count for each temp in the current function.
+    /// Built by `build_use_counts` at the start of each function.
+    /// Decremented by `retire_dead_temps` after each op runs;
+    /// when a count hits 0 the temp's slot is pushed onto
+    /// `free_slots` and removed from `temp_slots`.
+    use_counts: HashMap<IrTemp, u32>,
     /// Sprite name to tile index mapping.
     sprite_tiles: HashMap<String, u8>,
     /// State name to dispatch index mapping.
@@ -62,6 +82,11 @@ pub struct IrCodeGen<'a> {
     /// When true, emit code for `debug.log` / `debug.assert`.
     /// When false, these ops are stripped entirely.
     debug_mode: bool,
+    /// Set to true the first time we emit any audio op (`play` /
+    /// `start_music` / `stop_music`). Used to emit the `__audio_used`
+    /// marker label at most once per program so the linker can
+    /// decide whether to splice the audio tick into NMI.
+    audio_used: bool,
     allocations: &'a [VarAllocation],
 }
 
@@ -119,11 +144,14 @@ impl<'a> IrCodeGen<'a> {
             var_addrs,
             temp_slots: HashMap::new(),
             next_temp_slot: 0,
+            free_slots: Vec::new(),
+            use_counts: HashMap::new(),
             sprite_tiles: HashMap::new(),
             state_indices: HashMap::new(),
             function_names,
             in_frame_handler: false,
             debug_mode: false,
+            audio_used: false,
             allocations,
         }
     }
@@ -159,15 +187,64 @@ impl<'a> IrCodeGen<'a> {
     }
 
     /// Return the zero-page address for an IR temp, allocating a new slot
-    /// if needed.
+    /// if needed. Recycles slots from `free_slots` (temps whose use
+    /// count has hit zero) before growing the monotonic counter, so
+    /// functions with many short-lived temps stay within the 128-byte
+    /// TEMP region.
     fn temp_addr(&mut self, temp: IrTemp) -> u8 {
         if let Some(&slot) = self.temp_slots.get(&temp) {
             return slot;
         }
+        // Prefer a recycled slot if one is available.
+        if let Some(slot) = self.free_slots.pop() {
+            self.temp_slots.insert(temp, slot);
+            return slot;
+        }
+        // Otherwise grow the monotonic counter. If we've exhausted
+        // the 128 slots reserved at TEMP_BASE..$FF, panic with a
+        // diagnostic — this indicates either a bug in the liveness
+        // analysis or a function with pathologically long live
+        // ranges. In the common case, the free list keeps us well
+        // under the limit.
+        assert!(
+            u16::from(self.next_temp_slot) < 0x80,
+            "IR codegen: function exceeds 128 concurrent live temps; \
+             this is a compiler bug — temps at end of function should \
+             have been recycled via `retire_dead_temps`"
+        );
         let slot = TEMP_BASE + self.next_temp_slot;
-        self.next_temp_slot = self.next_temp_slot.wrapping_add(1);
+        self.next_temp_slot += 1;
         self.temp_slots.insert(temp, slot);
         slot
+    }
+
+    /// Decrement a temp's use count. When the count reaches zero,
+    /// the temp is dead and its slot can be reused for a later
+    /// allocation. This is called after every op reads its source
+    /// temps, just before the destination (if any) is allocated.
+    fn dec_use(&mut self, temp: IrTemp) {
+        if let Some(count) = self.use_counts.get_mut(&temp) {
+            if *count > 0 {
+                *count -= 1;
+                if *count == 0 {
+                    if let Some(slot) = self.temp_slots.remove(&temp) {
+                        self.free_slots.push(slot);
+                    }
+                }
+            }
+        }
+    }
+
+    /// After `gen_op` finishes processing an op, retire any source
+    /// temps whose last-use was this op. For ops with multiple
+    /// sources (`Add`, `CmpEq`, `Add16`, …) we decrement each one —
+    /// the count for the same temp used twice in one op is
+    /// correctly handled because we pre-built the counts by
+    /// scanning every operand appearance.
+    fn retire_op_sources(&mut self, op: &IrOp) {
+        for t in op_source_temps(op) {
+            self.dec_use(t);
+        }
     }
 
     /// Load a temp's value into A.
@@ -218,11 +295,27 @@ impl<'a> IrCodeGen<'a> {
                     }
                 }
             } else if let Some(val) = global.init_value {
-                self.emit(LDA, AM::Immediate(val as u8));
+                // Emit the low byte first.
+                let lo = (val & 0xFF) as u8;
+                self.emit(LDA, AM::Immediate(lo));
                 if base < 0x100 {
                     self.emit(STA, AM::ZeroPage(base as u8));
                 } else {
                     self.emit(STA, AM::Absolute(base));
+                }
+                // For multi-byte globals (u16), also emit the high
+                // byte at base+1. Without this the u16 initializer
+                // silently truncates to its low byte — the high
+                // byte stays at whatever the RAM clear left it.
+                if global.size >= 2 {
+                    let hi = ((val >> 8) & 0xFF) as u8;
+                    self.emit(LDA, AM::Immediate(hi));
+                    let hi_addr = base.wrapping_add(1);
+                    if hi_addr < 0x100 {
+                        self.emit(STA, AM::ZeroPage(hi_addr as u8));
+                    } else {
+                        self.emit(STA, AM::Absolute(hi_addr));
+                    }
                 }
             }
         }
@@ -240,24 +333,30 @@ impl<'a> IrCodeGen<'a> {
 
         // 2b. If the program has any `on scanline` handlers, set up
         // the MMC3 IRQ counter using the scanline count of the
-        // *start* state (if it has one). Per-state scanline switching
-        // is then handled by writing to `$C000`/`$C001`/`$E001` at
-        // the top of each on_enter handler via inline asm (future).
-        // For now we always set up with the first scanline found in
-        // the start state, or any scanline in the program as a
-        // fallback.
-        let scanline_handlers = collect_scanline_handlers(ir);
-        if !scanline_handlers.is_empty() {
-            // Prefer a scanline in the start state; otherwise use the
-            // first one found.
-            let (_state_name, line) = scanline_handlers
+        // *start* state's first scanline handler. Subsequent
+        // scanlines in the same frame reload the counter from
+        // within the IRQ handler itself using the delta to the
+        // next scanline. State transitions (`transition X`) rely
+        // on the NMI reload helper to pick the right first
+        // scanline for the new state.
+        let scanline_groups = group_scanline_handlers(ir);
+        if !scanline_groups.is_empty() {
+            // Prefer the start state's first scanline; otherwise
+            // use the first group's first line.
+            let first_line = scanline_groups
                 .iter()
                 .find(|(s, _)| *s == ir.start_state)
-                .or_else(|| scanline_handlers.first())
-                .unwrap();
-            // Write (line-1) to $C000 (scanline latch), any value to
-            // $C001 (reload counter), any value to $E001 (enable IRQ).
-            self.emit(LDA, AM::Immediate(line.saturating_sub(1)));
+                .and_then(|(_, lines)| lines.first().copied())
+                .or_else(|| {
+                    scanline_groups
+                        .first()
+                        .and_then(|(_, l)| l.first().copied())
+                })
+                .unwrap_or(0);
+            // Write (line-1) to $C000 (scanline latch), any value
+            // to $C001 (reload counter), any value to $E001 (enable
+            // IRQ).
+            self.emit(LDA, AM::Immediate(first_line.saturating_sub(1)));
             self.emit(STA, AM::Absolute(0xC000));
             self.emit(STA, AM::Absolute(0xC001));
             self.emit(STA, AM::Absolute(0xE001));
@@ -303,68 +402,21 @@ impl<'a> IrCodeGen<'a> {
         // current state's scanline handler (if any), restores
         // registers, and RTIs. The linker picks up `__irq_user` and
         // uses it as the IRQ vector instead of the default stub.
-        if !scanline_handlers.is_empty() {
-            self.emit_label("__irq_user");
-            // Save registers onto the stack.
-            self.emit(PHA, AM::Implied);
-            self.emit(TXA, AM::Implied);
-            self.emit(PHA, AM::Implied);
-            self.emit(TYA, AM::Implied);
-            self.emit(PHA, AM::Implied);
-            // Acknowledge the MMC3 IRQ ($E000 = disable/ack). NMI
-            // will re-enable each frame by reloading the counter.
-            self.emit(LDA, AM::Immediate(0));
-            self.emit(STA, AM::Absolute(0xE000));
-            // Dispatch by current_state: for each state with a
-            // scanline handler, CMP and JSR.
-            self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
-            let done_label = "__irq_user_done".to_string();
-            for (i, (state_name, line)) in scanline_handlers.iter().enumerate() {
-                let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
-                let skip_label = format!("__irq_disp_skip_{i}");
-                self.emit(CMP, AM::Immediate(state_idx));
-                self.emit(BNE, AM::LabelRelative(skip_label.clone()));
-                let handler = format!("{state_name}_scanline_{line}");
-                self.emit(JSR, AM::Label(format!("__ir_fn_{handler}")));
-                self.emit(JMP, AM::Label(done_label.clone()));
-                self.emit_label(&skip_label);
-            }
-            self.emit_label(&done_label);
-            // Restore registers and return from interrupt.
-            self.emit(PLA, AM::Implied);
-            self.emit(TAY, AM::Implied);
-            self.emit(PLA, AM::Implied);
-            self.emit(TAX, AM::Implied);
-            self.emit(PLA, AM::Implied);
-            self.emit(RTI, AM::Implied);
-
-            // Also emit a helper that the NMI handler can use to
-            // reload the MMC3 counter each frame. Linker extends the
-            // NMI with a JSR into this when `__ir_mmc3_reload` exists.
-            self.emit_label("__ir_mmc3_reload");
-            // Dispatch on current_state to pick the right scanline
-            // count, write (count-1) to $C000, reload $C001, enable
-            // $E001. States without a scanline handler fall through
-            // to disable ($E000).
-            self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
-            let reload_done = "__ir_mmc3_reload_done".to_string();
-            for (i, (state_name, line)) in scanline_handlers.iter().enumerate() {
-                let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
-                let skip_label = format!("__ir_reload_skip_{i}");
-                self.emit(CMP, AM::Immediate(state_idx));
-                self.emit(BNE, AM::LabelRelative(skip_label.clone()));
-                self.emit(LDA, AM::Immediate(line.saturating_sub(1)));
-                self.emit(STA, AM::Absolute(0xC000));
-                self.emit(STA, AM::Absolute(0xC001));
-                self.emit(STA, AM::Absolute(0xE001));
-                self.emit(JMP, AM::Label(reload_done.clone()));
-                self.emit_label(&skip_label);
-            }
-            // No matching state — disable IRQ for this frame.
-            self.emit(LDA, AM::Immediate(0));
-            self.emit(STA, AM::Absolute(0xE000));
-            self.emit_label(&reload_done);
-            self.emit(RTS, AM::Implied);
+        //
+        // Multi-scanline support: a state may have multiple `on
+        // scanline(N)` handlers. They fire in ascending order of
+        // N. We track which one is next via `ZP_SCANLINE_STEP`,
+        // reset to 0 by the NMI reload helper at the top of each
+        // frame. The IRQ dispatcher selects the handler for
+        // `(current_state, scanline_step)`, runs it, then reloads
+        // the MMC3 counter with the *delta* to the next scanline
+        // so the counter fires at exactly the right line. If
+        // there's no next scanline for the current state, the
+        // dispatcher leaves the IRQ disabled and waits for NMI to
+        // re-arm.
+        if !scanline_groups.is_empty() {
+            self.gen_scanline_irq(&scanline_groups);
+            self.gen_scanline_reload(&scanline_groups);
         }
 
         self.instructions
@@ -374,6 +426,8 @@ impl<'a> IrCodeGen<'a> {
         // Reset temp slot allocator per function.
         self.temp_slots.clear();
         self.next_temp_slot = 0;
+        self.free_slots.clear();
+        self.use_counts = build_use_counts(func);
         self.in_frame_handler = func.name.ends_with("_frame");
 
         self.emit_label(&format!("__ir_fn_{}", func.name));
@@ -419,9 +473,23 @@ impl<'a> IrCodeGen<'a> {
 
         for op in &block.ops {
             self.gen_op(op);
+            // After each op runs, decrement use counts for its
+            // source temps. When a count hits zero the temp's slot
+            // returns to the free list and can be reused by a
+            // subsequent op's destination. This is what keeps the
+            // 128-slot TEMP region large enough for any sane
+            // function.
+            self.retire_op_sources(op);
         }
 
+        // The terminator may also reference a temp (branch
+        // condition, return value). Those temps die after the
+        // terminator runs; retire them here so they don't leak
+        // across block boundaries.
         self.gen_terminator(&block.terminator);
+        for t in terminator_source_temps(&block.terminator) {
+            self.dec_use(t);
+        }
     }
 
     #[allow(clippy::too_many_lines)]
@@ -736,10 +804,413 @@ impl<'a> IrCodeGen<'a> {
                 }
                 self.store_temp(*dest);
             }
+            IrOp::PlaySfx(name) => self.gen_play_sfx(name),
+            IrOp::StartMusic(name) => self.gen_start_music(name),
+            IrOp::StopMusic => self.gen_stop_music(),
+            IrOp::LoadVarHi(dest, var) => {
+                if let Some(&base) = self.var_addrs.get(var) {
+                    let addr = base.wrapping_add(1);
+                    if addr < 0x100 {
+                        self.emit(LDA, AM::ZeroPage(addr as u8));
+                    } else {
+                        self.emit(LDA, AM::Absolute(addr));
+                    }
+                    self.store_temp(*dest);
+                }
+            }
+            IrOp::StoreVarHi(var, src) => {
+                if let Some(&base) = self.var_addrs.get(var) {
+                    let addr = base.wrapping_add(1);
+                    self.load_temp(*src);
+                    if addr < 0x100 {
+                        self.emit(STA, AM::ZeroPage(addr as u8));
+                    } else {
+                        self.emit(STA, AM::Absolute(addr));
+                    }
+                }
+            }
+            IrOp::Add16 {
+                d_lo,
+                d_hi,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+            } => {
+                // Low byte: CLC; LDA a_lo; ADC b_lo; STA d_lo
+                let b_lo_addr = self.temp_addr(*b_lo);
+                self.load_temp(*a_lo);
+                self.emit(CLC, AM::Implied);
+                self.emit(ADC, AM::ZeroPage(b_lo_addr));
+                self.store_temp(*d_lo);
+                // High byte: LDA a_hi; ADC b_hi; STA d_hi
+                // (carry is propagated from the low byte — no CLC)
+                let b_hi_addr = self.temp_addr(*b_hi);
+                self.load_temp(*a_hi);
+                self.emit(ADC, AM::ZeroPage(b_hi_addr));
+                self.store_temp(*d_hi);
+            }
+            IrOp::Sub16 {
+                d_lo,
+                d_hi,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+            } => {
+                // Low byte: SEC; LDA a_lo; SBC b_lo; STA d_lo
+                let b_lo_addr = self.temp_addr(*b_lo);
+                self.load_temp(*a_lo);
+                self.emit(SEC, AM::Implied);
+                self.emit(SBC, AM::ZeroPage(b_lo_addr));
+                self.store_temp(*d_lo);
+                // High byte: LDA a_hi; SBC b_hi; STA d_hi
+                // (borrow is propagated via the inverted carry flag)
+                let b_hi_addr = self.temp_addr(*b_hi);
+                self.load_temp(*a_hi);
+                self.emit(SBC, AM::ZeroPage(b_hi_addr));
+                self.store_temp(*d_hi);
+            }
+            IrOp::CmpEq16 {
+                dest,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::Eq),
+            IrOp::CmpNe16 {
+                dest,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::Ne),
+            IrOp::CmpLt16 {
+                dest,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::Lt),
+            IrOp::CmpGt16 {
+                dest,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::Gt),
+            IrOp::CmpLtEq16 {
+                dest,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::LtEq),
+            IrOp::CmpGtEq16 {
+                dest,
+                a_lo,
+                a_hi,
+                b_lo,
+                b_hi,
+            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::GtEq),
             IrOp::SourceLoc(_) => {
                 // No code for source location markers
             }
         }
+    }
+
+    /// Emit pulse-1 register writes for a one-shot sound effect and
+    /// set the SFX countdown frames. The name is looked up in the
+    /// builtin SFX table; unrecognized names play a generic beep.
+    /// Triggers inclusion of the audio driver body via the
+    /// `__audio_used` marker label (idempotent).
+    fn gen_play_sfx(&mut self, name: &str) {
+        self.emit_audio_marker();
+        let (vol, period_lo, period_hi, duration) = lookup_sfx(name);
+        // $4000: volume envelope byte (duty | length halt | constant | volume)
+        self.emit(LDA, AM::Immediate(vol));
+        self.emit(STA, AM::Absolute(0x4000));
+        // $4002: period low byte
+        self.emit(LDA, AM::Immediate(period_lo));
+        self.emit(STA, AM::Absolute(0x4002));
+        // $4003: length counter load + period high 3 bits.
+        // The length counter load also "triggers" the envelope
+        // so this is the canonical "start note" write.
+        self.emit(LDA, AM::Immediate(period_hi));
+        self.emit(STA, AM::Absolute(0x4003));
+        // Set the duration counter so the NMI audio tick knows
+        // when to mute.
+        self.emit(LDA, AM::Immediate(duration));
+        self.emit(STA, AM::ZeroPage(0x0A));
+    }
+
+    /// Emit pulse-2 register writes for sustained music, using the
+    /// sentinel `$FF` as "play forever" in the NMI tick. A subsequent
+    /// `stop_music` clears the counter and mutes pulse 2.
+    fn gen_start_music(&mut self, name: &str) {
+        self.emit_audio_marker();
+        let (vol, period_lo, period_hi) = lookup_music(name);
+        // Music: write to pulse 2 registers ($4004-$4007).
+        self.emit(LDA, AM::Immediate(vol));
+        self.emit(STA, AM::Absolute(0x4004));
+        self.emit(LDA, AM::Immediate(period_lo));
+        self.emit(STA, AM::Absolute(0x4006));
+        self.emit(LDA, AM::Immediate(period_hi));
+        self.emit(STA, AM::Absolute(0x4007));
+        // Music counter = $FF is the "infinite sustain" sentinel.
+        // The NMI tick only ever looks at the SFX counter ($0A)
+        // for mute — pulse 2 sustains through the halted length
+        // counter (the `0x30 | 0x0F` volume byte clears the halt
+        // bit, letting the envelope hold).
+        self.emit(LDA, AM::Immediate(0xFF));
+        self.emit(STA, AM::ZeroPage(0x0B));
+    }
+
+    /// Emit a mute for pulse 2 (music) and zero out both countdown
+    /// counters. Leaves pulse 1 alone — SFX tails naturally expire
+    /// via the audio tick.
+    fn gen_stop_music(&mut self) {
+        self.emit_audio_marker();
+        // Silence pulse 2: write the canonical mute byte ($30).
+        self.emit(LDA, AM::Immediate(0x30));
+        self.emit(STA, AM::Absolute(0x4004));
+        // Clear the music sustain sentinel so subsequent
+        // `start_music` calls don't race with a stale counter.
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(STA, AM::ZeroPage(0x0B));
+    }
+
+    /// Emit the `__audio_used` marker label at most once per program.
+    /// The linker scans for this label to decide whether to splice
+    /// the audio tick into NMI and link in the driver body.
+    fn emit_audio_marker(&mut self) {
+        if !self.audio_used {
+            self.emit_label("__audio_used");
+            self.audio_used = true;
+        }
+    }
+
+    /// Emit the MMC3 `__irq_user` handler that dispatches on the
+    /// `(current_state, scanline_step)` pair. Supports multiple
+    /// `on scanline(N)` handlers per state — they fire in ascending
+    /// line order, with `ZP_SCANLINE_STEP` tracking which one is
+    /// up next.
+    ///
+    /// For each state/step pair, the dispatcher JSRs the handler,
+    /// then either reloads the MMC3 counter with the delta to the
+    /// next scanline (so the counter fires at the right line) or
+    /// leaves the IRQ disabled until NMI re-arms it for the next
+    /// frame. The step counter is bumped regardless so a later
+    /// IRQ (should one slip in) routes to the right slot.
+    fn gen_scanline_irq(&mut self, groups: &[(String, Vec<u8>)]) {
+        self.emit_label("__irq_user");
+        // Save registers onto the stack.
+        self.emit(PHA, AM::Implied);
+        self.emit(TXA, AM::Implied);
+        self.emit(PHA, AM::Implied);
+        self.emit(TYA, AM::Implied);
+        self.emit(PHA, AM::Implied);
+        // Acknowledge the MMC3 IRQ ($E000 = disable/ack). We'll
+        // re-enable for the next scanline below if there is one.
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(STA, AM::Absolute(0xE000));
+
+        // Dispatch on current_state.
+        self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
+        let done_label = "__irq_user_done".to_string();
+        for (state_idx_iter, (state_name, lines)) in groups.iter().enumerate() {
+            let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
+            let next_state_label = format!("__irq_ns_{state_idx_iter}");
+            self.emit(CMP, AM::Immediate(state_idx));
+            self.emit(BNE, AM::LabelRelative(next_state_label.clone()));
+
+            // Matched this state. Now dispatch on
+            // ZP_SCANLINE_STEP to pick the right handler.
+            self.emit(LDY, AM::ZeroPage(ZP_SCANLINE_STEP));
+            // Bump step now (regardless of which handler we
+            // select) so the NEXT IRQ sees a fresh value. If we
+            // bumped after running the handler, a handler that
+            // JSRed into user code and somehow nested IRQs would
+            // see the old step. We do this eagerly by writing
+            // `step + 1` back — cheaper than reading, running,
+            // writing.
+            self.emit(INC, AM::ZeroPage(ZP_SCANLINE_STEP));
+
+            for (step, line) in lines.iter().enumerate() {
+                let next_step_label = format!("__irq_s{state_idx_iter}_step_{step}_skip");
+                // CPY #step ; BNE next_step
+                self.emit(CPY, AM::Immediate(step as u8));
+                self.emit(BNE, AM::LabelRelative(next_step_label.clone()));
+
+                // Run the handler for this (state, step).
+                let handler = format!("{state_name}_scanline_{line}");
+                self.emit(JSR, AM::Label(format!("__ir_fn_{handler}")));
+
+                // Reload the counter for the next scanline in
+                // this state, if any. Otherwise leave IRQ
+                // disabled (we already wrote $E000 above).
+                if let Some(next_line) = lines.get(step + 1) {
+                    let delta = next_line.saturating_sub(*line).saturating_sub(1);
+                    self.emit(LDA, AM::Immediate(delta));
+                    self.emit(STA, AM::Absolute(0xC000));
+                    self.emit(STA, AM::Absolute(0xC001));
+                    self.emit(STA, AM::Absolute(0xE001));
+                }
+
+                self.emit(JMP, AM::Label(done_label.clone()));
+                self.emit_label(&next_step_label);
+            }
+
+            // Fell off the end of this state's step list — nothing
+            // more to do this frame.
+            self.emit(JMP, AM::Label(done_label.clone()));
+            self.emit_label(&next_state_label);
+        }
+        self.emit_label(&done_label);
+        // Restore registers and return from interrupt.
+        self.emit(PLA, AM::Implied);
+        self.emit(TAY, AM::Implied);
+        self.emit(PLA, AM::Implied);
+        self.emit(TAX, AM::Implied);
+        self.emit(PLA, AM::Implied);
+        self.emit(RTI, AM::Implied);
+    }
+
+    /// Emit the NMI-invoked `__ir_mmc3_reload` helper. Each frame
+    /// the NMI handler calls this to (a) reset the scanline step
+    /// counter to 0 and (b) rearm the MMC3 counter for the current
+    /// state's *first* scanline handler. States with no scanline
+    /// handlers leave the counter disabled — no IRQs will fire
+    /// for that frame.
+    fn gen_scanline_reload(&mut self, groups: &[(String, Vec<u8>)]) {
+        self.emit_label("__ir_mmc3_reload");
+        // Reset the step counter so the first IRQ of the new
+        // frame always lands on step 0.
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(STA, AM::ZeroPage(ZP_SCANLINE_STEP));
+
+        self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
+        let reload_done = "__ir_mmc3_reload_done".to_string();
+        for (i, (state_name, lines)) in groups.iter().enumerate() {
+            let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
+            let skip_label = format!("__ir_reload_skip_{i}");
+            self.emit(CMP, AM::Immediate(state_idx));
+            self.emit(BNE, AM::LabelRelative(skip_label.clone()));
+            // Rearm with the first scanline of this state.
+            let first = lines.first().copied().unwrap_or(0);
+            self.emit(LDA, AM::Immediate(first.saturating_sub(1)));
+            self.emit(STA, AM::Absolute(0xC000));
+            self.emit(STA, AM::Absolute(0xC001));
+            self.emit(STA, AM::Absolute(0xE001));
+            self.emit(JMP, AM::Label(reload_done.clone()));
+            self.emit_label(&skip_label);
+        }
+        // No matching state — disable IRQ for this frame.
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(STA, AM::Absolute(0xE000));
+        self.emit_label(&reload_done);
+        self.emit(RTS, AM::Implied);
+    }
+
+    /// Emit 16-bit unsigned comparison code. Result is stored as
+    /// a u8 bool (0 or 1) in `dest`. All six comparison kinds are
+    /// handled uniformly: compare high bytes first, then low bytes
+    /// only when high bytes are equal.
+    fn gen_cmp16(
+        &mut self,
+        dest: IrTemp,
+        a_lo: IrTemp,
+        a_hi: IrTemp,
+        b_lo: IrTemp,
+        b_hi: IrTemp,
+        kind: Cmp16Kind,
+    ) {
+        let true_label = format!("__ir_cmp16_t_{}", self.instructions.len());
+        let false_label = format!("__ir_cmp16_f_{}", self.instructions.len());
+        let end_label = format!("__ir_cmp16_e_{}", self.instructions.len());
+        let lo_label = format!("__ir_cmp16_lo_{}", self.instructions.len());
+
+        // Compare high bytes.
+        self.load_temp(a_hi);
+        let b_hi_addr = self.temp_addr(b_hi);
+        self.emit(CMP, AM::ZeroPage(b_hi_addr));
+        // If high bytes differ, the result is determined by the
+        // high-byte comparison alone. If they're equal, fall
+        // through to the low-byte comparison.
+        self.emit(BEQ, AM::LabelRelative(lo_label.clone()));
+
+        match kind {
+            Cmp16Kind::Eq => {
+                // Unequal high bytes → not equal → false
+                self.emit(JMP, AM::Label(false_label.clone()));
+            }
+            Cmp16Kind::Ne => {
+                // Unequal high bytes → true
+                self.emit(JMP, AM::Label(true_label.clone()));
+            }
+            Cmp16Kind::Lt | Cmp16Kind::LtEq => {
+                // a < b when a_hi < b_hi (carry clear after CMP)
+                self.emit(BCC, AM::LabelRelative(true_label.clone()));
+                self.emit(JMP, AM::Label(false_label.clone()));
+            }
+            Cmp16Kind::Gt | Cmp16Kind::GtEq => {
+                // a > b when a_hi > b_hi.  After `CMP b_hi`, carry
+                // is set iff a_hi >= b_hi; we already know a_hi !=
+                // b_hi (the BEQ above didn't fire), so BCS here
+                // means strictly greater.
+                self.emit(BCS, AM::LabelRelative(true_label.clone()));
+                self.emit(JMP, AM::Label(false_label.clone()));
+            }
+        }
+
+        // High bytes were equal — compare low bytes.
+        self.emit_label(&lo_label);
+        self.load_temp(a_lo);
+        let b_lo_addr = self.temp_addr(b_lo);
+        self.emit(CMP, AM::ZeroPage(b_lo_addr));
+
+        match kind {
+            Cmp16Kind::Eq => {
+                self.emit(BEQ, AM::LabelRelative(true_label.clone()));
+                self.emit(JMP, AM::Label(false_label.clone()));
+            }
+            Cmp16Kind::Ne => {
+                self.emit(BNE, AM::LabelRelative(true_label.clone()));
+                self.emit(JMP, AM::Label(false_label.clone()));
+            }
+            Cmp16Kind::Lt => {
+                // a < b when a_lo < b_lo (carry clear)
+                self.emit(BCC, AM::LabelRelative(true_label.clone()));
+                self.emit(JMP, AM::Label(false_label.clone()));
+            }
+            Cmp16Kind::LtEq => {
+                // a <= b when carry clear OR equal.
+                self.emit(BCC, AM::LabelRelative(true_label.clone()));
+                self.emit(BEQ, AM::LabelRelative(true_label.clone()));
+                self.emit(JMP, AM::Label(false_label.clone()));
+            }
+            Cmp16Kind::Gt => {
+                // a > b when carry set AND not equal.
+                self.emit(BEQ, AM::LabelRelative(false_label.clone()));
+                self.emit(BCS, AM::LabelRelative(true_label.clone()));
+                self.emit(JMP, AM::Label(false_label.clone()));
+            }
+            Cmp16Kind::GtEq => {
+                // a >= b when carry set.
+                self.emit(BCS, AM::LabelRelative(true_label.clone()));
+                self.emit(JMP, AM::Label(false_label.clone()));
+            }
+        }
+
+        // False path
+        self.emit_label(&false_label);
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(JMP, AM::Label(end_label.clone()));
+        // True path
+        self.emit_label(&true_label);
+        self.emit(LDA, AM::Immediate(1));
+        self.emit_label(&end_label);
+        self.store_temp(dest);
     }
 
     fn gen_cmp(&mut self, dest: IrTemp, a: IrTemp, b: IrTemp, kind: CmpKind) {
@@ -817,6 +1288,16 @@ enum CmpKind {
     GtEq,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum Cmp16Kind {
+    Eq,
+    Ne,
+    Lt,
+    Gt,
+    LtEq,
+    GtEq,
+}
+
 /// Replace `{name}` tokens in an inline-asm body with the resolved
 /// hex address from the given resolver. Unknown names and malformed
 /// placeholders are passed through unchanged (the asm parser will
@@ -873,19 +1354,236 @@ fn function_draws_sprites(func: &IrFunction) -> bool {
         .any(|op| matches!(op, IrOp::DrawSprite { .. }))
 }
 
-/// Scan the IR functions for all scanline handlers (named
-/// `{state}_scanline_{line}`) and return them in IR function order.
-fn collect_scanline_handlers(ir: &IrProgram) -> Vec<(String, u8)> {
-    let mut out = Vec::new();
-    for func in &ir.functions {
-        // Match the pattern `<state>_scanline_<N>` by splitting on
-        // the last `_scanline_`. This keeps it simple and avoids
-        // re-threading scanline info through lowering.
-        if let Some((state_name, tail)) = func.name.rsplit_once("_scanline_") {
-            if let Ok(line) = tail.parse::<u8>() {
-                out.push((state_name.to_string(), line));
+/// Return every source temp referenced by an op. Destination temps
+/// are excluded. Mirrors `optimizer::collect_source_temps` but
+/// returns a small Vec instead of mutating a set — the codegen
+/// wants to iterate each use, not deduplicate them, so that a temp
+/// used twice by one op (e.g. `Add(d, t, t)`) is correctly
+/// retired twice.
+fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
+    match op {
+        IrOp::LoadImm(_, _) | IrOp::LoadVar(_, _) | IrOp::LoadVarHi(_, _) => Vec::new(),
+        IrOp::StoreVar(_, src) | IrOp::StoreVarHi(_, src) => vec![*src],
+        IrOp::Add(_, a, b)
+        | IrOp::Sub(_, a, b)
+        | IrOp::Mul(_, a, b)
+        | IrOp::And(_, a, b)
+        | IrOp::Or(_, a, b)
+        | IrOp::Xor(_, a, b)
+        | IrOp::CmpEq(_, a, b)
+        | IrOp::CmpNe(_, a, b)
+        | IrOp::CmpLt(_, a, b)
+        | IrOp::CmpGt(_, a, b)
+        | IrOp::CmpLtEq(_, a, b)
+        | IrOp::CmpGtEq(_, a, b) => vec![*a, *b],
+        IrOp::ShiftLeft(_, src, _) | IrOp::ShiftRight(_, src, _) => vec![*src],
+        IrOp::Negate(_, src) | IrOp::Complement(_, src) => vec![*src],
+        IrOp::ArrayLoad(_, _, idx) => vec![*idx],
+        IrOp::ArrayStore(_, idx, val) => vec![*idx, *val],
+        IrOp::Call(_, _, args) => args.clone(),
+        IrOp::DrawSprite { x, y, frame, .. } => {
+            let mut out = vec![*x, *y];
+            if let Some(f) = frame {
+                out.push(*f);
+            }
+            out
+        }
+        IrOp::Scroll(x, y) => vec![*x, *y],
+        IrOp::DebugLog(args) => args.clone(),
+        IrOp::DebugAssert(cond) => vec![*cond],
+        IrOp::Poke(_, src) => vec![*src],
+        IrOp::Add16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::Sub16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpEq16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpNe16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpLt16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpGt16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpLtEq16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpGtEq16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        } => vec![*a_lo, *a_hi, *b_lo, *b_hi],
+        IrOp::ReadInput(_, _)
+        | IrOp::WaitFrame
+        | IrOp::Transition(_)
+        | IrOp::InlineAsm(_)
+        | IrOp::Peek(_, _)
+        | IrOp::PlaySfx(_)
+        | IrOp::StartMusic(_)
+        | IrOp::StopMusic
+        | IrOp::SourceLoc(_) => Vec::new(),
+    }
+}
+
+/// Return every source temp referenced by a terminator.
+fn terminator_source_temps(term: &IrTerminator) -> Vec<IrTemp> {
+    match term {
+        IrTerminator::Branch(t, _, _) => vec![*t],
+        IrTerminator::Return(Some(t)) => vec![*t],
+        IrTerminator::Jump(_) | IrTerminator::Return(None) | IrTerminator::Unreachable => {
+            Vec::new()
+        }
+    }
+}
+
+/// Count how many times each temp appears as a source operand in a
+/// function. A terminator that reads a temp counts as one use; an
+/// op that reads the same temp twice counts as two uses. Used to
+/// drive slot recycling in `retire_op_sources`.
+fn build_use_counts(func: &IrFunction) -> HashMap<IrTemp, u32> {
+    let mut counts: HashMap<IrTemp, u32> = HashMap::new();
+    for block in &func.blocks {
+        for op in &block.ops {
+            for t in op_source_temps(op) {
+                *counts.entry(t).or_insert(0) += 1;
             }
         }
+        for t in terminator_source_temps(&block.terminator) {
+            *counts.entry(t).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Look up APU parameters for a named sound effect. Returns
+/// `(volume_byte, period_lo, period_hi, duration_frames)` suitable
+/// for direct writes to $4000/$4002/$4003 and a frame countdown to
+/// store at the SFX counter.
+///
+/// The table is a small set of builtin names; anything not matched
+/// falls back to a generic 1/16th-second beep. Names are matched
+/// case-insensitively so `Coin`, `COIN`, and `coin` all work.
+///
+/// Volume byte format: `DD LC VVVV` where `DD` is the duty cycle,
+/// `L` halts the length counter (1 = sustained), `C` selects
+/// constant volume (1 = constant, 0 = envelope decay), and `VVVV`
+/// is the volume level (0–15). We use constant volume + short
+/// duration counter for all SFX so the envelope doesn't surprise
+/// users.
+///
+/// Period: NES pulse channels compute frequency as
+/// `CPU / (16 * (period + 1))`. Lower period = higher pitch. The
+/// table uses periods chosen to land roughly on NES-era notes.
+fn lookup_sfx(name: &str) -> (u8, u8, u8, u8) {
+    // Duty = 10 (50% square), length halt off, constant volume,
+    // volume 11 (~-8 dB) — a comfortable loudness that doesn't
+    // dominate the mix. `0xBF = 0b1011_1111`.
+    const VOL: u8 = 0xBF;
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        // High, short blip — classic pickup sound.
+        "coin" | "pickup" | "collect" => (VOL, 0x50, 0x08, 6),
+        // Mid tone with slight length — jump ack.
+        "jump" | "hop" => (VOL, 0x80, 0x0A, 8),
+        // Low short blast — hit/damage.
+        "hit" | "damage" | "explode" => (0xBC, 0xA0, 0x0D, 10),
+        // Very low short thud — footstep.
+        "step" | "footstep" => (VOL, 0xC0, 0x0D, 3),
+        // Higher short beep — menu click.
+        "click" | "select" | "confirm" => (VOL, 0x40, 0x08, 4),
+        // Low long-ish tone — cancel/back.
+        "cancel" | "back" | "error" => (VOL, 0xB0, 0x0C, 10),
+        // Very high short beep — laser shoot.
+        "shoot" | "laser" | "fire" => (VOL, 0x30, 0x08, 5),
+        // Default generic beep.
+        _ => (VOL, 0x70, 0x0A, 6),
+    }
+}
+
+/// Look up APU parameters for a named music track. Returns
+/// `(volume_byte, period_lo, period_hi)` for pulse 2. Music is
+/// sustained (halt bit set) until `stop_music` runs. The table
+/// maps a few well-known names to a single held tone; picking a
+/// real tune is out of scope for the minimal driver.
+fn lookup_music(name: &str) -> (u8, u8, u8) {
+    // `0x3F` = duty 00 (12.5% pulse), length halt on, constant
+    // volume, volume 15. The halt bit keeps the note playing
+    // without envelope decay.
+    const VOL: u8 = 0x3F;
+    let lower = name.to_ascii_lowercase();
+    match lower.as_str() {
+        "title" | "theme" | "main" => (VOL, 0xFD, 0x02),
+        "battle" | "boss" => (VOL, 0xA0, 0x01),
+        "win" | "victory" | "fanfare" => (VOL, 0x60, 0x01),
+        "gameover" | "lose" | "fail" => (VOL, 0xE0, 0x03),
+        _ => (VOL, 0xC0, 0x01),
+    }
+}
+
+/// Group all scanline handlers by state name, returning
+/// `(state_name, sorted_scanlines)` pairs. Within each state the
+/// scanlines are sorted ascending — the IRQ dispatcher walks them
+/// in order, reloading the MMC3 counter with the delta between
+/// consecutive scanlines so the handlers fire at the right lines.
+fn group_scanline_handlers(ir: &IrProgram) -> Vec<(String, Vec<u8>)> {
+    use std::collections::BTreeMap;
+    let mut grouped: BTreeMap<String, Vec<u8>> = BTreeMap::new();
+    // Iterate in IR function order to preserve deterministic output
+    // for unchanged programs; sort the per-state line lists at the
+    // end so the IRQ dispatcher always sees them ascending.
+    let mut seen_order = Vec::new();
+    for func in &ir.functions {
+        if let Some((state_name, tail)) = func.name.rsplit_once("_scanline_") {
+            if let Ok(line) = tail.parse::<u8>() {
+                let state = state_name.to_string();
+                if !grouped.contains_key(&state) {
+                    seen_order.push(state.clone());
+                }
+                grouped.entry(state).or_default().push(line);
+            }
+        }
+    }
+    let mut out = Vec::with_capacity(seen_order.len());
+    for name in seen_order {
+        let mut lines = grouped.remove(&name).unwrap_or_default();
+        lines.sort_unstable();
+        lines.dedup();
+        out.push((name, lines));
     }
     out
 }
@@ -1129,6 +1827,96 @@ mod more_tests {
     }
 
     #[test]
+    fn ir_codegen_multi_scanline_per_state_emits_step_counter_dispatch() {
+        // A state with multiple scanline handlers must dispatch on
+        // both `current_state` and `ZP_SCANLINE_STEP` (at $0C). The
+        // old codegen just took the first handler per state, so
+        // scanline 120 and scanline 180 would never fire even with
+        // their handlers linked in.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: MMC3 }
+            state Main {
+                on frame { wait_frame }
+                on scanline(60)  { wait_frame }
+                on scanline(120) { wait_frame }
+                on scanline(180) { wait_frame }
+            }
+            start Main
+        "#,
+        );
+        // The IRQ dispatcher must read the step counter at $0C.
+        let reads_step = insts
+            .iter()
+            .any(|i| i.opcode == LDY && i.mode == AM::ZeroPage(0x0C));
+        assert!(
+            reads_step,
+            "multi-scanline dispatcher should read ZP_SCANLINE_STEP at $0C"
+        );
+        // It must also INC the step counter so the next IRQ lands
+        // on the next handler.
+        let bumps_step = insts
+            .iter()
+            .any(|i| i.opcode == INC && i.mode == AM::ZeroPage(0x0C));
+        assert!(
+            bumps_step,
+            "multi-scanline dispatcher should bump ZP_SCANLINE_STEP"
+        );
+        // All three handlers should be emitted as distinct functions.
+        for line in [60u8, 120, 180] {
+            let name = format!("__ir_fn_Main_scanline_{line}");
+            let has_fn = insts
+                .iter()
+                .any(|i| matches!(&i.mode, AM::Label(l) if l == &name));
+            assert!(
+                has_fn,
+                "handler for scanline {line} should be emitted as function label '{name}'"
+            );
+        }
+        // The reload helper must reset the step counter at the top
+        // of each frame.
+        let resets_step = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(0x0C));
+        assert!(
+            resets_step,
+            "reload helper should clear ZP_SCANLINE_STEP at NMI"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_multi_scanline_reload_uses_delta_not_absolute_line() {
+        // Between two scanlines in the same state, the MMC3 counter
+        // reload must use the *delta* (next - current - 1), not
+        // the absolute next line. Otherwise the counter would
+        // double-count past lines.
+        //
+        // For scanlines 60 and 120 the delta is 120 - 60 - 1 = 59.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: MMC3 }
+            state Main {
+                on frame { wait_frame }
+                on scanline(60)  { wait_frame }
+                on scanline(120) { wait_frame }
+            }
+            start Main
+        "#,
+        );
+        // Find the expected delta load. The absolute line number
+        // 120 should NOT appear as an immediate if the codegen is
+        // doing delta reloads correctly — only 60 (initial) and
+        // 59 (delta) should.
+        let has_delta = insts
+            .iter()
+            .any(|i| i.opcode == LDA && i.mode == AM::Immediate(59));
+        assert!(
+            has_delta,
+            "multi-scanline reload should use delta 59 (= 120 - 60 - 1) for the second scanline"
+        );
+    }
+
+    #[test]
     fn ir_codegen_scanline_emits_mmc3_setup_and_irq_user() {
         let insts = lower_and_gen(
             r#"
@@ -1331,5 +2119,317 @@ mod more_tests {
                  — bug B regression (compile-time slot bumps are back)"
             );
         }
+    }
+
+    // ── Audio driver tests ──
+
+    fn has_inst(insts: &[Instruction], opcode: crate::asm::Opcode, mode: &AM) -> bool {
+        insts.iter().any(|i| i.opcode == opcode && i.mode == *mode)
+    }
+
+    #[test]
+    fn ir_codegen_play_sfx_emits_pulse1_writes_and_marker() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { play coin }
+            start Main
+        "#,
+        );
+        // `play` must emit writes to $4000 (volume), $4002 (period
+        // low) and $4003 (length + period high).
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x4000)),
+            "play should write pulse-1 volume register $4000"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x4002)),
+            "play should write pulse-1 period-lo register $4002"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x4003)),
+            "play should write pulse-1 length+period-hi register $4003"
+        );
+        // The SFX countdown counter at $0A must be set so the NMI
+        // audio tick knows how long to sustain the tone.
+        assert!(
+            has_inst(&insts, STA, &AM::ZeroPage(0x0A)),
+            "play should set the SFX counter at $0A"
+        );
+        // The `__audio_used` marker label must be present so the
+        // linker knows to splice the audio tick into NMI.
+        let has_marker = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__audio_used"));
+        assert!(has_marker, "play should emit the __audio_used marker label");
+    }
+
+    #[test]
+    fn ir_codegen_start_music_writes_pulse2() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { start_music theme }
+            start Main
+        "#,
+        );
+        // Music uses pulse 2 ($4004-$4007).
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x4004)),
+            "start_music should write pulse-2 volume register $4004"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x4006)),
+            "start_music should write pulse-2 period-lo register $4006"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x4007)),
+            "start_music should write pulse-2 length+period-hi register $4007"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_stop_music_mutes_pulse2() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { stop_music }
+            start Main
+        "#,
+        );
+        // Stop must write the mute byte ($30) to $4004.
+        assert!(
+            has_inst(&insts, LDA, &AM::Immediate(0x30)),
+            "stop_music should load the mute byte $30"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x4004)),
+            "stop_music should store to pulse-2 volume register $4004"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_no_audio_means_no_marker() {
+        // Programs that never play audio should not emit the
+        // `__audio_used` marker — the linker relies on its absence
+        // to skip the audio tick and driver entirely.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var x: u8 = 0
+            on frame { x += 1 }
+            start Main
+        "#,
+        );
+        let has_marker = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__audio_used"));
+        assert!(
+            !has_marker,
+            "programs without audio should not emit the __audio_used marker"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_audio_marker_emitted_once() {
+        // Multiple audio ops in the same program should produce
+        // exactly one marker label — the linker looks it up by
+        // name and duplicates would cause assembler errors.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame {
+                play coin
+                play jump
+                start_music theme
+                stop_music
+            }
+            start Main
+        "#,
+        );
+        let marker_count = insts
+            .iter()
+            .filter(|i| matches!(&i.mode, AM::Label(l) if l == "__audio_used"))
+            .count();
+        assert_eq!(
+            marker_count, 1,
+            "__audio_used marker must be emitted exactly once per program"
+        );
+    }
+
+    // ── u16 arithmetic tests ──
+
+    #[test]
+    fn ir_codegen_u16_literal_init_writes_both_bytes() {
+        // A u16 initializer `var big: u16 = 1000` must write BOTH
+        // bytes of 1000 (low=0xE8, high=0x03) into memory. The old
+        // behaviour was to truncate to a single low-byte store,
+        // leaving the high byte as whatever the RAM clear left it
+        // — a silent 232/0 instead of 1000.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var big: u16 = 1000
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        // 1000 = 0x03E8 → low byte 0xE8, high byte 0x03
+        assert!(
+            has_inst(&insts, LDA, &AM::Immediate(0xE8)),
+            "u16 init should load low byte"
+        );
+        assert!(
+            has_inst(&insts, LDA, &AM::Immediate(0x03)),
+            "u16 init should load high byte"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_u16_add_uses_carry_propagation() {
+        // `big += 1` on a u16 must propagate carry from the low
+        // byte into the high byte. Codegen shape: CLC, LDA a_lo,
+        // ADC b_lo, STA d_lo, LDA a_hi, ADC b_hi, STA d_hi — the
+        // second ADC has no CLC before it so it uses the carry
+        // from the low-byte addition.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var big: u16 = 0
+            on frame { big = big + 1 }
+            start Main
+        "#,
+        );
+        // There should be at least two ADC instructions (one per
+        // byte) and exactly one CLC before them — the Add16 op
+        // emits CLC only before the low byte.
+        let adc_count = insts.iter().filter(|i| i.opcode == ADC).count();
+        assert!(
+            adc_count >= 2,
+            "Add16 should emit at least two ADC instructions (one per byte), got {adc_count}"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_u16_compound_add_stores_high_byte() {
+        // `big += 1` on a u16 variable must emit a store for the
+        // high byte after the Add16. Previously the compiler would
+        // store only the low byte, silently dropping the carry.
+        //
+        // The analyzer's RAM allocator sends anything larger than
+        // one byte into main RAM starting at `$0300`, so `big`'s
+        // high byte lives at `$0301`. That's what we check for.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var big: u16 = 0
+            on frame { big += 1 }
+            start Main
+        "#,
+        );
+        let has_hi_store = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x0301));
+        assert!(
+            has_hi_store,
+            "u16 compound assignment should store the high byte at var+1 ($0301)"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_u16_compare_checks_high_byte() {
+        // `big > 256` on a u16 must compare the high byte. A
+        // purely low-byte compare would give wrong answers for any
+        // value where the high bytes differ.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var big: u16 = 0
+            var flag: u8 = 0
+            on frame {
+                if big > 256 { flag = 1 }
+            }
+            start Main
+        "#,
+        );
+        // There should be two CMP instructions: one for the high
+        // byte and (conditionally) one for the low byte.
+        let cmp_count = insts.iter().filter(|i| i.opcode == CMP).count();
+        assert!(
+            cmp_count >= 2,
+            "u16 comparison should emit at least two CMP instructions (one per byte), got {cmp_count}"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_recycles_temp_slots_in_long_functions() {
+        // Regression guard for the "IR temps exceed 128 slots"
+        // panic that used to crash `bitwise_ops.ne`. A function
+        // with many short-lived temps must recycle slots so the
+        // allocator stays within the 128-byte TEMP region
+        // ($80-$FF). We compile a program with dozens of
+        // independent arithmetic expressions and assert that no
+        // zero-page address is ever written outside that range.
+        let source = r#"
+            game "T" { mapper: NROM }
+            var a: u8 = 0
+            var b: u8 = 0
+            var c: u8 = 0
+            var d: u8 = 0
+            var e: u8 = 0
+            var f: u8 = 0
+            var g: u8 = 0
+            var h: u8 = 0
+            on frame {
+                a = (a ^ 0x80) | (b & 0x0F)
+                b = (b ^ 0x40) | (c & 0x0F)
+                c = (c ^ 0x20) | (d & 0x0F)
+                d = (d ^ 0x10) | (e & 0x0F)
+                e = (e ^ 0x08) | (f & 0x0F)
+                f = (f ^ 0x04) | (g & 0x0F)
+                g = (g ^ 0x02) | (h & 0x0F)
+                h = (h ^ 0x01) | (a & 0x0F)
+            }
+            start Main
+        "#;
+        let insts = lower_and_gen(source);
+        // Count distinct temp slots used.
+        let mut slots = std::collections::HashSet::new();
+        for inst in &insts {
+            if let AM::ZeroPage(addr) = inst.mode {
+                if addr >= 0x80 {
+                    slots.insert(addr);
+                }
+            }
+        }
+        // Should use far fewer than 128 slots — the recycling
+        // means each short-lived temp reuses the same handful of
+        // slots.
+        assert!(
+            slots.len() <= 16,
+            "expected slot recycling to keep temp count low, got {} slots: {slots:?}",
+            slots.len()
+        );
+    }
+
+    #[test]
+    fn ir_codegen_u8_var_still_uses_8bit_ops() {
+        // Regression guard: u8 variables must NOT take the 16-bit
+        // path. This is the baseline sanity check that u16 handling
+        // didn't accidentally widen every operation.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var x: u8 = 0
+            on frame { x += 1 }
+            start Main
+        "#,
+        );
+        // For a plain u8 increment we expect exactly one ADC.
+        let adc_count = insts.iter().filter(|i| i.opcode == ADC).count();
+        assert_eq!(
+            adc_count, 1,
+            "u8 += should emit exactly one ADC; got {adc_count}"
+        );
     }
 }

@@ -116,6 +116,15 @@ impl Linker {
         all_instructions.extend(runtime::gen_multiply());
         all_instructions.extend(runtime::gen_divide());
 
+        // Audio driver body — linked in whenever user code touched
+        // audio. The driver needs to exist before `__nmi` (the NMI
+        // JSR target must be defined before the caller), so emit it
+        // alongside the math routines. No-cost elision when unused:
+        // the `has_label` check below skips the whole block.
+        if has_label(user_code, "__audio_used") {
+            all_instructions.extend(runtime::gen_audio_tick());
+        }
+
         // NMI handler
         all_instructions.push(Instruction::new(NOP, AM::Label("__nmi".into())));
         // If user code emits an MMC3 reload hook, splice in a JSR
@@ -128,6 +137,17 @@ impl Linker {
         // when there's no work to do.
         if has_label(user_code, "__ir_mmc3_reload") {
             all_instructions.push(Instruction::new(JSR, AM::Label("__ir_mmc3_reload".into())));
+        }
+        // Audio tick: if the user program ever triggered an SFX or
+        // music (detected by the marker label `__audio_used` emitted
+        // by `IrCodeGen` when it sees any audio op), JSR into the
+        // driver's per-frame tick before the normal NMI body. The
+        // tick decrements the SFX counter and silences pulse 1 when
+        // it reaches zero. Programs that never play audio skip both
+        // the splice and the driver body entirely — no ROM cost.
+        let has_audio = has_label(user_code, "__audio_used");
+        if has_audio {
+            all_instructions.push(Instruction::new(JSR, AM::Label("__audio_tick".into())));
         }
         all_instructions.extend(runtime::gen_nmi());
 

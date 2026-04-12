@@ -155,6 +155,103 @@ pub enum IrOp {
     /// `peek(addr)` — LDA from a fixed absolute address into a temp.
     Peek(IrTemp, u16),
 
+    // 16-bit operations — emitted for u16-typed expressions and
+    // assignments. Each wide value is carried as a pair of 8-bit
+    // temps `(lo, hi)`, so the existing temp-slot allocator still
+    // works without modification.
+    /// Load the high byte of a u16 variable (var address + 1).
+    /// The existing `LoadVar` is repurposed as "load the low byte"
+    /// because it loads from the var's base address — which is the
+    /// low byte of a little-endian u16.
+    LoadVarHi(IrTemp, VarId),
+    /// Store the high byte of a u16 variable (var address + 1).
+    StoreVarHi(VarId, IrTemp),
+    /// 16-bit add: `(d_lo, d_hi) = (a_lo, a_hi) + (b_lo, b_hi)`.
+    /// Codegen emits `CLC; LDA a_lo; ADC b_lo; STA d_lo; LDA a_hi;
+    /// ADC b_hi; STA d_hi` — the ADC for the high byte propagates
+    /// the carry flag set by the low-byte addition.
+    Add16 {
+        d_lo: IrTemp,
+        d_hi: IrTemp,
+        a_lo: IrTemp,
+        a_hi: IrTemp,
+        b_lo: IrTemp,
+        b_hi: IrTemp,
+    },
+    /// 16-bit subtract: `(d_lo, d_hi) = (a_lo, a_hi) - (b_lo, b_hi)`.
+    /// Uses SEC; SBC to propagate borrow through the high byte.
+    Sub16 {
+        d_lo: IrTemp,
+        d_hi: IrTemp,
+        a_lo: IrTemp,
+        a_hi: IrTemp,
+        b_lo: IrTemp,
+        b_hi: IrTemp,
+    },
+    /// 16-bit equality comparison; `dest = (a == b) ? 1 : 0`.
+    /// Lowered as two CMPs with a short-circuit on the low byte.
+    CmpEq16 {
+        dest: IrTemp,
+        a_lo: IrTemp,
+        a_hi: IrTemp,
+        b_lo: IrTemp,
+        b_hi: IrTemp,
+    },
+    /// 16-bit not-equal comparison.
+    CmpNe16 {
+        dest: IrTemp,
+        a_lo: IrTemp,
+        a_hi: IrTemp,
+        b_lo: IrTemp,
+        b_hi: IrTemp,
+    },
+    /// 16-bit unsigned less-than. `dest = (a < b) ? 1 : 0`.
+    /// Codegen compares high bytes first; falls through to compare
+    /// low bytes only when the high bytes are equal.
+    CmpLt16 {
+        dest: IrTemp,
+        a_lo: IrTemp,
+        a_hi: IrTemp,
+        b_lo: IrTemp,
+        b_hi: IrTemp,
+    },
+    /// 16-bit unsigned greater-than.
+    CmpGt16 {
+        dest: IrTemp,
+        a_lo: IrTemp,
+        a_hi: IrTemp,
+        b_lo: IrTemp,
+        b_hi: IrTemp,
+    },
+    /// 16-bit unsigned less-or-equal.
+    CmpLtEq16 {
+        dest: IrTemp,
+        a_lo: IrTemp,
+        a_hi: IrTemp,
+        b_lo: IrTemp,
+        b_hi: IrTemp,
+    },
+    /// 16-bit unsigned greater-or-equal.
+    CmpGtEq16 {
+        dest: IrTemp,
+        a_lo: IrTemp,
+        a_hi: IrTemp,
+        b_lo: IrTemp,
+        b_hi: IrTemp,
+    },
+
+    // Audio ops — map to the minimal APU driver emitted by the linker.
+    /// `play SfxName` — trigger a one-shot sound effect on pulse 1.
+    /// The sfx name is looked up in a builtin table; unrecognized names
+    /// play a generic beep.
+    PlaySfx(String),
+    /// `start_music TrackName` — play a sustained tone on pulse 2 until
+    /// `stop_music`. The track name is hashed into a tone parameter.
+    StartMusic(String),
+    /// `stop_music` — silence the music channel (pulse 2) and any
+    /// currently-playing SFX tail.
+    StopMusic,
+
     // Source mapping
     SourceLoc(Span),
 }

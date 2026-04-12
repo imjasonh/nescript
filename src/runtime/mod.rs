@@ -25,6 +25,15 @@ pub const ZP_INPUT_P2: u8 = 0x08;
 /// the oldest slot gets overwritten — the classic NES flicker
 /// fallback.
 pub const ZP_OAM_CURSOR: u8 = 0x09;
+/// Pulse-1 SFX countdown frames. `play SfxName` sets this to the
+/// SFX duration and writes the tone registers; the NMI audio tick
+/// decrements it every frame, silencing pulse 1 when it reaches 0.
+pub const ZP_SFX_COUNTER: u8 = 0x0A;
+/// Pulse-2 music countdown frames. `start_music TrackName` sets
+/// this to `$FF` (infinite sustain) and writes a pulse-2 tone;
+/// `stop_music` zeros it and mutes pulse 2. `$FF` skips the NMI
+/// decrement so music plays until explicitly stopped.
+pub const ZP_MUSIC_COUNTER: u8 = 0x0B;
 
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
@@ -48,8 +57,28 @@ pub fn gen_init() -> Vec<Instruction> {
     out.push(Instruction::new(STA, AM::Absolute(PPU_CTRL)));
     out.push(Instruction::new(STA, AM::Absolute(PPU_MASK)));
 
-    // Disable DMC IRQs
+    // Disable DMC IRQs momentarily (will re-enable the square
+    // channels below so `play`/`start_music` can make sound).
     out.push(Instruction::new(STA, AM::Absolute(APU_STATUS)));
+
+    // Enable pulse 1 and pulse 2 channels for the minimal audio
+    // driver. SFX runs on pulse 1, music on pulse 2. We leave
+    // triangle / noise / DMC disabled — the engine is deliberately
+    // simple and those channels would go unused anyway.
+    out.push(Instruction::new(LDA, AM::Immediate(0x03)));
+    out.push(Instruction::new(STA, AM::Absolute(APU_STATUS)));
+    // Pre-silence both channels: `$30` on the volume register sets
+    // constant-volume envelope with volume 0 and halts the length
+    // counter, which is the canonical "silent but armed" state.
+    out.push(Instruction::new(LDA, AM::Immediate(0x30)));
+    out.push(Instruction::new(STA, AM::Absolute(0x4000)));
+    out.push(Instruction::new(STA, AM::Absolute(0x4004)));
+    // Clear sweep units so the channel tone doesn't auto-slide.
+    out.push(Instruction::new(LDA, AM::Immediate(0x08)));
+    out.push(Instruction::new(STA, AM::Absolute(0x4001)));
+    out.push(Instruction::new(STA, AM::Absolute(0x4005)));
+    // Restore the zero we need for the subsequent RAM clear below.
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
 
     // Wait for first vblank
     // vblankwait1:
@@ -222,6 +251,46 @@ pub fn gen_multiply() -> Vec<Instruction> {
     // (since we shifted the multiplicand left, result is in $03)
     out.push(Instruction::new(LDA, AM::ZeroPage(ZP_MUL_RESULT_HI)));
 
+    out.push(Instruction::implied(RTS));
+
+    out
+}
+
+/// Generate the per-NMI audio tick that ages the SFX counter and
+/// silences pulse 1 when the counter hits zero. Music on pulse 2
+/// uses the sentinel `$FF` for infinite sustain and is never
+/// decremented here — `stop_music` handles mute explicitly.
+///
+/// The linker splices a `JSR __audio_tick` into the NMI handler
+/// whenever user code contains any audio ops, so programs that
+/// never call `play`/`start_music`/`stop_music` pay zero cost.
+///
+/// Contract:
+/// - Input: `ZP_SFX_COUNTER` = remaining frames for pulse 1's tone
+/// - Effect: decrements the counter; on 0→transition mutes $4000
+/// - Clobbers: A (which the NMI handler restores via PLA)
+pub fn gen_audio_tick() -> Vec<Instruction> {
+    let mut out = Vec::new();
+
+    out.push(Instruction::new(NOP, AM::Label("__audio_tick".into())));
+
+    // SFX counter check: if 0, nothing to do.
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_SFX_COUNTER)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__audio_tick_done".into()),
+    ));
+    out.push(Instruction::new(DEC, AM::ZeroPage(ZP_SFX_COUNTER)));
+    // If still non-zero, leave the tone alone.
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_tick_done".into()),
+    ));
+    // Counter just hit 0: silence pulse 1 (volume envelope = mute).
+    out.push(Instruction::new(LDA, AM::Immediate(0x30)));
+    out.push(Instruction::new(STA, AM::Absolute(0x4000)));
+
+    out.push(Instruction::new(NOP, AM::Label("__audio_tick_done".into())));
     out.push(Instruction::implied(RTS));
 
     out

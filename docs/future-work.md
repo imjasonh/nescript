@@ -163,15 +163,18 @@ These are defined in `ErrorCode` but never emitted:
 
 ## 12. Audio
 
-**Status**: `play`, `start_music`, `stop_music` keywords are lexed but produce
-no output. No audio driver exists.
+**Status**: A minimal APU driver is now in place. `play SfxName` emits
+pulse-1 register writes from a builtin SFX table, `start_music` holds a
+tone on pulse 2, `stop_music` mutes pulse 2. The NMI handler gains a
+`JSR __audio_tick` splice whenever user code triggered audio so the SFX
+countdown counter can mute the tone when its frames are up. Unused
+programs pay zero ROM cost.
 
-**What's needed**:
+**Still TODO for a full audio solution**:
 - `@sfx("file.nsf")` / `@music("file.ftm")` asset directives
-- Audio driver running in the NMI handler (after OAM DMA)
-- `play SfxName` → trigger one-shot sound effect
-- `start_music TrackName` / `stop_music` → start/stop background music
-- FamiTracker export format parsing (complex — consider using existing tools)
+- FamiTracker export format parsing
+- Multi-channel music driver with note tables and envelopes
+- Per-SFX duration override in the declaration rather than the builtin table
 
 ---
 
@@ -281,6 +284,49 @@ spills to zero-page $02 for comparisons. A proper allocator would:
 ### Recently completed (removed from backlog)
 
 These items were documented as future work but have since been implemented:
+
+- **Minimal audio driver** — `src/runtime/mod.rs::gen_audio_tick()`
+  plus codegen for `IrOp::PlaySfx` / `StartMusic` / `StopMusic`. SFX
+  and music map through a builtin name table (`coin`, `jump`, `hit`,
+  `theme`, etc.) to APU pulse 1/2 register writes. The NMI handler
+  gains a `JSR __audio_tick` splice (via the linker's `__audio_used`
+  marker lookup) that decrements a per-frame counter and mutes the
+  channel when the tone's time is up. Programs without audio pay
+  zero ROM cost.
+- **u16 arithmetic and comparisons** — new IR ops `LoadVarHi`,
+  `StoreVarHi`, `Add16`, `Sub16`, `CmpEq16` through `CmpGtEq16`. The
+  lowering context tracks variable types via the analyzer's symbol
+  table and routes each expression through the 8-bit or 16-bit path
+  based on operand width. Initializers, compound assignments, and
+  comparisons all preserve both bytes. The codegen emits
+  `CLC;ADC;ADC` for Add16 with carry propagating naturally, and
+  compare-high-then-compare-low dispatch for the six comparison
+  variants.
+- **Multi-scanline on_scanline per state** — `gen_scanline_irq` now
+  dispatches on `(current_state, ZP_SCANLINE_STEP)` and reloads the
+  MMC3 counter with the delta to the next scanline in the same
+  state. `gen_scanline_reload` resets the step counter at the top
+  of each NMI so a state with multiple handlers fires them in
+  ascending line order.
+- **IR temp slot recycling** — `build_use_counts` pre-scans each
+  function to count per-temp uses; `retire_op_sources` decrements
+  the counts after each op runs and pushes dead slots back onto
+  `free_slots` for later allocation. Previously, `bitwise_ops.ne`
+  crashed (debug) or silently miscompiled (release) once it
+  allocated more than 128 concurrent temps. With recycling the
+  same function now uses ~4 slots instead of 136.
+- **INC/DEC peephole fold** — `fold_inc_dec` collapses
+  `LDA addr; CLC; ADC #1; STA addr` into a single `INC addr`
+  (and the SEC/SBC/#1 variant into `DEC addr`). Saves 5 bytes and
+  5 cycles per increment. The fold is suppressed when the next
+  instruction is a carry-dependent branch (`BCC`/`BCS`) since
+  INC/DEC don't update the carry flag.
+- **Peephole dead-load elimination across passive ops** — the
+  old `remove_dead_loads` only dropped an LDA if the very next
+  instruction was another A-writer. Now it walks past
+  INC/DEC/STX/STY (which don't touch A) to find the actual
+  next A-use, catching more dead loads produced by copy
+  propagation.
 
 - **State machine dispatch** — CMP + BNE + JMP trampoline dispatch table,
   `current_state` in ZP $03, on_enter/on_exit handlers as JSR targets
@@ -440,18 +486,26 @@ These items were documented as future work but have since been implemented:
 
 For someone picking up this codebase, the recommended order of work:
 
-1. **u16 / array / nested struct fields** — current structs only
-   allow u8/i8/bool fields. The layout machinery is ready for more
-   types but the codegen only handles 1-byte loads/stores.
-2. **Audio driver** — the `play`/`start_music`/`stop_music`
-   statements parse but don't generate any code. A minimal NSF-style
-   driver running in NMI would unblock game projects.
-3. **Multi-scanline on_scanline reload** — the current codegen
-   supports one scanline per state but not a chain of handlers at
-   different scanlines in the same frame.
-4. **Register allocator** — proper A/X/Y allocation to replace
+1. **u16 / array / nested struct fields** — u16 *globals* now work
+   end-to-end (load/store, +/-, comparisons all propagate through
+   16-bit IR ops). Struct fields and array elements are still u8-only
+   — the layout machinery needs to grow multi-byte field offsets.
+2. **Full multi-channel music driver** — the current audio engine
+   holds a single tone on each of pulse 1 (SFX) and pulse 2 (music).
+   A proper NSF-style driver with note tables, envelopes, and a
+   multi-track stream would unblock real game music.
+3. **Register allocator** — proper A/X/Y allocation to replace
    zero-page spills used by the current IR codegen. Partially
-   mitigated by peephole passes but still wasteful in some cases.
-5. **Match statement** — `match x { 0 => ... , 1 => ... }` would be
-   useful for state dispatch and enum-driven logic.
-8. **Text / HUD layer** — font sheet + layout system for scores.
+   mitigated by peephole passes + the new slot recycler, but still
+   wasteful in some cases (every temp spills to a ZP slot even if
+   its live range is one op wide).
+4. **Text / HUD layer** — font sheet + layout system for scores.
+5. **Cross-block temp live-range analysis** — the current slot
+   recycler is function-local; temps that flow across block
+   boundaries always get a dedicated slot for the full function.
+   A proper CFG-aware live range interference graph would let more
+   temps share slots.
+6. **Peephole: drop LDA dead across unconditional JMPs** — after
+   the INC/DEC fold we sometimes leave an `LDA #1` whose value is
+   consumed by nothing before the next `JMP __ir_main_loop`. Local
+   analysis can't prove it's dead; a cross-block pass could.
