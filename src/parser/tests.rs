@@ -678,3 +678,240 @@ fn parse_bank_decl() {
     assert_eq!(prog.banks[0].name, "Level1Data");
     assert_eq!(prog.banks[0].bank_type, BankType::Prg);
 }
+
+// ── Edge cases and regression tests ──
+
+#[test]
+fn draw_followed_by_statement() {
+    // Regression: draw keyword-arg parser used to consume the next statement's
+    // identifier as a keyword arg, causing "expected ':'" errors.
+    let src = r#"
+        game "T" { mapper: NROM }
+        var i: u8 = 0
+        on frame {
+            draw Sprite at: (0, 0)
+            i += 1
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert_eq!(frame.statements.len(), 2); // draw + assignment
+}
+
+#[test]
+fn draw_with_frame_followed_by_statement() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            draw Sprite at: (0, 0) frame: 1
+            x = 5
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert_eq!(frame.statements.len(), 2);
+}
+
+#[test]
+fn nested_if_else_chain() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            if x == 0 {
+                x = 1
+            } else if x == 1 {
+                x = 2
+            } else if x == 2 {
+                x = 3
+            } else {
+                x = 0
+            }
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    match &frame.statements[0] {
+        Statement::If(_, _, else_ifs, else_block, _) => {
+            assert_eq!(else_ifs.len(), 2);
+            assert!(else_block.is_some());
+        }
+        other => panic!("expected If, got {other:?}"),
+    }
+}
+
+#[test]
+fn deeply_nested_blocks() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            if x == 0 {
+                if x == 0 {
+                    if x == 0 {
+                        if x == 0 {
+                            x = 1
+                        }
+                    }
+                }
+            }
+        }
+        start Main
+    "#;
+    parse_ok(src); // should not stack overflow
+}
+
+#[test]
+fn empty_function_body() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        fun noop() {}
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.functions.len(), 1);
+    assert!(prog.functions[0].body.statements.is_empty());
+}
+
+#[test]
+fn empty_state_handlers() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        state Main {
+            on enter {}
+            on exit {}
+            on frame {}
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert!(prog.states[0]
+        .on_enter
+        .as_ref()
+        .unwrap()
+        .statements
+        .is_empty());
+    assert!(prog.states[0]
+        .on_exit
+        .as_ref()
+        .unwrap()
+        .statements
+        .is_empty());
+    assert!(prog.states[0]
+        .on_frame
+        .as_ref()
+        .unwrap()
+        .statements
+        .is_empty());
+}
+
+#[test]
+fn button_start_in_condition() {
+    // "start" is a keyword but valid as a button name
+    let src = r#"
+        game "T" { mapper: NROM }
+        on frame {
+            if button.start { wait_frame }
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    match &frame.statements[0] {
+        Statement::If(Expr::ButtonRead(_, button, _), _, _, _, _) => {
+            assert_eq!(button, "start");
+        }
+        other => panic!("expected if with button.start, got {other:?}"),
+    }
+}
+
+#[test]
+fn button_select_in_condition() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        on frame {
+            if button.select { wait_frame }
+        }
+        start Main
+    "#;
+    parse_ok(src); // "select" is a keyword too — must parse as button name
+}
+
+#[test]
+fn multiple_draws_in_sequence() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            draw A at: (0, 0)
+            draw B at: (10, 10)
+            draw C at: (20, 20)
+            x += 1
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert_eq!(frame.statements.len(), 4); // 3 draws + 1 assignment
+}
+
+#[test]
+fn parser_no_panic_on_garbage() {
+    // The parser should never panic, only return errors.
+    let garbage_inputs = [
+        "",
+        "{}{}{}",
+        "game",
+        "game \"\"",
+        "game \"\" {",
+        "game \"\" { mapper: }",
+        "var : = 0",
+        "fun () {}",
+        "if if if",
+        "while { }",
+        "draw",
+        "draw X",
+        "draw X at:",
+        "draw X at: (",
+        "draw X at: (0",
+        "draw X at: (0,",
+        "draw X at: (0, 0",
+        "sprite {",
+        "palette { colors: }",
+        "[[[",
+        "))))",
+        "0x 0b",
+        "\"unterminated",
+        "/* no block comments */",
+        "!@#$%",
+        &"x ".repeat(1000), // long input
+    ];
+    for input in &garbage_inputs {
+        let _ = parse(input); // must not panic
+    }
+}
+
+#[test]
+fn lexer_no_panic_on_garbage() {
+    use crate::lexer::lex;
+    let garbage_inputs = [
+        "\0\0\0",
+        "\x01\x02\x03",
+        "\"\\",
+        "0x",
+        "0b",
+        "99999999999999999999",
+        "0xFFFFFFFFFF",
+        &"a".repeat(10000),
+        "!!!!!!",
+        "\t\r\n \t\r\n",
+    ];
+    for input in &garbage_inputs {
+        let _ = lex(input); // must not panic
+    }
+}
