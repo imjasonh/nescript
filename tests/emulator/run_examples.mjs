@@ -1,66 +1,194 @@
-// Drive the local jsnes harness from puppeteer to sanity-check every compiled
-// example ROM. For each ROM we load it, run a couple of seconds of frames,
-// capture a screenshot, and record basic "did it render" stats. This is a
-// load+render smoke test, not a gameplay test.
+// End-to-end smoke test: runs every compiled `.nes` in `examples/`
+// through a local `jsnes` (wrapped by `harness.html` in a
+// puppeteer-driven headless Chrome), lets it render ~180 frames,
+// grabs the raw canvas pixels, and diffs them byte-for-byte against
+// a committed golden PNG under `goldens/`.
+//
+// The goldens are the whole contract. Any change to the compiler
+// (or any regression in jsnes, or any change to this harness that
+// affects rendering) will change at least one golden, and the diff
+// will fail CI loudly. That's the point — it's the only way to
+// catch "silently emits wrong code" bugs without writing a
+// full-fat CPU test vector per example.
+//
+// Updating goldens:
+//
+//     UPDATE_GOLDENS=1 node run_examples.mjs
+//     # or
+//     node run_examples.mjs --update-goldens
+//
+// When a diff is legitimate, rerun with that flag. It rewrites the
+// PNGs in `goldens/` from whatever the harness just produced. Then
+// check the new PNGs in git — `git diff goldens/*.png` lets you eye
+// each change, and the commit message is where you document why.
+//
+// When a diff is not legitimate, the runner writes:
+//
+//     actual/<name>.png       the actual pixels for this run
+//     actual/<name>.diff.png  red-highlighted pixel diff vs. golden
+//
+// so you can upload them as CI artifacts or inspect locally. The
+// `actual/` directory is gitignored.
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import puppeteer from "puppeteer";
+import { PNG } from "pngjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, "..", "..");
 const examplesDir = path.join(repoRoot, "examples");
-const screenshotsDir = path.join(__dirname, "screenshots");
+const goldensDir = path.join(__dirname, "goldens");
+const actualDir = path.join(__dirname, "actual");
 const harnessUrl = pathToFileURL(path.join(__dirname, "harness.html")).toString();
 
-const FRAMES_TO_RUN = 180; // ~3 seconds at 60 fps, enough to get past a title/boot
+const WIDTH = 256;
+const HEIGHT = 240;
+const BYTES_PER_PIXEL = 4; // RGBA
+const PIXEL_BYTES = WIDTH * HEIGHT * BYTES_PER_PIXEL;
+
+const FRAMES_TO_RUN = 180; // ~3 seconds at 60 fps
 const SCREENSHOT_FRAME = 180;
 
-// Per-example non-black pixel floors, used to catch silent
-// render regressions. A bare smiley sprite contributes ~52
-// non-black pixels; the default floor below assumes one visible
-// sprite. Examples that draw more sprites override the floor
-// with a tighter value so bugs like "only one of the four
-// enemies actually shows up" fail CI instead of silently
-// slipping past the base `nonBlack > 0` check.
-//
-// Each entry is `[minNonBlack, note]`. The note is printed when
-// the floor fails so it's easy to tell what the example was
-// supposed to show.
-const DEFAULT_MIN_NON_BLACK = 40; // one small sprite, conservative
-const EXAMPLE_FLOORS = {
-  arrays_and_functions: [200, "player + 4 enemies drawn by a while loop"],
-  bitwise_ops: [150, "player + multiple flag/pip sprites across if branches and a while loop"],
-  loop_break_continue: [150, "player + 3 active hazards (one slot is inactive)"],
-  structs_enums_for: [200, "player + 4 enemies drawn by a `for` loop"],
-  sprites_and_palettes: [60, "custom CHR tiles visible"],
-  scanline_split: [80, "banner + player"],
-  mmc3_per_state_split: [80, "marker + player in the split-screen state"],
-  two_player: [100, "two player sprites drawn independently"],
-  function_chain: [100, "player swept by chained function return + a static marker"],
-  // `comparisons` has at least `value != MIDPOINT` true for 255 of
-  // 256 frames, plus either `<`/`<=` or `>`/`>=`, plus the player.
-  // That's 4+ sprites on most frames.
-  comparisons: [150, "player + pips for each true comparison against MIDPOINT"],
-};
+const updateGoldens =
+  process.env.UPDATE_GOLDENS === "1" ||
+  process.env.UPDATE_GOLDENS === "true" ||
+  process.argv.includes("--update-goldens");
+
+// ── PNG helpers ────────────────────────────────────────────────
+
+// Decode a PNG file to a raw RGBA Buffer of length PIXEL_BYTES.
+// Rejects if the file doesn't exist or has the wrong dimensions.
+async function decodeGolden(filePath) {
+  const bytes = await fs.readFile(filePath);
+  const png = PNG.sync.read(bytes);
+  if (png.width !== WIDTH || png.height !== HEIGHT) {
+    throw new Error(
+      `golden ${filePath} has wrong dimensions ${png.width}x${png.height}, expected ${WIDTH}x${HEIGHT}`,
+    );
+  }
+  // `png.data` is already RGBA in top-left-first row-major order.
+  return png.data;
+}
+
+// Encode a raw RGBA Buffer to a PNG file.
+async function writePng(filePath, rgba) {
+  if (rgba.length !== PIXEL_BYTES) {
+    throw new Error(
+      `writePng: expected ${PIXEL_BYTES} bytes, got ${rgba.length}`,
+    );
+  }
+  const png = new PNG({ width: WIDTH, height: HEIGHT });
+  rgba.copy(png.data);
+  const buf = PNG.sync.write(png);
+  await fs.writeFile(filePath, buf);
+}
+
+// Build a diff PNG: mismatching pixels in bright red, matching
+// pixels in dim grayscale so you can still see the sprite silhouettes
+// for context. First differing pixel is also returned for logs.
+function buildDiff(expected, actual) {
+  const out = Buffer.alloc(PIXEL_BYTES);
+  let mismatched = 0;
+  let firstDiff = null;
+  for (let i = 0; i < PIXEL_BYTES; i += 4) {
+    const eR = expected[i];
+    const eG = expected[i + 1];
+    const eB = expected[i + 2];
+    const aR = actual[i];
+    const aG = actual[i + 1];
+    const aB = actual[i + 2];
+    const same = eR === aR && eG === aG && eB === aB;
+    if (same) {
+      // Dim grayscale of the expected pixel — 25% brightness,
+      // preserves the silhouette without competing with red.
+      const gray = Math.round((eR * 0.299 + eG * 0.587 + eB * 0.114) * 0.25);
+      out[i] = gray;
+      out[i + 1] = gray;
+      out[i + 2] = gray;
+      out[i + 3] = 0xff;
+    } else {
+      mismatched++;
+      if (firstDiff === null) {
+        const px = (i / 4) | 0;
+        firstDiff = {
+          x: px % WIDTH,
+          y: (px / WIDTH) | 0,
+          expected: [eR, eG, eB],
+          actual: [aR, aG, aB],
+        };
+      }
+      out[i] = 0xff;
+      out[i + 1] = 0x00;
+      out[i + 2] = 0x00;
+      out[i + 3] = 0xff;
+    }
+  }
+  return { mismatched, firstDiff, rgba: out };
+}
+
+// ── ROM discovery ──────────────────────────────────────────────
 
 async function listRoms() {
   const entries = await fs.readdir(examplesDir);
   return entries
     .filter((f) => f.endsWith(".nes"))
     .sort()
-    .map((f) => ({ name: f.replace(/\.nes$/, ""), file: path.join(examplesDir, f) }));
+    .map((f) => ({
+      name: f.replace(/\.nes$/, ""),
+      file: path.join(examplesDir, f),
+    }));
 }
 
-function floorFor(name) {
-  const entry = EXAMPLE_FLOORS[name];
-  if (entry) return entry;
-  return [DEFAULT_MIN_NON_BLACK, "generic single-sprite floor"];
+// ── Harness driver ─────────────────────────────────────────────
+
+async function runRomInHarness(page, rom) {
+  const romBytes = await fs.readFile(rom.file);
+  const romB64 = romBytes.toString("base64");
+
+  let bootError = null;
+  try {
+    await page.evaluate((b64) => window.nesHarness.loadRomBase64(b64), romB64);
+  } catch (err) {
+    bootError = String(err);
+    return { bootError, rgba: null };
+  }
+
+  try {
+    // Use runFrames — a single round-trip is much faster than
+    // 180 separate `frame()` calls across puppeteer's RPC.
+    await page.evaluate(
+      (n) => window.nesHarness.runFrames(n),
+      FRAMES_TO_RUN,
+    );
+  } catch (err) {
+    return { bootError: String(err), rgba: null };
+  }
+  // Frame count here is a no-op marker kept for readability.
+  void SCREENSHOT_FRAME;
+
+  const pixelsB64 = await page.evaluate(() => window.nesHarness.rawPixelsBase64());
+  const rgba = Buffer.from(pixelsB64, "base64");
+  if (rgba.length !== PIXEL_BYTES) {
+    return {
+      bootError: `harness returned ${rgba.length} pixel bytes, expected ${PIXEL_BYTES}`,
+      rgba: null,
+    };
+  }
+  return { bootError: null, rgba };
 }
+
+// ── Main ───────────────────────────────────────────────────────
 
 async function main() {
-  await fs.mkdir(screenshotsDir, { recursive: true });
+  await fs.mkdir(goldensDir, { recursive: true });
+  // Wipe and recreate `actual/` so each run starts clean. This
+  // directory is gitignored, so it only exists to give the CI job
+  // something to upload when diffs fail.
+  await fs.rm(actualDir, { recursive: true, force: true });
+  await fs.mkdir(actualDir, { recursive: true });
+
   const roms = await listRoms();
   if (roms.length === 0) {
     console.error("no .nes files found in examples/ — build them first");
@@ -72,6 +200,7 @@ async function main() {
     args: ["--no-sandbox", "--disable-setuid-sandbox", "--allow-file-access-from-files"],
   });
 
+  /** @type {Array<{name: string, status: string, reason: string | null}>} */
   const results = [];
   let failures = 0;
 
@@ -85,105 +214,108 @@ async function main() {
       });
 
       await page.goto(harnessUrl, { waitUntil: "load" });
-      // Wait until the harness reports ready.
-      await page.waitForFunction("window.nesHarness && document.getElementById('info').textContent === 'ready'");
-
-      const romBytes = await fs.readFile(rom.file);
-      const romB64 = romBytes.toString("base64");
-
-      let booted = true;
-      let bootError = null;
-      try {
-        await page.evaluate((b64) => window.nesHarness.loadRomBase64(b64), romB64);
-      } catch (err) {
-        booted = false;
-        bootError = String(err);
-      }
-
-      // Collect hashes across frames so we can detect a frozen / all-black boot.
-      const frameHashes = [];
-      if (booted) {
-        try {
-          for (let i = 0; i < FRAMES_TO_RUN; i++) {
-            await page.evaluate(() => window.nesHarness.frame());
-            if (i === 29 || i === 89 || i === 149 || i === SCREENSHOT_FRAME - 1) {
-              const stats = await page.evaluate(() => window.nesHarness.frameStats());
-              frameHashes.push({ frame: i + 1, ...stats });
-            }
-          }
-        } catch (err) {
-          booted = false;
-          bootError = String(err);
-        }
-      }
-
-      const screenshotPath = path.join(screenshotsDir, `${rom.name}.png`);
-      if (booted) {
-        const canvas = await page.$("#screen");
-        await canvas.screenshot({ path: screenshotPath });
-      }
-
-      const lastStats = frameHashes[frameHashes.length - 1];
-      const uniqueHashes = new Set(frameHashes.map((h) => h.hash)).size;
-      const rendered = booted && lastStats && lastStats.nonBlack > 0;
-      const animated = uniqueHashes > 1;
-
-      const [minNonBlack, floorNote] = floorFor(rom.name);
-      const meetsFloor = rendered && lastStats.nonBlack >= minNonBlack;
-      const pass = rendered && meetsFloor;
-
-      const status = pass ? "OK" : "FAIL";
-      if (!pass) failures++;
-
-      let failReason = null;
-      if (!booted) {
-        failReason = `boot error: ${bootError ?? "unknown"}`;
-      } else if (!rendered) {
-        failReason = "rendered a fully black screen (nonBlack=0)";
-      } else if (!meetsFloor) {
-        failReason = `nonBlack=${lastStats.nonBlack} below floor=${minNonBlack} (${floorNote})`;
-      }
-
-      results.push({
-        name: rom.name,
-        status,
-        bootError,
-        rendered,
-        animated,
-        meetsFloor,
-        minNonBlack,
-        floorNote,
-        failReason,
-        frames: frameHashes,
-        consoleErrors,
-        screenshot: booted ? path.relative(repoRoot, screenshotPath) : null,
-      });
-
-      console.log(
-        `${status.padEnd(4)} ${rom.name.padEnd(28)} ` +
-          (rendered
-            ? `nonBlack=${lastStats.nonBlack}/${lastStats.totalPixels} (floor=${minNonBlack}) uniqueHashes=${uniqueHashes} animated=${animated}`
-            : `boot=${booted} bootError=${bootError ?? "none"}`),
+      await page.waitForFunction(
+        "window.nesHarness && document.getElementById('info').textContent === 'ready'",
       );
-      if (failReason && !rendered) {
-        console.log(`    reason: ${failReason}`);
-      } else if (failReason) {
-        console.log(`    reason: ${failReason}`);
-      }
-      if (consoleErrors.length > 0) {
+
+      const { bootError, rgba } = await runRomInHarness(page, rom);
+      await page.close();
+
+      if (bootError || !rgba) {
+        failures++;
+        const reason = `boot error: ${bootError ?? "no pixels"}`;
+        results.push({ name: rom.name, status: "FAIL", reason });
+        console.log(`FAIL  ${rom.name.padEnd(28)} ${reason}`);
         for (const e of consoleErrors) console.log("    console:", e);
+        continue;
       }
 
-      await page.close();
+      const goldenPath = path.join(goldensDir, `${rom.name}.png`);
+      let goldenExists = true;
+      try {
+        await fs.access(goldenPath);
+      } catch {
+        goldenExists = false;
+      }
+
+      // ── Update mode ──────────────────────────────────────
+      if (updateGoldens) {
+        await writePng(goldenPath, rgba);
+        results.push({ name: rom.name, status: "UPDATED", reason: null });
+        console.log(`UPD   ${rom.name.padEnd(28)} wrote golden`);
+        continue;
+      }
+
+      // ── Missing golden ──────────────────────────────────
+      if (!goldenExists) {
+        failures++;
+        // Write the actual so the user can inspect, then bail.
+        await writePng(path.join(actualDir, `${rom.name}.png`), rgba);
+        const reason = `no golden at ${path.relative(repoRoot, goldenPath)} — run with UPDATE_GOLDENS=1 to create`;
+        results.push({ name: rom.name, status: "MISSING", reason });
+        console.log(`MISS  ${rom.name.padEnd(28)} ${reason}`);
+        continue;
+      }
+
+      // ── Byte-for-byte diff ──────────────────────────────
+      let golden;
+      try {
+        golden = await decodeGolden(goldenPath);
+      } catch (err) {
+        failures++;
+        const reason = `failed to decode golden: ${err.message}`;
+        results.push({ name: rom.name, status: "FAIL", reason });
+        console.log(`FAIL  ${rom.name.padEnd(28)} ${reason}`);
+        continue;
+      }
+
+      // `rgba.equals(golden)` is an O(n) native memcmp — fastest
+      // path when they match, which is the common case.
+      if (rgba.equals(golden)) {
+        results.push({ name: rom.name, status: "OK", reason: null });
+        console.log(`OK    ${rom.name.padEnd(28)} exact match`);
+        continue;
+      }
+
+      // Mismatch: write the actual and a diff PNG, record why.
+      const { mismatched, firstDiff, rgba: diffRgba } = buildDiff(golden, rgba);
+      const actualPath = path.join(actualDir, `${rom.name}.png`);
+      const diffPath = path.join(actualDir, `${rom.name}.diff.png`);
+      await writePng(actualPath, rgba);
+      await writePng(diffPath, diffRgba);
+
+      failures++;
+      const reason =
+        `${mismatched}/${WIDTH * HEIGHT} pixels differ; ` +
+        `first at (${firstDiff.x},${firstDiff.y}) ` +
+        `expected [${firstDiff.expected.join(",")}] ` +
+        `got [${firstDiff.actual.join(",")}]`;
+      results.push({ name: rom.name, status: "DIFF", reason });
+      console.log(`DIFF  ${rom.name.padEnd(28)} ${reason}`);
+      console.log(`        actual: ${path.relative(repoRoot, actualPath)}`);
+      console.log(`          diff: ${path.relative(repoRoot, diffPath)}`);
     }
   } finally {
     await browser.close();
   }
 
   const reportPath = path.join(__dirname, "report.json");
-  await fs.writeFile(reportPath, JSON.stringify({ generatedAt: new Date().toISOString(), results }, null, 2));
-  console.log(`\nreport written to ${path.relative(repoRoot, reportPath)}`);
-  console.log(`${results.length - failures}/${results.length} ROMs rendered successfully`);
+  await fs.writeFile(
+    reportPath,
+    JSON.stringify({ generatedAt: new Date().toISOString(), updateGoldens, results }, null, 2),
+  );
+
+  console.log("");
+  console.log(`report written to ${path.relative(repoRoot, reportPath)}`);
+  if (updateGoldens) {
+    console.log(`${results.length} goldens updated`);
+    console.log("review the changes with `git diff tests/emulator/goldens/` before committing");
+  } else {
+    console.log(`${results.length - failures}/${results.length} ROMs match their goldens`);
+    if (failures > 0) {
+      console.log("rerun with UPDATE_GOLDENS=1 if the new output is intentional");
+    }
+  }
 
   if (failures > 0) process.exit(1);
 }
