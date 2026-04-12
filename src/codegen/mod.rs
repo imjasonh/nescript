@@ -362,6 +362,19 @@ impl CodeGen {
                 }
             }
             Statement::Call(name, args, _) => {
+                // Built-in `poke(addr, value)` writes `value` to the
+                // compile-time-constant `addr`. The IR codegen handles
+                // this intrinsic in ir/lowering.rs; the legacy AST
+                // codegen has to recognize it here too, otherwise it
+                // falls through to the generic JSR path and tries to
+                // call a non-existent `__fn_poke` routine.
+                if name == "poke" && args.len() == 2 {
+                    if let Some(addr) = const_u16(&args[0]) {
+                        self.gen_expr(&args[1]);
+                        self.emit(STA, AM::Absolute(addr));
+                        return;
+                    }
+                }
                 // Pass arguments via zero-page param slots ($04-$07)
                 for (i, arg) in args.iter().enumerate() {
                     self.gen_expr(arg);
@@ -868,9 +881,20 @@ impl CodeGen {
                     self.emit_load(addr);
                 }
             }
-            Expr::Call(_, _, _) => {
-                // Function calls as expressions need JSR — handled elsewhere
-                // For now, result is 0
+            Expr::Call(name, args, _) => {
+                // Built-in `peek(addr)` reads a byte from the
+                // compile-time-constant `addr`. Matches the IR codegen's
+                // `Peek` handling so the legacy AST path doesn't emit a
+                // bogus JSR to a non-existent `__fn_peek` routine.
+                if name == "peek" && args.len() == 1 {
+                    if let Some(addr) = const_u16(&args[0]) {
+                        self.emit(LDA, AM::Absolute(addr));
+                        return;
+                    }
+                }
+                // Other function calls as expressions would need JSR
+                // with a return-value slot; the legacy codegen doesn't
+                // implement that yet, so fall back to loading 0.
                 self.emit(LDA, AM::Immediate(0));
             }
             Expr::ArrayLiteral(_, _) => {
@@ -1120,5 +1144,16 @@ fn button_mask(button: &str) -> u8 {
         "left" => 0x02,
         "right" => 0x01,
         _ => 0x00,
+    }
+}
+
+/// Return the compile-time-constant u16 value of an expression, or
+/// `None` if it's not a plain integer literal. Used by the intrinsic
+/// call handling to recognize `poke(0x2007, …)` and `peek(0x2002)`
+/// at codegen time.
+fn const_u16(expr: &Expr) -> Option<u16> {
+    match expr {
+        Expr::IntLiteral(v, _) => Some(*v),
+        _ => None,
     }
 }

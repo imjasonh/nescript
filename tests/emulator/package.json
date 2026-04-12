@@ -1,0 +1,14 @@
+{
+  "name": "nescript-emulator-tests",
+  "version": "1.0.0",
+  "description": "Local jsnes + puppeteer smoke test for compiled NEScript example ROMs.",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node run_examples.mjs"
+  },
+  "dependencies": {
+    "jsnes": "^2.1.0",
+    "puppeteer": "^24.40.0"
+  }
+}
