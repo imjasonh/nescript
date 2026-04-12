@@ -388,6 +388,34 @@ These items were documented as future work but have since been implemented:
 - **Asset pipeline @binary / @chr loading** — `resolve_sprites()` reads
   raw binary files and converts PNGs via `png_to_chr()`. Missing files
   are silently skipped (documentation-friendly)
+- **Call arity validation** — E0203 when `Statement::Call` or
+  `Expr::Call` has the wrong number of arguments or a mismatched
+  argument type (uses a `function_signatures` map)
+- **Return type validation** — `return value` is type-checked against
+  the function's declared return type (E0201); returning a value from a
+  void function emits E0203
+- **W0102 loop-without-yield warning** — emitted when a `loop { ... }`
+  body contains no `break`, `return`, `transition`, or `wait_frame`
+- **W0101 expensive mul/div/mod warning** — flags multiply/divide/modulo
+  with two non-constant operands; literal operands are silent because
+  the optimizer strength-reduces them
+- **W0104 dead-code-after-terminator warning** — statements after
+  `return`, `break`, `continue`, or `transition` in the same block
+  emit W0104 with a label pointing at the terminator
+- **E0301 RAM overflow** — the zero-page user region is now bounded
+  above by `$80` (leaving `$80-$FF` for IR temps) and the main RAM
+  allocator stops at `$0800`; overflow emits E0301 at the declaration
+- **E0505 multiple start declarations** — parser rejects a second
+  `start X` token
+- **`on scanline(N)` parsing** — `state { on scanline(240) { ... } }`
+  parses and populates `StateDecl::on_scanline`; analyzer emits E0203
+  if the game isn't using MMC3. Codegen (MMC3 IRQ vector wiring) is
+  still TODO
+- **Inline assembly** — `asm { ... }` blocks. The lexer captures the
+  body as a raw `AsmBody` token; `src/asm/inline_parser.rs` provides a
+  minimal 6502 mnemonic parser that handles every addressing mode the
+  codegen emits. Both IR and AST codegen splice parsed instructions
+  directly into the output stream
 
 ### Remaining priority order
 
@@ -398,9 +426,11 @@ For someone picking up this codebase, the recommended order of work:
    of game-writing), remove `--use-ast` and `src/codegen/mod.rs`'s
    AST-specific code. Keep the shared constants (`DEBUG_PORT`, ZP
    layout) in a common module.
-2. **Audio** — SFX/music driver
-3. **on_scanline for MMC3** — scanline IRQ handlers
+2. **`on scanline` codegen** — parser and analyzer support are in
+   place, but the MMC3 IRQ vector is still stubbed. Need to install an
+   IRQ handler that dispatches to the right scanline block based on
+   the counter latched in `$C000`/`$C001`.
+3. **Audio** — SFX/music driver
 4. **Language features** — structs, enums, fixed-point
 5. **Register allocator** — proper A/X/Y allocation to replace
    zero-page spills used by the current IR codegen
-6. **Inline assembly** — `asm { }` blocks
