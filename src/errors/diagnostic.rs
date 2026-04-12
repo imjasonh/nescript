@@ -39,7 +39,6 @@ pub enum ErrorCode {
     E0502, // undefined variable
     E0503, // undefined function
     E0504, // missing start declaration
-    #[allow(dead_code)]
     E0505, // multiple start declarations
 
     // W01xx: Warnings

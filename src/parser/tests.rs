@@ -666,6 +666,22 @@ fn parse_mmc3_mapper() {
 }
 
 #[test]
+fn parse_multiple_start_declarations_error() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        state A { on frame { wait_frame } }
+        state B { on frame { wait_frame } }
+        start A
+        start B
+    "#;
+    let errors = parse_err(src);
+    assert!(
+        errors.contains(&crate::errors::ErrorCode::E0505),
+        "duplicate start should produce E0505, got: {errors:?}"
+    );
+}
+
+#[test]
 fn parse_on_scanline_handler() {
     let src = r#"
         game "Test" { mapper: MMC3 }

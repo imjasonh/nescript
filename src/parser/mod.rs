@@ -163,8 +163,16 @@ impl Parser {
                     on_frame = Some(self.parse_on_frame()?);
                 }
                 TokenKind::KwStart => {
+                    let kw_span = self.current_span();
                     self.advance();
                     let (name, _) = self.expect_ident()?;
+                    if start_state.is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0505,
+                            "multiple 'start' declarations",
+                            kw_span,
+                        ));
+                    }
                     start_state = Some(name);
                 }
                 _ => {
