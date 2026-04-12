@@ -13,10 +13,108 @@ pub fn optimize(instructions: &mut Vec<Instruction>) {
         remove_sta_then_lda(instructions);
         remove_lda_then_sta_same(instructions);
         remove_dead_temp_stores(instructions);
+        remove_redundant_loads(instructions);
         if instructions.len() == before {
             break;
         }
     }
+}
+
+/// Track what `A` holds through a linear run of instructions and
+/// eliminate `LDA` that would reload a value A already has.
+///
+/// The tracker knows about three states:
+/// - `AKnown::None` — A's value is unknown
+/// - `AKnown::Addr(addr)` — A equals the byte currently at `addr`
+/// - `AKnown::Imm(val)` — A equals the immediate value `val`
+///
+/// After any instruction that may clobber A (ADC, AND, etc.) we
+/// transition to `None`. After `STA addr` A is still known and we
+/// additionally record that `addr` now equals A's known value (so a
+/// later `LDA addr` is redundant). Any control-flow instruction or
+/// label resets the tracker.
+fn remove_redundant_loads(instructions: &mut Vec<Instruction>) {
+    use AKnown::*;
+    let mut keep = vec![true; instructions.len()];
+    let mut a: AKnown = None;
+    for (i, inst) in instructions.iter().enumerate() {
+        if instruction_crosses_block(inst) {
+            a = None;
+            continue;
+        }
+        match (inst.opcode, &inst.mode) {
+            (Opcode::LDA, AddressingMode::Immediate(v)) => {
+                if let Imm(existing) = a {
+                    if existing == *v {
+                        keep[i] = false;
+                        continue;
+                    }
+                }
+                a = Imm(*v);
+            }
+            (Opcode::LDA, AddressingMode::ZeroPage(addr)) => {
+                if let Addr(existing) = a {
+                    if existing == *addr {
+                        keep[i] = false;
+                        continue;
+                    }
+                }
+                a = Addr(*addr);
+            }
+            (Opcode::LDA, AddressingMode::Absolute(addr)) => {
+                // We could track absolute addresses too, but don't
+                // try to unify them with ZP. Just record the value.
+                // Not going to eliminate against prior state.
+                let _ = addr;
+                a = None;
+            }
+            (Opcode::STA, AddressingMode::ZeroPage(addr)) => {
+                // After STA, A is unchanged. Additionally, `addr` now
+                // holds A's value. Remember that equivalence: a later
+                // `LDA addr` is redundant.
+                a = Addr(*addr);
+            }
+            (Opcode::STA, _) => {
+                // A unchanged, but we don't track non-ZP addresses.
+            }
+            // Ops that clobber A — clear tracker.
+            (
+                Opcode::ADC
+                | Opcode::SBC
+                | Opcode::AND
+                | Opcode::ORA
+                | Opcode::EOR
+                | Opcode::ASL
+                | Opcode::LSR
+                | Opcode::ROL
+                | Opcode::ROR
+                | Opcode::LDX
+                | Opcode::LDY
+                | Opcode::PLA
+                | Opcode::TXA
+                | Opcode::TYA,
+                _,
+            ) => {
+                a = None;
+            }
+            // Ops that don't touch A — leave the tracker alone.
+            _ => {}
+        }
+    }
+    let mut out = Vec::with_capacity(instructions.len());
+    for (i, inst) in instructions.iter().enumerate() {
+        if keep[i] {
+            out.push(inst.clone());
+        }
+    }
+    *instructions = out;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AKnown {
+    None,
+    Addr(u8),
+    Imm(u8),
 }
 
 /// Remove `STA temp_slot` instructions whose written value is never
@@ -232,14 +330,32 @@ mod tests {
     }
 
     #[test]
-    fn keeps_sta_then_lda_user_var() {
-        // $10 is a user variable, not a temp slot — must not eliminate.
+    fn eliminates_sta_then_lda_via_a_tracking() {
+        // Even for user variables, `STA $10; LDA $10` is redundant in
+        // straight-line code: A still holds the value we just stored.
+        // The A-value tracker handles this. (If a JSR or branch
+        // intervenes, the tracker clears and the LDA is preserved.)
         let mut insts = vec![
             Instruction::new(STA, AM::ZeroPage(0x10)),
             Instruction::new(LDA, AM::ZeroPage(0x10)),
         ];
         optimize(&mut insts);
-        assert_eq!(insts.len(), 2);
+        assert_eq!(insts.len(), 1);
+        assert_eq!(insts[0].opcode, STA);
+    }
+
+    #[test]
+    fn preserves_lda_across_jsr() {
+        // JSR clobbers A (callee can do anything), so the second LDA
+        // must survive.
+        let mut insts = vec![
+            Instruction::new(STA, AM::ZeroPage(0x10)),
+            Instruction::new(JSR, AM::Label("foo".into())),
+            Instruction::new(LDA, AM::ZeroPage(0x10)),
+        ];
+        optimize(&mut insts);
+        // STA, JSR, LDA — all preserved
+        assert_eq!(insts.len(), 3);
     }
 
     #[test]
