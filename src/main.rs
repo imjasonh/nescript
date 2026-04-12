@@ -81,8 +81,13 @@ fn dump_asm(instructions: &[nescript::asm::Instruction]) {
 }
 
 fn compile(input: &PathBuf, _debug: bool, asm_dump: bool) -> Result<Vec<u8>, ()> {
-    let source = std::fs::read_to_string(input).map_err(|e| {
+    let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
+    })?;
+
+    // Preprocess: inline include directives
+    let source = nescript::parser::preprocess_source(&raw_source, Some(input)).map_err(|e| {
+        eprintln!("error: {e}");
     })?;
 
     let filename = input.to_string_lossy();
@@ -141,8 +146,12 @@ fn compile(input: &PathBuf, _debug: bool, asm_dump: bool) -> Result<Vec<u8>, ()>
 }
 
 fn check(input: &PathBuf) -> Result<(), ()> {
-    let source = std::fs::read_to_string(input).map_err(|e| {
+    let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
+    })?;
+
+    let source = nescript::parser::preprocess_source(&raw_source, Some(input)).map_err(|e| {
+        eprintln!("error: {e}");
     })?;
 
     let filename = input.to_string_lossy();

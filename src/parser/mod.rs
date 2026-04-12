@@ -1,6 +1,9 @@
 pub mod ast;
+pub mod preprocess;
 #[cfg(test)]
 mod tests;
+
+pub use preprocess::preprocess as preprocess_source;
 
 use crate::errors::{Diagnostic, ErrorCode};
 use crate::lexer::{Span, Token, TokenKind};
