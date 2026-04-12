@@ -459,6 +459,32 @@ These items were documented as future work but have since been implemented:
   weren't in `var_addrs` so callees read temp slots instead of
   parameters. Both bugs are now fixed with an integration test
   guard.
+- **Struct literal syntax** — `Vec2 { x: 100, y: 50 }` in both
+  variable initializers and assignments. Desugars in lowering to
+  per-field stores. Restricted to non-condition expression contexts
+  (if/while/for conditions) to avoid ambiguity with block `{`.
+- **Match statement** — `match x { pat => body, _ => default }`
+  parses to an if/else-if chain at parse time, so no new AST
+  variant is needed. Supports any expression patterns and an
+  underscore catch-all.
+- **For loops** — `for i in start..end { body }` (half-open range).
+  Desugars in IR lowering to a while loop with a proper
+  continue-edge block.
+- **Semicolon statement separators** — short statements can share
+  a line: `a += 1; b += 2`.
+- **Inline asm `{var}` substitution** — inside an `asm { ... }`
+  block, `{name}` is replaced with the hex address of the variable
+  `name`. The lexer balances nested braces so `{counter}` inside
+  an asm body is captured correctly.
+- **`raw asm { ... }` blocks** — variant of inline asm that skips
+  `{var}` substitution, passing the body through verbatim.
+- **`poke(addr, value)` / `peek(addr)` intrinsics** — hardware
+  register access without needing an asm block. Compile to a
+  single LDA/STA against a compile-time-constant address.
+- **`--memory-map` CLI flag** — prints a human-readable variable
+  allocation table showing what's in ZP vs main RAM.
+- **`--call-graph` CLI flag** — prints a call-tree view with max
+  depth reached from each entry point handler.
 
 ### Remaining priority order
 
