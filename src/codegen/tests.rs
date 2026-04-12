@@ -232,3 +232,47 @@ fn codegen_shift_left() {
         "shift left should generate ASL A"
     );
 }
+
+#[test]
+fn codegen_debug_log_stripped_in_release() {
+    // Without --debug, debug.log should not emit any $4800 writes
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 42
+        on frame {
+            debug.log(x)
+        }
+        start Main
+    "#;
+    let insts = compile_to_instructions(src);
+    // Should NOT write to $4800
+    let has_debug = insts
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4800));
+    assert!(!has_debug, "debug.log should be stripped in release mode");
+}
+
+#[test]
+fn codegen_debug_log_emits_in_debug_mode() {
+    use crate::analyzer;
+    use crate::parser;
+
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 42
+        on frame {
+            debug.log(x)
+        }
+        start Main
+    "#;
+    let (prog, _) = parser::parse(src);
+    let prog = prog.unwrap();
+    let analysis = analyzer::analyze(&prog);
+    let codegen = CodeGen::new(&analysis.var_allocations, &prog.constants).with_debug(true);
+    let insts = codegen.generate(&prog);
+    // Should write to $4800 at least once
+    let has_debug = insts
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4800));
+    assert!(has_debug, "debug.log should write to $4800 in debug mode");
+}

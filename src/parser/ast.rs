@@ -239,6 +239,12 @@ pub enum Statement {
     LoadBackground(String, Span),
     SetPalette(String, Span),
     Scroll(Expr, Expr, Span),
+    /// debug.log(expr, ...) — writes values to the emulator debug port.
+    /// Stripped in release mode.
+    DebugLog(Vec<Expr>, Span),
+    /// debug.assert(cond) — runtime check, halts on failure.
+    /// Stripped in release mode.
+    DebugAssert(Expr, Span),
 }
 
 #[derive(Debug, Clone)]

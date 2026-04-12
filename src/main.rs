@@ -80,7 +80,7 @@ fn dump_asm(instructions: &[nescript::asm::Instruction]) {
     }
 }
 
-fn compile(input: &PathBuf, _debug: bool, asm_dump: bool) -> Result<Vec<u8>, ()> {
+fn compile(input: &PathBuf, debug: bool, asm_dump: bool) -> Result<Vec<u8>, ()> {
     let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
     })?;
@@ -130,8 +130,9 @@ fn compile(input: &PathBuf, _debug: bool, asm_dump: bool) -> Result<Vec<u8>, ()>
     })?;
 
     // Code generation (still AST-based for M2; IR codegen comes in M3)
-    let codegen =
-        CodeGen::new(&analysis.var_allocations, &program.constants).with_sprites(&sprites);
+    let codegen = CodeGen::new(&analysis.var_allocations, &program.constants)
+        .with_sprites(&sprites)
+        .with_debug(debug);
     let instructions = codegen.generate(&program);
 
     if asm_dump {

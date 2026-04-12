@@ -787,6 +787,7 @@ impl Parser {
                 self.expect(&TokenKind::RParen)?;
                 Ok(Statement::Scroll(x, y, span))
             }
+            TokenKind::KwDebug => self.parse_debug_statement(),
             TokenKind::Ident(_) => self.parse_assign_or_call(),
             _ => Err(Diagnostic::error(
                 ErrorCode::E0201,
@@ -889,6 +890,38 @@ impl Parser {
             frame,
             span: start,
         }))
+    }
+
+    /// Parse debug.log(...) or debug.assert(...)
+    fn parse_debug_statement(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwDebug)?;
+        self.expect(&TokenKind::Dot)?;
+        let (method, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LParen)?;
+        match method.as_str() {
+            "log" => {
+                let mut args = Vec::new();
+                while *self.peek() != TokenKind::RParen && *self.peek() != TokenKind::Eof {
+                    args.push(self.parse_expr()?);
+                    if *self.peek() == TokenKind::Comma {
+                        self.advance();
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+                Ok(Statement::DebugLog(args, start))
+            }
+            "assert" => {
+                let cond = self.parse_expr()?;
+                self.expect(&TokenKind::RParen)?;
+                Ok(Statement::DebugAssert(cond, start))
+            }
+            _ => Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!("unknown debug method '{method}' (expected 'log' or 'assert')"),
+                start,
+            )),
+        }
     }
 
     fn parse_assign_or_call(&mut self) -> Result<Statement, Diagnostic> {

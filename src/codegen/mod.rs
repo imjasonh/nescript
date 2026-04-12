@@ -13,6 +13,9 @@ pub const ZP_CURRENT_STATE: u8 = 0x03;
 /// Zero-page addresses for function call parameter passing ($04-$07, up to 4 params).
 pub const ZP_PARAM_BASE: u8 = 0x04;
 
+/// Debug output port address used by Mesen and some other emulators.
+pub const DEBUG_PORT: u16 = 0x4800;
+
 /// Code generator: translates AST directly to 6502 instructions.
 /// For Milestone 1, we skip the IR and go AST → 6502 directly.
 pub struct CodeGen {
@@ -20,6 +23,9 @@ pub struct CodeGen {
     var_addrs: HashMap<String, u16>,
     const_values: HashMap<String, u16>,
     label_counter: u32,
+    /// When true, debug.log/assert statements emit runtime code.
+    /// When false, they are stripped entirely.
+    debug_mode: bool,
     /// Address of the NMI-signaled "frame ready" flag in zero page
     pub frame_flag_addr: u8,
     /// Address of controller state byte in zero page
@@ -53,6 +59,7 @@ impl CodeGen {
             var_addrs,
             const_values,
             label_counter: 0,
+            debug_mode: false,
             frame_flag_addr: 0x00,
             input_addr: 0x01,
             state_indices: HashMap::new(),
@@ -60,6 +67,14 @@ impl CodeGen {
             next_oam_slot: 0,
             sprite_tiles: HashMap::new(),
         }
+    }
+
+    /// Enable debug mode: debug.log/debug.assert statements will emit runtime code.
+    /// When disabled (the default), debug statements are stripped.
+    #[must_use]
+    pub fn with_debug(mut self, enabled: bool) -> Self {
+        self.debug_mode = enabled;
+        self
     }
 
     /// Register sprite-to-tile-index mappings so that `draw SpriteName` can
@@ -305,6 +320,29 @@ impl CodeGen {
             }
             Statement::LoadBackground(_, _) | Statement::SetPalette(_, _) => {
                 // TODO: implement in asset pipeline
+            }
+            Statement::DebugLog(args, _) => {
+                if self.debug_mode {
+                    for arg in args {
+                        self.gen_expr(arg);
+                        // Write A to debug port $4800
+                        self.emit(STA, AM::Absolute(DEBUG_PORT));
+                    }
+                }
+                // In release mode, stripped entirely
+            }
+            Statement::DebugAssert(cond, _) => {
+                if self.debug_mode {
+                    // Evaluate condition; if zero (false), halt
+                    self.gen_condition(cond);
+                    let pass_label = self.fresh_label("assert_pass");
+                    self.emit(BNE, AM::LabelRelative(pass_label.clone()));
+                    // Assertion failed: write marker to debug port and BRK
+                    self.emit(LDA, AM::Immediate(0xFF));
+                    self.emit(STA, AM::Absolute(DEBUG_PORT));
+                    self.emit(BRK, AM::Implied);
+                    self.emit_label(&pass_label);
+                }
             }
         }
     }

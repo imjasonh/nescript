@@ -305,6 +305,11 @@ impl LoweringContext {
             Statement::LoadBackground(_, _) | Statement::SetPalette(_, _) => {
                 // TODO: implement in asset pipeline
             }
+            Statement::DebugLog(_, _) | Statement::DebugAssert(_, _) => {
+                // Debug statements don't produce IR ops in release mode.
+                // In debug mode, the AST-based codegen handles them directly
+                // (IR codegen path for debug is a future enhancement).
+            }
         }
     }
 

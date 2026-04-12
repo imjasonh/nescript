@@ -999,3 +999,55 @@ fn parse_shift_assign_operators() {
     let frame = prog.states[0].on_frame.as_ref().unwrap();
     assert_eq!(frame.statements.len(), 2);
 }
+
+#[test]
+fn parse_debug_log() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            debug.log(x)
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    match &frame.statements[0] {
+        Statement::DebugLog(args, _) => assert_eq!(args.len(), 1),
+        other => panic!("expected DebugLog, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_debug_log_multiple_args() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        var y: u8 = 0
+        on frame {
+            debug.log(x, y, 42)
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    match &frame.statements[0] {
+        Statement::DebugLog(args, _) => assert_eq!(args.len(), 3),
+        other => panic!("expected DebugLog, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_debug_assert() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            debug.assert(x == 0)
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert!(matches!(frame.statements[0], Statement::DebugAssert(..)));
+}

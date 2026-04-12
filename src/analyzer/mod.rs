@@ -606,6 +606,15 @@ impl Analyzer {
             | Statement::Return(None, _)
             | Statement::LoadBackground(_, _)
             | Statement::SetPalette(_, _) => {}
+            Statement::DebugLog(args, _) => {
+                for arg in args {
+                    self.walk_expr_reads(arg);
+                }
+            }
+            Statement::DebugAssert(cond, _) => {
+                self.walk_expr_reads(cond);
+                self.check_expr_type(cond, &NesType::Bool);
+            }
         }
     }
 
@@ -803,6 +812,14 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
         Statement::Scroll(x, y, _) => {
             collect_calls_expr(x, calls);
             collect_calls_expr(y, calls);
+        }
+        Statement::DebugLog(args, _) => {
+            for arg in args {
+                collect_calls_expr(arg, calls);
+            }
+        }
+        Statement::DebugAssert(cond, _) => {
+            collect_calls_expr(cond, calls);
         }
         Statement::Return(None, _)
         | Statement::Transition(_, _)
