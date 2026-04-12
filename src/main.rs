@@ -140,6 +140,7 @@ fn compile(input: &PathBuf, debug: bool, asm_dump: bool, use_ir: bool) -> Result
         use nescript::codegen::IrCodeGen;
         IrCodeGen::new(&analysis.var_allocations, &ir_program)
             .with_sprites(&sprites)
+            .with_debug(debug)
             .generate(&ir_program)
     } else {
         CodeGen::new(&analysis.var_allocations, &program.constants)

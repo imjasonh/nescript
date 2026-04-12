@@ -129,6 +129,14 @@ pub enum IrOp {
     ReadInput(IrTemp, u8),
     WaitFrame,
     Transition(String),
+    /// Write PPU scroll registers (two writes to $2005: X then Y).
+    Scroll(IrTemp, IrTemp),
+    /// Debug: write a list of temps to the emulator debug port ($4800).
+    /// Stripped in release mode by the codegen.
+    DebugLog(Vec<IrTemp>),
+    /// Debug: runtime assertion — if `cond` is zero, halt with debug marker.
+    /// Stripped in release mode by the codegen.
+    DebugAssert(IrTemp),
 
     // Source mapping
     SourceLoc(Span),

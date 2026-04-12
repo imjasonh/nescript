@@ -310,16 +310,21 @@ impl LoweringContext {
                 let arg_temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                 self.emit(IrOp::Call(None, name.clone(), arg_temps));
             }
-            Statement::Scroll(_, _, _) => {
-                // TODO: implement scroll hardware writes
+            Statement::Scroll(x_expr, y_expr, _) => {
+                let x = self.lower_expr(x_expr);
+                let y = self.lower_expr(y_expr);
+                self.emit(IrOp::Scroll(x, y));
             }
             Statement::LoadBackground(_, _) | Statement::SetPalette(_, _) => {
                 // TODO: implement in asset pipeline
             }
-            Statement::DebugLog(_, _) | Statement::DebugAssert(_, _) => {
-                // Debug statements don't produce IR ops in release mode.
-                // In debug mode, the AST-based codegen handles them directly
-                // (IR codegen path for debug is a future enhancement).
+            Statement::DebugLog(args, _) => {
+                let temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
+                self.emit(IrOp::DebugLog(temps));
+            }
+            Statement::DebugAssert(cond, _) => {
+                let t = self.lower_expr(cond);
+                self.emit(IrOp::DebugAssert(t));
             }
         }
     }

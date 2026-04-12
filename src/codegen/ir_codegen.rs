@@ -34,6 +34,11 @@ const TEMP_BASE: u8 = 0x80;
 const ZP_FRAME_FLAG: u8 = 0x00;
 const ZP_CURRENT_STATE: u8 = 0x03;
 
+/// Emulator debug output port. Writes to this address are logged by
+/// Mesen / fceux when the debugger is attached. Used by `debug.log`
+/// and `debug.assert` when compiled with `--debug`.
+const DEBUG_PORT: u16 = 0x4800;
+
 /// IR codegen that produces 6502 instructions from an `IrProgram`.
 pub struct IrCodeGen<'a> {
     instructions: Vec<Instruction>,
@@ -54,6 +59,9 @@ pub struct IrCodeGen<'a> {
     /// True while generating code inside a state frame handler.
     /// When set, `Return` terminators emit `JMP __ir_main_loop` instead of `RTS`.
     in_frame_handler: bool,
+    /// When true, emit code for `debug.log` / `debug.assert`.
+    /// When false, these ops are stripped entirely.
+    debug_mode: bool,
     _allocations: &'a [VarAllocation],
 }
 
@@ -79,8 +87,17 @@ impl<'a> IrCodeGen<'a> {
             function_names,
             next_oam_slot: 0,
             in_frame_handler: false,
+            debug_mode: false,
             _allocations: allocations,
         }
+    }
+
+    /// Enable debug-mode code generation. When set, `debug.log` and
+    /// `debug.assert` emit runtime code; otherwise they are stripped.
+    #[must_use]
+    pub fn with_debug(mut self, debug: bool) -> Self {
+        self.debug_mode = debug;
+        self
     }
 
     fn function_exists(&self, name: &str) -> bool {
@@ -442,6 +459,35 @@ impl<'a> IrCodeGen<'a> {
                     self.emit(JMP, AM::Label("__ir_main_loop".into()));
                 }
             }
+            IrOp::Scroll(x, y) => {
+                // PPU scroll register $2005 takes two writes: X then Y
+                self.load_temp(*x);
+                self.emit(STA, AM::Absolute(0x2005));
+                self.load_temp(*y);
+                self.emit(STA, AM::Absolute(0x2005));
+            }
+            IrOp::DebugLog(args) => {
+                if self.debug_mode {
+                    for arg in args {
+                        self.load_temp(*arg);
+                        self.emit(STA, AM::Absolute(DEBUG_PORT));
+                    }
+                }
+                // In release mode, stripped entirely
+            }
+            IrOp::DebugAssert(cond) => {
+                if self.debug_mode {
+                    // Load cond; if nonzero (true) skip; else halt
+                    self.load_temp(*cond);
+                    let pass_label = format!("__ir_assert_pass_{}", self.instructions.len());
+                    self.emit(BNE, AM::LabelRelative(pass_label.clone()));
+                    // Assertion failed: write marker to debug port and BRK
+                    self.emit(LDA, AM::Immediate(0xFF));
+                    self.emit(STA, AM::Absolute(DEBUG_PORT));
+                    self.emit(BRK, AM::Implied);
+                    self.emit_label(&pass_label);
+                }
+            }
             IrOp::SourceLoc(_) => {
                 // No code for source location markers
             }
@@ -727,5 +773,86 @@ mod more_tests {
             .iter()
             .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(0x03));
         assert!(has_store_state, "transition should write to current_state");
+    }
+
+    #[test]
+    fn ir_codegen_scroll_writes_ppu_register() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var sx: u8 = 0
+            var sy: u8 = 0
+            on frame { scroll(sx, sy) }
+            start Main
+        "#,
+        );
+        // Both X and Y scroll values should be written to $2005
+        let scroll_writes = insts
+            .iter()
+            .filter(|i| i.opcode == STA && i.mode == AM::Absolute(0x2005))
+            .count();
+        assert_eq!(scroll_writes, 2, "scroll should emit two STA $2005 writes");
+    }
+
+    fn lower_and_gen_debug(source: &str) -> Vec<Instruction> {
+        let (prog, _) = parser::parse(source);
+        let prog = prog.unwrap();
+        let analysis = analyzer::analyze(&prog);
+        let ir_program = ir::lower(&prog, &analysis);
+        IrCodeGen::new(&analysis.var_allocations, &ir_program)
+            .with_debug(true)
+            .generate(&ir_program)
+    }
+
+    #[test]
+    fn ir_codegen_debug_log_emits_in_debug_mode() {
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            var x: u8 = 42
+            on frame { debug.log(x) }
+            start Main
+        "#,
+        );
+        // Should write to the debug port $4800
+        let writes_debug_port = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4800));
+        assert!(writes_debug_port, "debug.log should write to $4800");
+    }
+
+    #[test]
+    fn ir_codegen_debug_log_stripped_in_release() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var x: u8 = 42
+            on frame { debug.log(x) }
+            start Main
+        "#,
+        );
+        // No debug port writes in release mode
+        let writes_debug_port = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4800));
+        assert!(
+            !writes_debug_port,
+            "debug.log should be stripped in release mode"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_debug_assert_emits_in_debug_mode() {
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            var x: u8 = 42
+            on frame { debug.assert(x == 42) }
+            start Main
+        "#,
+        );
+        // Should emit a BRK for the fail path
+        let has_brk = insts.iter().any(|i| i.opcode == BRK);
+        assert!(has_brk, "debug.assert should emit BRK on failure path");
     }
 }
