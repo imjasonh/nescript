@@ -282,7 +282,11 @@ fn run_tests(dir: &Path) -> bool {
     let mut passed = 0usize;
     let mut failed = 0usize;
 
-    println!("running {} test{}", total, if total == 1 { "" } else { "s" });
+    println!(
+        "running {} test{}",
+        total,
+        if total == 1 { "" } else { "s" }
+    );
 
     for path in &test_files {
         let name = path.display().to_string();
