@@ -111,6 +111,9 @@ impl Parser {
         let mut constants = Vec::new();
         let mut functions = Vec::new();
         let mut states = Vec::new();
+        let mut sprites = Vec::new();
+        let mut palettes = Vec::new();
+        let mut backgrounds = Vec::new();
         let mut start_state = None;
         let mut on_frame = None;
         let span = self.current_span();
@@ -134,6 +137,15 @@ impl Parser {
                 }
                 TokenKind::KwState => {
                     states.push(self.parse_state_decl()?);
+                }
+                TokenKind::KwSprite => {
+                    sprites.push(self.parse_sprite_decl()?);
+                }
+                TokenKind::KwPalette => {
+                    palettes.push(self.parse_palette_decl()?);
+                }
+                TokenKind::KwBackground => {
+                    backgrounds.push(self.parse_background_decl()?);
                 }
                 TokenKind::KwOn => {
                     // Top-level `on frame` — implicit single state for M1
@@ -187,6 +199,9 @@ impl Parser {
             constants,
             functions,
             states,
+            sprites,
+            palettes,
+            backgrounds,
             start_state,
             span,
         })
@@ -450,6 +465,204 @@ impl Parser {
         self.parse_block()
     }
 
+    // ── Sprite / Palette / Background declarations ──
+
+    fn parse_sprite_decl(&mut self) -> Result<SpriteDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwSprite)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut chr_source = None;
+
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let (key, _) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "chr" => {
+                    chr_source = Some(self.parse_asset_source()?);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown sprite property '{key}'"),
+                        self.current_span(),
+                    ));
+                }
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let chr_source = chr_source.ok_or_else(|| {
+            Diagnostic::error(ErrorCode::E0201, "sprite requires 'chr' property", start)
+        })?;
+
+        Ok(SpriteDecl {
+            name,
+            chr_source,
+            span: Span::new(start.file_id, start.start, self.current_span().start),
+        })
+    }
+
+    fn parse_palette_decl(&mut self) -> Result<PaletteDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwPalette)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut colors = None;
+
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let (key, _) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "colors" => {
+                    self.expect(&TokenKind::LBracket)?;
+                    let mut vals = Vec::new();
+                    while *self.peek() != TokenKind::RBracket && *self.peek() != TokenKind::Eof {
+                        if let TokenKind::IntLiteral(v) = self.peek().clone() {
+                            self.advance();
+                            vals.push(v as u8);
+                        } else {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!("expected color index, found '{}'", self.peek()),
+                                self.current_span(),
+                            ));
+                        }
+                        if *self.peek() == TokenKind::Comma {
+                            self.advance();
+                        }
+                    }
+                    self.expect(&TokenKind::RBracket)?;
+                    colors = Some(vals);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown palette property '{key}'"),
+                        self.current_span(),
+                    ));
+                }
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let colors = colors.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                "palette requires 'colors' property",
+                start,
+            )
+        })?;
+
+        Ok(PaletteDecl {
+            name,
+            colors,
+            span: Span::new(start.file_id, start.start, self.current_span().start),
+        })
+    }
+
+    fn parse_background_decl(&mut self) -> Result<BackgroundDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwBackground)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut chr_source = None;
+
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let (key, _) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "chr" => {
+                    chr_source = Some(self.parse_asset_source()?);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown background property '{key}'"),
+                        self.current_span(),
+                    ));
+                }
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let chr_source = chr_source.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                "background requires 'chr' property",
+                start,
+            )
+        })?;
+
+        Ok(BackgroundDecl {
+            name,
+            chr_source,
+            span: Span::new(start.file_id, start.start, self.current_span().start),
+        })
+    }
+
+    fn parse_asset_source(&mut self) -> Result<AssetSource, Diagnostic> {
+        match self.peek() {
+            TokenKind::At => {
+                self.advance(); // consume '@'
+                let (kind, _) = self.expect_ident()?;
+                self.expect(&TokenKind::LParen)?;
+                let path = if let TokenKind::StringLiteral(s) = self.peek().clone() {
+                    self.advance();
+                    s
+                } else {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("expected string path, found '{}'", self.peek()),
+                        self.current_span(),
+                    ));
+                };
+                self.expect(&TokenKind::RParen)?;
+                match kind.as_str() {
+                    "chr" => Ok(AssetSource::Chr(path)),
+                    "binary" => Ok(AssetSource::Binary(path)),
+                    _ => Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown asset source kind '@{kind}'"),
+                        self.current_span(),
+                    )),
+                }
+            }
+            TokenKind::LBracket => {
+                self.advance();
+                let mut bytes = Vec::new();
+                while *self.peek() != TokenKind::RBracket && *self.peek() != TokenKind::Eof {
+                    if let TokenKind::IntLiteral(v) = self.peek().clone() {
+                        self.advance();
+                        bytes.push(v as u8);
+                    } else {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!("expected byte value, found '{}'", self.peek()),
+                            self.current_span(),
+                        ));
+                    }
+                    if *self.peek() == TokenKind::Comma {
+                        self.advance();
+                    }
+                }
+                self.expect(&TokenKind::RBracket)?;
+                Ok(AssetSource::Inline(bytes))
+            }
+            _ => Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!(
+                    "expected asset source (@chr, @binary, or [...]), found '{}'",
+                    self.peek()
+                ),
+                self.current_span(),
+            )),
+        }
+    }
+
     // ── Block ──
 
     fn parse_block(&mut self) -> Result<Block, Diagnostic> {
@@ -510,6 +723,18 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
                 Ok(Statement::WaitFrame(span))
+            }
+            TokenKind::KwLoadBackground => {
+                let span = self.current_span();
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                Ok(Statement::LoadBackground(name, span))
+            }
+            TokenKind::KwSetPalette => {
+                let span = self.current_span();
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                Ok(Statement::SetPalette(name, span))
             }
             TokenKind::Ident(_) => self.parse_assign_or_call(),
             _ => Err(Diagnostic::error(

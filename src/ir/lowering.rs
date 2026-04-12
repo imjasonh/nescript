@@ -299,6 +299,9 @@ impl LoweringContext {
                 let arg_temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                 self.emit(IrOp::Call(None, name.clone(), arg_temps));
             }
+            Statement::LoadBackground(_, _) | Statement::SetPalette(_, _) => {
+                // TODO: implement in asset pipeline
+            }
         }
     }
 

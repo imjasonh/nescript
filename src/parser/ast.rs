@@ -7,8 +7,39 @@ pub struct Program {
     pub constants: Vec<ConstDecl>,
     pub functions: Vec<FunDecl>,
     pub states: Vec<StateDecl>,
+    pub sprites: Vec<SpriteDecl>,
+    pub palettes: Vec<PaletteDecl>,
+    pub backgrounds: Vec<BackgroundDecl>,
     pub start_state: String,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct SpriteDecl {
+    pub name: String,
+    pub chr_source: AssetSource,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct PaletteDecl {
+    pub name: String,
+    pub colors: Vec<u8>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct BackgroundDecl {
+    pub name: String,
+    pub chr_source: AssetSource,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub enum AssetSource {
+    Chr(String),
+    Binary(String),
+    Inline(Vec<u8>),
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +219,8 @@ pub enum Statement {
     Transition(String, Span),
     WaitFrame(Span),
     Call(String, Vec<Expr>, Span),
+    LoadBackground(String, Span),
+    SetPalette(String, Span),
 }
 
 #[derive(Debug, Clone)]

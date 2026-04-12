@@ -288,3 +288,44 @@ fn error_test_recursion_detected() {
         "should detect recursion"
     );
 }
+
+// ── M3 Tests ──
+
+#[test]
+fn program_with_sprites_and_palette() {
+    let source = r#"
+        game "M3 Assets" { mapper: NROM }
+
+        sprite Player {
+            chr: [0x3C, 0x42, 0x81, 0x81, 0x81, 0x81, 0x42, 0x3C,
+                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        }
+
+        palette MainPal {
+            colors: [0x0F, 0x00, 0x10, 0x20]
+        }
+
+        background TitleBg {
+            chr: @binary("title.bin")
+        }
+
+        var px: u8 = 128
+        var py: u8 = 120
+
+        state Title {
+            on enter {
+                load_background TitleBg
+                set_palette MainPal
+            }
+            on frame {
+                if button.right { px += 2 }
+                if button.left  { px -= 2 }
+                draw Player at: (px, py)
+            }
+        }
+
+        start Title
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}

@@ -19,6 +19,10 @@ enum Cli {
         /// Output ROM file (default: input with .nes extension)
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Enable debug mode (runtime checks, debug.log)
+        #[arg(long)]
+        debug: bool,
     },
     /// Type-check a source file without building
     Check {
@@ -31,9 +35,13 @@ fn main() {
     let cli = Cli::parse();
 
     match cli {
-        Cli::Build { input, output } => {
+        Cli::Build {
+            input,
+            output,
+            debug,
+        } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
-            match compile(&input) {
+            match compile(&input, debug) {
                 Ok(rom) => {
                     std::fs::write(&output, rom).unwrap_or_else(|e| {
                         eprintln!("error: failed to write {}: {e}", output.display());
@@ -56,7 +64,7 @@ fn main() {
     }
 }
 
-fn compile(input: &PathBuf) -> Result<Vec<u8>, ()> {
+fn compile(input: &PathBuf, _debug: bool) -> Result<Vec<u8>, ()> {
     let source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
     })?;

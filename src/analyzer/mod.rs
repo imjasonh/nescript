@@ -364,7 +364,9 @@ impl Analyzer {
             Statement::Break(_)
             | Statement::Continue(_)
             | Statement::WaitFrame(_)
-            | Statement::Return(None, _) => {}
+            | Statement::Return(None, _)
+            | Statement::LoadBackground(_, _)
+            | Statement::SetPalette(_, _) => {}
         }
     }
 
@@ -519,7 +521,9 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
         | Statement::Transition(_, _)
         | Statement::WaitFrame(_)
         | Statement::Break(_)
-        | Statement::Continue(_) => {}
+        | Statement::Continue(_)
+        | Statement::LoadBackground(_, _)
+        | Statement::SetPalette(_, _) => {}
     }
 }
 

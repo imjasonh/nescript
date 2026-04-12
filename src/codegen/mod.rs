@@ -148,6 +148,9 @@ impl CodeGen {
             | Statement::Call(_, _, _) => {
                 // TODO: implement for later milestones
             }
+            Statement::LoadBackground(_, _) | Statement::SetPalette(_, _) => {
+                // TODO: implement in asset pipeline
+            }
         }
     }
 

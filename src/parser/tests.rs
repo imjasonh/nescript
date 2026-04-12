@@ -482,3 +482,103 @@ fn parse_function_call_expr() {
         other => panic!("expected assignment with Call, got {other:?}"),
     }
 }
+
+// ── Milestone 3: Sprites / Palettes / Backgrounds ──
+
+#[test]
+fn parse_sprite_decl() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        sprite Player {
+            chr: [0x3C, 0x42, 0x81, 0x81, 0x81, 0x81, 0x42, 0x3C,
+                  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sprites.len(), 1);
+    assert_eq!(prog.sprites[0].name, "Player");
+    match &prog.sprites[0].chr_source {
+        AssetSource::Inline(data) => {
+            assert_eq!(data.len(), 16);
+            assert_eq!(data[0], 0x3C);
+        }
+        other => panic!("expected Inline, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_palette_decl() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        palette MainPal {
+            colors: [0x0F, 0x00, 0x10, 0x20]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.palettes.len(), 1);
+    assert_eq!(prog.palettes[0].name, "MainPal");
+    assert_eq!(prog.palettes[0].colors, vec![0x0F, 0x00, 0x10, 0x20]);
+}
+
+#[test]
+fn parse_background_decl() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        background TitleBg {
+            chr: @chr("title.png")
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.backgrounds.len(), 1);
+    assert_eq!(prog.backgrounds[0].name, "TitleBg");
+    match &prog.backgrounds[0].chr_source {
+        AssetSource::Chr(path) => assert_eq!(path, "title.png"),
+        other => panic!("expected Chr, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_load_background_statement() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        state Title {
+            on frame {
+                load_background TitleBg
+            }
+        }
+        start Title
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert_eq!(frame.statements.len(), 1);
+    match &frame.statements[0] {
+        Statement::LoadBackground(name, _) => assert_eq!(name, "TitleBg"),
+        other => panic!("expected LoadBackground, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_set_palette_statement() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        state Title {
+            on frame {
+                set_palette MainPal
+            }
+        }
+        start Title
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert_eq!(frame.statements.len(), 1);
+    match &frame.statements[0] {
+        Statement::SetPalette(name, _) => assert_eq!(name, "MainPal"),
+        other => panic!("expected SetPalette, got {other:?}"),
+    }
+}
