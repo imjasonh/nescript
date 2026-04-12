@@ -2,52 +2,32 @@
 
 ## Quick Start
 
-### 1. Build the compiler
-
-```
+```bash
+# Build the compiler
 cargo build --release
-```
 
-### 2. Compile an example
+# Compile all examples
+for f in examples/*.ne; do cargo run -- build "$f"; done
 
-```
+# Or compile one
 cargo run -- build examples/hello_sprite.ne
 ```
 
-This produces `examples/hello_sprite.nes` — a valid iNES ROM file.
-
-### 3. Run in an emulator
-
-Open the `.nes` file in any NES emulator:
-
-- **[Mesen](https://www.mesen.ca/)** (recommended — best debugging support)
-- **[FCEUX](https://fceux.com/)**
-- **[Nestopia](http://nestopia.sourceforge.net/)**
-
-Use the d-pad (arrow keys in most emulators) to move the sprite.
+Open any `.nes` file in an NES emulator ([Mesen](https://www.mesen.ca/), [FCEUX](https://fceux.com/), etc.)
 
 ## Examples
 
-| File | Description |
-|------|-------------|
-| `hello_sprite.ne` | Move a smiley face with the d-pad |
-| `bouncing_ball.ne` | A sprite that bounces around the screen automatically |
+| File | Features | Description |
+|------|----------|-------------|
+| `hello_sprite.ne` | input, draw | Move a sprite with the d-pad |
+| `bouncing_ball.ne` | if/else, variables | Auto-bouncing sprite with edge detection |
+| `coin_cavern.ne` | states, functions, constants | 3-state game with gravity and coin collection |
+| `arrays_and_functions.ne` | arrays, functions, while | Enemy array with collision detection |
+| `state_machine.ne` | on enter/exit, transitions | Multi-state flow with timers |
+| `sprites_and_palettes.ne` | sprites, palettes, scroll, cast | Inline CHR data, palette switching, type casting |
+| `mmc1_banked.ne` | MMC1, banks, multiply | Banked mapper with software multiply |
 
-## What you'll see
-
-The ROM displays a small 8x8 smiley-face sprite. This is a default tile built
-into the compiler's CHR data. In `hello_sprite`, you control it with the d-pad.
-In `bouncing_ball`, it moves on its own and bounces off the screen edges.
-
-### About sprite names
-
-In Milestone 1, the name in `draw Smiley at: (x, y)` is parsed but not
-resolved to a specific tile — all draws use CHR tile 0 (the built-in smiley).
-The `draw` syntax is forward-compatible: when `sprite` declarations and the
-asset pipeline arrive in M3, names like `Smiley` will reference actual
-sprite definitions with custom tile data from PNGs.
-
-## Emulator controls
+## Emulator Controls
 
 | NES Button | Typical Key |
 |------------|-------------|
@@ -57,17 +37,36 @@ sprite definitions with custom tile data from PNGs.
 | Start      | Enter       |
 | Select     | Right Shift |
 
-(Exact mappings vary by emulator — check your emulator's input settings.)
+## About Sprites
 
-## Compiler commands
+Sprite names in `draw Player at: (x, y)` are parsed and recorded in the AST.
+You can define sprites with inline CHR tile data:
 
 ```
+sprite Player {
+    chr: [0x3C, 0x42, 0x81, 0x81, 0x81, 0x81, 0x42, 0x3C,
+          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+}
+```
+
+If no matching sprite declaration exists, the draw uses the built-in default
+tile (a smiley face). See `sprites_and_palettes.ne` for a full example.
+
+## Compiler Commands
+
+```bash
 # Compile to ROM
-cargo run -- build examples/hello_sprite.ne
+cargo run -- build game.ne
 
-# Compile with custom output path
-cargo run -- build examples/hello_sprite.ne --output my_game.nes
+# Custom output path
+cargo run -- build game.ne --output my_game.nes
 
-# Type-check only (no ROM output)
-cargo run -- check examples/hello_sprite.ne
+# Type-check only
+cargo run -- check game.ne
+
+# View generated 6502 assembly
+cargo run -- build game.ne --asm-dump
+
+# Debug mode
+cargo run -- build game.ne --debug
 ```

@@ -39,6 +39,10 @@ impl Parser {
             .map_or(&TokenKind::Eof, |t| &t.kind)
     }
 
+    fn peek_at_offset(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens.get(self.pos + offset).map(|t| &t.kind)
+    }
+
     fn current_span(&self) -> Span {
         self.tokens.get(self.pos).map_or(Span::dummy(), |t| t.span)
     }
@@ -841,7 +845,10 @@ impl Parser {
         let mut frame = None;
 
         // Parse keyword arguments: at: (x, y), frame: n
-        while let TokenKind::Ident(_) = self.peek() {
+        // Only consume an ident if it's followed by ':', indicating a keyword arg.
+        while matches!(self.peek(), TokenKind::Ident(_))
+            && self.peek_at_offset(1) == Some(&TokenKind::Colon)
+        {
             let (key, _) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             match key.as_str() {
