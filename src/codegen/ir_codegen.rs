@@ -47,8 +47,13 @@ pub struct IrCodeGen<'a> {
     sprite_tiles: HashMap<String, u8>,
     /// State name to dispatch index mapping.
     state_indices: HashMap<String, u8>,
+    /// Set of function names defined in the IR program (for existence checks).
+    function_names: std::collections::HashSet<String>,
     /// Next OAM slot to allocate (0-63); reset at start of each frame handler.
     next_oam_slot: u8,
+    /// True while generating code inside a state frame handler.
+    /// When set, `Return` terminators emit `JMP __ir_main_loop` instead of `RTS`.
+    in_frame_handler: bool,
     _allocations: &'a [VarAllocation],
 }
 
@@ -63,6 +68,7 @@ impl<'a> IrCodeGen<'a> {
                 var_addrs.insert(global.var_id, alloc.address);
             }
         }
+        let function_names = ir.functions.iter().map(|f| f.name.clone()).collect();
         Self {
             instructions: Vec::new(),
             var_addrs,
@@ -70,9 +76,15 @@ impl<'a> IrCodeGen<'a> {
             next_temp_slot: 0,
             sprite_tiles: HashMap::new(),
             state_indices: HashMap::new(),
+            function_names,
             next_oam_slot: 0,
+            in_frame_handler: false,
             _allocations: allocations,
         }
+    }
+
+    fn function_exists(&self, name: &str) -> bool {
+        self.function_names.contains(name)
     }
 
     #[must_use]
@@ -145,10 +157,15 @@ impl<'a> IrCodeGen<'a> {
             }
         }
 
-        // 2. Initialize current_state to start state index
+        // 2. Initialize current_state to start state index and call
+        // the start state's on_enter handler (if any).
         if let Some(&start_idx) = self.state_indices.get(&ir.start_state) {
             self.emit(LDA, AM::Immediate(start_idx));
             self.emit(STA, AM::ZeroPage(ZP_CURRENT_STATE));
+            let enter_fn = format!("{}_enter", ir.start_state);
+            if self.function_exists(&enter_fn) {
+                self.emit(JSR, AM::Label(format!("__ir_fn_{enter_fn}")));
+            }
         }
 
         // 3. Main dispatch loop
@@ -192,7 +209,8 @@ impl<'a> IrCodeGen<'a> {
         self.temp_slots.clear();
         self.next_temp_slot = 0;
         // Reset OAM slot counter per frame handler
-        if func.name.ends_with("_frame") {
+        self.in_frame_handler = func.name.ends_with("_frame");
+        if self.in_frame_handler {
             self.next_oam_slot = 0;
         }
 
@@ -202,11 +220,7 @@ impl<'a> IrCodeGen<'a> {
             self.gen_block(block);
         }
 
-        // Frame handlers end with JMP to main loop; other functions end
-        // with RTS (emitted by the Return terminator in IR).
-        if func.name.ends_with("_frame") {
-            self.emit(JMP, AM::Label("__ir_main_loop".into()));
-        }
+        self.in_frame_handler = false;
     }
 
     fn gen_block(&mut self, block: &IrBasicBlock) {
@@ -408,11 +422,21 @@ impl<'a> IrCodeGen<'a> {
             }
             IrOp::Transition(name) => {
                 // Write the target state's index to current_state, then
-                // JMP back to main loop to run the new state's frame
-                // handler on the next dispatch cycle.
+                // call the target state's on_enter handler if it exists,
+                // then JMP to main loop for the new state's frame handler.
+                //
+                // Note: on_exit of the current state isn't called here
+                // because we don't know from an IR op alone which state
+                // we're leaving. Proper on_exit support would need
+                // per-state transition lowering. Future improvement.
                 if let Some(&idx) = self.state_indices.get(name) {
                     self.emit(LDA, AM::Immediate(idx));
                     self.emit(STA, AM::ZeroPage(ZP_CURRENT_STATE));
+                    // Call the target state's on_enter handler if defined
+                    let enter_fn = format!("{name}_enter");
+                    if self.function_exists(&enter_fn) {
+                        self.emit(JSR, AM::Label(format!("__ir_fn_{enter_fn}")));
+                    }
                     self.emit(JMP, AM::Label("__ir_main_loop".into()));
                 }
             }
@@ -471,7 +495,13 @@ impl<'a> IrCodeGen<'a> {
                 if let Some(v) = value {
                     self.load_temp(*v);
                 }
-                self.emit(RTS, AM::Implied);
+                // Frame handlers return to the main dispatch loop,
+                // not via RTS (they aren't called via JSR).
+                if self.in_frame_handler {
+                    self.emit(JMP, AM::Label("__ir_main_loop".into()));
+                } else {
+                    self.emit(RTS, AM::Implied);
+                }
             }
             IrTerminator::Unreachable => {
                 // Generate a BRK just in case
