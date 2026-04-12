@@ -333,15 +333,35 @@ spills to zero-page $02 for comparisons. A proper allocator would:
 
 ## Priority Order
 
+### Recently completed (removed from backlog)
+
+These items were documented as future work but have since been implemented:
+
+- **State machine dispatch** — CMP + BNE + JMP trampoline dispatch table,
+  `current_state` in ZP $03, on_enter/on_exit handlers as JSR targets
+- **Function call codegen** — JSR to function labels, ZP $04-$07 param passing,
+  RTS for returns
+- **Break/continue** — loop_stack with JMP to continue/break labels
+- **Return** — evaluate expr to A + RTS
+- **Transition** — write state index + JMP to main loop
+- **Array indexing** — TAX + LDA/STA with ZeroPageX or AbsoluteX
+- **Scroll** — PPU $2005 writes (X then Y)
+- **Multiply/divide/modulo** — JSR __multiply/__divide with shift-and-add/restoring division
+- **Shift left/right** — ASL A / LSR A
+- **Multi-OAM sprites** — sequential slot allocation (0-63), reset per frame
+- **Const assignment error** — E0203 for assigning to constants
+- **Break outside loop error** — E0203 for break/continue without enclosing loop
+- **Math routines wired into linker** — gen_multiply/gen_divide included in ROM
+
+### Remaining priority order
+
 For someone picking up this codebase, the recommended order of work:
 
-1. **State machine dispatch** (#5) — makes multi-state games actually work
-2. **Function call codegen** (#2, calls/returns) — makes functions actually work
-3. **Multi-OAM sprites** (#4) — makes games with >1 sprite possible
-4. **Array index codegen** (#2, arrays) — makes array-based games work
-5. **IR-based codegen** (#1) — enables optimizer to affect output
-6. **Sprite name resolution** (#3) — makes custom graphics work
-7. **Include directive** (#6) — enables multi-file projects
-8. **Asset pipeline wiring** (#9) — PNG assets compile into ROMs
-9. **Error message polish** (#10) — better developer experience
-10. **Debug mode** (#7) — runtime debugging support
+1. **IR-based codegen** (#1) — enables optimizer to affect output
+2. **Sprite name resolution** (#3) — maps sprite names to CHR tile indices
+3. **Include directive** (#6) — enables multi-file projects
+4. **Asset pipeline wiring** (#9) — PNG assets compile into ROMs
+5. **Debug mode** (#7) — runtime debugging support
+6. **Error message polish** (#10) — unused error codes, missing validations
+7. **Audio** (#12) — SFX/music driver
+8. **Language features** (#13) — structs, enums, fixed-point
