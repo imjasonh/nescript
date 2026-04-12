@@ -84,6 +84,7 @@ mod tests {
             globals: Vec::new(),
             constants: Vec::new(),
             enums: Vec::new(),
+            structs: Vec::new(),
             functions: Vec::new(),
             states: Vec::new(),
             sprites: vec![sprite],

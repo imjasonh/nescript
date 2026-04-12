@@ -62,7 +62,7 @@ pub struct IrCodeGen<'a> {
     /// When true, emit code for `debug.log` / `debug.assert`.
     /// When false, these ops are stripped entirely.
     debug_mode: bool,
-    _allocations: &'a [VarAllocation],
+    allocations: &'a [VarAllocation],
 }
 
 impl<'a> IrCodeGen<'a> {
@@ -74,6 +74,33 @@ impl<'a> IrCodeGen<'a> {
         for global in &ir.globals {
             if let Some(alloc) = allocations.iter().find(|a| a.name == global.name) {
                 var_addrs.insert(global.var_id, alloc.address);
+            }
+        }
+        // Map each function's parameter VarIds to the zero-page
+        // parameter-passing slots $04-$07 (up to 4 params). Map the
+        // rest of each function's locals into main RAM starting at
+        // `$0300` (after the OAM buffer). Locals don't overlap with
+        // globals (which were placed by the analyzer) and are
+        // disjoint across functions so nested calls don't corrupt
+        // each other.
+        let mut local_ram_next: u16 = 0x0300;
+        // Advance past any global addresses so we don't clobber them.
+        // This is conservative: scan existing var_addrs for the max.
+        if let Some(max_global) = var_addrs.values().copied().max() {
+            if max_global >= local_ram_next {
+                local_ram_next = max_global + 1;
+            }
+        }
+        for func in &ir.functions {
+            for (i, local) in func.locals.iter().enumerate() {
+                if i < func.param_count {
+                    if i < 4 {
+                        var_addrs.insert(local.var_id, 0x04 + i as u16);
+                    }
+                } else {
+                    var_addrs.insert(local.var_id, local_ram_next);
+                    local_ram_next += local.size.max(1);
+                }
             }
         }
         let function_names = ir.functions.iter().map(|f| f.name.clone()).collect();
@@ -88,7 +115,7 @@ impl<'a> IrCodeGen<'a> {
             next_oam_slot: 0,
             in_frame_handler: false,
             debug_mode: false,
-            _allocations: allocations,
+            allocations,
         }
     }
 
@@ -185,6 +212,33 @@ impl<'a> IrCodeGen<'a> {
             }
         }
 
+        // 2b. If the program has any `on scanline` handlers, set up
+        // the MMC3 IRQ counter using the scanline count of the
+        // *start* state (if it has one). Per-state scanline switching
+        // is then handled by writing to `$C000`/`$C001`/`$E001` at
+        // the top of each on_enter handler via inline asm (future).
+        // For now we always set up with the first scanline found in
+        // the start state, or any scanline in the program as a
+        // fallback.
+        let scanline_handlers = collect_scanline_handlers(ir);
+        if !scanline_handlers.is_empty() {
+            // Prefer a scanline in the start state; otherwise use the
+            // first one found.
+            let (_state_name, line) = scanline_handlers
+                .iter()
+                .find(|(s, _)| *s == ir.start_state)
+                .or_else(|| scanline_handlers.first())
+                .unwrap();
+            // Write (line-1) to $C000 (scanline latch), any value to
+            // $C001 (reload counter), any value to $E001 (enable IRQ).
+            self.emit(LDA, AM::Immediate(line.saturating_sub(1)));
+            self.emit(STA, AM::Absolute(0xC000));
+            self.emit(STA, AM::Absolute(0xC001));
+            self.emit(STA, AM::Absolute(0xE001));
+            // Enable interrupts (CLI) so the IRQ can fire.
+            self.emit(CLI, AM::Implied);
+        }
+
         // 3. Main dispatch loop
         let main_loop = "__ir_main_loop".to_string();
         self.emit_label(&main_loop);
@@ -218,6 +272,75 @@ impl<'a> IrCodeGen<'a> {
             self.gen_function(func);
         }
 
+        // 5. If we have scanline handlers, emit an IRQ handler that
+        // saves registers, ACKs the MMC3 IRQ, dispatches to the
+        // current state's scanline handler (if any), restores
+        // registers, and RTIs. The linker picks up `__irq_user` and
+        // uses it as the IRQ vector instead of the default stub.
+        if !scanline_handlers.is_empty() {
+            self.emit_label("__irq_user");
+            // Save registers onto the stack.
+            self.emit(PHA, AM::Implied);
+            self.emit(TXA, AM::Implied);
+            self.emit(PHA, AM::Implied);
+            self.emit(TYA, AM::Implied);
+            self.emit(PHA, AM::Implied);
+            // Acknowledge the MMC3 IRQ ($E000 = disable/ack). NMI
+            // will re-enable each frame by reloading the counter.
+            self.emit(LDA, AM::Immediate(0));
+            self.emit(STA, AM::Absolute(0xE000));
+            // Dispatch by current_state: for each state with a
+            // scanline handler, CMP and JSR.
+            self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
+            let done_label = "__irq_user_done".to_string();
+            for (i, (state_name, line)) in scanline_handlers.iter().enumerate() {
+                let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
+                let skip_label = format!("__irq_disp_skip_{i}");
+                self.emit(CMP, AM::Immediate(state_idx));
+                self.emit(BNE, AM::LabelRelative(skip_label.clone()));
+                let handler = format!("{state_name}_scanline_{line}");
+                self.emit(JSR, AM::Label(format!("__ir_fn_{handler}")));
+                self.emit(JMP, AM::Label(done_label.clone()));
+                self.emit_label(&skip_label);
+            }
+            self.emit_label(&done_label);
+            // Restore registers and return from interrupt.
+            self.emit(PLA, AM::Implied);
+            self.emit(TAY, AM::Implied);
+            self.emit(PLA, AM::Implied);
+            self.emit(TAX, AM::Implied);
+            self.emit(PLA, AM::Implied);
+            self.emit(RTI, AM::Implied);
+
+            // Also emit a helper that the NMI handler can use to
+            // reload the MMC3 counter each frame. Linker extends the
+            // NMI with a JSR into this when `__ir_mmc3_reload` exists.
+            self.emit_label("__ir_mmc3_reload");
+            // Dispatch on current_state to pick the right scanline
+            // count, write (count-1) to $C000, reload $C001, enable
+            // $E001. States without a scanline handler fall through
+            // to disable ($E000).
+            self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
+            let reload_done = "__ir_mmc3_reload_done".to_string();
+            for (i, (state_name, line)) in scanline_handlers.iter().enumerate() {
+                let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
+                let skip_label = format!("__ir_reload_skip_{i}");
+                self.emit(CMP, AM::Immediate(state_idx));
+                self.emit(BNE, AM::LabelRelative(skip_label.clone()));
+                self.emit(LDA, AM::Immediate(line.saturating_sub(1)));
+                self.emit(STA, AM::Absolute(0xC000));
+                self.emit(STA, AM::Absolute(0xC001));
+                self.emit(STA, AM::Absolute(0xE001));
+                self.emit(JMP, AM::Label(reload_done.clone()));
+                self.emit_label(&skip_label);
+            }
+            // No matching state — disable IRQ for this frame.
+            self.emit(LDA, AM::Immediate(0));
+            self.emit(STA, AM::Absolute(0xE000));
+            self.emit_label(&reload_done);
+            self.emit(RTS, AM::Implied);
+        }
+
         self.instructions
     }
 
@@ -232,6 +355,27 @@ impl<'a> IrCodeGen<'a> {
         }
 
         self.emit_label(&format!("__ir_fn_{}", func.name));
+
+        // At the start of a frame handler that actually draws
+        // sprites, clear the OAM shadow buffer so stale sprites from
+        // the previous frame (or from a different state's handler)
+        // don't linger on screen. We set the Y position byte of every
+        // OAM entry to $FE (off-screen) and the `draw` code
+        // overwrites the slots it needs. Handlers that never call
+        // `draw` skip the clear entirely — the NMI handler's DMA
+        // copies whatever's in $0200 unchanged.
+        if self.in_frame_handler && function_draws_sprites(func) {
+            let clear_loop = format!("__ir_oam_clear_{}", func.name);
+            self.emit(LDX, AM::Immediate(0));
+            self.emit(LDA, AM::Immediate(0xFE));
+            self.emit_label(&clear_loop);
+            self.emit(STA, AM::AbsoluteX(0x0200));
+            self.emit(INX, AM::Implied);
+            self.emit(INX, AM::Implied);
+            self.emit(INX, AM::Implied);
+            self.emit(INX, AM::Implied);
+            self.emit(BNE, AM::LabelRelative(clear_loop));
+        }
 
         for block in &func.blocks {
             self.gen_block(block);
@@ -377,11 +521,15 @@ impl<'a> IrCodeGen<'a> {
                 }
             }
             IrOp::Call(dest, name, args) => {
-                for (i, arg) in args.iter().enumerate() {
+                // Pass up to 4 arguments via zero-page slots $04-$07.
+                // Arguments beyond the fourth are silently dropped
+                // (the analyzer has already validated arity against
+                // the declared signature).
+                for (i, arg) in args.iter().enumerate().take(4) {
                     self.load_temp(*arg);
                     self.emit(STA, AM::ZeroPage(0x04 + i as u8));
                 }
-                self.emit(JSR, AM::Label(format!("__fn_{name}")));
+                self.emit(JSR, AM::Label(format!("__ir_fn_{name}")));
                 if let Some(d) = dest {
                     // Return value is in A
                     self.store_temp(*d);
@@ -489,18 +637,44 @@ impl<'a> IrCodeGen<'a> {
                 }
             }
             IrOp::InlineAsm(body) => {
-                // Parse the asm body with the shared inline parser and
-                // splice the resulting instructions directly into our
-                // output stream. Parse errors are emitted as `BRK` so
-                // the ROM still links — codegen is too late to return
-                // user-facing diagnostics cleanly.
-                match crate::asm::parse_inline(body) {
+                // Preprocess `{var}` substitutions (unless this is a
+                // `raw asm` block, flagged by the lowering with a
+                // magic prefix), then parse with the shared inline
+                // parser and splice the resulting instructions.
+                let raw = body.strip_prefix(crate::ir::RAW_ASM_PREFIX);
+                let to_parse: std::borrow::Cow<'_, str> = if let Some(raw_body) = raw {
+                    std::borrow::Cow::Borrowed(raw_body)
+                } else {
+                    std::borrow::Cow::Owned(substitute_asm_vars(body, |name| {
+                        self.allocations
+                            .iter()
+                            .find(|a| a.name == name)
+                            .map(|a| a.address)
+                    }))
+                };
+                match crate::asm::parse_inline(&to_parse) {
                     Ok(parsed) => self.instructions.extend(parsed),
                     Err(msg) => {
                         eprintln!("inline asm error: {msg}");
                         self.emit(BRK, AM::Implied);
                     }
                 }
+            }
+            IrOp::Poke(addr, src) => {
+                self.load_temp(*src);
+                if *addr < 0x100 {
+                    self.emit(STA, AM::ZeroPage(*addr as u8));
+                } else {
+                    self.emit(STA, AM::Absolute(*addr));
+                }
+            }
+            IrOp::Peek(dest, addr) => {
+                if *addr < 0x100 {
+                    self.emit(LDA, AM::ZeroPage(*addr as u8));
+                } else {
+                    self.emit(LDA, AM::Absolute(*addr));
+                }
+                self.store_temp(*dest);
             }
             IrOp::SourceLoc(_) => {
                 // No code for source location markers
@@ -581,6 +755,79 @@ enum CmpKind {
     Gt,
     LtEq,
     GtEq,
+}
+
+/// Replace `{name}` tokens in an inline-asm body with the resolved
+/// hex address from the given resolver. Unknown names and malformed
+/// placeholders are passed through unchanged (the asm parser will
+/// surface a clearer error than we could at this stage).
+///
+/// Addresses that fit in a byte become zero-page syntax (`$XX`),
+/// otherwise absolute (`$XXXX`). This lets users write
+/// `lda {score}` and have it resolve to `lda $10` or similar.
+fn substitute_asm_vars<F: Fn(&str) -> Option<u16>>(body: &str, resolver: F) -> String {
+    let mut out = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // Find the closing `}`.
+            if let Some(end) = bytes[i + 1..].iter().position(|&b| b == b'}') {
+                let name_start = i + 1;
+                let name_end = i + 1 + end;
+                let name = &body[name_start..name_end];
+                // Only substitute bare identifiers.
+                let is_ident = !name.is_empty()
+                    && name
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                    && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+                if is_ident {
+                    if let Some(addr) = resolver(name) {
+                        use std::fmt::Write;
+                        if addr < 0x100 {
+                            let _ = write!(out, "${addr:02X}");
+                        } else {
+                            let _ = write!(out, "${addr:04X}");
+                        }
+                        i = name_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
+/// True if the given IR function contains at least one
+/// `DrawSprite` op. Used by the frame-handler OAM clear to skip
+/// the clear loop when a handler doesn't actually draw anything.
+fn function_draws_sprites(func: &IrFunction) -> bool {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::DrawSprite { .. }))
+}
+
+/// Scan the IR functions for all scanline handlers (named
+/// `{state}_scanline_{line}`) and return them in IR function order.
+fn collect_scanline_handlers(ir: &IrProgram) -> Vec<(String, u8)> {
+    let mut out = Vec::new();
+    for func in &ir.functions {
+        // Match the pattern `<state>_scanline_<N>` by splitting on
+        // the last `_scanline_`. This keeps it simple and avoids
+        // re-threading scanline info through lowering.
+        if let Some((state_name, tail)) = func.name.rsplit_once("_scanline_") {
+            if let Ok(line) = tail.parse::<u8>() {
+                out.push((state_name.to_string(), line));
+            }
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -766,6 +1013,68 @@ mod more_tests {
             .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x0204));
         assert!(writes_slot0, "first draw should use OAM slot 0");
         assert!(writes_slot1, "second draw should use OAM slot 1");
+    }
+
+    #[test]
+    fn ir_codegen_function_call_uses_correct_label_and_params() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            fun sum(a: u8, b: u8) -> u8 { return a + b }
+            var x: u8 = 0
+            on frame { x = sum(3, 4) }
+            start Main
+        "#,
+        );
+        // Caller must store arg0 to $04 and arg1 to $05.
+        let writes_arg0 = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(0x04));
+        let writes_arg1 = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(0x05));
+        assert!(writes_arg0, "caller should store arg0 to $04");
+        assert!(writes_arg1, "caller should store arg1 to $05");
+        // Caller must JSR to __ir_fn_sum (not __fn_sum).
+        let has_jsr = insts
+            .iter()
+            .any(|i| i.opcode == JSR && i.mode == AM::Label("__ir_fn_sum".into()));
+        assert!(has_jsr, "caller should JSR to __ir_fn_sum");
+        // Callee must read parameters from $04 and $05, not from
+        // temp slots $80+.
+        let has_param_read = insts
+            .iter()
+            .any(|i| i.opcode == LDA && i.mode == AM::ZeroPage(0x04));
+        assert!(has_param_read, "callee should read parameters from $04");
+    }
+
+    #[test]
+    fn ir_codegen_scanline_emits_mmc3_setup_and_irq_user() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: MMC3 }
+            state Main {
+                on frame { wait_frame }
+                on scanline(100) { wait_frame }
+            }
+            start Main
+        "#,
+        );
+        // MMC3 latch write (LDA #99; STA $C000)
+        let has_latch = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0xC000));
+        assert!(has_latch, "should write to MMC3 latch $C000");
+        // __irq_user label should be emitted
+        let has_irq_user = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__irq_user"));
+        assert!(has_irq_user, "should emit __irq_user label");
+        // The scanline handler function should exist
+        let has_handler = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__ir_fn_Main_scanline_100"));
+        assert!(has_handler, "should emit scanline handler function");
     }
 
     #[test]

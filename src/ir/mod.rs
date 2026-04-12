@@ -2,7 +2,7 @@ mod lowering;
 #[cfg(test)]
 mod tests;
 
-pub use lowering::lower;
+pub use lowering::{lower, RAW_ASM_PREFIX};
 
 use crate::lexer::Span;
 use std::fmt;
@@ -139,6 +139,10 @@ pub enum IrOp {
     DebugAssert(IrTemp),
     /// Raw 6502 assembly text; parsed and emitted by the codegen.
     InlineAsm(String),
+    /// `poke(addr, value)` — STA value to a fixed absolute address.
+    Poke(u16, IrTemp),
+    /// `peek(addr)` — LDA from a fixed absolute address into a temp.
+    Peek(IrTemp, u16),
 
     // Source mapping
     SourceLoc(Span),

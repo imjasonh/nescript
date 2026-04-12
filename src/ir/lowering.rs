@@ -4,6 +4,11 @@ use super::*;
 use crate::analyzer::AnalysisResult;
 use crate::parser::ast::*;
 
+/// Marker prefix the lowering prepends to the body of a `raw asm`
+/// block, telling the codegen to skip `{var}` substitution. Uses
+/// NUL characters so no normal source text can spoof it.
+pub const RAW_ASM_PREFIX: &str = "\0RAW\0";
+
 /// Lower a parsed & analyzed program into IR.
 pub fn lower(program: &Program, analysis: &AnalysisResult) -> IrProgram {
     let mut ctx = LoweringContext::new(analysis);
@@ -24,6 +29,7 @@ struct LoweringContext {
     current_blocks: Vec<IrBasicBlock>,
     current_ops: Vec<IrOp>,
     current_label: String,
+    current_locals: Vec<IrLocal>,
     // Loop context for break/continue
     loop_stack: Vec<LoopContext>,
     // State metadata captured from the AST
@@ -59,6 +65,7 @@ impl LoweringContext {
             current_blocks: Vec::new(),
             current_ops: Vec::new(),
             current_label: String::new(),
+            current_locals: Vec::new(),
             loop_stack: Vec::new(),
             state_names: Vec::new(),
             start_state: String::new(),
@@ -84,6 +91,53 @@ impl LoweringContext {
             self.next_var_id += 1;
             self.var_map.insert(name.to_string(), id);
             id
+        }
+    }
+
+    /// Try to evaluate an expression at compile time, using the
+    /// already-registered constants as operands. Returns `None` if
+    /// the expression references something that isn't known at this
+    /// point (e.g. a runtime variable) or contains an operator we
+    /// don't constant-fold. The result is a u16 to keep the same
+    /// range as the AST integer literal type.
+    fn eval_const(&self, expr: &Expr) -> Option<u16> {
+        match expr {
+            Expr::IntLiteral(v, _) => Some(*v),
+            Expr::BoolLiteral(b, _) => Some(u16::from(*b)),
+            Expr::Ident(name, _) => self.const_values.get(name).copied(),
+            Expr::BinaryOp(lhs, op, rhs, _) => {
+                let l = self.eval_const(lhs)?;
+                let r = self.eval_const(rhs)?;
+                match op {
+                    BinOp::Add => Some(l.wrapping_add(r)),
+                    BinOp::Sub => Some(l.wrapping_sub(r)),
+                    BinOp::Mul => Some(l.wrapping_mul(r)),
+                    BinOp::Div if r != 0 => Some(l / r),
+                    BinOp::Mod if r != 0 => Some(l % r),
+                    BinOp::BitwiseAnd => Some(l & r),
+                    BinOp::BitwiseOr => Some(l | r),
+                    BinOp::BitwiseXor => Some(l ^ r),
+                    BinOp::ShiftLeft => Some(l.wrapping_shl(u32::from(r))),
+                    BinOp::ShiftRight => Some(l.wrapping_shr(u32::from(r))),
+                    BinOp::Eq => Some(u16::from(l == r)),
+                    BinOp::NotEq => Some(u16::from(l != r)),
+                    BinOp::Lt => Some(u16::from(l < r)),
+                    BinOp::Gt => Some(u16::from(l > r)),
+                    BinOp::LtEq => Some(u16::from(l <= r)),
+                    BinOp::GtEq => Some(u16::from(l >= r)),
+                    _ => None,
+                }
+            }
+            Expr::UnaryOp(op, inner, _) => {
+                let v = self.eval_const(inner)?;
+                match op {
+                    UnaryOp::Negate => Some(v.wrapping_neg()),
+                    UnaryOp::BitNot => Some(!v),
+                    UnaryOp::Not => Some(u16::from(v == 0)),
+                }
+            }
+            Expr::Cast(inner, _, _) => self.eval_const(inner),
+            _ => None,
         }
     }
 
@@ -119,30 +173,26 @@ impl LoweringContext {
         self.state_names = program.states.iter().map(|s| s.name.clone()).collect();
         program.start_state.clone_into(&mut self.start_state);
 
-        // Register constants
-        for c in &program.constants {
-            if let Expr::IntLiteral(v, _) = &c.value {
-                self.const_values.insert(c.name.clone(), *v);
-            }
-        }
-
-        // Register enum variants as constants (0, 1, 2, ... per enum)
+        // Register enum variants first so constants that reference
+        // them (e.g. `const FIRST: u8 = VariantA`) can resolve.
         for e in &program.enums {
             for (i, (variant, _)) in e.variants.iter().enumerate() {
                 self.const_values.insert(variant.clone(), i as u16);
             }
         }
 
-        // Lower globals
+        // Register constants with constant-evaluation. Each const
+        // may reference earlier constants.
+        for c in &program.constants {
+            if let Some(v) = self.eval_const(&c.value) {
+                self.const_values.insert(c.name.clone(), v);
+            }
+        }
+
+        // Lower globals. Initializers can be any constant expression.
         for var in &program.globals {
             let var_id = self.get_or_create_var(&var.name);
-            let init = var.init.as_ref().and_then(|e| {
-                if let Expr::IntLiteral(v, _) = e {
-                    Some(*v)
-                } else {
-                    None
-                }
-            });
+            let init = var.init.as_ref().and_then(|e| self.eval_const(e));
             self.globals.push(IrGlobal {
                 var_id,
                 name: var.name.clone(),
@@ -165,12 +215,12 @@ impl LoweringContext {
     fn lower_function(&mut self, fun: &FunDecl) {
         self.next_temp = 0;
         self.current_blocks = Vec::new();
-        let mut locals = Vec::new();
+        self.current_locals = Vec::new();
 
         // Register parameters as locals
         for param in &fun.params {
             let var_id = self.get_or_create_var(&param.name);
-            locals.push(IrLocal {
+            self.current_locals.push(IrLocal {
                 var_id,
                 name: param.name.clone(),
                 size: type_size(&param.param_type),
@@ -194,7 +244,7 @@ impl LoweringContext {
         self.functions.push(IrFunction {
             name: fun.name.clone(),
             blocks: std::mem::take(&mut self.current_blocks),
-            locals,
+            locals: std::mem::take(&mut self.current_locals),
             param_count: fun.params.len(),
             has_return: fun.return_type.is_some(),
             source_span: fun.span,
@@ -214,6 +264,14 @@ impl LoweringContext {
 
         if let Some(on_frame) = &state.on_frame {
             self.lower_handler(&format!("{}_frame", state.name), on_frame, state);
+        }
+
+        // Lower each scanline handler as a function named
+        // `{state}_scanline_{N}`. The IR codegen will generate the MMC3
+        // IRQ dispatch wrapper separately.
+        for (line, block) in &state.on_scanline {
+            let name = format!("{}_scanline_{line}", state.name);
+            self.lower_handler(&name, block, state);
         }
     }
 
@@ -256,10 +314,31 @@ impl LoweringContext {
     fn lower_statement(&mut self, stmt: &Statement) {
         match stmt {
             Statement::VarDecl(var) => {
+                let var_id = self.get_or_create_var(&var.name);
+                // Track every local declared inside the current
+                // function so the IR codegen can allocate backing
+                // storage (e.g. RAM) for it.
+                if !self.current_locals.iter().any(|l| l.var_id == var_id) {
+                    self.current_locals.push(IrLocal {
+                        var_id,
+                        name: var.name.clone(),
+                        size: type_size(&var.var_type),
+                    });
+                }
                 if let Some(init) = &var.init {
-                    let var_id = self.get_or_create_var(&var.name);
-                    let val = self.lower_expr(init);
-                    self.emit(IrOp::StoreVar(var_id, val));
+                    // Struct literal initializers expand to per-field
+                    // stores on the synthetic field variables.
+                    if let Expr::StructLiteral(_, fields, _) = init {
+                        for (fname, fexpr) in fields {
+                            let full = format!("{}.{fname}", var.name);
+                            let fvid = self.get_or_create_var(&full);
+                            let val = self.lower_expr(fexpr);
+                            self.emit(IrOp::StoreVar(fvid, val));
+                        }
+                    } else {
+                        let val = self.lower_expr(init);
+                        self.emit(IrOp::StoreVar(var_id, val));
+                    }
                 }
             }
             Statement::Assign(lvalue, op, expr, _) => {
@@ -273,6 +352,24 @@ impl LoweringContext {
             }
             Statement::Loop(body, _) => {
                 self.lower_loop(body);
+            }
+            Statement::For {
+                var,
+                start,
+                end,
+                body,
+                ..
+            } => {
+                // Desugar `for var in start..end { body }` into:
+                //     var = start
+                //     while var < end { body; var = var + 1 }
+                let var_id = self.get_or_create_var(var);
+                let start_temp = self.lower_expr(start);
+                self.emit(IrOp::StoreVar(var_id, start_temp));
+                // Precompute the end value once outside the loop
+                // header so subsequent iterations don't recompute it.
+                // (For a literal, the optimizer collapses this.)
+                self.lower_for_body(var_id, end, body);
             }
             Statement::Break(_) => {
                 if let Some(ctx) = self.loop_stack.last() {
@@ -314,8 +411,20 @@ impl LoweringContext {
                 self.emit(IrOp::WaitFrame);
             }
             Statement::Call(name, args, _) => {
-                let arg_temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
-                self.emit(IrOp::Call(None, name.clone(), arg_temps));
+                match name.as_str() {
+                    // Built-in `poke(addr, value)` — write a byte to
+                    // a compile-time-constant address.
+                    "poke" if args.len() == 2 => {
+                        if let Some(addr) = self.eval_const(&args[0]) {
+                            let val = self.lower_expr(&args[1]);
+                            self.emit(IrOp::Poke(addr, val));
+                        }
+                    }
+                    _ => {
+                        let arg_temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
+                        self.emit(IrOp::Call(None, name.clone(), arg_temps));
+                    }
+                }
             }
             Statement::Scroll(x_expr, y_expr, _) => {
                 let x = self.lower_expr(x_expr);
@@ -336,10 +445,36 @@ impl LoweringContext {
             Statement::InlineAsm(body, _) => {
                 self.emit(IrOp::InlineAsm(body.clone()));
             }
+            Statement::RawAsm(body, _) => {
+                // Raw asm skips `{var}` substitution. We reuse the
+                // same IR op variant but mark the body with a magic
+                // prefix the codegen can detect — simpler than
+                // adding a separate IrOp.
+                self.emit(IrOp::InlineAsm(format!("{RAW_ASM_PREFIX}{body}")));
+            }
+            Statement::Play(_, _) | Statement::StartMusic(_, _) | Statement::StopMusic(_) => {
+                // No audio driver yet — these parse but produce no
+                // IR.
+            }
         }
     }
 
     fn lower_assign(&mut self, lvalue: &LValue, op: AssignOp, expr: &Expr) {
+        // Special case: `var = StructLiteral { ... }` expands to
+        // per-field stores against the analyzer-synthesized field
+        // variables. This avoids needing struct values as IR temps.
+        if let (LValue::Var(name), AssignOp::Assign, Expr::StructLiteral(_, fields, _)) =
+            (lvalue, op, expr)
+        {
+            for (fname, fexpr) in fields {
+                let full = format!("{name}.{fname}");
+                let field_var = self.get_or_create_var(&full);
+                let val = self.lower_expr(fexpr);
+                self.emit(IrOp::StoreVar(field_var, val));
+            }
+            return;
+        }
+
         match lvalue {
             LValue::Var(name) => {
                 let var_id = self.get_or_create_var(name);
@@ -391,6 +526,38 @@ impl LoweringContext {
                     };
                     self.emit(ir_op);
                     self.emit(IrOp::ArrayStore(var_id, idx, result));
+                }
+            }
+            LValue::Field(name, field) => {
+                // The analyzer synthesizes a variable named
+                // `"struct.field"` for each struct field, so we can
+                // treat field assignment as a regular variable
+                // assignment to that synthetic name.
+                let full_name = format!("{name}.{field}");
+                let var_id = self.get_or_create_var(&full_name);
+                match op {
+                    AssignOp::Assign => {
+                        let val = self.lower_expr(expr);
+                        self.emit(IrOp::StoreVar(var_id, val));
+                    }
+                    _ => {
+                        let current = self.fresh_temp();
+                        self.emit(IrOp::LoadVar(current, var_id));
+                        let rhs = self.lower_expr(expr);
+                        let result = self.fresh_temp();
+                        let ir_op = match op {
+                            AssignOp::PlusAssign => IrOp::Add(result, current, rhs),
+                            AssignOp::MinusAssign => IrOp::Sub(result, current, rhs),
+                            AssignOp::AmpAssign => IrOp::And(result, current, rhs),
+                            AssignOp::PipeAssign => IrOp::Or(result, current, rhs),
+                            AssignOp::CaretAssign => IrOp::Xor(result, current, rhs),
+                            AssignOp::ShiftLeftAssign => IrOp::ShiftLeft(result, current, 1),
+                            AssignOp::ShiftRightAssign => IrOp::ShiftRight(result, current, 1),
+                            AssignOp::Assign => unreachable!(),
+                        };
+                        self.emit(ir_op);
+                        self.emit(IrOp::StoreVar(var_id, result));
+                    }
                 }
             }
         }
@@ -488,6 +655,55 @@ impl LoweringContext {
         self.start_block(&end_label);
     }
 
+    /// Lower the loop body for a `for var in start..end { body }`.
+    /// Assumes `var` has already been initialized to the start
+    /// value. Emits the condition `var < end` each iteration and
+    /// increments `var` at the continue edge.
+    fn lower_for_body(&mut self, var_id: VarId, end: &Expr, body: &Block) {
+        let cond_label = self.fresh_label("for_cond");
+        let body_label = self.fresh_label("for_body");
+        let end_label = self.fresh_label("for_end");
+
+        self.end_block(IrTerminator::Jump(cond_label.clone()));
+
+        // Condition: var < end
+        self.start_block(&cond_label);
+        let var_temp = self.fresh_temp();
+        self.emit(IrOp::LoadVar(var_temp, var_id));
+        let end_temp = self.lower_expr(end);
+        let cmp_temp = self.fresh_temp();
+        self.emit(IrOp::CmpLt(cmp_temp, var_temp, end_temp));
+        self.end_block(IrTerminator::Branch(
+            cmp_temp,
+            body_label.clone(),
+            end_label.clone(),
+        ));
+
+        // Body + increment.
+        let step_label = self.fresh_label("for_step");
+        self.loop_stack.push(LoopContext {
+            continue_label: step_label.clone(),
+            break_label: end_label.clone(),
+        });
+        self.start_block(&body_label);
+        self.lower_block(body);
+        self.end_block(IrTerminator::Jump(step_label.clone()));
+        self.loop_stack.pop();
+
+        // Step: var = var + 1
+        self.start_block(&step_label);
+        let cur = self.fresh_temp();
+        self.emit(IrOp::LoadVar(cur, var_id));
+        let one = self.fresh_temp();
+        self.emit(IrOp::LoadImm(one, 1));
+        let next = self.fresh_temp();
+        self.emit(IrOp::Add(next, cur, one));
+        self.emit(IrOp::StoreVar(var_id, next));
+        self.end_block(IrTerminator::Jump(cond_label));
+
+        self.start_block(&end_label);
+    }
+
     fn lower_loop(&mut self, body: &Block) {
         let body_label = self.fresh_label("loop_body");
         let end_label = self.fresh_label("loop_end");
@@ -537,6 +753,16 @@ impl LoweringContext {
                 self.emit(IrOp::ArrayLoad(t, var_id, idx));
                 t
             }
+            Expr::FieldAccess(name, field, _) => {
+                // Field access lowers to a plain load of the
+                // synthetic `"struct.field"` variable produced by the
+                // analyzer.
+                let full_name = format!("{name}.{field}");
+                let var_id = self.get_or_create_var(&full_name);
+                let t = self.fresh_temp();
+                self.emit(IrOp::LoadVar(t, var_id));
+                t
+            }
             Expr::BinaryOp(left, op, right, _) => self.lower_binop(left, *op, right),
             Expr::UnaryOp(op, inner, _) => {
                 let val = self.lower_expr(inner);
@@ -554,6 +780,15 @@ impl LoweringContext {
                 t
             }
             Expr::Call(name, args, _) => {
+                // Built-in `peek(addr)` reads a byte from a fixed
+                // absolute address at compile time.
+                if name == "peek" && args.len() == 1 {
+                    if let Some(addr) = self.eval_const(&args[0]) {
+                        let t = self.fresh_temp();
+                        self.emit(IrOp::Peek(t, addr));
+                        return t;
+                    }
+                }
                 let arg_temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let t = self.fresh_temp();
                 self.emit(IrOp::Call(Some(t), name.clone(), arg_temps));
@@ -577,6 +812,16 @@ impl LoweringContext {
             }
             Expr::ArrayLiteral(_, _) => {
                 // Array literals are handled during initialization, not as general expressions
+                let t = self.fresh_temp();
+                self.emit(IrOp::LoadImm(t, 0));
+                t
+            }
+            Expr::StructLiteral(_, _, _) => {
+                // Struct literals are only supported as the right
+                // hand side of a plain assignment (see lower_assign).
+                // Falling through here means the literal was used in
+                // an expression context the lowering can't handle;
+                // emit zero so the build still produces a ROM.
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadImm(t, 0));
                 t
@@ -697,6 +942,10 @@ fn type_size(t: &NesType) -> u16 {
         NesType::U8 | NesType::I8 | NesType::Bool => 1,
         NesType::U16 => 2,
         NesType::Array(elem, count) => type_size(elem) * count,
+        // Struct sizes are resolved in the analyzer. IR lowering only
+        // sees struct types on `var` declarations, which are skipped
+        // below via the analyzer's synthetic field allocations.
+        NesType::Struct(_) => 0,
     }
 }
 

@@ -155,6 +155,66 @@ table, so a variant cannot share its name with any other constant,
 variable, or function (E0501). An enum cannot have more than 256
 variants because each is stored as a `u8`.
 
+### Structs
+
+Structs declare composite types with named fields:
+
+```
+struct Vec2 {
+    x: u8,
+    y: u8,
+}
+
+struct Player {
+    health: u8,
+    lives: u8,
+}
+
+var pos: Vec2
+var hero: Player
+
+on frame {
+    pos.x = 100
+    pos.y = 50
+    hero.health = 3
+    hero.lives = 5
+    if button.right { pos.x += 1 }
+    draw Hero at: (pos.x, pos.y)
+}
+```
+
+Fields are laid out contiguously in declaration order. A variable of
+struct type allocates enough contiguous bytes to hold all its fields;
+each field is accessible via the dot operator.
+
+Struct literals initialize or assign all fields at once:
+
+```
+struct Vec2 { x: u8, y: u8 }
+
+// as an initializer
+var pos: Vec2 = Vec2 { x: 100, y: 50 }
+
+// as an assignment
+on frame {
+    pos = Vec2 { x: 0, y: 0 }
+    if button.right {
+        pos = Vec2 { x: pos.x + 1, y: pos.y }
+    }
+}
+```
+
+Inside `if`, `while`, and `for` conditions the struct literal syntax
+is reserved for the following block, so wrap the literal in parens if
+you ever need one in a condition:
+
+```
+if pos == (Vec2 { x: 0, y: 0 }) { /* ... */ }
+```
+
+In v0.1 only primitive field types (`u8`, `i8`, `bool`) are supported —
+nested structs, `u16`, and array fields are not yet allowed.
+
 ### Memory Placement Hints
 
 The NES has 256 bytes of zero-page RAM with faster access. You can hint where variables should be placed:
@@ -449,6 +509,55 @@ while i < 10 {
 }
 ```
 
+### Match Statement
+
+`match` matches a scrutinee against a sequence of patterns and
+executes the body of the first matching arm. Each arm's pattern is
+compared against the scrutinee with `==`. An underscore arm `_` acts
+as the catch-all:
+
+```
+enum State { Title, Playing, GameOver }
+var state: u8 = Title
+
+on frame {
+    match state {
+        Title => {
+            if button.start { state = Playing }
+        }
+        Playing => {
+            // ... game logic ...
+        }
+        GameOver => {
+            if button.a { state = Title }
+        }
+        _ => {}
+    }
+}
+```
+
+`match` desugars to an `if` / `else if` chain at parse time, so
+patterns can be any expression that produces a value comparable to
+the scrutinee.
+
+### For Loop
+
+The `for` loop iterates over a half-open integer range `[start, end)`:
+
+```
+for i in 0..8 {
+    total += arr[i]
+}
+```
+
+The loop variable is a `u8` scoped to the loop body. Both bounds can
+be any expression that evaluates to `u8` at runtime, including
+constants or variables. The range is half-open, so `0..8` iterates
+`0, 1, 2, ..., 7` (8 iterations). For a closed range, use `0..9`.
+
+The loop is desugared into a `while` loop with an index variable, so
+`break` and `continue` work the same as in any loop body.
+
 ### Loop (Infinite)
 
 ```
@@ -686,36 +795,56 @@ In debug mode, the compiler inserts:
 
 ---
 
+## Hardware Intrinsics
+
+For the common case of reading or writing a single PPU/APU/mapper
+register, NEScript provides two built-in intrinsics:
+
+```
+poke(0x2006, 0x3F)        // write $3F to PPU address register
+poke(0x2006, 0x00)        // (second half of the address)
+poke(0x2007, 0x0F)        // write a palette byte to PPU data
+
+var status: u8 = peek(0x2002)  // read PPU status register
+```
+
+The address argument to both is a compile-time constant. Zero-page
+addresses compile to `STA $XX` / `LDA $XX`; anything larger compiles
+to absolute addressing.
+
 ## Inline Assembly
 
-For performance-critical code, drop to 6502 assembly:
-
-### Bound Assembly
+For more elaborate sequences, use `asm { ... }` blocks:
 
 ```
 fun fast_shift(input: u8) -> u8 {
+    var result: u8 = 0
     asm {
-        lda {input}
-        asl a
-        asl a
-        sta {return}
+        LDA {input}
+        ASL A
+        ASL A
+        STA {result}
     }
+    return result
 }
 ```
 
-`{variable_name}` resolves to the variable's memory address. `{return}` is the return value location.
+Inside an `asm` block, `{name}` is replaced with the resolved
+zero-page or absolute address of the variable `name`. Labels
+defined with `name:` are local to the block.
 
 ### Raw Assembly
 
 ```
 raw asm {
-    .org $C000
-    nop
-    rti
+    LDA #$42
+    STA $2007
 }
 ```
 
-Raw blocks bypass all compiler management. Use with extreme caution.
+`raw asm` skips variable substitution — `{name}` is passed through
+verbatim. Useful for completely unmanaged snippets that don't
+reference NEScript variables.
 
 ---
 
@@ -796,9 +925,7 @@ error[E0402]: recursion is not allowed
 
 ---
 
-## Compiler Commands
-
-### Build
+## Command Line
 
 Compile a `.ne` source file into a `.nes` ROM:
 
@@ -810,13 +937,15 @@ nescript build game.ne --asm-dump
 nescript build game.ne --dump-ir
 ```
 
-| Flag          | Description                                                    |
-|---------------|----------------------------------------------------------------|
-| `--output`    | Set output ROM file path (default: input.nes)                  |
-| `--debug`     | Enable debug mode with runtime checks                          |
-| `--asm-dump`  | Dump generated 6502 assembly to stdout                         |
-| `--dump-ir`   | Dump the lowered IR program (after optimization) to stdout     |
-| `--use-ast`   | Use the legacy AST-based codegen (default is the IR codegen)   |
+| Flag            | Description                                                    |
+|-----------------|----------------------------------------------------------------|
+| `--output`      | Set output ROM file path (default: input.nes)                  |
+| `--debug`       | Enable debug mode with runtime checks                          |
+| `--asm-dump`    | Dump generated 6502 assembly to stdout                         |
+| `--dump-ir`     | Dump the lowered IR program (after optimization) to stdout     |
+| `--memory-map`  | Dump a memory map of variable allocations to stdout            |
+| `--call-graph`  | Dump a call graph (which handler/function calls which) to stdout |
+| `--use-ast`     | Use the legacy AST-based codegen (default is the IR codegen)   |
 
 ### Check
 

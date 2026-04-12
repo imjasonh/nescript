@@ -107,6 +107,40 @@ impl CodeGen {
         self
     }
 
+    /// Replace `{name}` placeholders in an inline-asm body with the
+    /// resolved zero-page or absolute hex address. Unknown names
+    /// pass through unchanged so the asm parser can surface a clear
+    /// error.
+    fn substitute_asm_vars(&self, body: &str) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(body.len());
+        let bytes = body.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'{' {
+                if let Some(end) = bytes[i + 1..].iter().position(|&b| b == b'}') {
+                    let name_start = i + 1;
+                    let name_end = i + 1 + end;
+                    let name = &body[name_start..name_end];
+                    if !name.is_empty() {
+                        if let Some(&addr) = self.var_addrs.get(name) {
+                            if addr < 0x100 {
+                                let _ = write!(out, "${addr:02X}");
+                            } else {
+                                let _ = write!(out, "${addr:04X}");
+                            }
+                            i = name_end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out
+    }
+
     fn fresh_label(&mut self, prefix: &str) -> String {
         self.label_counter += 1;
         format!("__{prefix}_{}", self.label_counter)
@@ -285,6 +319,12 @@ impl CodeGen {
                 self.emit_label(&end_label);
                 self.loop_stack.pop();
             }
+            Statement::For { .. } => {
+                // AST codegen is legacy; for loops are only supported
+                // through the IR codegen path. Emit nothing so the
+                // program still links — users should use `--use-ast`
+                // without for loops if they rely on this path.
+            }
             Statement::Draw(draw) => {
                 self.gen_draw(draw);
             }
@@ -363,13 +403,29 @@ impl CodeGen {
                     self.emit_label(&pass_label);
                 }
             }
-            Statement::InlineAsm(body, _) => match crate::asm::parse_inline(body) {
-                Ok(parsed) => self.instructions.extend(parsed),
-                Err(msg) => {
-                    eprintln!("inline asm error: {msg}");
-                    self.emit(BRK, AM::Implied);
+            Statement::InlineAsm(body, _) => {
+                let substituted = self.substitute_asm_vars(body);
+                match crate::asm::parse_inline(&substituted) {
+                    Ok(parsed) => self.instructions.extend(parsed),
+                    Err(msg) => {
+                        eprintln!("inline asm error: {msg}");
+                        self.emit(BRK, AM::Implied);
+                    }
                 }
-            },
+            }
+            Statement::RawAsm(body, _) => {
+                // Raw asm bypasses variable substitution.
+                match crate::asm::parse_inline(body) {
+                    Ok(parsed) => self.instructions.extend(parsed),
+                    Err(msg) => {
+                        eprintln!("inline asm error: {msg}");
+                        self.emit(BRK, AM::Implied);
+                    }
+                }
+            }
+            Statement::Play(_, _) | Statement::StartMusic(_, _) | Statement::StopMusic(_) => {
+                // Audio statements compile to no-ops for now.
+            }
         }
     }
 
@@ -422,6 +478,38 @@ impl CodeGen {
                             self.emit_load(addr);
                             self.emit(LSR, AM::Accumulator);
                             let _ = expr;
+                            self.emit_store(addr);
+                        }
+                    }
+                }
+            }
+            LValue::Field(name, field) => {
+                // Treat `name.field` as a regular variable. The
+                // analyzer has already synthesized a VarAllocation
+                // entry under the name `"struct.field"`.
+                let full_name = format!("{name}.{field}");
+                if let Some(&addr) = self.var_addrs.get(&full_name) {
+                    match op {
+                        AssignOp::Assign => {
+                            self.gen_expr(expr);
+                            self.emit_store(addr);
+                        }
+                        AssignOp::PlusAssign => {
+                            self.emit_load(addr);
+                            self.emit(CLC, AM::Implied);
+                            self.gen_adc_expr(expr);
+                            self.emit_store(addr);
+                        }
+                        AssignOp::MinusAssign => {
+                            self.emit_load(addr);
+                            self.emit(SEC, AM::Implied);
+                            self.gen_sbc_expr(expr);
+                            self.emit_store(addr);
+                        }
+                        _ => {
+                            // Other compound ops: read, compute, store
+                            self.emit_load(addr);
+                            self.gen_expr(expr);
                             self.emit_store(addr);
                         }
                     }
@@ -774,6 +862,12 @@ impl CodeGen {
                     }
                 }
             }
+            Expr::FieldAccess(name, field, _) => {
+                let full_name = format!("{name}.{field}");
+                if let Some(&addr) = self.var_addrs.get(&full_name) {
+                    self.emit_load(addr);
+                }
+            }
             Expr::Call(_, _, _) => {
                 // Function calls as expressions need JSR — handled elsewhere
                 // For now, result is 0
@@ -781,6 +875,11 @@ impl CodeGen {
             }
             Expr::ArrayLiteral(_, _) => {
                 // Array literals are handled at initialization time
+            }
+            Expr::StructLiteral(_, _, _) => {
+                // Struct literals only appear in assignments on the
+                // IR codegen path. Legacy AST codegen treats them as
+                // no-ops.
             }
         }
     }

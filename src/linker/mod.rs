@@ -22,6 +22,15 @@ pub struct SpriteData {
     pub chr_bytes: Vec<u8>,
 }
 
+/// True if `instructions` contains a label definition with the given
+/// name. Labels are emitted as `NOP` pseudo-instructions whose mode
+/// is `AddressingMode::Label(name)`.
+fn has_label(instructions: &[Instruction], name: &str) -> bool {
+    instructions
+        .iter()
+        .any(|i| matches!(&i.mode, AM::Label(n) if n == name))
+}
+
 /// A smiley face CHR tile for the default sprite (M1).
 const DEFAULT_SPRITE_CHR: [u8; 16] = [
     // Plane 0 (low bits)
@@ -109,6 +118,17 @@ impl Linker {
 
         // NMI handler
         all_instructions.push(Instruction::new(NOP, AM::Label("__nmi".into())));
+        // If user code emits an MMC3 reload hook, splice in a JSR
+        // before the regular NMI runs. This reloads the scanline IRQ
+        // counter each frame so the handler fires at the right line.
+        // The presence of the `__ir_mmc3_reload` label is detected
+        // during assembly via the labels map; we unconditionally
+        // emit a conditional JSR whose target is resolved at link
+        // time. The helper emits an RTS so it's safe to call even
+        // when there's no work to do.
+        if has_label(user_code, "__ir_mmc3_reload") {
+            all_instructions.push(Instruction::new(JSR, AM::Label("__ir_mmc3_reload".into())));
+        }
         all_instructions.extend(runtime::gen_nmi());
 
         // IRQ handler
@@ -130,10 +150,17 @@ impl Linker {
         }
         prg.resize(vector_offset, 0xFF);
 
-        // Write vector table
+        // Write vector table. IR codegen emits a richer IRQ handler
+        // under `__irq_user` when the program has scanline handlers;
+        // prefer that over the generic RTI stub at `__irq`.
         let nmi_addr = result.labels.get("__nmi").copied().unwrap_or(0xC000);
         let reset_addr = result.labels.get("__reset").copied().unwrap_or(0xC000);
-        let irq_addr = result.labels.get("__irq").copied().unwrap_or(0xC000);
+        let irq_addr = result
+            .labels
+            .get("__irq_user")
+            .or_else(|| result.labels.get("__irq"))
+            .copied()
+            .unwrap_or(0xC000);
 
         prg.extend_from_slice(&nmi_addr.to_le_bytes());
         prg.extend_from_slice(&reset_addr.to_le_bytes());

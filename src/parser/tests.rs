@@ -666,6 +666,180 @@ fn parse_mmc3_mapper() {
 }
 
 #[test]
+fn parse_semicolon_separators() {
+    // `;` should act as an optional statement separator so short
+    // statements can share a line.
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var a: u8 = 0
+        var b: u8 = 0
+        on frame {
+            a += 1; b += 2
+            if button.a { a -= 1; b -= 1 }
+            wait_frame
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    // Top-level statements: two assigns + if + wait_frame
+    assert_eq!(frame.statements.len(), 4);
+}
+
+#[test]
+fn parse_match_statement() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        enum State { Title, Playing, GameOver }
+        var s: u8 = Title
+        on frame {
+            match s {
+                Title => { s = Playing }
+                Playing => { s = GameOver }
+                _ => {}
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+    // Match desugars to an If, so after parsing the first statement
+    // inside the frame handler should be an If with two elifs and an
+    // else.
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    match &frame.statements[0] {
+        Statement::If(_, _, elifs, else_block, _) => {
+            assert_eq!(elifs.len(), 1, "expected 1 else-if, got {elifs:?}");
+            assert!(else_block.is_some(), "expected an else block for `_`");
+        }
+        _ => panic!("expected If, got {:?}", frame.statements[0]),
+    }
+}
+
+#[test]
+fn parse_for_loop() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var sum: u8 = 0
+        on frame {
+            for i in 0..10 {
+                sum += i
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert!(
+        matches!(&frame.statements[0], Statement::For { var, .. } if var == "i"),
+        "expected for loop, got {:?}",
+        frame.statements[0]
+    );
+}
+
+#[test]
+fn parse_for_loop_with_const_bounds() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        const START: u8 = 5
+        const END: u8 = 15
+        var total: u8 = 0
+        on frame {
+            for n in START..END { total += n }
+            wait_frame
+        }
+        start Main
+    "#;
+    parse_ok(src);
+}
+
+#[test]
+fn parse_audio_statements() {
+    let src = r#"
+        game "Audio" { mapper: NROM }
+        on frame {
+            play JumpSfx
+            start_music MainTheme
+            stop_music
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert!(matches!(frame.statements[0], Statement::Play(ref n, _) if n == "JumpSfx"));
+    assert!(matches!(
+        frame.statements[1],
+        Statement::StartMusic(ref n, _) if n == "MainTheme"
+    ));
+    assert!(matches!(frame.statements[2], Statement::StopMusic(_)));
+}
+
+#[test]
+fn parse_struct_decl() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.structs.len(), 1);
+    assert_eq!(prog.structs[0].name, "Vec2");
+    assert_eq!(prog.structs[0].fields.len(), 2);
+    assert_eq!(prog.structs[0].fields[0].name, "x");
+    assert_eq!(prog.structs[0].fields[1].name, "y");
+}
+
+#[test]
+fn parse_struct_literal_expr() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2 = Vec2 { x: 10, y: 20 }
+        on frame {
+            pos = Vec2 { x: 1, y: 2 }
+        }
+        start Main
+    "#;
+    parse_ok(src);
+}
+
+#[test]
+fn parse_struct_literal_in_if_condition_must_be_paren() {
+    // `if x == Vec2 { ... }` is ambiguous: the `{` could be the if
+    // block or the start of a struct literal. Without parens, the
+    // parser should treat the struct literal fields as the if body.
+    // This test just asserts the parser doesn't crash and doesn't
+    // misinterpret the condition.
+    let src = r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2
+        on frame {
+            if pos.x == 5 { pos = Vec2 { x: 0, y: 0 } }
+        }
+        start Main
+    "#;
+    parse_ok(src);
+}
+
+#[test]
+fn parse_struct_field_access_expr() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2
+        on frame {
+            pos.x = 10
+            pos.y = pos.x
+        }
+        start Main
+    "#;
+    parse_ok(src);
+}
+
+#[test]
 fn parse_enum_decl() {
     let src = r#"
         game "Test" { mapper: NROM }

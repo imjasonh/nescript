@@ -9,73 +9,403 @@ use crate::asm::{AddressingMode, Instruction, Opcode};
 /// Run all peephole passes until fixed point.
 pub fn optimize(instructions: &mut Vec<Instruction>) {
     loop {
-        let before = instructions.len();
+        let before_len = instructions.len();
+        let before = snapshot(instructions);
+        copy_propagate_temps(instructions);
+        remove_dead_loads(instructions);
         remove_sta_then_lda(instructions);
         remove_lda_then_sta_same(instructions);
         remove_dead_temp_stores(instructions);
         remove_redundant_loads(instructions);
-        if instructions.len() == before {
+        fold_branch_over_jmp(instructions);
+        remove_jmp_to_next_label(instructions);
+        // Stop when no pass removed an instruction *and* the stream
+        // is unchanged. Copy propagation doesn't shrink the stream —
+        // it rewrites operands — so we need the content check too.
+        if instructions.len() == before_len && !changed(&before, instructions) {
             break;
         }
     }
 }
 
+/// Fold `Bxx label1; JMP label2; label1:` into `Byy label2`, where
+/// `Byy` is the inversion of `Bxx`. This is emitted by the IR codegen
+/// for every `if` statement without an else clause — the `BNE taken;
+/// JMP fallthrough; taken: … fallthrough:` pattern collapses to
+/// `BEQ fallthrough; …`. Saves 2 instructions per if.
+///
+/// The fold is only safe when the JMP target is close enough to fit
+/// in a branch's signed 8-bit offset (-128..+127 bytes). We use a
+/// conservative estimate: scan forward up to 60 instructions (~120
+/// bytes) looking for the target label. If it's not found in that
+/// window, leave the JMP alone.
+fn fold_branch_over_jmp(instructions: &mut Vec<Instruction>) {
+    const MAX_LOOKAHEAD: usize = 60;
+    let mut out = Vec::with_capacity(instructions.len());
+    let mut i = 0;
+    while i < instructions.len() {
+        if i + 2 < instructions.len() {
+            let br = &instructions[i];
+            let jmp = &instructions[i + 1];
+            let lbl = &instructions[i + 2];
+            let inverted = invert_branch(br.opcode);
+            let is_branch = inverted.is_some();
+            let is_jmp = jmp.opcode == Opcode::JMP;
+            let is_label =
+                lbl.opcode == Opcode::NOP && matches!(lbl.mode, AddressingMode::Label(_));
+            if is_branch && is_jmp && is_label {
+                if let (AddressingMode::LabelRelative(br_tgt), AddressingMode::Label(lbl_name)) =
+                    (&br.mode, &lbl.mode)
+                {
+                    if br_tgt == lbl_name {
+                        let jmp_tgt = match &jmp.mode {
+                            AddressingMode::Label(n) => n.clone(),
+                            _ => {
+                                out.push(instructions[i].clone());
+                                i += 1;
+                                continue;
+                            }
+                        };
+                        // Confirm the target is reachable within a
+                        // short branch. Scan forward looking for the
+                        // label definition.
+                        let mut found = false;
+                        for (offset, ahead) in instructions
+                            .iter()
+                            .enumerate()
+                            .skip(i + 1)
+                            .take(MAX_LOOKAHEAD)
+                        {
+                            if ahead.opcode == Opcode::NOP {
+                                if let AddressingMode::Label(name) = &ahead.mode {
+                                    if name == &jmp_tgt {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            // Stop scan if we walk off the end.
+                            let _ = offset;
+                        }
+                        if !found {
+                            out.push(instructions[i].clone());
+                            i += 1;
+                            continue;
+                        }
+                        out.push(Instruction::new(
+                            inverted.unwrap(),
+                            AddressingMode::LabelRelative(jmp_tgt),
+                        ));
+                        // Preserve the label definition.
+                        out.push(lbl.clone());
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(instructions[i].clone());
+        i += 1;
+    }
+    *instructions = out;
+}
+
+/// Remove `JMP label` when the very next instruction is the label
+/// definition itself. This is a dead jump left behind by IR codegen
+/// patterns like `if-else` and `while` that unconditionally jump to
+/// a label that's already directly following.
+fn remove_jmp_to_next_label(instructions: &mut Vec<Instruction>) {
+    let mut out = Vec::with_capacity(instructions.len());
+    let mut i = 0;
+    while i < instructions.len() {
+        if i + 1 < instructions.len() {
+            let jmp = &instructions[i];
+            let next = &instructions[i + 1];
+            if jmp.opcode == Opcode::JMP {
+                if let (AddressingMode::Label(tgt), AddressingMode::Label(name)) =
+                    (&jmp.mode, &next.mode)
+                {
+                    if next.opcode == Opcode::NOP && tgt == name {
+                        // Drop the JMP — fall through to the label.
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(instructions[i].clone());
+        i += 1;
+    }
+    *instructions = out;
+}
+
+/// Return the logical inverse of a branch opcode, or None if the
+/// opcode isn't a conditional branch.
+fn invert_branch(op: Opcode) -> Option<Opcode> {
+    Some(match op {
+        Opcode::BEQ => Opcode::BNE,
+        Opcode::BNE => Opcode::BEQ,
+        Opcode::BCC => Opcode::BCS,
+        Opcode::BCS => Opcode::BCC,
+        Opcode::BMI => Opcode::BPL,
+        Opcode::BPL => Opcode::BMI,
+        Opcode::BVC => Opcode::BVS,
+        Opcode::BVS => Opcode::BVC,
+        _ => return None,
+    })
+}
+
+/// Remove `LDA …` instructions whose value is never read — the next
+/// instruction overwrites A without using the current value.
+///
+/// The heuristic looks one instruction ahead. If the next instruction
+/// is an A-clobbering load (`LDA`, `LDX`, `LDY`, `PLA`, `TXA`, `TYA`),
+/// the preceding `LDA` is dead. Shifts and arithmetic ops read A, so
+/// they don't qualify. A label or branch in between stops the scan
+/// (we can't prove A's dead across control flow).
+fn remove_dead_loads(instructions: &mut Vec<Instruction>) {
+    let mut keep = vec![true; instructions.len()];
+    for i in 0..instructions.len() {
+        let inst = &instructions[i];
+        if inst.opcode != Opcode::LDA {
+            continue;
+        }
+        // Find the next instruction that isn't a label definition.
+        let mut j = i + 1;
+        while j < instructions.len() {
+            let next = &instructions[j];
+            // Label definitions are passive markers; skip over them.
+            if next.opcode == Opcode::NOP && matches!(next.mode, AddressingMode::Label(_)) {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        if j >= instructions.len() {
+            continue;
+        }
+        let next = &instructions[j];
+        if matches!(
+            next.opcode,
+            Opcode::LDA | Opcode::PLA | Opcode::TXA | Opcode::TYA
+        ) {
+            // A is about to be overwritten without being used.
+            keep[i] = false;
+        }
+    }
+    let mut out = Vec::with_capacity(instructions.len());
+    for (i, inst) in instructions.iter().enumerate() {
+        if keep[i] {
+            out.push(inst.clone());
+        }
+    }
+    *instructions = out;
+}
+
+fn snapshot(instructions: &[Instruction]) -> Vec<(Opcode, AddressingMode)> {
+    instructions
+        .iter()
+        .map(|i| (i.opcode, i.mode.clone()))
+        .collect()
+}
+
+fn changed(before: &[(Opcode, AddressingMode)], after: &[Instruction]) -> bool {
+    if before.len() != after.len() {
+        return true;
+    }
+    before
+        .iter()
+        .zip(after.iter())
+        .any(|((op, mode), inst)| *op != inst.opcode || *mode != inst.mode)
+}
+
+/// Copy propagation for IR temp slots.
+///
+/// After the IR codegen, each temp produced by an IR op is spilled
+/// to a zero-page slot via `STA slot`. Any subsequent op that needs
+/// the temp emits `LDA slot`. Copy propagation notes the *source*
+/// of each temp store (e.g. "slot 128 was set from [slot 16]") and
+/// rewrites subsequent loads of that slot to load from the source
+/// directly. If the source is later written, the equivalence is
+/// invalidated before we see the consuming load. Immediate values
+/// are tracked the same way.
+///
+/// The rewrite doesn't remove anything — it just swaps the operand.
+/// The other peephole passes then pick up the now-dead `STA slot`
+/// and drop it.
+fn copy_propagate_temps(instructions: &mut [Instruction]) {
+    use std::collections::HashMap;
+
+    // slot -> source of the most recent STA into that slot.
+    let mut temp_source: HashMap<u8, Source> = HashMap::new();
+    // Track what A currently holds so we can decide whether an STA
+    // actually copies a known source into the slot.
+    let mut a: Option<Source> = None;
+
+    for inst in instructions.iter_mut() {
+        if instruction_crosses_block(inst) {
+            temp_source.clear();
+            a = None;
+            continue;
+        }
+        match (inst.opcode, inst.mode.clone()) {
+            (Opcode::LDA, AddressingMode::Immediate(v)) => {
+                a = Some(Source::Imm(v));
+            }
+            (Opcode::LDA, AddressingMode::ZeroPage(addr)) => {
+                // If addr is a temp whose source is tracked, rewrite
+                // the load to use the source directly.
+                if is_temp_slot_addr(addr) {
+                    if let Some(src) = temp_source.get(&addr).copied() {
+                        inst.mode = source_to_mode(src);
+                        a = Some(src);
+                        continue;
+                    }
+                }
+                a = Some(Source::Zp(addr));
+            }
+            (Opcode::LDA, AddressingMode::Absolute(addr)) => {
+                a = Some(Source::Abs(addr));
+            }
+            // Arithmetic / logical ops that read a temp slot: rewrite
+            // the operand to the temp's tracked source. Clobbers A.
+            (
+                Opcode::ADC | Opcode::SBC | Opcode::AND | Opcode::ORA | Opcode::EOR | Opcode::CMP,
+                AddressingMode::ZeroPage(addr),
+            ) if is_temp_slot_addr(addr) => {
+                if let Some(src) = temp_source.get(&addr).copied() {
+                    inst.mode = source_to_mode(src);
+                }
+                a = None;
+            }
+            (Opcode::STA, AddressingMode::ZeroPage(addr)) => {
+                // If we're storing to a temp slot and we know the
+                // source of the value in A, record the equivalence.
+                if is_temp_slot_addr(addr) {
+                    if let Some(src) = a {
+                        temp_source.insert(addr, src);
+                    } else {
+                        temp_source.remove(&addr);
+                    }
+                } else {
+                    // Storing to a non-temp ZP addr invalidates any
+                    // temp that was tracking [addr] as its source.
+                    temp_source.retain(|_, src| !matches!(*src, Source::Zp(a) if a == addr));
+                }
+            }
+            (Opcode::STA, AddressingMode::Absolute(addr)) => {
+                // Invalidate any temp tracking this absolute source.
+                temp_source.retain(|_, src| !matches!(*src, Source::Abs(a) if a == addr));
+            }
+            // Any op that reads a non-ZP location or clobbers A: just
+            // invalidate A; temps are unaffected.
+            _ => {
+                if modifies_a(inst.opcode) {
+                    a = None;
+                }
+            }
+        }
+    }
+}
+
+fn source_to_mode(src: Source) -> AddressingMode {
+    match src {
+        Source::Imm(v) => AddressingMode::Immediate(v),
+        Source::Zp(addr) => AddressingMode::ZeroPage(addr),
+        Source::Abs(addr) => AddressingMode::Absolute(addr),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Imm(u8),
+    Zp(u8),
+    Abs(u16),
+}
+
+fn is_temp_slot_addr(addr: u8) -> bool {
+    addr >= 0x80
+}
+
+fn modifies_a(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::LDA
+            | Opcode::ADC
+            | Opcode::SBC
+            | Opcode::AND
+            | Opcode::ORA
+            | Opcode::EOR
+            | Opcode::ASL
+            | Opcode::LSR
+            | Opcode::ROL
+            | Opcode::ROR
+            | Opcode::PLA
+            | Opcode::TXA
+            | Opcode::TYA
+    )
+}
+
 /// Track what `A` holds through a linear run of instructions and
 /// eliminate `LDA` that would reload a value A already has.
 ///
-/// The tracker knows about three states:
-/// - `AKnown::None` — A's value is unknown
-/// - `AKnown::Addr(addr)` — A equals the byte currently at `addr`
-/// - `AKnown::Imm(val)` — A equals the immediate value `val`
+/// We track an equivalence class for A: at any point, A equals a
+/// single `AValue` (immediate, ZP cell, or absolute cell). After a
+/// `STA addr`, that address is added to the equivalence — a later
+/// `LDA` from the same class is redundant.
 ///
-/// After any instruction that may clobber A (ADC, AND, etc.) we
-/// transition to `None`. After `STA addr` A is still known and we
-/// additionally record that `addr` now equals A's known value (so a
-/// later `LDA addr` is redundant). Any control-flow instruction or
-/// label resets the tracker.
+/// Any instruction that may clobber A resets the tracker, as does
+/// a control-flow instruction or label.
 fn remove_redundant_loads(instructions: &mut Vec<Instruction>) {
-    use AKnown::*;
     let mut keep = vec![true; instructions.len()];
-    let mut a: AKnown = None;
+    // Current equivalence class for A. All members hold the same
+    // value as A right now.
+    let mut eq: Vec<AValue> = Vec::new();
+
     for (i, inst) in instructions.iter().enumerate() {
         if instruction_crosses_block(inst) {
-            a = None;
+            eq.clear();
             continue;
         }
         match (inst.opcode, &inst.mode) {
             (Opcode::LDA, AddressingMode::Immediate(v)) => {
-                if let Imm(existing) = a {
-                    if existing == *v {
-                        keep[i] = false;
-                        continue;
-                    }
+                if eq.contains(&AValue::Imm(*v)) {
+                    keep[i] = false;
+                    continue;
                 }
-                a = Imm(*v);
+                eq.clear();
+                eq.push(AValue::Imm(*v));
             }
             (Opcode::LDA, AddressingMode::ZeroPage(addr)) => {
-                if let Addr(existing) = a {
-                    if existing == *addr {
-                        keep[i] = false;
-                        continue;
-                    }
+                if eq.contains(&AValue::Zp(*addr)) {
+                    keep[i] = false;
+                    continue;
                 }
-                a = Addr(*addr);
+                eq.clear();
+                eq.push(AValue::Zp(*addr));
             }
             (Opcode::LDA, AddressingMode::Absolute(addr)) => {
-                // We could track absolute addresses too, but don't
-                // try to unify them with ZP. Just record the value.
-                // Not going to eliminate against prior state.
-                let _ = addr;
-                a = None;
+                if eq.contains(&AValue::Abs(*addr)) {
+                    keep[i] = false;
+                    continue;
+                }
+                eq.clear();
+                eq.push(AValue::Abs(*addr));
             }
             (Opcode::STA, AddressingMode::ZeroPage(addr)) => {
-                // After STA, A is unchanged. Additionally, `addr` now
-                // holds A's value. Remember that equivalence: a later
-                // `LDA addr` is redundant.
-                a = Addr(*addr);
+                // A unchanged; address now holds A's value. Add the
+                // address to the equivalence class.
+                if eq.is_empty() {
+                    // No prior knowledge — start fresh with this
+                    // address.
+                }
+                eq.push(AValue::Zp(*addr));
+            }
+            (Opcode::STA, AddressingMode::Absolute(addr)) => {
+                eq.push(AValue::Abs(*addr));
             }
             (Opcode::STA, _) => {
-                // A unchanged, but we don't track non-ZP addresses.
+                // Other addressing modes: A unchanged.
             }
             // Ops that clobber A — clear tracker.
             (
@@ -95,9 +425,23 @@ fn remove_redundant_loads(instructions: &mut Vec<Instruction>) {
                 | Opcode::TYA,
                 _,
             ) => {
-                a = None;
+                eq.clear();
             }
-            // Ops that don't touch A — leave the tracker alone.
+            // Ops that write to an address we might be tracking:
+            // invalidate any equivalence pointing at that cell,
+            // because the stored value is no longer correct.
+            (
+                Opcode::STX | Opcode::STY | Opcode::INC | Opcode::DEC,
+                AddressingMode::ZeroPage(addr),
+            ) => {
+                eq.retain(|v| !matches!(v, AValue::Zp(a) if *a == *addr));
+            }
+            (
+                Opcode::STX | Opcode::STY | Opcode::INC | Opcode::DEC,
+                AddressingMode::Absolute(addr),
+            ) => {
+                eq.retain(|v| !matches!(v, AValue::Abs(a) if *a == *addr));
+            }
             _ => {}
         }
     }
@@ -111,10 +455,10 @@ fn remove_redundant_loads(instructions: &mut Vec<Instruction>) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AKnown {
-    None,
-    Addr(u8),
+enum AValue {
     Imm(u8),
+    Zp(u8),
+    Abs(u16),
 }
 
 /// Remove `STA temp_slot` instructions whose written value is never
@@ -128,8 +472,18 @@ enum AKnown {
 /// store-to-temp is dead.
 fn remove_dead_temp_stores(instructions: &mut Vec<Instruction>) {
     // Walk forward. For each `STA slot` where slot is a temp, look
-    // ahead to see if the slot is read before being either
-    // overwritten or invalidated by a control-flow boundary.
+    // ahead through the rest of the current function (bounded by the
+    // next `__ir_fn_` label or EOF). If no subsequent instruction
+    // reads the slot before the function ends or the slot is
+    // overwritten, the STA is dead.
+    //
+    // IR temp slots are assigned uniquely per IR op within a function
+    // (the IR codegen resets `next_temp_slot` to 0 at each function
+    // entry and never reuses slot numbers within a function), so it's
+    // safe to scan past labels and branches within the same function.
+    // Cross-function JSR can't read our temps because the callee also
+    // starts its own temp numbering from $80 — if it stomps on our
+    // slots, we can't have relied on them surviving the call anyway.
     let mut keep = vec![true; instructions.len()];
     for i in 0..instructions.len() {
         let inst = &instructions[i];
@@ -140,24 +494,18 @@ fn remove_dead_temp_stores(instructions: &mut Vec<Instruction>) {
             AddressingMode::ZeroPage(addr) if addr >= 0x80 => addr,
             _ => continue,
         };
-        // Scan forward until the slot is read, overwritten, or we hit
-        // a control-flow boundary that might branch to code we can't
-        // see.
-        let mut dead = false;
+        let mut dead = true;
         for next in instructions.iter().skip(i + 1) {
-            if instruction_crosses_block(next) {
-                // The slot might be read later; be conservative.
+            if is_function_boundary(next) {
                 break;
             }
             if reads_zero_page(next, slot) {
-                // A subsequent instruction reads from the slot, so
-                // the STA is live.
+                dead = false;
                 break;
             }
             if writes_zero_page(next, slot) {
-                // The slot is overwritten with no read in between —
-                // the original STA is dead.
-                dead = true;
+                // Overwritten with no read in between — our STA is
+                // dead. Stop scanning either way.
                 break;
             }
         }
@@ -172,6 +520,24 @@ fn remove_dead_temp_stores(instructions: &mut Vec<Instruction>) {
         }
     }
     *instructions = out;
+}
+
+/// True if `inst` marks the start of a new function. IR codegen emits
+/// function bodies with a `NOP Label("__ir_fn_…")` pseudo-instruction.
+/// A JSR to a function also transfers control away, but since each
+/// function starts its own temp slot allocation at $80 we don't rely
+/// on slot contents surviving calls.
+fn is_function_boundary(inst: &Instruction) -> bool {
+    if inst.opcode == Opcode::NOP {
+        if let AddressingMode::Label(name) = &inst.mode {
+            return name.starts_with("__ir_fn_")
+                || name.starts_with("__fn_")
+                || name == "__reset"
+                || name == "__nmi"
+                || name == "__irq";
+        }
+    }
+    matches!(inst.opcode, Opcode::RTS | Opcode::RTI)
 }
 
 /// True if the given instruction is a control-flow boundary — we can't
@@ -318,15 +684,41 @@ mod tests {
 
     #[test]
     fn removes_sta_then_lda_temp() {
+        // `STA $80; LDA $80; CLC; RTS` — the STA is dead (the slot
+        // is never read by anything reachable), and even if we did
+        // keep the STA the LDA would be eliminated by A-tracking
+        // since A already holds the value we just stored. Both get
+        // stripped, leaving just CLC + RTS.
         let mut insts = vec![
             Instruction::new(STA, AM::ZeroPage(0x80)),
             Instruction::new(LDA, AM::ZeroPage(0x80)),
             Instruction::new(CLC, AM::Implied),
+            Instruction::new(RTS, AM::Implied),
         ];
         optimize(&mut insts);
         assert_eq!(insts.len(), 2);
-        assert_eq!(insts[0].opcode, STA);
-        assert_eq!(insts[1].opcode, CLC);
+        assert_eq!(insts[0].opcode, CLC);
+        assert_eq!(insts[1].opcode, RTS);
+    }
+
+    #[test]
+    fn keeps_sta_when_temp_is_read_later() {
+        // STA $80; LDA #5; ORA $80 — the ORA reads slot $80, so
+        // the STA is live.
+        let mut insts = vec![
+            Instruction::new(STA, AM::ZeroPage(0x80)),
+            Instruction::new(LDA, AM::Immediate(5)),
+            Instruction::new(ORA, AM::ZeroPage(0x80)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // STA must remain because the ORA reads it.
+        assert!(
+            insts
+                .iter()
+                .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(0x80)),
+            "STA to $80 should be preserved: {insts:?}"
+        );
     }
 
     #[test]
@@ -359,6 +751,26 @@ mod tests {
     }
 
     #[test]
+    fn eliminates_duplicate_immediate_loads_across_stores() {
+        // LDA #5; STA $10; LDA #5 — the second LDA should be
+        // eliminated because A still holds 5 after STA.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::Immediate(5)),
+            Instruction::new(STA, AM::ZeroPage(0x10)),
+            Instruction::new(LDA, AM::Immediate(5)),
+            Instruction::new(STA, AM::ZeroPage(0x11)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // Expect: LDA #5, STA $10, STA $11, RTS
+        let lda_count = insts.iter().filter(|i| i.opcode == LDA).count();
+        assert_eq!(
+            lda_count, 1,
+            "expected one LDA (the second is redundant): {insts:?}"
+        );
+    }
+
+    #[test]
     fn removes_lda_then_sta_same_address() {
         let mut insts = vec![
             Instruction::new(LDA, AM::ZeroPage(0x10)),
@@ -373,13 +785,149 @@ mod tests {
     }
 
     #[test]
-    fn preserves_different_addresses() {
+    fn preserves_sta_when_slot_is_read() {
         let mut insts = vec![
             Instruction::new(STA, AM::ZeroPage(0x80)),
             Instruction::new(LDA, AM::ZeroPage(0x81)),
+            Instruction::new(CMP, AM::ZeroPage(0x80)),
+            Instruction::new(RTS, AM::Implied),
         ];
         optimize(&mut insts);
-        assert_eq!(insts.len(), 2);
+        // STA $80 is live because CMP reads it.
+        assert!(
+            insts
+                .iter()
+                .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(0x80)),
+            "STA should be preserved when slot is later read: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn copy_propagation_rewrites_temp_load_to_source() {
+        // LDA $10; STA $80; LDA $80 should become LDA $10; (stores
+        // trimmed by dead-store). End result: just a single LDA.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::ZeroPage(0x10)),
+            Instruction::new(STA, AM::ZeroPage(0x80)),
+            Instruction::new(LDA, AM::ZeroPage(0x80)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // After copy prop + dead store elim + A-tracking, the sequence
+        // collapses to a single LDA + RTS.
+        assert!(
+            insts
+                .iter()
+                .any(|i| i.opcode == LDA && i.mode == AM::ZeroPage(0x10)),
+            "should preserve original LDA: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn copy_propagation_rewrites_arithmetic_operand() {
+        // LDA #1; STA $80; LDA $10; CLC; ADC $80 — the ADC should be
+        // rewritten to `ADC #1` because $80 is a temp tracked to Imm(1).
+        let mut insts = vec![
+            Instruction::new(LDA, AM::Immediate(1)),
+            Instruction::new(STA, AM::ZeroPage(0x80)),
+            Instruction::new(LDA, AM::ZeroPage(0x10)),
+            Instruction::new(CLC, AM::Implied),
+            Instruction::new(ADC, AM::ZeroPage(0x80)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        assert!(
+            insts
+                .iter()
+                .any(|i| i.opcode == ADC && i.mode == AM::Immediate(1)),
+            "ADC should be rewritten to immediate: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn dead_load_elimination_drops_overwritten_lda() {
+        // LDA $10; LDA #0 — the first LDA is dead because A is
+        // overwritten before being used.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::ZeroPage(0x10)),
+            Instruction::new(LDA, AM::Immediate(0)),
+            Instruction::new(STA, AM::ZeroPage(0x10)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // First LDA dropped; result is LDA #0, STA $10, RTS
+        let lda_count = insts.iter().filter(|i| i.opcode == LDA).count();
+        assert_eq!(lda_count, 1, "expected one LDA, got: {insts:?}");
+    }
+
+    #[test]
+    fn folds_branch_over_jmp_to_nearby_label() {
+        // BNE taken; JMP fallthrough; taken:
+        // becomes: BEQ fallthrough; taken:
+        // (and taken: is harmless even without a corresponding JSR).
+        let mut insts = vec![
+            Instruction::new(LDA, AM::Immediate(0)),
+            Instruction::new(BNE, AM::LabelRelative("taken".into())),
+            Instruction::new(JMP, AM::Label("fallthrough".into())),
+            Instruction::new(NOP, AM::Label("taken".into())),
+            Instruction::new(NOP, AM::Implied),
+            Instruction::new(NOP, AM::Label("fallthrough".into())),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // The BNE should have been rewritten to BEQ fallthrough.
+        let has_beq_fallthrough = insts
+            .iter()
+            .any(|i| i.opcode == BEQ && i.mode == AM::LabelRelative("fallthrough".into()));
+        assert!(
+            has_beq_fallthrough,
+            "expected BEQ fallthrough after folding: {insts:?}"
+        );
+        // The JMP fallthrough should be gone.
+        let has_jmp = insts
+            .iter()
+            .any(|i| i.opcode == JMP && i.mode == AM::Label("fallthrough".into()));
+        assert!(!has_jmp, "JMP should be folded away: {insts:?}");
+    }
+
+    #[test]
+    fn skips_branch_fold_for_distant_labels() {
+        // Same pattern but the target label is too far away (beyond
+        // the lookahead window). The fold should be skipped.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::Immediate(0)),
+            Instruction::new(BNE, AM::LabelRelative("taken".into())),
+            Instruction::new(JMP, AM::Label("far_label".into())),
+            Instruction::new(NOP, AM::Label("taken".into())),
+        ];
+        // Pad with 100 NOPs.
+        for _ in 0..100 {
+            insts.push(Instruction::new(NOP, AM::Implied));
+        }
+        insts.push(Instruction::new(NOP, AM::Label("far_label".into())));
+        insts.push(Instruction::new(RTS, AM::Implied));
+        optimize(&mut insts);
+        // The BNE should NOT have been rewritten — far_label is too
+        // far to reach with a short branch.
+        let has_beq_far = insts
+            .iter()
+            .any(|i| i.opcode == BEQ && i.mode == AM::LabelRelative("far_label".into()));
+        assert!(
+            !has_beq_far,
+            "BNE should not be folded when target is far: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn removes_jmp_to_immediately_following_label() {
+        let mut insts = vec![
+            Instruction::new(JMP, AM::Label("next".into())),
+            Instruction::new(NOP, AM::Label("next".into())),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        let has_jmp = insts.iter().any(|i| i.opcode == JMP);
+        assert!(!has_jmp, "JMP to next label should be removed: {insts:?}");
     }
 
     #[test]

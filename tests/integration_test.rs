@@ -142,6 +142,166 @@ fn program_with_functions() {
 }
 
 #[test]
+fn program_with_on_scanline_mmc3() {
+    let source = r#"
+        game "Scanline" { mapper: MMC3 }
+        var sx: u8 = 0
+        state Main {
+            on frame { wait_frame }
+            on scanline(120) { scroll(sx, 0) }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_on_scanline_per_state() {
+    // Two states, each with its own scanline handler at a different
+    // position. The IR codegen should emit per-state dispatch in
+    // both `__irq_user` and `__ir_mmc3_reload`.
+    let source = r#"
+        game "MultiSL" { mapper: MMC3 }
+        var s: u8 = 0
+        state A {
+            on frame { wait_frame }
+            on scanline(64) { scroll(0, 0) }
+        }
+        state B {
+            on frame { wait_frame }
+            on scanline(192) { scroll(0, 0) }
+        }
+        start A
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_function_local_variables() {
+    // Functions with locally-declared variables should allocate
+    // their own backing storage and not corrupt caller state when
+    // nested.
+    let source = r#"
+        game "Locals" { mapper: NROM }
+        var out: u8 = 0
+
+        fun double(x: u8) -> u8 {
+            var t: u8 = x
+            t = t + t
+            return t
+        }
+
+        fun double_sum(a: u8, b: u8) -> u8 {
+            var s1: u8 = double(a)
+            var s2: u8 = double(b)
+            return s1 + s2
+        }
+
+        on frame {
+            out = double_sum(10, 20)
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_for_loop() {
+    let source = r#"
+        game "ForLoop" { mapper: NROM }
+        var arr: u8[8] = [0, 0, 0, 0, 0, 0, 0, 0]
+        var total: u8 = 0
+        on frame {
+            total = 0
+            for i in 0..8 {
+                total += arr[i]
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_match_statement() {
+    // Note: the parser doesn't support `;` as a statement separator,
+    // so each arm body uses newlines between statements.
+    let source = r#"
+        game "Match" { mapper: NROM }
+        enum Mode { Idle, Run, Jump }
+        var mode: u8 = Idle
+        var x: u8 = 0
+        on frame {
+            match mode {
+                Idle => { if button.a { mode = Run } }
+                Run => {
+                    x += 1
+                    if button.b { mode = Jump }
+                }
+                Jump => {
+                    x += 2
+                    if button.a { mode = Idle }
+                }
+                _ => {}
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_struct_literals() {
+    let source = r#"
+        game "Lit" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2 = Vec2 { x: 10, y: 20 }
+        on frame {
+            pos = Vec2 { x: 100, y: 50 }
+            if button.right {
+                pos = Vec2 { x: pos.x + 1, y: pos.y }
+            }
+            draw Smiley at: (pos.x, pos.y)
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_structs() {
+    let source = r#"
+        game "Structs" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        struct Player { health: u8, lives: u8 }
+
+        var pos: Vec2
+        var hero: Player
+
+        on frame {
+            pos.x = 100
+            pos.y = 50
+            hero.health = 3
+            hero.lives = 5
+            if button.right { pos.x += 1 }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_enums() {
     let source = r#"
         game "Enums" { mapper: NROM }
@@ -155,6 +315,66 @@ fn program_with_enums() {
             if button.right { dir = Right }
             if button.left { dir = Left }
             if dir == Right { mode = Running }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_poke_peek_intrinsics() {
+    let source = r#"
+        game "Hardware" { mapper: NROM }
+        var status: u8 = 0
+        on frame {
+            // Write to PPU address / data registers directly.
+            poke(0x2006, 0x3F)
+            poke(0x2006, 0x00)
+            poke(0x2007, 0x0F)
+            // Read PPU status.
+            status = peek(0x2002)
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_raw_asm_block() {
+    // `raw asm` bypasses `{var}` substitution so the body is passed
+    // to the inline parser unchanged.
+    let source = r#"
+        game "RawAsm" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            raw asm {
+                LDA #$42
+                STA $00
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_inline_asm_variable_substitution() {
+    let source = r#"
+        game "AsmVar" { mapper: NROM }
+        var counter: u8 = 0
+        on frame {
+            asm {
+                LDA {counter}
+                CLC
+                ADC #$01
+                STA {counter}
+            }
+            wait_frame
         }
         start Main
     "#;

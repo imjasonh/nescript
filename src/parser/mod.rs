@@ -13,6 +13,11 @@ pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
+    /// When true, `parse_primary` refuses to consume an `Ident {`
+    /// pattern as a struct literal — the `{` is reserved for the
+    /// following `if` / `while` / `for` block. Struct literals in
+    /// conditions must be parenthesized: `if x == (Foo { a: 1 })`.
+    restrict_struct_literals: bool,
 }
 
 impl Parser {
@@ -21,6 +26,7 @@ impl Parser {
             tokens,
             pos: 0,
             diagnostics: Vec::new(),
+            restrict_struct_literals: false,
         }
     }
 
@@ -117,6 +123,7 @@ impl Parser {
         let mut globals = Vec::new();
         let mut constants = Vec::new();
         let mut enums: Vec<EnumDecl> = Vec::new();
+        let mut structs: Vec<StructDecl> = Vec::new();
         let mut functions = Vec::new();
         let mut states = Vec::new();
         let mut sprites = Vec::new();
@@ -146,6 +153,9 @@ impl Parser {
                 }
                 TokenKind::KwEnum => {
                     enums.push(self.parse_enum_decl()?);
+                }
+                TokenKind::KwStruct => {
+                    structs.push(self.parse_struct_decl()?);
                 }
                 TokenKind::KwState => {
                     states.push(self.parse_state_decl()?);
@@ -221,6 +231,7 @@ impl Parser {
             globals,
             constants,
             enums,
+            structs,
             functions,
             states,
             sprites,
@@ -229,6 +240,40 @@ impl Parser {
             banks,
             start_state,
             span,
+        })
+    }
+
+    fn parse_struct_decl(&mut self) -> Result<StructDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwStruct)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let field_span = self.current_span();
+            let (field_name, _) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let field_type = self.parse_type()?;
+            fields.push(StructField {
+                name: field_name,
+                field_type,
+                span: field_span,
+            });
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            } else if *self.peek() != TokenKind::RBrace {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    "expected ',' or '}' in struct body",
+                    self.current_span(),
+                ));
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(StructDecl {
+            name,
+            fields,
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
@@ -785,6 +830,13 @@ impl Parser {
         let mut statements = Vec::new();
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             statements.push(self.parse_statement()?);
+            // Allow optional `;` between statements for readability.
+            // Newlines are still the primary separator, but `;` lets
+            // users put short statements on the same line:
+            //   `x += 1; y += 1`
+            while *self.peek() == TokenKind::Semicolon {
+                self.advance();
+            }
         }
         self.expect(&TokenKind::RBrace)?;
 
@@ -804,6 +856,8 @@ impl Parser {
             }
             TokenKind::KwIf => self.parse_if(),
             TokenKind::KwWhile => self.parse_while(),
+            TokenKind::KwFor => self.parse_for(),
+            TokenKind::KwMatch => self.parse_match(),
             TokenKind::KwLoop => self.parse_loop(),
             TokenKind::KwBreak => {
                 let span = self.current_span();
@@ -860,6 +914,23 @@ impl Parser {
                 Ok(Statement::Scroll(x, y, span))
             }
             TokenKind::KwDebug => self.parse_debug_statement(),
+            TokenKind::KwPlay => {
+                let span = self.current_span();
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                Ok(Statement::Play(name, span))
+            }
+            TokenKind::KwStartMusic => {
+                let span = self.current_span();
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                Ok(Statement::StartMusic(name, span))
+            }
+            TokenKind::KwStopMusic => {
+                let span = self.current_span();
+                self.advance();
+                Ok(Statement::StopMusic(span))
+            }
             TokenKind::KwAsm => {
                 let span = self.current_span();
                 self.advance(); // KwAsm
@@ -876,6 +947,23 @@ impl Parser {
                     ))
                 }
             }
+            TokenKind::KwRaw => {
+                // `raw asm { ... }` — verbatim bytes, no `{var}`
+                // substitution.
+                let span = self.current_span();
+                self.advance(); // KwRaw
+                self.expect(&TokenKind::KwAsm)?;
+                if let TokenKind::AsmBody(body) = self.peek().clone() {
+                    self.advance();
+                    Ok(Statement::RawAsm(body, span))
+                } else {
+                    Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        "expected `{` after `raw asm`",
+                        self.current_span(),
+                    ))
+                }
+            }
             TokenKind::Ident(_) => self.parse_assign_or_call(),
             _ => Err(Diagnostic::error(
                 ErrorCode::E0201,
@@ -888,7 +976,10 @@ impl Parser {
     fn parse_if(&mut self) -> Result<Statement, Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwIf)?;
+        let saved = self.restrict_struct_literals;
+        self.restrict_struct_literals = true;
         let condition = self.parse_expr()?;
+        self.restrict_struct_literals = saved;
         let then_block = self.parse_block()?;
 
         let mut else_ifs = Vec::new();
@@ -898,7 +989,9 @@ impl Parser {
             self.advance();
             if *self.peek() == TokenKind::KwIf {
                 self.advance();
+                self.restrict_struct_literals = true;
                 let cond = self.parse_expr()?;
+                self.restrict_struct_literals = saved;
                 let block = self.parse_block()?;
                 else_ifs.push((cond, block));
             } else {
@@ -915,7 +1008,10 @@ impl Parser {
     fn parse_while(&mut self) -> Result<Statement, Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwWhile)?;
+        let saved = self.restrict_struct_literals;
+        self.restrict_struct_literals = true;
         let condition = self.parse_expr()?;
+        self.restrict_struct_literals = saved;
         let body = self.parse_block()?;
         Ok(Statement::While(condition, body, start))
     }
@@ -925,6 +1021,104 @@ impl Parser {
         self.expect(&TokenKind::KwLoop)?;
         let body = self.parse_block()?;
         Ok(Statement::Loop(body, start))
+    }
+
+    /// Parse `match expr { pat => { body }, pat => { body }, _ => { body } }`.
+    /// Desugars to a chain of `if expr == pat { body } else if ...`
+    /// at parse time — no dedicated AST variant needed.
+    fn parse_match(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwMatch)?;
+        let saved = self.restrict_struct_literals;
+        self.restrict_struct_literals = true;
+        let scrutinee = self.parse_expr()?;
+        self.restrict_struct_literals = saved;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut arms: Vec<(Expr, Block)> = Vec::new();
+        let mut default: Option<Block> = None;
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            // A default arm is `_ => { ... }`.
+            if let TokenKind::Ident(name) = self.peek().clone() {
+                if name == "_" {
+                    self.advance();
+                    self.expect(&TokenKind::FatArrow)?;
+                    let body = self.parse_block()?;
+                    default = Some(body);
+                    if *self.peek() == TokenKind::Comma {
+                        self.advance();
+                    }
+                    continue;
+                }
+            }
+            let pat_span = self.current_span();
+            let pat = self.parse_expr()?;
+            self.expect(&TokenKind::FatArrow)?;
+            let body = self.parse_block()?;
+            // Build `scrutinee == pat` as the branch condition.
+            let cond = Expr::BinaryOp(
+                Box::new(scrutinee.clone()),
+                BinOp::Eq,
+                Box::new(pat),
+                pat_span,
+            );
+            arms.push((cond, body));
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        if arms.is_empty() {
+            // `match x { _ => body }` or empty match — emit the
+            // default block directly, or an empty no-op.
+            if let Some(body) = default {
+                return Ok(Statement::If(
+                    Expr::BoolLiteral(true, start),
+                    body,
+                    Vec::new(),
+                    None,
+                    start,
+                ));
+            }
+            return Ok(Statement::If(
+                Expr::BoolLiteral(false, start),
+                Block {
+                    statements: Vec::new(),
+                    span: start,
+                },
+                Vec::new(),
+                None,
+                start,
+            ));
+        }
+
+        // Build an if/else-if chain. The first arm becomes the
+        // `then` block; subsequent arms become `else if` entries;
+        // the default arm (if any) becomes the final `else`.
+        let (first_cond, first_body) = arms.remove(0);
+        Ok(Statement::If(first_cond, first_body, arms, default, start))
+    }
+
+    fn parse_for(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwFor)?;
+        let (var, _) = self.expect_ident()?;
+        self.expect(&TokenKind::KwIn)?;
+        let saved = self.restrict_struct_literals;
+        self.restrict_struct_literals = true;
+        let start_expr = self.parse_expr()?;
+        self.expect(&TokenKind::DotDot)?;
+        let end_expr = self.parse_expr()?;
+        self.restrict_struct_literals = saved;
+        let body = self.parse_block()?;
+        Ok(Statement::For {
+            var,
+            start: start_expr,
+            end: end_expr,
+            body,
+            span: start,
+        })
     }
 
     fn parse_draw(&mut self) -> Result<Statement, Diagnostic> {
@@ -1121,6 +1315,19 @@ impl Parser {
                     start,
                 ))
             }
+            TokenKind::Dot => {
+                // Field assignment: name.field = value
+                self.advance();
+                let (field, _) = self.expect_ident()?;
+                let op = self.parse_assign_op()?;
+                let value = self.parse_expr()?;
+                Ok(Statement::Assign(
+                    LValue::Field(name, field),
+                    op,
+                    value,
+                    start,
+                ))
+            }
             TokenKind::LParen => {
                 // Function call
                 self.advance();
@@ -1206,6 +1413,12 @@ impl Parser {
             TokenKind::KwBool => {
                 self.advance();
                 NesType::Bool
+            }
+            TokenKind::Ident(name) => {
+                // User-declared struct types are referenced by name.
+                // The analyzer validates that the name exists.
+                self.advance();
+                NesType::Struct(name)
             }
             _ => {
                 return Err(Diagnostic::error(
@@ -1462,6 +1675,45 @@ impl Parser {
                     }
                     self.expect(&TokenKind::RParen)?;
                     return Ok(Expr::Call(name, args, span));
+                }
+
+                // Check for field access: `name.field`
+                if *self.peek() == TokenKind::Dot {
+                    self.advance();
+                    let (field, _) = self.expect_ident()?;
+                    return Ok(Expr::FieldAccess(name, field, span));
+                }
+
+                // Check for struct literal: `Name { field: expr, ... }`.
+                // Disabled in condition contexts to keep parsing
+                // unambiguous for `if`/`while`/`for`.
+                if !self.restrict_struct_literals && *self.peek() == TokenKind::LBrace {
+                    self.advance();
+                    let mut fields = Vec::new();
+                    while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+                        let (field_name, _) = self.expect_ident()?;
+                        self.expect(&TokenKind::Colon)?;
+                        // Struct literal field values can contain
+                        // their own nested struct literals, so we
+                        // temporarily allow them regardless of the
+                        // outer restriction.
+                        let saved = self.restrict_struct_literals;
+                        self.restrict_struct_literals = false;
+                        let value = self.parse_expr()?;
+                        self.restrict_struct_literals = saved;
+                        fields.push((field_name, value));
+                        if *self.peek() == TokenKind::Comma {
+                            self.advance();
+                        } else if *self.peek() != TokenKind::RBrace {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                "expected ',' or '}' in struct literal",
+                                self.current_span(),
+                            ));
+                        }
+                    }
+                    self.expect(&TokenKind::RBrace)?;
+                    return Ok(Expr::StructLiteral(name, fields, span));
                 }
 
                 Ok(Expr::Ident(name, span))

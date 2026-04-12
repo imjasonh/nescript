@@ -33,6 +33,15 @@ enum Cli {
         #[arg(long)]
         dump_ir: bool,
 
+        /// Dump a human-readable memory map of variable allocations
+        /// to stdout.
+        #[arg(long)]
+        memory_map: bool,
+
+        /// Dump a call graph showing which functions call which.
+        #[arg(long)]
+        call_graph: bool,
+
         /// Use the legacy AST-based codegen. The default is the IR-based
         /// codegen, which runs the optimizer passes before emitting 6502.
         #[arg(long)]
@@ -55,6 +64,8 @@ fn main() {
             debug,
             asm_dump,
             dump_ir,
+            memory_map,
+            call_graph,
             use_ast,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
@@ -64,6 +75,8 @@ fn main() {
                     debug,
                     asm_dump,
                     dump_ir,
+                    memory_map,
+                    call_graph,
                     use_ast,
                 },
             ) {
@@ -89,11 +102,118 @@ fn main() {
     }
 }
 
+/// Print a human-readable memory map of variable allocations.
+/// Entries are sorted by address and labelled with their scope
+/// (zero-page vs RAM).
+fn print_memory_map(analysis: &nescript::analyzer::AnalysisResult) {
+    let mut allocs: Vec<_> = analysis.var_allocations.iter().collect();
+    allocs.sort_by_key(|a| a.address);
+
+    println!("=== NEScript Memory Map ===");
+    println!("Zero Page ($00-$FF):");
+    println!("  $00-$0F  [SYSTEM]  reserved (frame flag, input, state, params, scratch)");
+    for a in allocs.iter().filter(|a| a.address < 0x100) {
+        if a.size == 1 {
+            println!("  ${:04X}    [USER]    {} (u8)", a.address, a.name);
+        } else {
+            println!(
+                "  ${:04X}-${:04X}  [USER]  {} ({} bytes)",
+                a.address,
+                a.address + a.size - 1,
+                a.name,
+                a.size
+            );
+        }
+    }
+
+    let ram_allocs: Vec<_> = allocs.iter().filter(|a| a.address >= 0x100).collect();
+    if !ram_allocs.is_empty() {
+        println!("\nRAM ($0200-$07FF):");
+        println!("  $0200-$02FF  [SYSTEM]  OAM shadow buffer");
+        for a in &ram_allocs {
+            if a.size == 1 {
+                println!("  ${:04X}        [USER]    {} (u8)", a.address, a.name);
+            } else {
+                println!(
+                    "  ${:04X}-${:04X}  [USER]  {} ({} bytes)",
+                    a.address,
+                    a.address + a.size - 1,
+                    a.name,
+                    a.size
+                );
+            }
+        }
+    }
+
+    // Summary line.
+    let zp_used: u16 = allocs
+        .iter()
+        .filter(|a| a.address < 0x80)
+        .map(|a| a.size)
+        .sum();
+    let ram_used: u16 = allocs
+        .iter()
+        .filter(|a| a.address >= 0x300)
+        .map(|a| a.size)
+        .sum();
+    println!();
+    println!("Zero Page: {zp_used}/128 bytes used");
+    println!("Main RAM:  {ram_used}/1280 bytes used");
+}
+
+/// Print a human-readable call graph of the analyzed program.
+/// Entries show the max call depth reached from each entry point
+/// (state handler) and the transitive callees.
+fn print_call_graph(analysis: &nescript::analyzer::AnalysisResult) {
+    use std::collections::BTreeMap;
+
+    let sorted: BTreeMap<_, _> = analysis
+        .call_graph
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let max_depth = analysis.max_depths.values().copied().max().unwrap_or(0);
+
+    println!("=== Call Graph (max depth: {max_depth} / 8) ===");
+    if sorted.is_empty() {
+        println!("  (no functions or handlers)");
+        return;
+    }
+    for (caller, callees) in &sorted {
+        if let Some(depth) = analysis.max_depths.get(caller) {
+            println!("{caller} (max depth {depth})");
+        } else {
+            println!("{caller}");
+        }
+        if callees.is_empty() {
+            println!("  └── (leaf)");
+        } else {
+            let count = callees.len();
+            for (i, callee) in callees.iter().enumerate() {
+                let branch = if i + 1 == count {
+                    "└──"
+                } else {
+                    "├──"
+                };
+                println!("  {branch} {callee}");
+            }
+        }
+    }
+}
+
 fn dump_asm(instructions: &[nescript::asm::Instruction]) {
+    use nescript::asm::{AddressingMode, Opcode};
     for inst in instructions {
-        if let nescript::asm::AddressingMode::Label(name) = &inst.mode {
-            println!("{name}:");
-            continue;
+        // A bare `NOP` with a `Label` operand is a label *definition*
+        // (the pseudo-instruction the codegen emits when marking a
+        // position). Any other opcode with `Label` mode is an actual
+        // instruction like `JSR foo` or `JMP bar`, so we show the
+        // opcode + target.
+        if inst.opcode == Opcode::NOP {
+            if let AddressingMode::Label(name) = &inst.mode {
+                println!("{name}:");
+                continue;
+            }
         }
         println!("    {:?} {:?}", inst.opcode, inst.mode);
     }
@@ -104,6 +224,8 @@ struct CompileOptions {
     debug: bool,
     asm_dump: bool,
     dump_ir: bool,
+    memory_map: bool,
+    call_graph: bool,
     use_ast: bool,
 }
 
@@ -111,6 +233,8 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     let debug = opts.debug;
     let asm_dump = opts.asm_dump;
     let dump_ir = opts.dump_ir;
+    let memory_map = opts.memory_map;
+    let call_graph = opts.call_graph;
     let use_ast = opts.use_ast;
     let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
@@ -155,6 +279,14 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
 
     if dump_ir {
         print!("{}", ir_program.pretty());
+    }
+
+    if memory_map {
+        print_memory_map(&analysis);
+    }
+
+    if call_graph {
+        print_call_graph(&analysis);
     }
 
     // Resolve sprite assets (CHR data + tile indices) relative to the

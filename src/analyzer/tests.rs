@@ -299,6 +299,85 @@ fn analyze_return_wrong_type() {
 }
 
 #[test]
+fn analyze_struct_variable_allocates_fields() {
+    let result = analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2
+        on frame {
+            pos.x = 10
+            pos.y = pos.x
+        }
+        start Main
+    "#,
+    );
+    // The analyzer should synthesize pos.x and pos.y as separate
+    // variables with consecutive addresses.
+    let px = result
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "pos.x")
+        .expect("pos.x should be allocated");
+    let py = result
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "pos.y")
+        .expect("pos.y should be allocated");
+    assert_eq!(py.address, px.address + 1);
+}
+
+#[test]
+fn analyze_struct_unknown_field_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2
+        on frame { pos.z = 5 }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "unknown field should emit E0201: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_unknown_struct_type_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        var pos: NoSuchStruct
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "unknown struct type should emit E0201: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_assign_to_undefined_var_errors() {
+    // Assigning to an undeclared variable must produce E0502
+    // rather than silently creating the variable.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        on frame { nope = 5 }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0502),
+        "assignment to undefined var should produce E0502, got: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_enum_variants_as_constants() {
     let result = analyze_ok(
         r#"
@@ -519,6 +598,26 @@ fn analyze_loop_with_break_ok() {
         }
         start Main
     "#,
+    );
+}
+
+#[test]
+fn analyze_bare_return_from_typed_fn_errors() {
+    // A `return` with no value inside a function that has a declared
+    // return type should produce E0203.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        fun get_five() -> u8 {
+            return
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0203),
+        "bare return from typed fn should produce E0203, got: {errors:?}"
     );
 }
 

@@ -6,6 +6,7 @@ pub struct Program {
     pub globals: Vec<VarDecl>,
     pub constants: Vec<ConstDecl>,
     pub enums: Vec<EnumDecl>,
+    pub structs: Vec<StructDecl>,
     pub functions: Vec<FunDecl>,
     pub states: Vec<StateDecl>,
     pub sprites: Vec<SpriteDecl>,
@@ -24,6 +25,24 @@ pub struct Program {
 pub struct EnumDecl {
     pub name: String,
     pub variants: Vec<(String, Span)>,
+    pub span: Span,
+}
+
+/// `struct Name { field1: u8, field2: u8 }` — composite type with a
+/// known layout. Fields are stored contiguously in memory in
+/// declaration order (no padding). Only primitive-sized fields (u8,
+/// i8, bool) are supported in the v1 layout.
+#[derive(Debug, Clone)]
+pub struct StructDecl {
+    pub name: String,
+    pub fields: Vec<StructField>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructField {
+    pub name: String,
+    pub field_type: NesType,
     pub span: Span,
 }
 
@@ -148,6 +167,9 @@ pub enum NesType {
     U16,
     Bool,
     Array(Box<NesType>, u16),
+    /// A user-declared struct, identified by its name. The analyzer
+    /// looks up field layouts in the `StructDecl` table.
+    Struct(String),
 }
 
 impl std::fmt::Display for NesType {
@@ -158,6 +180,7 @@ impl std::fmt::Display for NesType {
             Self::U16 => write!(f, "u16"),
             Self::Bool => write!(f, "bool"),
             Self::Array(t, n) => write!(f, "{t}[{n}]"),
+            Self::Struct(name) => write!(f, "{name}"),
         }
     }
 }
@@ -174,12 +197,19 @@ pub enum Expr {
     BoolLiteral(bool, Span),
     Ident(String, Span),
     ArrayIndex(String, Box<Expr>, Span),
+    /// Field access on a struct variable: `pos.x`.
+    FieldAccess(String, String, Span),
     BinaryOp(Box<Expr>, BinOp, Box<Expr>, Span),
     UnaryOp(UnaryOp, Box<Expr>, Span),
     Call(String, Vec<Expr>, Span),
     ButtonRead(Option<Player>, String, Span),
     ArrayLiteral(Vec<Expr>, Span),
     Cast(Box<Expr>, NesType, Span),
+    /// Struct literal: `Name { field1: expr, field2: expr, ... }`.
+    /// Only allowed in non-condition expression positions — the
+    /// parser bans them inside `if`/`while`/`for` conditions to
+    /// avoid ambiguity with the following block.
+    StructLiteral(String, Vec<(String, Expr)>, Span),
 }
 
 impl Expr {
@@ -189,12 +219,14 @@ impl Expr {
             | Self::BoolLiteral(_, s)
             | Self::Ident(_, s)
             | Self::ArrayIndex(_, _, s)
+            | Self::FieldAccess(_, _, s)
             | Self::BinaryOp(_, _, _, s)
             | Self::UnaryOp(_, _, s)
             | Self::Call(_, _, s)
             | Self::ButtonRead(_, _, s)
             | Self::ArrayLiteral(_, s)
-            | Self::Cast(_, _, s) => *s,
+            | Self::Cast(_, _, s)
+            | Self::StructLiteral(_, _, s) => *s,
         }
     }
 }
@@ -241,6 +273,15 @@ pub enum Statement {
     If(Expr, Block, Vec<(Expr, Block)>, Option<Block>, Span),
     While(Expr, Block, Span),
     Loop(Block, Span),
+    /// `for NAME in START..END { BODY }` — half-open range.
+    /// Lowers to an index variable + while loop in IR.
+    For {
+        var: String,
+        start: Expr,
+        end: Expr,
+        body: Block,
+        span: Span,
+    },
     Break(Span),
     Continue(Span),
     Return(Option<Expr>, Span),
@@ -258,8 +299,19 @@ pub enum Statement {
     /// Stripped in release mode.
     DebugAssert(Expr, Span),
     /// Inline 6502 assembly captured verbatim. The body is parsed by
-    /// the codegen stage using `asm::parse_inline`.
+    /// the codegen stage using `asm::parse_inline`. `raw` variants
+    /// skip variable substitution for completely unmanaged bytes.
     InlineAsm(String, Span),
+    RawAsm(String, Span),
+    /// Audio: `play SfxName` — trigger a one-shot sound effect.
+    /// Currently a no-op at codegen time; no audio driver exists.
+    Play(String, Span),
+    /// Audio: `start_music TrackName` — begin playing background music.
+    /// Currently a no-op at codegen time.
+    StartMusic(String, Span),
+    /// Audio: `stop_music` — stop any currently-playing music.
+    /// Currently a no-op at codegen time.
+    StopMusic(Span),
 }
 
 impl Statement {
@@ -267,6 +319,7 @@ impl Statement {
         match self {
             Self::VarDecl(v) => v.span,
             Self::Draw(d) => d.span,
+            Self::For { span, .. } => *span,
             Self::Assign(_, _, _, s)
             | Self::If(_, _, _, _, s)
             | Self::While(_, _, s)
@@ -282,7 +335,11 @@ impl Statement {
             | Self::Scroll(_, _, s)
             | Self::DebugLog(_, s)
             | Self::DebugAssert(_, s)
-            | Self::InlineAsm(_, s) => *s,
+            | Self::InlineAsm(_, s)
+            | Self::RawAsm(_, s)
+            | Self::Play(_, s)
+            | Self::StartMusic(_, s)
+            | Self::StopMusic(s) => *s,
         }
     }
 }
@@ -300,6 +357,9 @@ pub struct DrawStmt {
 pub enum LValue {
     Var(String),
     ArrayIndex(String, Box<Expr>),
+    /// Struct field: `pos.x = 5`. First string is the struct variable
+    /// name, second is the field name.
+    Field(String, String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
