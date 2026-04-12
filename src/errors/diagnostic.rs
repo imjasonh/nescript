@@ -42,7 +42,6 @@ pub enum ErrorCode {
     E0505, // multiple start declarations
 
     // W01xx: Warnings
-    #[allow(dead_code)]
     W0101, // expensive multiply/divide operation
     W0102, // loop without break or wait_frame
     W0103, // unused variable

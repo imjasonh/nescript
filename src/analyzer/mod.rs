@@ -255,7 +255,34 @@ impl Analyzer {
                 }
                 self.walk_expr_reads(idx);
             }
-            Expr::BinaryOp(lhs, _, rhs, _) => {
+            Expr::BinaryOp(lhs, op, rhs, span) => {
+                // W0101: warn about multiply/divide/modulo with a non-
+                // constant operand. These lower to calls into the
+                // software multiply/divide routines, which are far more
+                // expensive than the simple inline opcodes used for
+                // add/sub. A literal like `x * 2` can be strength-
+                // reduced to a shift and is therefore cheap.
+                if matches!(op, BinOp::Mul | BinOp::Div | BinOp::Mod)
+                    && !is_small_constant(lhs)
+                    && !is_small_constant(rhs)
+                {
+                    let op_name = match op {
+                        BinOp::Mul => "multiply",
+                        BinOp::Div => "divide",
+                        BinOp::Mod => "modulo",
+                        _ => unreachable!(),
+                    };
+                    self.diagnostics.push(
+                        Diagnostic::warning(
+                            ErrorCode::W0101,
+                            format!("{op_name} with two non-constant operands is expensive"),
+                            *span,
+                        )
+                        .with_help(
+                            "consider precomputing or using a power-of-2 constant for strength reduction",
+                        ),
+                    );
+                }
                 self.walk_expr_reads(lhs);
                 self.walk_expr_reads(rhs);
             }
@@ -930,6 +957,13 @@ fn collect_calls_block(block: &Block, calls: &mut Vec<String>) {
 /// unbounded `loop { }` is actually an infinite spin. We recurse into
 /// nested control-flow blocks so that a `break` inside a conditional
 /// body still counts as "can exit".
+/// True if the expression is a small integer literal — used to avoid
+/// emitting W0101 for multiply/divide where at least one operand can be
+/// handled by strength reduction (e.g. `x * 2`, `x / 4`).
+fn is_small_constant(expr: &Expr) -> bool {
+    matches!(expr, Expr::IntLiteral(_, _))
+}
+
 fn block_can_exit_or_yield(block: &Block) -> bool {
     block.statements.iter().any(stmt_can_exit_or_yield)
 }

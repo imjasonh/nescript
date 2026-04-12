@@ -299,6 +299,38 @@ fn analyze_return_wrong_type() {
 }
 
 #[test]
+fn analyze_expensive_multiply_warns() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        var a: u8 = 3
+        var b: u8 = 5
+        var c: u8 = 0
+        on frame { c = a * b }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::W0101),
+        "variable*variable multiply should emit W0101, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_multiply_by_constant_ok() {
+    // Multiply by a literal is cheap (strength reduced to shifts).
+    analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var a: u8 = 3
+        var c: u8 = 0
+        on frame { c = a * 4 }
+        start Main
+    "#,
+    );
+}
+
+#[test]
 fn analyze_on_scanline_requires_mmc3() {
     let errors = analyze_errors(
         r#"
