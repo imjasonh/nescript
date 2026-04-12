@@ -4,6 +4,11 @@ use super::*;
 use crate::analyzer::AnalysisResult;
 use crate::parser::ast::*;
 
+/// Marker prefix the lowering prepends to the body of a `raw asm`
+/// block, telling the codegen to skip `{var}` substitution. Uses
+/// NUL characters so no normal source text can spoof it.
+pub const RAW_ASM_PREFIX: &str = "\0RAW\0";
+
 /// Lower a parsed & analyzed program into IR.
 pub fn lower(program: &Program, analysis: &AnalysisResult) -> IrProgram {
     let mut ctx = LoweringContext::new(analysis);
@@ -427,6 +432,13 @@ impl LoweringContext {
             }
             Statement::InlineAsm(body, _) => {
                 self.emit(IrOp::InlineAsm(body.clone()));
+            }
+            Statement::RawAsm(body, _) => {
+                // Raw asm skips `{var}` substitution. We reuse the
+                // same IR op variant but mark the body with a magic
+                // prefix the codegen can detect — simpler than
+                // adding a separate IrOp.
+                self.emit(IrOp::InlineAsm(format!("{RAW_ASM_PREFIX}{body}")));
             }
             Statement::Play(_, _) | Statement::StartMusic(_, _) | Statement::StopMusic(_) => {
                 // No audio driver yet — these parse but produce no

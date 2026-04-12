@@ -947,6 +947,23 @@ impl Parser {
                     ))
                 }
             }
+            TokenKind::KwRaw => {
+                // `raw asm { ... }` — verbatim bytes, no `{var}`
+                // substitution.
+                let span = self.current_span();
+                self.advance(); // KwRaw
+                self.expect(&TokenKind::KwAsm)?;
+                if let TokenKind::AsmBody(body) = self.peek().clone() {
+                    self.advance();
+                    Ok(Statement::RawAsm(body, span))
+                } else {
+                    Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        "expected `{` after `raw asm`",
+                        self.current_span(),
+                    ))
+                }
+            }
             TokenKind::Ident(_) => self.parse_assign_or_call(),
             _ => Err(Diagnostic::error(
                 ErrorCode::E0201,

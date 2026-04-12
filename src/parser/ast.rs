@@ -299,8 +299,10 @@ pub enum Statement {
     /// Stripped in release mode.
     DebugAssert(Expr, Span),
     /// Inline 6502 assembly captured verbatim. The body is parsed by
-    /// the codegen stage using `asm::parse_inline`.
+    /// the codegen stage using `asm::parse_inline`. `raw` variants
+    /// skip variable substitution for completely unmanaged bytes.
     InlineAsm(String, Span),
+    RawAsm(String, Span),
     /// Audio: `play SfxName` — trigger a one-shot sound effect.
     /// Currently a no-op at codegen time; no audio driver exists.
     Play(String, Span),
@@ -334,6 +336,7 @@ impl Statement {
             | Self::DebugLog(_, s)
             | Self::DebugAssert(_, s)
             | Self::InlineAsm(_, s)
+            | Self::RawAsm(_, s)
             | Self::Play(_, s)
             | Self::StartMusic(_, s)
             | Self::StopMusic(s) => *s,

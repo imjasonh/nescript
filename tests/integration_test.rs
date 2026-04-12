@@ -323,6 +323,26 @@ fn program_with_enums() {
 }
 
 #[test]
+fn program_with_raw_asm_block() {
+    // `raw asm` bypasses `{var}` substitution so the body is passed
+    // to the inline parser unchanged.
+    let source = r#"
+        game "RawAsm" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            raw asm {
+                LDA #$42
+                STA $00
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_inline_asm_variable_substitution() {
     let source = r#"
         game "AsmVar" { mapper: NROM }

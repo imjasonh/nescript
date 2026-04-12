@@ -616,19 +616,22 @@ impl<'a> IrCodeGen<'a> {
                 }
             }
             IrOp::InlineAsm(body) => {
-                // Preprocess `{var}` substitutions, then parse with
-                // the shared inline parser and splice the resulting
-                // instructions. Parse errors emit `BRK` so the ROM
-                // still links — codegen is too late to return
-                // user-facing diagnostics cleanly.
-                let substituted = substitute_asm_vars(body, |name| {
-                    // Look up by allocated name. Prefer exact match.
-                    self.allocations
-                        .iter()
-                        .find(|a| a.name == name)
-                        .map(|a| a.address)
-                });
-                match crate::asm::parse_inline(&substituted) {
+                // Preprocess `{var}` substitutions (unless this is a
+                // `raw asm` block, flagged by the lowering with a
+                // magic prefix), then parse with the shared inline
+                // parser and splice the resulting instructions.
+                let raw = body.strip_prefix(crate::ir::RAW_ASM_PREFIX);
+                let to_parse: std::borrow::Cow<'_, str> = if let Some(raw_body) = raw {
+                    std::borrow::Cow::Borrowed(raw_body)
+                } else {
+                    std::borrow::Cow::Owned(substitute_asm_vars(body, |name| {
+                        self.allocations
+                            .iter()
+                            .find(|a| a.name == name)
+                            .map(|a| a.address)
+                    }))
+                };
+                match crate::asm::parse_inline(&to_parse) {
                     Ok(parsed) => self.instructions.extend(parsed),
                     Err(msg) => {
                         eprintln!("inline asm error: {msg}");

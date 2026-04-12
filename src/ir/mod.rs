@@ -2,7 +2,7 @@ mod lowering;
 #[cfg(test)]
 mod tests;
 
-pub use lowering::lower;
+pub use lowering::{lower, RAW_ASM_PREFIX};
 
 use crate::lexer::Span;
 use std::fmt;

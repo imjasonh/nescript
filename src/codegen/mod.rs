@@ -413,6 +413,16 @@ impl CodeGen {
                     }
                 }
             }
+            Statement::RawAsm(body, _) => {
+                // Raw asm bypasses variable substitution.
+                match crate::asm::parse_inline(body) {
+                    Ok(parsed) => self.instructions.extend(parsed),
+                    Err(msg) => {
+                        eprintln!("inline asm error: {msg}");
+                        self.emit(BRK, AM::Implied);
+                    }
+                }
+            }
             Statement::Play(_, _) | Statement::StartMusic(_, _) | Statement::StopMusic(_) => {
                 // Audio statements compile to no-ops for now.
             }
