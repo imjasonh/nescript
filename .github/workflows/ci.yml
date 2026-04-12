@@ -77,3 +77,58 @@ jobs:
             size=$(stat -c%s "$f")
             echo "    OK: $size bytes"
           done
+
+  emulator:
+    name: Emulator Smoke Test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install Chrome runtime deps for puppeteer
+        # puppeteer ships its own Chrome for Testing binary via the
+        # package's postinstall hook, but the runner image is missing
+        # a handful of shared libs that Chrome needs to launch.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libnss3 \
+            libatk-bridge2.0-0 \
+            libatk1.0-0 \
+            libatspi2.0-0 \
+            libcups2t64 \
+            libdbus-1-3 \
+            libdrm2 \
+            libgbm1 \
+            libpango-1.0-0 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxfixes3 \
+            libxkbcommon0 \
+            libxrandr2 \
+            libasound2t64
+      - name: Build compiler
+        run: cargo build --release
+      - name: Compile all .ne examples
+        run: |
+          for f in examples/*.ne; do
+            echo "==> Compiling $f"
+            ./target/release/nescript build "$f"
+          done
+      - name: Install emulator harness dependencies
+        working-directory: tests/emulator
+        run: npm ci
+      - name: Run each ROM in jsnes and verify it renders
+        working-directory: tests/emulator
+        run: node run_examples.mjs
+      - name: Upload emulator screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: emulator-screenshots
+          path: |
+            tests/emulator/screenshots/
+            tests/emulator/report.json
