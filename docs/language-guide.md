@@ -155,6 +155,41 @@ table, so a variant cannot share its name with any other constant,
 variable, or function (E0501). An enum cannot have more than 256
 variants because each is stored as a `u8`.
 
+### Structs
+
+Structs declare composite types with named fields:
+
+```
+struct Vec2 {
+    x: u8,
+    y: u8,
+}
+
+struct Player {
+    health: u8,
+    lives: u8,
+}
+
+var pos: Vec2
+var hero: Player
+
+on frame {
+    pos.x = 100
+    pos.y = 50
+    hero.health = 3
+    hero.lives = 5
+    if button.right { pos.x += 1 }
+    draw Hero at: (pos.x, pos.y)
+}
+```
+
+Fields are laid out contiguously in declaration order. A variable of
+struct type allocates enough contiguous bytes to hold all its fields;
+each field is accessible via the dot operator.
+
+In v0.1 only primitive field types (`u8`, `i8`, `bool`) are supported —
+nested structs, `u16`, and array fields are not yet allowed.
+
 ### Memory Placement Hints
 
 The NES has 256 bytes of zero-page RAM with faster access. You can hint where variables should be placed:
