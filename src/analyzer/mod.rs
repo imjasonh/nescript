@@ -561,11 +561,21 @@ impl Analyzer {
                 self.check_block(body, state_names);
                 self.in_loop = was_in_loop;
             }
-            Statement::Loop(body, _) => {
+            Statement::Loop(body, span) => {
                 let was_in_loop = self.in_loop;
                 self.in_loop = true;
                 self.check_block(body, state_names);
                 self.in_loop = was_in_loop;
+                // W0102: loop body must contain a break, return,
+                // transition, or wait_frame — otherwise the NES spins
+                // forever inside the loop and vblank never gets handled.
+                if !block_can_exit_or_yield(body) {
+                    self.diagnostics.push(Diagnostic::warning(
+                        ErrorCode::W0102,
+                        "infinite loop with no break, return, transition, or wait_frame",
+                        *span,
+                    ).with_help("add `wait_frame`, `break`, `return`, or `transition` somewhere in the body"));
+                }
             }
             Statement::Transition(name, span) => {
                 if !state_names.contains(&name.as_str()) {
@@ -897,6 +907,38 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
 fn collect_calls_block(block: &Block, calls: &mut Vec<String>) {
     for stmt in &block.statements {
         collect_calls_stmt(stmt, calls);
+    }
+}
+
+/// Return true if the given block contains any statement that can
+/// either exit the enclosing loop (`break`, `return`, `transition`)
+/// or yield control back to the frame loop (`wait_frame`).
+///
+/// This is used by the W0102 check to decide whether an otherwise-
+/// unbounded `loop { }` is actually an infinite spin. We recurse into
+/// nested control-flow blocks so that a `break` inside a conditional
+/// body still counts as "can exit".
+fn block_can_exit_or_yield(block: &Block) -> bool {
+    block.statements.iter().any(stmt_can_exit_or_yield)
+}
+
+fn stmt_can_exit_or_yield(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Break(_)
+        | Statement::Return(_, _)
+        | Statement::Transition(_, _)
+        | Statement::WaitFrame(_) => true,
+        Statement::If(_, then_b, elifs, else_b, _) => {
+            block_can_exit_or_yield(then_b)
+                || elifs.iter().any(|(_, b)| block_can_exit_or_yield(b))
+                || else_b.as_ref().is_some_and(block_can_exit_or_yield)
+        }
+        Statement::While(_, body, _) | Statement::Loop(body, _) => {
+            // A nested loop with a wait_frame inside still yields
+            // control, so check its body recursively.
+            block_can_exit_or_yield(body)
+        }
+        _ => false,
     }
 }
 

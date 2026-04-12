@@ -45,7 +45,6 @@ pub enum ErrorCode {
     // W01xx: Warnings
     #[allow(dead_code)]
     W0101, // expensive multiply/divide operation
-    #[allow(dead_code)]
     W0102, // loop without break or wait_frame
     W0103, // unused variable
     W0104, // unreachable state
@@ -116,6 +115,13 @@ impl Diagnostic {
             help: None,
             note: None,
         }
+    }
+
+    /// Construct a diagnostic with the level implied by the code
+    /// (identical to [`Diagnostic::error`], but reads better at call
+    /// sites that emit a warning code).
+    pub fn warning(code: ErrorCode, message: impl Into<String>, span: Span) -> Self {
+        Self::error(code, message, span)
     }
 
     #[must_use]

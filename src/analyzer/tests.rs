@@ -299,6 +299,54 @@ fn analyze_return_wrong_type() {
 }
 
 #[test]
+fn analyze_loop_without_exit_warns() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            loop { x += 1 }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::W0102),
+        "infinite loop with no exit should produce W0102, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_loop_with_wait_frame_ok() {
+    analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        on frame {
+            loop { wait_frame }
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_loop_with_break_ok() {
+    analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            loop {
+                x += 1
+                if x == 10 { break }
+            }
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
 fn analyze_return_value_from_void_fn() {
     let errors = analyze_errors(
         r#"
