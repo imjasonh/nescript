@@ -49,6 +49,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         stack_depth_limit: DEFAULT_STACK_DEPTH,
         in_loop: false,
         used_vars: HashSet::new(),
+        function_signatures: HashMap::new(),
     };
     analyzer.analyze_program(program);
 
@@ -74,6 +75,9 @@ struct Analyzer {
     /// Names of variables that have been read somewhere in the program.
     /// Used for the W0103 unused-variable warning.
     used_vars: HashSet<String>,
+    /// Function name to parameter types (in order). Used to validate
+    /// call arity and argument types.
+    function_signatures: HashMap<String, Vec<NesType>>,
 }
 
 impl Analyzer {
@@ -231,10 +235,13 @@ impl Analyzer {
             Expr::UnaryOp(_, inner, _) | Expr::Cast(inner, _, _) => {
                 self.walk_expr_reads(inner);
             }
-            Expr::Call(_, args, _) => {
-                // Function name is validated separately via E0503; here we
-                // just recurse into argument expressions so their reads
-                // get tracked (and undefined-var errors surface).
+            Expr::Call(name, args, span) => {
+                // If the function is known, validate its call signature.
+                // Undefined-function errors are surfaced elsewhere (for
+                // Statement::Call) and via the call-graph pass.
+                if self.function_signatures.contains_key(name) {
+                    self.check_call_signature(name, args, *span);
+                }
                 for arg in args {
                     self.walk_expr_reads(arg);
                 }
@@ -380,6 +387,9 @@ impl Analyzer {
                 span: fun.span,
             },
         );
+        let param_types: Vec<NesType> = fun.params.iter().map(|p| p.param_type.clone()).collect();
+        self.function_signatures
+            .insert(fun.name.clone(), param_types);
     }
 
     fn allocate_ram(&mut self, size: u16) -> u16 {
@@ -567,7 +577,9 @@ impl Analyzer {
                 let _ = self.infer_type(expr);
             }
             Statement::Call(name, args, span) => {
-                if !self.symbols.contains_key(name) {
+                if self.symbols.contains_key(name) {
+                    self.check_call_signature(name, args, *span);
+                } else {
                     self.diagnostics.push(Diagnostic::error(
                         ErrorCode::E0503,
                         format!("undefined function '{name}'"),
@@ -627,6 +639,30 @@ impl Analyzer {
                     _ => None,
                 })
             }
+        }
+    }
+
+    /// Check that a call site matches the function's declared signature:
+    /// argument count matches the parameter count, and each argument's
+    /// inferred type is compatible with the declared parameter type.
+    fn check_call_signature(&mut self, name: &str, args: &[Expr], span: Span) {
+        let Some(params) = self.function_signatures.get(name).cloned() else {
+            return;
+        };
+        if params.len() != args.len() {
+            self.diagnostics.push(Diagnostic::error(
+                ErrorCode::E0203,
+                format!(
+                    "wrong number of arguments to '{name}': expected {}, got {}",
+                    params.len(),
+                    args.len()
+                ),
+                span,
+            ));
+            return;
+        }
+        for (param_ty, arg) in params.iter().zip(args.iter()) {
+            self.check_expr_type(arg, param_ty);
         }
     }
 

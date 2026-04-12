@@ -225,6 +225,52 @@ fn analyze_undefined_function() {
 }
 
 #[test]
+fn analyze_call_arity_mismatch() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        fun add(a: u8, b: u8) -> u8 { return a }
+        on frame { add(1) }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0203),
+        "calling with wrong argument count should produce E0203, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_call_arity_ok() {
+    analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        fun add(a: u8, b: u8) -> u8 { return a }
+        on frame { add(1, 2) }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_call_arity_in_expr_context() {
+    // Calls used as expressions should also be checked.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        fun two(a: u8, b: u8) -> u8 { return a }
+        var x: u8 = 0
+        on frame { x = two(1) }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0203),
+        "call arity error in expression context should still trigger E0203: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_const_assignment_error() {
     let errors = analyze_errors(
         r#"
