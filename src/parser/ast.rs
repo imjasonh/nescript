@@ -247,6 +247,30 @@ pub enum Statement {
     DebugAssert(Expr, Span),
 }
 
+impl Statement {
+    pub fn span(&self) -> Span {
+        match self {
+            Self::VarDecl(v) => v.span,
+            Self::Draw(d) => d.span,
+            Self::Assign(_, _, _, s)
+            | Self::If(_, _, _, _, s)
+            | Self::While(_, _, s)
+            | Self::Loop(_, s)
+            | Self::Break(s)
+            | Self::Continue(s)
+            | Self::Return(_, s)
+            | Self::Transition(_, s)
+            | Self::WaitFrame(s)
+            | Self::Call(_, _, s)
+            | Self::LoadBackground(_, s)
+            | Self::SetPalette(_, s)
+            | Self::Scroll(_, _, s)
+            | Self::DebugLog(_, s)
+            | Self::DebugAssert(_, s) => *s,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct DrawStmt {
     pub sprite_name: String,

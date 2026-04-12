@@ -573,8 +573,26 @@ impl Analyzer {
     }
 
     fn check_block(&mut self, block: &Block, state_names: &[&str]) {
+        let mut terminated_by: Option<Span> = None;
+        let mut warned_dead_code = false;
         for stmt in &block.statements {
+            if let Some(term_span) = terminated_by {
+                if !warned_dead_code {
+                    self.diagnostics.push(
+                        Diagnostic::warning(
+                            ErrorCode::W0104,
+                            "unreachable code after return / break / transition",
+                            stmt.span(),
+                        )
+                        .with_label(term_span, "execution stops here"),
+                    );
+                    warned_dead_code = true;
+                }
+            }
             self.check_statement(stmt, state_names);
+            if stmt_is_terminator(stmt) && terminated_by.is_none() {
+                terminated_by = Some(stmt.span());
+            }
         }
     }
 
@@ -1006,6 +1024,18 @@ fn collect_calls_block(block: &Block, calls: &mut Vec<String>) {
 /// handled by strength reduction (e.g. `x * 2`, `x / 4`).
 fn is_small_constant(expr: &Expr) -> bool {
     matches!(expr, Expr::IntLiteral(_, _))
+}
+
+/// True if this statement unconditionally ends block execution —
+/// subsequent statements in the same block cannot be reached.
+fn stmt_is_terminator(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Return(_, _)
+            | Statement::Break(_)
+            | Statement::Continue(_)
+            | Statement::Transition(_, _)
+    )
 }
 
 fn block_can_exit_or_yield(block: &Block) -> bool {

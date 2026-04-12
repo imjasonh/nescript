@@ -299,6 +299,64 @@ fn analyze_return_wrong_type() {
 }
 
 #[test]
+fn analyze_dead_code_after_break() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            loop {
+                break
+                x += 1
+            }
+        }
+        start Main
+    "#;
+    let errors = analyze_errors(src);
+    assert!(
+        errors.contains(&ErrorCode::W0104),
+        "code after break should trigger W0104, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_dead_code_after_transition() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        state A {
+            on frame {
+                transition B
+                wait_frame
+            }
+        }
+        state B { on frame { wait_frame } }
+        start A
+    "#;
+    let errors = analyze_errors(src);
+    assert!(
+        errors.contains(&ErrorCode::W0104),
+        "code after transition should trigger W0104, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_dead_code_after_return_in_fn() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        fun foo() -> u8 {
+            return 5
+            return 6
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let errors = analyze_errors(src);
+    assert!(
+        errors.contains(&ErrorCode::W0104),
+        "code after return should trigger W0104, got: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_ram_overflow_emits_e0301() {
     // Two arrays totalling >2 KB cannot fit in NES RAM, triggering
     // E0301 at allocation time.
