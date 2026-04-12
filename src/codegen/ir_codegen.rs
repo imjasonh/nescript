@@ -356,12 +356,15 @@ impl<'a> IrCodeGen<'a> {
 
         self.emit_label(&format!("__ir_fn_{}", func.name));
 
-        // At the start of every frame handler, clear the OAM shadow
-        // buffer so stale sprites from the previous frame (or from a
-        // different state's handler) don't linger on screen. We set
-        // the Y position byte of every OAM entry to $FE (off-screen).
-        // The actual drawing code overwrites the slots it needs.
-        if self.in_frame_handler {
+        // At the start of a frame handler that actually draws
+        // sprites, clear the OAM shadow buffer so stale sprites from
+        // the previous frame (or from a different state's handler)
+        // don't linger on screen. We set the Y position byte of every
+        // OAM entry to $FE (off-screen) and the `draw` code
+        // overwrites the slots it needs. Handlers that never call
+        // `draw` skip the clear entirely — the NMI handler's DMA
+        // copies whatever's in $0200 unchanged.
+        if self.in_frame_handler && function_draws_sprites(func) {
             let clear_loop = format!("__ir_oam_clear_{}", func.name);
             self.emit(LDX, AM::Immediate(0));
             self.emit(LDA, AM::Immediate(0xFE));
@@ -798,6 +801,16 @@ fn substitute_asm_vars<F: Fn(&str) -> Option<u16>>(body: &str, resolver: F) -> S
         i += 1;
     }
     out
+}
+
+/// True if the given IR function contains at least one
+/// `DrawSprite` op. Used by the frame-handler OAM clear to skip
+/// the clear loop when a handler doesn't actually draw anything.
+fn function_draws_sprites(func: &IrFunction) -> bool {
+    func.blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::DrawSprite { .. }))
 }
 
 /// Scan the IR functions for all scanline handlers (named
