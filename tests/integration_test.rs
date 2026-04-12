@@ -482,3 +482,69 @@ fn program_with_mmc1() {
     let info = rom::validate_ines(&rom_data).expect("should be valid iNES");
     assert_eq!(info.mapper, 1, "should be MMC1 (mapper 1)");
 }
+
+// ── IR Codegen Tests ──
+
+/// Compile a program using the IR-based codegen path instead of the
+/// AST-based codegen. Validates the full IR pipeline produces a valid ROM.
+fn compile_with_ir_codegen(source: &str) -> Vec<u8> {
+    use nescript::codegen::IrCodeGen;
+
+    let (program, diags) = nescript::parser::parse(source);
+    assert!(
+        diags.is_empty(),
+        "unexpected parse errors: {diags:?}\nsource:\n{source}"
+    );
+    let program = program.expect("parse should succeed");
+
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.diagnostics.iter().all(|d| !d.is_error()),
+        "unexpected analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    // Lower to IR and run the optimizer
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+
+    // IR-based codegen
+    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
+    let instructions = codegen.generate(&ir_program);
+
+    // Link into a ROM
+    let linker = Linker::new(program.game.mirroring);
+    linker.link(&instructions)
+}
+
+#[test]
+fn ir_codegen_minimal_rom() {
+    let source = r#"
+        game "IR Test" { mapper: NROM }
+        var x: u8 = 42
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom_data = compile_with_ir_codegen(source);
+    let info = rom::validate_ines(&rom_data).expect("should be valid iNES");
+    assert_eq!(info.mapper, 0);
+    assert_eq!(rom_data.len(), 16 + 16384 + 8192);
+}
+
+#[test]
+fn ir_codegen_full_pipeline() {
+    let source = r#"
+        game "IR Full" { mapper: NROM }
+        var x: u8 = 0
+        var y: u8 = 0
+        on frame {
+            if button.right { x += 1 }
+            if button.left  { x -= 1 }
+            if x > 100 { x = 0 }
+            draw Smiley at: (x, y)
+        }
+        start Main
+    "#;
+    let rom_data = compile_with_ir_codegen(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}

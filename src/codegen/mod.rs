@@ -1,5 +1,9 @@
+pub mod ir_codegen;
+
 #[cfg(test)]
 mod tests;
+
+pub use ir_codegen::IrCodeGen;
 
 use std::collections::HashMap;
 

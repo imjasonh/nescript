@@ -152,7 +152,7 @@ fn lower_button_read() {
         .blocks
         .iter()
         .flat_map(|b| &b.ops)
-        .any(|op| matches!(op, IrOp::ReadInput));
+        .any(|op| matches!(op, IrOp::ReadInput(_)));
     assert!(has_input, "button read should emit ReadInput op");
 }
 

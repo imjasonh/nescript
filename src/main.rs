@@ -28,6 +28,11 @@ enum Cli {
         /// Dump generated 6502 assembly to stdout
         #[arg(long)]
         asm_dump: bool,
+
+        /// Use the experimental IR-based codegen instead of the
+        /// AST-based codegen. Enables optimizer passes on the output.
+        #[arg(long)]
+        use_ir: bool,
     },
     /// Type-check a source file without building
     Check {
@@ -45,9 +50,10 @@ fn main() {
             output,
             debug,
             asm_dump,
+            use_ir,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
-            match compile(&input, debug, asm_dump) {
+            match compile(&input, debug, asm_dump, use_ir) {
                 Ok(rom) => {
                     std::fs::write(&output, rom).unwrap_or_else(|e| {
                         eprintln!("error: failed to write {}: {e}", output.display());
@@ -80,7 +86,7 @@ fn dump_asm(instructions: &[nescript::asm::Instruction]) {
     }
 }
 
-fn compile(input: &PathBuf, debug: bool, asm_dump: bool) -> Result<Vec<u8>, ()> {
+fn compile(input: &PathBuf, debug: bool, asm_dump: bool, use_ir: bool) -> Result<Vec<u8>, ()> {
     let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
     })?;
@@ -129,11 +135,18 @@ fn compile(input: &PathBuf, debug: bool, asm_dump: bool) -> Result<Vec<u8>, ()> 
         eprintln!("error: {e}");
     })?;
 
-    // Code generation (still AST-based for M2; IR codegen comes in M3)
-    let codegen = CodeGen::new(&analysis.var_allocations, &program.constants)
-        .with_sprites(&sprites)
-        .with_debug(debug);
-    let instructions = codegen.generate(&program);
+    // Code generation: choose between IR-based and AST-based codegen.
+    let instructions = if use_ir {
+        use nescript::codegen::IrCodeGen;
+        IrCodeGen::new(&analysis.var_allocations, &ir_program)
+            .with_sprites(&sprites)
+            .generate(&ir_program)
+    } else {
+        CodeGen::new(&analysis.var_allocations, &program.constants)
+            .with_sprites(&sprites)
+            .with_debug(debug)
+            .generate(&program)
+    };
 
     if asm_dump {
         dump_asm(&instructions);

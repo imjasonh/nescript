@@ -534,13 +534,15 @@ impl LoweringContext {
                 t
             }
             Expr::ButtonRead(_, button, _) => {
-                // Button reads are lowered to a ReadInput + mask check
-                self.emit(IrOp::ReadInput);
-                let t = self.fresh_temp();
+                // Button reads: read the input byte, mask with the button bit.
+                // (Player selection is ignored here; IR codegen handles it.)
+                let input = self.fresh_temp();
+                self.emit(IrOp::ReadInput(input));
                 let mask = button_mask(button);
                 let mask_temp = self.fresh_temp();
                 self.emit(IrOp::LoadImm(mask_temp, mask));
-                self.emit(IrOp::And(t, t, mask_temp));
+                let t = self.fresh_temp();
+                self.emit(IrOp::And(t, input, mask_temp));
                 t
             }
             Expr::ArrayLiteral(_, _) => {
@@ -593,6 +595,14 @@ impl LoweringContext {
         t
     }
 
+    /// Emit an IR "move" from `src` to `dest`: `dest = src | 0`.
+    /// Used to merge values from different control-flow paths.
+    fn emit_move(&mut self, dest: IrTemp, src: IrTemp) {
+        let zero = self.fresh_temp();
+        self.emit(IrOp::LoadImm(zero, 0));
+        self.emit(IrOp::Or(dest, src, zero));
+    }
+
     fn lower_logical_and(&mut self, left: &Expr, right: &Expr) -> IrTemp {
         let result = self.fresh_temp();
         let right_label = self.fresh_label("and_right");
@@ -609,7 +619,7 @@ impl LoweringContext {
         // Right side (only evaluated if left is true)
         self.start_block(&right_label);
         let r = self.lower_expr(right);
-        self.emit(IrOp::StoreVar(VarId(self.next_var_id), r)); // temp storage
+        self.emit_move(result, r);
         self.end_block(IrTerminator::Jump(end_label.clone()));
 
         // False path
@@ -643,7 +653,7 @@ impl LoweringContext {
         // Right side
         self.start_block(&right_label);
         let r = self.lower_expr(right);
-        self.emit(IrOp::StoreVar(VarId(self.next_var_id), r));
+        self.emit_move(result, r);
         self.end_block(IrTerminator::Jump(end_label.clone()));
 
         // Merge
