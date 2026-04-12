@@ -932,7 +932,7 @@ start Main
 - Full analyzer (call graph, depth limits, recursion detection, state validation)
 - IR lowering
 - Basic optimizer (constant folding, dead code)
-- Codegen from IR (replacing direct AST codegen)
+- Codegen from IR
 - Memory map report
 - Call graph report
 

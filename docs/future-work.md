@@ -314,7 +314,7 @@ These items were documented as future work but have since been implemented:
 - **debug.log / debug.assert** — parses into `Statement::DebugLog` /
   `Statement::DebugAssert`, codegen emits runtime writes to $4800 when
   `--debug` is set, stripped in release mode
-- **--debug CLI flag wired** — threads through `CodeGen::with_debug`
+- **--debug CLI flag wired** — threads through `IrCodeGen::with_debug`
 - **IR-based codegen** — `src/codegen/ir_codegen.rs` walks `IrProgram` and
   emits 6502 for every IR op: load/store, arithmetic, comparisons, arrays,
   calls, draws, input (P1 and P2), scroll, debug.log/assert, state
@@ -330,8 +330,8 @@ These items were documented as future work but have since been implemented:
 - **IR scroll support** — `scroll(x, y)` lowers to `IrOp::Scroll(x, y)`
   which emits two PPU $2005 writes in IR codegen
 - **IR debug.log / debug.assert** — new `IrOp::DebugLog(temps)` and
-  `IrOp::DebugAssert(cond)` variants, emitted as $4800 writes in debug
-  mode and stripped in release (same behavior as AST codegen)
+  `IrOp::DebugAssert(cond)` variants, emitted as $4800 writes in
+  debug mode and stripped in release
 - **Asset pipeline @binary / @chr loading** — `resolve_sprites()` reads
   raw binary files and converts PNGs via `png_to_chr()`. Missing files
   are silently skipped (documentation-friendly)
@@ -354,15 +354,18 @@ These items were documented as future work but have since been implemented:
   allocator stops at `$0800`; overflow emits E0301 at the declaration
 - **E0505 multiple start declarations** — parser rejects a second
   `start X` token
-- **`on scanline(N)` parsing** — `state { on scanline(240) { ... } }`
+- **`on scanline(N)` handlers** — `state { on scanline(240) { ... } }`
   parses and populates `StateDecl::on_scanline`; analyzer emits E0203
-  if the game isn't using MMC3. Codegen (MMC3 IRQ vector wiring) is
-  still TODO
+  if the game isn't using MMC3. The IR codegen now emits the full
+  MMC3 IRQ vector glue: per-state dispatch in `__irq_user` and a
+  `__ir_mmc3_reload` helper that picks the right `$C000` latch value
+  based on `current_state`. See `examples/scanline_split.ne` and
+  `examples/mmc3_per_state_split.ne`.
 - **Inline assembly** — `asm { ... }` blocks. The lexer captures the
   body as a raw `AsmBody` token; `src/asm/inline_parser.rs` provides a
   minimal 6502 mnemonic parser that handles every addressing mode the
-  codegen emits. Both IR and AST codegen splice parsed instructions
-  directly into the output stream
+  codegen emits. The IR codegen splices parsed instructions directly
+  into the output stream
 - **Enum types** — `enum Name { V1, V2, ... }` declares u8 constants
   with values equal to declaration order. Variant names are flattened
   into the global symbol table
