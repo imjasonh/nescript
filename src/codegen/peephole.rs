@@ -349,64 +349,63 @@ fn modifies_a(op: Opcode) -> bool {
 /// Track what `A` holds through a linear run of instructions and
 /// eliminate `LDA` that would reload a value A already has.
 ///
-/// The tracker knows about three states:
-/// - `AKnown::None` — A's value is unknown
-/// - `AKnown::Addr(addr)` — A equals the byte currently at `addr`
-/// - `AKnown::Imm(val)` — A equals the immediate value `val`
+/// We track an equivalence class for A: at any point, A equals a
+/// single `AValue` (immediate, ZP cell, or absolute cell). After a
+/// `STA addr`, that address is added to the equivalence — a later
+/// `LDA` from the same class is redundant.
 ///
-/// After any instruction that may clobber A (ADC, AND, etc.) we
-/// transition to `None`. After `STA addr` A is still known and we
-/// additionally record that `addr` now equals A's known value (so a
-/// later `LDA addr` is redundant). Any control-flow instruction or
-/// label resets the tracker.
+/// Any instruction that may clobber A resets the tracker, as does
+/// a control-flow instruction or label.
 fn remove_redundant_loads(instructions: &mut Vec<Instruction>) {
-    use AKnown::*;
     let mut keep = vec![true; instructions.len()];
-    let mut a: AKnown = None;
+    // Current equivalence class for A. All members hold the same
+    // value as A right now.
+    let mut eq: Vec<AValue> = Vec::new();
+
     for (i, inst) in instructions.iter().enumerate() {
         if instruction_crosses_block(inst) {
-            a = None;
+            eq.clear();
             continue;
         }
         match (inst.opcode, &inst.mode) {
             (Opcode::LDA, AddressingMode::Immediate(v)) => {
-                if let Imm(existing) = a {
-                    if existing == *v {
-                        keep[i] = false;
-                        continue;
-                    }
+                if eq.contains(&AValue::Imm(*v)) {
+                    keep[i] = false;
+                    continue;
                 }
-                a = Imm(*v);
+                eq.clear();
+                eq.push(AValue::Imm(*v));
             }
             (Opcode::LDA, AddressingMode::ZeroPage(addr)) => {
-                if let Zp(existing) = a {
-                    if existing == *addr {
-                        keep[i] = false;
-                        continue;
-                    }
+                if eq.contains(&AValue::Zp(*addr)) {
+                    keep[i] = false;
+                    continue;
                 }
-                a = Zp(*addr);
+                eq.clear();
+                eq.push(AValue::Zp(*addr));
             }
             (Opcode::LDA, AddressingMode::Absolute(addr)) => {
-                if let Abs(existing) = a {
-                    if existing == *addr {
-                        keep[i] = false;
-                        continue;
-                    }
+                if eq.contains(&AValue::Abs(*addr)) {
+                    keep[i] = false;
+                    continue;
                 }
-                a = Abs(*addr);
+                eq.clear();
+                eq.push(AValue::Abs(*addr));
             }
             (Opcode::STA, AddressingMode::ZeroPage(addr)) => {
-                // After STA, A is unchanged. Additionally, `addr` now
-                // holds A's value. Remember that equivalence: a later
-                // `LDA addr` is redundant.
-                a = Zp(*addr);
+                // A unchanged; address now holds A's value. Add the
+                // address to the equivalence class.
+                if eq.is_empty() {
+                    // No prior knowledge — start fresh with this
+                    // address.
+                }
+                eq.push(AValue::Zp(*addr));
             }
             (Opcode::STA, AddressingMode::Absolute(addr)) => {
-                a = Abs(*addr);
+                eq.push(AValue::Abs(*addr));
             }
             (Opcode::STA, _) => {
-                // A unchanged, but we don't track exotic addressing modes.
+                // Other addressing modes: A unchanged.
             }
             // Ops that clobber A — clear tracker.
             (
@@ -426,9 +425,23 @@ fn remove_redundant_loads(instructions: &mut Vec<Instruction>) {
                 | Opcode::TYA,
                 _,
             ) => {
-                a = None;
+                eq.clear();
             }
-            // Ops that don't touch A — leave the tracker alone.
+            // Ops that write to an address we might be tracking:
+            // invalidate any equivalence pointing at that cell,
+            // because the stored value is no longer correct.
+            (
+                Opcode::STX | Opcode::STY | Opcode::INC | Opcode::DEC,
+                AddressingMode::ZeroPage(addr),
+            ) => {
+                eq.retain(|v| !matches!(v, AValue::Zp(a) if *a == *addr));
+            }
+            (
+                Opcode::STX | Opcode::STY | Opcode::INC | Opcode::DEC,
+                AddressingMode::Absolute(addr),
+            ) => {
+                eq.retain(|v| !matches!(v, AValue::Abs(a) if *a == *addr));
+            }
             _ => {}
         }
     }
@@ -442,11 +455,10 @@ fn remove_redundant_loads(instructions: &mut Vec<Instruction>) {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AKnown {
-    None,
+enum AValue {
+    Imm(u8),
     Zp(u8),
     Abs(u16),
-    Imm(u8),
 }
 
 /// Remove `STA temp_slot` instructions whose written value is never
@@ -736,6 +748,26 @@ mod tests {
         optimize(&mut insts);
         // STA, JSR, LDA — all preserved
         assert_eq!(insts.len(), 3);
+    }
+
+    #[test]
+    fn eliminates_duplicate_immediate_loads_across_stores() {
+        // LDA #5; STA $10; LDA #5 — the second LDA should be
+        // eliminated because A still holds 5 after STA.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::Immediate(5)),
+            Instruction::new(STA, AM::ZeroPage(0x10)),
+            Instruction::new(LDA, AM::Immediate(5)),
+            Instruction::new(STA, AM::ZeroPage(0x11)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // Expect: LDA #5, STA $10, STA $11, RTS
+        let lda_count = insts.iter().filter(|i| i.opcode == LDA).count();
+        assert_eq!(
+            lda_count, 1,
+            "expected one LDA (the second is redundant): {insts:?}"
+        );
     }
 
     #[test]
