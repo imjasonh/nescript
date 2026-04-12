@@ -166,6 +166,41 @@ impl IrProgram {
             .map(|b| b.ops.len())
             .sum()
     }
+
+    /// Human-readable pretty-print of the entire program — used by
+    /// the `--dump-ir` CLI flag and by debugging sessions.
+    pub fn pretty(&self) -> String {
+        use std::fmt::Write;
+        let mut out = String::new();
+        out.push_str("# IR Program\n");
+        let _ = writeln!(out, "# start_state = {}", self.start_state);
+        let _ = writeln!(out, "# states = {:?}", self.states);
+        if !self.globals.is_empty() {
+            out.push_str("\n# Globals\n");
+            for g in &self.globals {
+                let _ = writeln!(
+                    out,
+                    "  {} {} (size={}) = {:?}",
+                    g.var_id, g.name, g.size, g.init_value
+                );
+            }
+        }
+        for func in &self.functions {
+            let _ = writeln!(
+                out,
+                "\nfn {}({} params, has_return={}):",
+                func.name, func.param_count, func.has_return
+            );
+            for block in &func.blocks {
+                let _ = writeln!(out, "  {}:", block.label);
+                for op in &block.ops {
+                    let _ = writeln!(out, "    {op:?}");
+                }
+                let _ = writeln!(out, "    -> {:?}", block.terminator);
+            }
+        }
+        out
+    }
 }
 
 impl IrFunction {

@@ -29,6 +29,10 @@ enum Cli {
         #[arg(long)]
         asm_dump: bool,
 
+        /// Dump the lowered IR program to stdout (after optimization)
+        #[arg(long)]
+        dump_ir: bool,
+
         /// Use the legacy AST-based codegen. The default is the IR-based
         /// codegen, which runs the optimizer passes before emitting 6502.
         #[arg(long)]
@@ -50,10 +54,19 @@ fn main() {
             output,
             debug,
             asm_dump,
+            dump_ir,
             use_ast,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
-            match compile(&input, debug, asm_dump, use_ast) {
+            match compile(
+                &input,
+                &CompileOptions {
+                    debug,
+                    asm_dump,
+                    dump_ir,
+                    use_ast,
+                },
+            ) {
                 Ok(rom) => {
                     std::fs::write(&output, rom).unwrap_or_else(|e| {
                         eprintln!("error: failed to write {}: {e}", output.display());
@@ -86,7 +99,19 @@ fn dump_asm(instructions: &[nescript::asm::Instruction]) {
     }
 }
 
-fn compile(input: &PathBuf, debug: bool, asm_dump: bool, use_ast: bool) -> Result<Vec<u8>, ()> {
+#[allow(clippy::struct_excessive_bools)]
+struct CompileOptions {
+    debug: bool,
+    asm_dump: bool,
+    dump_ir: bool,
+    use_ast: bool,
+}
+
+fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
+    let debug = opts.debug;
+    let asm_dump = opts.asm_dump;
+    let dump_ir = opts.dump_ir;
+    let use_ast = opts.use_ast;
     let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
     })?;
@@ -127,6 +152,10 @@ fn compile(input: &PathBuf, debug: bool, asm_dump: bool, use_ast: bool) -> Resul
     // IR lowering and optimization
     let mut ir_program = ir::lower(&program, &analysis);
     optimizer::optimize(&mut ir_program);
+
+    if dump_ir {
+        print!("{}", ir_program.pretty());
+    }
 
     // Resolve sprite assets (CHR data + tile indices) relative to the
     // source file's directory, so `@binary` / `@chr` paths work naturally.
