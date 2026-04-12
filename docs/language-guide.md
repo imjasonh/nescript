@@ -132,6 +132,29 @@ const SPEED: u8 = 3
 const SIN_TABLE: u8[8] = [0, 49, 90, 117, 127, 117, 90, 49]
 ```
 
+### Enums
+
+Enums declare a named set of `u8` constants. Each variant is assigned an
+index starting at 0 in declaration order:
+
+```
+enum Direction { Up, Down, Left, Right }
+// Up=0, Down=1, Left=2, Right=3
+
+var player_dir: u8 = Up
+
+on frame {
+    if button.left  { player_dir = Left }
+    if button.right { player_dir = Right }
+    if player_dir == Down { /* ... */ }
+}
+```
+
+Variant names are global — they are flattened into the top-level symbol
+table, so a variant cannot share its name with any other constant,
+variable, or function (E0501). An enum cannot have more than 256
+variants because each is stored as a `u8`.
+
 ### Memory Placement Hints
 
 The NES has 256 bytes of zero-page RAM with faster access. You can hint where variables should be placed:
@@ -784,13 +807,16 @@ nescript build game.ne
 nescript build game.ne --output my_game.nes
 nescript build game.ne --debug
 nescript build game.ne --asm-dump
+nescript build game.ne --dump-ir
 ```
 
-| Flag          | Description                                    |
-|---------------|------------------------------------------------|
-| `--output`    | Set output ROM file path (default: input.nes)  |
-| `--debug`     | Enable debug mode with runtime checks          |
-| `--asm-dump`  | Dump generated 6502 assembly to stdout         |
+| Flag          | Description                                                    |
+|---------------|----------------------------------------------------------------|
+| `--output`    | Set output ROM file path (default: input.nes)                  |
+| `--debug`     | Enable debug mode with runtime checks                          |
+| `--asm-dump`  | Dump generated 6502 assembly to stdout                         |
+| `--dump-ir`   | Dump the lowered IR program (after optimization) to stdout     |
+| `--use-ast`   | Use the legacy AST-based codegen (default is the IR codegen)   |
 
 ### Check
 

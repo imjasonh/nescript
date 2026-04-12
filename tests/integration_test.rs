@@ -142,6 +142,27 @@ fn program_with_functions() {
 }
 
 #[test]
+fn program_with_enums() {
+    let source = r#"
+        game "Enums" { mapper: NROM }
+        enum Direction { Up, Down, Left, Right }
+        enum Mode { Idle, Running, Jumping }
+
+        var dir: u8 = 0
+        var mode: u8 = 0
+
+        on frame {
+            if button.right { dir = Right }
+            if button.left { dir = Left }
+            if dir == Right { mode = Running }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_inline_asm() {
     let source = r#"
         game "Asm" { mapper: NROM }
