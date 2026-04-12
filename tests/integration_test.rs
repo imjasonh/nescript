@@ -2,13 +2,17 @@ use std::path::Path;
 
 use nescript::analyzer;
 use nescript::assets;
-use nescript::codegen::CodeGen;
+use nescript::codegen::IrCodeGen;
 use nescript::ir;
 use nescript::linker::Linker;
 use nescript::optimizer;
 use nescript::rom;
 
-/// Compile a `NEScript` source string into a .nes ROM.
+/// Compile a `NEScript` source string into a .nes ROM. Runs the full
+/// IR pipeline: parse → analyze → IR lower → optimize → IR codegen
+/// → peephole → link. This is what the `nescript build` CLI does
+/// (minus file IO and the dump flags), so these integration tests
+/// exercise the same path end users hit.
 fn compile(source: &str) -> Vec<u8> {
     let (program, diags) = nescript::parser::parse(source);
     assert!(
@@ -24,16 +28,15 @@ fn compile(source: &str) -> Vec<u8> {
         analysis.diagnostics
     );
 
-    // Run IR lowering and optimization (validates the pipeline works)
     let mut ir_program = ir::lower(&program, &analysis);
     optimizer::optimize(&mut ir_program);
 
     let sprites = assets::resolve_sprites(&program, Path::new("."))
         .expect("sprite resolution should succeed");
 
-    let codegen =
-        CodeGen::new(&analysis.var_allocations, &program.constants).with_sprites(&sprites);
-    let instructions = codegen.generate(&program);
+    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program).with_sprites(&sprites);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
 
     let linker = Linker::new(program.game.mirroring);
     linker.link_with_assets(&instructions, &sprites)
@@ -643,9 +646,9 @@ fn compile_with_mapper(source: &str) -> Vec<u8> {
     let sprites = assets::resolve_sprites(&program, Path::new("."))
         .expect("sprite resolution should succeed");
 
-    let codegen = nescript::codegen::CodeGen::new(&analysis.var_allocations, &program.constants)
-        .with_sprites(&sprites);
-    let instructions = codegen.generate(&program);
+    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program).with_sprites(&sprites);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
 
     let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
     linker.link_with_assets(&instructions, &sprites)
@@ -703,13 +706,15 @@ fn sprite_resolution_uses_tile_index() {
         "tile 0 should still contain the default smiley",
     );
 
-    // In PRG ROM, look for `LDA #$01 ; STA $0201` which writes the Player's
-    // tile index (1) into the tile-index byte of the first OAM slot.
+    // In PRG ROM, look for `LDA #$01 ; STA $0201,Y` which writes
+    // the Player's tile index (1) into the tile-index byte of the
+    // current OAM slot (the slot is computed at runtime via the
+    // OAM cursor in Y). The STA AbsoluteY opcode is $99.
     let prg = &rom_data[16..16 + 16384];
-    let pattern = [0xA9u8, 0x01, 0x8D, 0x01, 0x02];
+    let pattern = [0xA9u8, 0x01, 0x99, 0x01, 0x02];
     assert!(
         prg.windows(pattern.len()).any(|w| w == pattern),
-        "PRG ROM should contain LDA #$01 ; STA $0201 for draw Player",
+        "PRG ROM should contain LDA #$01 ; STA $0201,Y for draw Player",
     );
 }
 
@@ -746,38 +751,11 @@ fn program_with_mmc1() {
 }
 
 // ── IR Codegen Tests ──
-
-/// Compile a program using the IR-based codegen path instead of the
-/// AST-based codegen. Validates the full IR pipeline produces a valid ROM.
-fn compile_with_ir_codegen(source: &str) -> Vec<u8> {
-    use nescript::codegen::IrCodeGen;
-
-    let (program, diags) = nescript::parser::parse(source);
-    assert!(
-        diags.is_empty(),
-        "unexpected parse errors: {diags:?}\nsource:\n{source}"
-    );
-    let program = program.expect("parse should succeed");
-
-    let analysis = analyzer::analyze(&program);
-    assert!(
-        analysis.diagnostics.iter().all(|d| !d.is_error()),
-        "unexpected analysis errors: {:?}",
-        analysis.diagnostics
-    );
-
-    // Lower to IR and run the optimizer
-    let mut ir_program = ir::lower(&program, &analysis);
-    optimizer::optimize(&mut ir_program);
-
-    // IR-based codegen
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
-    let instructions = codegen.generate(&ir_program);
-
-    // Link into a ROM
-    let linker = Linker::new(program.game.mirroring);
-    linker.link(&instructions)
-}
+//
+// These tests exercise specific end-to-end IR codegen behavior.
+// They all use the top-level `compile()` helper now that it runs
+// the full IR pipeline — there's no longer a separate legacy path
+// to compare against.
 
 #[test]
 fn ir_codegen_minimal_rom() {
@@ -787,7 +765,7 @@ fn ir_codegen_minimal_rom() {
         on frame { wait_frame }
         start Main
     "#;
-    let rom_data = compile_with_ir_codegen(source);
+    let rom_data = compile(source);
     let info = rom::validate_ines(&rom_data).expect("should be valid iNES");
     assert_eq!(info.mapper, 0);
     assert_eq!(rom_data.len(), 16 + 16384 + 8192);
@@ -807,7 +785,7 @@ fn ir_codegen_full_pipeline() {
         }
         start Main
     "#;
-    let rom_data = compile_with_ir_codegen(source);
+    let rom_data = compile(source);
     rom::validate_ines(&rom_data).expect("should be valid iNES");
 }
 
@@ -831,7 +809,7 @@ fn ir_codegen_multi_state_dispatch() {
         }
         start Title
     "#;
-    let rom_data = compile_with_ir_codegen(source);
+    let rom_data = compile(source);
     let info = rom::validate_ines(&rom_data).expect("should be valid iNES");
     assert_eq!(info.mapper, 0);
 }
@@ -851,6 +829,144 @@ fn ir_codegen_multi_oam() {
         }
         start Main
     "#;
-    let rom_data = compile_with_ir_codegen(source);
+    let rom_data = compile(source);
     rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn ir_codegen_array_literal_globals_emit_per_byte_init() {
+    // Regression test: `var xs: u8[4] = [10, 20, 30, 40]` used to
+    // compile to a zero-initialized array because `eval_const`
+    // returned `None` for `Expr::ArrayLiteral` and no startup
+    // stores were emitted. The fix captures the literal values
+    // in `IrGlobal::init_array` and has the IR codegen emit one
+    // `LDA #imm; STA base+i` per byte during startup.
+    use nescript::asm::{AddressingMode, Opcode};
+    use nescript::codegen::IrCodeGen;
+
+    let source = r#"
+        game "ArrLit" { mapper: NROM }
+        var xs: u8[4] = [10, 20, 30, 40]
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (prog, diags) = nescript::parser::parse(source);
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let prog = prog.unwrap();
+    let analysis = analyzer::analyze(&prog);
+    let mut ir_program = ir::lower(&prog, &analysis);
+    optimizer::optimize(&mut ir_program);
+
+    let xs_addr = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "xs")
+        .expect("xs should be allocated")
+        .address;
+
+    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
+    let instructions = codegen.generate(&ir_program);
+
+    // For each element, look for `LDA #val` followed shortly by
+    // `STA absolute(xs_addr + i)`. We don't require them to be
+    // adjacent because the peephole passes can reshuffle, but a
+    // store of the correct value to the correct address must
+    // exist.
+    for (i, &expected) in [10u8, 20, 30, 40].iter().enumerate() {
+        let target = xs_addr + i as u16;
+        let has_store = instructions.windows(2).any(|w| {
+            matches!(w[0].mode, AddressingMode::Immediate(v) if v == expected)
+                && w[0].opcode == Opcode::LDA
+                && w[1].opcode == Opcode::STA
+                && matches!(w[1].mode, AddressingMode::Absolute(a) if a == target)
+        });
+        assert!(
+            has_store,
+            "expected `LDA #{expected}; STA ${target:04X}` for xs[{i}] but did not find it"
+        );
+    }
+}
+
+#[test]
+fn ir_codegen_locals_do_not_overlap_array_globals() {
+    // Regression test for the local-allocator off-by-array-size
+    // bug. `IrCodeGen::new` used to start handler-local vars at
+    // `max_global_base + 1`, which for an array global at
+    // `$0300-$0303` put the first local at `$0301` — inside the
+    // array. Any store through that local then corrupted the
+    // array mid-frame. The fix advances past the global's END,
+    // not its base.
+    //
+    // We verify by asking the IR codegen what addresses it
+    // assigned. Since `var_addrs` is private, we check indirectly
+    // via emitted instructions: any `STA $030N` for N > 3 that
+    // isn't part of the startup init must be writing to a local
+    // whose address is outside the array. If the bug regressed,
+    // we'd see `STA $0302` or similar in the frame handler's
+    // computation code.
+    use nescript::asm::{AddressingMode, Opcode};
+    use nescript::codegen::IrCodeGen;
+
+    let source = r#"
+        game "LocalVsArr" { mapper: NROM }
+        var xs: u8[4] = [11, 22, 33, 44]
+        on frame {
+            var tmp: u8 = 0
+            tmp = xs[0]
+            tmp += 1
+            wait_frame
+        }
+        start Main
+    "#;
+    let (prog, diags) = nescript::parser::parse(source);
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let prog = prog.unwrap();
+    let analysis = analyzer::analyze(&prog);
+    let mut ir_program = ir::lower(&prog, &analysis);
+    optimizer::optimize(&mut ir_program);
+
+    let xs_alloc = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "xs")
+        .expect("xs should be allocated");
+    let xs_base = xs_alloc.address;
+    let xs_end = xs_base + xs_alloc.size; // one past last element
+
+    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
+    let instructions = codegen.generate(&ir_program);
+
+    // Collect the (ordered) list of `STA absolute` targets and
+    // immediate values preceding each store. The first four
+    // stores into `[xs_base, xs_end)` should be the `LDA #imm;
+    // STA addr` init pairs — those are fine. Any STA into the
+    // array AFTER the init sequence would indicate a local var
+    // was allocated inside the array.
+    let mut init_stores_seen = 0usize;
+    for w in instructions.windows(2) {
+        if w[1].opcode != Opcode::STA {
+            continue;
+        }
+        let AddressingMode::Absolute(addr) = w[1].mode else {
+            continue;
+        };
+        if addr < xs_base || addr >= xs_end {
+            continue;
+        }
+        if w[0].opcode == Opcode::LDA
+            && matches!(w[0].mode, AddressingMode::Immediate(_))
+            && init_stores_seen < 4
+        {
+            init_stores_seen += 1;
+            continue;
+        }
+        panic!(
+            "store into xs array (${addr:04X}) after init sequence — \
+             local probably overlapping with array global"
+        );
+    }
+    assert_eq!(
+        init_stores_seen, 4,
+        "expected 4 init stores for xs[0..4], found {init_stores_seen}"
+    );
 }

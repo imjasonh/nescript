@@ -7,64 +7,9 @@ in the NEScript compiler. Items are organized by priority and area.
 
 ## 1. IR-Based Code Generation
 
-**Status**: The IR pipeline (lowering + optimization) runs during compilation but
-its output is discarded. Code generation still works from the AST directly
-(`src/codegen/mod.rs`). This means IR-level optimizations have no effect on the
-final ROM.
-
-**What exists**:
-- `src/ir/mod.rs`: Complete IR type definitions (`IrProgram`, `IrFunction`,
-  `IrBasicBlock`, `IrOp`, `IrTerminator`)
-- `src/ir/lowering.rs`: AST → IR translation for all statement and expression types
-- `src/optimizer/mod.rs`: Constant folding, dead code elimination, strength
-  reduction, ZP promotion analysis, function inlining — all operating on IR
-
-**What's needed**:
-- A new `src/codegen/ir_codegen.rs` that walks `IrProgram` and emits 6502
-  `Instruction` sequences from `IrOp`/`IrTerminator` instead of from AST nodes
-- Register allocation strategy for IR temps → A/X/Y/zero-page spill slots
-- Replace the `CodeGen::generate(&program)` call in `main.rs` with
-  `ir_codegen::generate(&ir_program, &analysis)`
-- Once working, delete the AST-based codegen entirely
-
-**IR lowering issues to fix first** (found during code review):
-- `ButtonRead` emits `ReadInput` with no destination temp, then uses uninitialized
-  temp in the `And` mask operation (`src/ir/lowering.rs:534`). The fix: `ReadInput`
-  should store the input byte into a temp, or the lowering should emit
-  `LoadVar(t, input_var_id)` after `ReadInput`.
-- Logical AND/OR use raw `VarId(self.next_var_id)` for temp storage without
-  registering it (`src/ir/lowering.rs:603,637`). Should use `IrTemp` instead.
-- Break/continue create unreachable blocks that contain subsequent dead statements
-  (`src/ir/lowering.rs:259`). Should either skip lowering after a terminator, or
-  the dead code elimination pass should handle it.
-
-**Impact**: Enables all optimizer passes to actually affect output quality.
-Currently the optimizer is validated by tests but its results are thrown away.
-
----
-
-## 2. Codegen Gaps (AST-Based)
-
-These features are parsed and analyzed but produce no 6502 output:
-
-| Feature | Location | Status |
-|---------|----------|--------|
-| Function calls | `codegen:148` | `Statement::Call` is a no-op |
-| Return values | `codegen:148` | `Statement::Return` is a no-op |
-| State transitions | `codegen:148` | `Statement::Transition` is a no-op |
-| Array indexing | `codegen:199-200` | `LValue::ArrayIndex` assignment is a no-op |
-| Array expressions | `codegen:417` | `Expr::ArrayIndex`, `Expr::ArrayLiteral` are no-ops |
-| Function call expressions | `codegen:417` | `Expr::Call` returns nothing |
-| Scroll | `codegen:151-152` | `Statement::Scroll` is a no-op |
-| Load background | `codegen:154-155` | `Statement::LoadBackground` is a no-op |
-| Set palette | `codegen:154-155` | `Statement::SetPalette` is a no-op |
-| Multiply/divide/modulo | `codegen:450-452` | `BinOp::Mul/Div/Mod` only emit left operand |
-| Dynamic shifts | `ir/lowering:575` | Shift amount is hardcoded to 1 |
-
-**Priority fixes for a working multi-state game**:
-1. **Function calls**: JSR to function label, pass args via zero-page, return via A
-2. **State transitions**: Write state ID to a zero-page variable, jump to dispatcher
-3. **Array indexing**: Use X register for index, LDA absolute,X for loads
+**Status**: Complete. The AST → IR lowering, optimizer, and
+`src/codegen/ir_codegen.rs` all work end-to-end; the legacy AST
+codegen has been removed. See "Recently completed" below.
 
 ---
 
@@ -369,12 +314,14 @@ These items were documented as future work but have since been implemented:
 - **debug.log / debug.assert** — parses into `Statement::DebugLog` /
   `Statement::DebugAssert`, codegen emits runtime writes to $4800 when
   `--debug` is set, stripped in release mode
-- **--debug CLI flag wired** — threads through `CodeGen::with_debug`
+- **--debug CLI flag wired** — threads through `IrCodeGen::with_debug`
 - **IR-based codegen** — `src/codegen/ir_codegen.rs` walks `IrProgram` and
   emits 6502 for every IR op: load/store, arithmetic, comparisons, arrays,
   calls, draws, input (P1 and P2), scroll, debug.log/assert, state
-  dispatch, multi-OAM slot allocation, transitions + on_enter handlers.
-  Now the default; `--use-ast` falls back to the legacy AST-based codegen.
+  dispatch, runtime OAM cursor for looped draws, transitions + on_enter
+  handlers. It's the only codegen — the legacy AST-based path and the
+  `--use-ast` flag were removed once the IR pipeline was proven correct
+  by the jsnes emulator smoke test.
 - **IR lowering bug fixes** — `ReadInput` now has a destination temp,
   `ButtonRead` uses the proper input temp, logical AND/OR use a new
   `emit_move` helper instead of the buggy raw VarId temp storage
@@ -383,8 +330,8 @@ These items were documented as future work but have since been implemented:
 - **IR scroll support** — `scroll(x, y)` lowers to `IrOp::Scroll(x, y)`
   which emits two PPU $2005 writes in IR codegen
 - **IR debug.log / debug.assert** — new `IrOp::DebugLog(temps)` and
-  `IrOp::DebugAssert(cond)` variants, emitted as $4800 writes in debug
-  mode and stripped in release (same behavior as AST codegen)
+  `IrOp::DebugAssert(cond)` variants, emitted as $4800 writes in
+  debug mode and stripped in release
 - **Asset pipeline @binary / @chr loading** — `resolve_sprites()` reads
   raw binary files and converts PNGs via `png_to_chr()`. Missing files
   are silently skipped (documentation-friendly)
@@ -407,15 +354,18 @@ These items were documented as future work but have since been implemented:
   allocator stops at `$0800`; overflow emits E0301 at the declaration
 - **E0505 multiple start declarations** — parser rejects a second
   `start X` token
-- **`on scanline(N)` parsing** — `state { on scanline(240) { ... } }`
+- **`on scanline(N)` handlers** — `state { on scanline(240) { ... } }`
   parses and populates `StateDecl::on_scanline`; analyzer emits E0203
-  if the game isn't using MMC3. Codegen (MMC3 IRQ vector wiring) is
-  still TODO
+  if the game isn't using MMC3. The IR codegen now emits the full
+  MMC3 IRQ vector glue: per-state dispatch in `__irq_user` and a
+  `__ir_mmc3_reload` helper that picks the right `$C000` latch value
+  based on `current_state`. See `examples/scanline_split.ne` and
+  `examples/mmc3_per_state_split.ne`.
 - **Inline assembly** — `asm { ... }` blocks. The lexer captures the
   body as a raw `AsmBody` token; `src/asm/inline_parser.rs` provides a
   minimal 6502 mnemonic parser that handles every addressing mode the
-  codegen emits. Both IR and AST codegen splice parsed instructions
-  directly into the output stream
+  codegen emits. The IR codegen splices parsed instructions directly
+  into the output stream
 - **Enum types** — `enum Name { V1, V2, ... }` declares u8 constants
   with values equal to declaration order. Variant names are flattened
   into the global symbol table
@@ -490,23 +440,18 @@ These items were documented as future work but have since been implemented:
 
 For someone picking up this codebase, the recommended order of work:
 
-1. **Delete AST codegen** — IR codegen is now the default and beats
-   the AST codegen in 5/7 examples. Once confidence is high, remove
-   `--use-ast` and `src/codegen/mod.rs`'s AST-specific code.
-2. **Struct literals** — `pos = Vec2 { x: 100, y: 50 }` as an
-   expression. Currently fields must be assigned individually.
-3. **u16 / array / nested struct fields** — current structs only
+1. **u16 / array / nested struct fields** — current structs only
    allow u8/i8/bool fields. The layout machinery is ready for more
    types but the codegen only handles 1-byte loads/stores.
-4. **Audio driver** — the `play`/`start_music`/`stop_music`
+2. **Audio driver** — the `play`/`start_music`/`stop_music`
    statements parse but don't generate any code. A minimal NSF-style
    driver running in NMI would unblock game projects.
-5. **Multi-scanline on_scanline reload** — the current codegen
+3. **Multi-scanline on_scanline reload** — the current codegen
    supports one scanline per state but not a chain of handlers at
    different scanlines in the same frame.
-6. **Register allocator** — proper A/X/Y allocation to replace
+4. **Register allocator** — proper A/X/Y allocation to replace
    zero-page spills used by the current IR codegen. Partially
    mitigated by peephole passes but still wasteful in some cases.
-7. **Match statement** — `match x { 0 => ... , 1 => ... }` would be
+5. **Match statement** — `match x { 0 => ... , 1 => ... }` would be
    useful for state dispatch and enum-driven logic.
 8. **Text / HUD layer** — font sheet + layout system for scores.

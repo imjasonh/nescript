@@ -312,3 +312,68 @@ fn lower_wait_frame() {
         .any(|op| matches!(op, IrOp::WaitFrame));
     assert!(has_wait, "should emit WaitFrame op");
 }
+
+#[test]
+fn array_literal_global_init_is_captured() {
+    // Regression test: `var xs: u8[4] = [1, 2, 3, 4]` used to lose
+    // its initializer because `eval_const` returns None for
+    // `Expr::ArrayLiteral` and `init_value` ended up `None`. The
+    // fix captures the per-element values in a new `init_array`
+    // field so the IR codegen can emit one `LDA #imm; STA base+i`
+    // per byte at startup.
+    let ir = lower_ok(
+        r#"
+        game "Arr" { mapper: NROM }
+        var xs: u8[4] = [1, 2, 3, 4]
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    let xs = ir
+        .globals
+        .iter()
+        .find(|g| g.name == "xs")
+        .expect("`xs` global should exist");
+    assert_eq!(
+        xs.init_array,
+        vec![1, 2, 3, 4],
+        "array literal initializer should populate init_array: {:?}",
+        xs.init_array
+    );
+}
+
+#[test]
+fn for_loop_counter_is_registered_as_handler_local() {
+    // Regression test for bug B's secondary fix: `for i in 0..N`
+    // implicitly declares the counter `i`, and the lowering must
+    // push it onto `current_locals` so the IR codegen can give
+    // it a backing address. Without this entry, every
+    // `LoadVar(i)` / `StoreVar(i)` in the desugared while loop
+    // silently emitted no code (the codegen's `var_addrs` lookup
+    // returned None), the counter stayed at 0, the loop spun
+    // forever, and any `draw` inside the loop kept writing to
+    // the first OAM slot with the index-0 array element.
+    let ir = lower_ok(
+        r#"
+        game "ForCounter" { mapper: NROM }
+        var xs: u8[4] = [1, 2, 3, 4]
+        var out: u8 = 0
+        on frame {
+            for i in 0..4 {
+                out = xs[i]
+            }
+        }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    assert!(
+        frame_fn.locals.iter().any(|l| l.name == "i"),
+        "for-loop counter `i` should be registered as a handler local: {:?}",
+        frame_fn.locals
+    );
+}

@@ -80,8 +80,31 @@ impl Assembler {
     fn emit_instruction(&mut self, inst: &Instruction) {
         match &inst.mode {
             AddressingMode::Label(name) => {
-                // This should be a label definition, not an instruction
-                self.labels.insert(name.clone(), self.current_address());
+                // A `NOP` with a `Label` mode is the label-definition
+                // pseudo-instruction: it records the current address and
+                // emits no bytes. Any other opcode paired with `Label` is
+                // an actual jump-style instruction targeting that label
+                // (e.g. `JMP __ir_main_loop`, `JSR __ir_fn_frame`), which
+                // needs an opcode byte plus a 2-byte absolute-address
+                // fixup resolved in the second pass.
+                if inst.opcode == Opcode::NOP {
+                    self.labels.insert(name.clone(), self.current_address());
+                } else if let Some(op) = opcodes::encode(inst.opcode, &AddressingMode::Absolute(0))
+                {
+                    self.output.push(op);
+                    self.fixups.push(Fixup {
+                        offset: self.output.len(),
+                        label: name.clone(),
+                        kind: FixupKind::Absolute,
+                    });
+                    self.output.push(0); // placeholder low byte
+                    self.output.push(0); // placeholder high byte
+                } else {
+                    panic!(
+                        "opcode {:?} cannot target a label (no absolute encoding)",
+                        inst.opcode
+                    );
+                }
             }
             AddressingMode::LabelRelative(name) => {
                 // Branch to label — emit opcode + placeholder

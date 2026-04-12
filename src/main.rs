@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use nescript::analyzer;
 use nescript::assets;
-use nescript::codegen::{CodeGen, IrCodeGen};
+use nescript::codegen::IrCodeGen;
 use nescript::errors::render_diagnostics;
 use nescript::ir;
 use nescript::linker::Linker;
@@ -41,11 +41,6 @@ enum Cli {
         /// Dump a call graph showing which functions call which.
         #[arg(long)]
         call_graph: bool,
-
-        /// Use the legacy AST-based codegen. The default is the IR-based
-        /// codegen, which runs the optimizer passes before emitting 6502.
-        #[arg(long)]
-        use_ast: bool,
     },
     /// Type-check a source file without building
     Check {
@@ -66,7 +61,6 @@ fn main() {
             dump_ir,
             memory_map,
             call_graph,
-            use_ast,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
             match compile(
@@ -77,7 +71,6 @@ fn main() {
                     dump_ir,
                     memory_map,
                     call_graph,
-                    use_ast,
                 },
             ) {
                 Ok(rom) => {
@@ -226,7 +219,6 @@ struct CompileOptions {
     dump_ir: bool,
     memory_map: bool,
     call_graph: bool,
-    use_ast: bool,
 }
 
 fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
@@ -235,7 +227,6 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     let dump_ir = opts.dump_ir;
     let memory_map = opts.memory_map;
     let call_graph = opts.call_graph;
-    let use_ast = opts.use_ast;
     let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
     })?;
@@ -296,24 +287,14 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         eprintln!("error: {e}");
     })?;
 
-    // Code generation: IR-based is the default. `--use-ast` switches to
-    // the legacy AST-based codegen for comparison and fallback.
-    let mut instructions = if use_ast {
-        CodeGen::new(&analysis.var_allocations, &program.constants)
-            .with_sprites(&sprites)
-            .with_enums(&program.enums)
-            .with_debug(debug)
-            .generate(&program)
-    } else {
-        IrCodeGen::new(&analysis.var_allocations, &ir_program)
-            .with_sprites(&sprites)
-            .with_debug(debug)
-            .generate(&ir_program)
-    };
+    // IR-based code generation. Lower → optimize → emit 6502.
+    let mut instructions = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_debug(debug)
+        .generate(&ir_program);
 
-    // Peephole optimization: cheap pass that removes redundant
-    // store-then-load pairs over IR temp slots. Biggest win for the
-    // IR codegen, but safe for the AST codegen too.
+    // Peephole pass: cleans up the IR codegen's temp-heavy output —
+    // dead stores, redundant loads, short-branch folds, etc.
     nescript::codegen::peephole::optimize(&mut instructions);
 
     if asm_dump {

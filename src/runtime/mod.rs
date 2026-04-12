@@ -17,6 +17,14 @@ const APU_FRAME: u16 = 0x4017;
 pub const ZP_FRAME_FLAG: u8 = 0x00;
 pub const ZP_INPUT_P1: u8 = 0x01;
 pub const ZP_INPUT_P2: u8 = 0x08;
+/// Runtime OAM cursor, incremented by 4 on every `draw` inside a
+/// frame handler. The IR codegen resets this to 0 after the OAM
+/// clear at the top of the handler, so each `draw` writes to the
+/// next 4-byte sprite slot regardless of how many loop iterations
+/// came before it. At 64 slots the u8 naturally wraps to 0 and
+/// the oldest slot gets overwritten — the classic NES flicker
+/// fallback.
+pub const ZP_OAM_CURSOR: u8 = 0x09;
 
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.

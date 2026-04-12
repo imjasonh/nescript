@@ -1,0 +1,87 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8" />
+<title>NEScript jsnes harness</title>
+<style>
+  body { margin: 0; background: #222; color: #eee; font-family: monospace; }
+  canvas { image-rendering: pixelated; background: #000; display: block; }
+  #info { padding: 8px; }
+</style>
+</head>
+<body>
+<canvas id="screen" width="256" height="240"></canvas>
+<div id="info">waiting…</div>
+<script src="./node_modules/jsnes/dist/jsnes.js"></script>
+<script>
+(function () {
+  const { NES } = window.jsnes;
+  const canvas = document.getElementById("screen");
+  const ctx = canvas.getContext("2d");
+  const image = ctx.createImageData(256, 240);
+  // Pre-fill alpha channel so we don't have to do it every frame.
+  const buf = new ArrayBuffer(image.data.length);
+  const buf8 = new Uint8ClampedArray(buf);
+  const buf32 = new Uint32Array(buf);
+  for (let i = 0; i < buf32.length; i++) buf32[i] = 0xff000000;
+
+  const nes = new NES({
+    onFrame(frameBuffer) {
+      for (let i = 0; i < 256 * 240; i++) {
+        // jsnes pixel is 0x00BBGGRR in little-endian = 0xFFBBGGRR when alpha set
+        buf32[i] = 0xff000000 | frameBuffer[i];
+      }
+      image.data.set(buf8);
+      ctx.putImageData(image, 0, 0);
+    },
+    // Silence audio; we are only checking video.
+    onAudioSample() {},
+    sampleRate: 44100,
+  });
+
+  // Expose an API for puppeteer to drive.
+  window.nesHarness = {
+    loadRomBase64(b64) {
+      // atob produces a binary string, which is exactly what jsnes wants.
+      const bin = atob(b64);
+      nes.loadROM(bin);
+    },
+    frame() {
+      nes.frame();
+    },
+    runFrames(n) {
+      for (let i = 0; i < n; i++) nes.frame();
+    },
+    buttonDown(player, button) {
+      nes.buttonDown(player, button);
+    },
+    buttonUp(player, button) {
+      nes.buttonUp(player, button);
+    },
+    // Return a hash and non-zero-pixel count for the current canvas contents.
+    frameStats() {
+      const data = ctx.getImageData(0, 0, 256, 240).data;
+      let nonBlack = 0;
+      let hash = 2166136261 >>> 0; // FNV-1a
+      for (let i = 0; i < data.length; i += 4) {
+        const r = data[i], g = data[i + 1], b = data[i + 2];
+        if (r !== 0 || g !== 0 || b !== 0) nonBlack++;
+        hash ^= r; hash = Math.imul(hash, 16777619);
+        hash ^= g; hash = Math.imul(hash, 16777619);
+        hash ^= b; hash = Math.imul(hash, 16777619);
+      }
+      return { nonBlack, hash: (hash >>> 0).toString(16), totalPixels: 256 * 240 };
+    },
+  };
+
+  // Controller button enum constants (from jsnes Controller).
+  window.nesButtons = {
+    A: 0, B: 1, SELECT: 2, START: 3,
+    UP: 4, DOWN: 5, LEFT: 6, RIGHT: 7,
+  };
+
+  document.getElementById("info").textContent = "ready";
+})();
+</script>
+</body>
+</html>

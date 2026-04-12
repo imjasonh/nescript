@@ -190,15 +190,44 @@ impl LoweringContext {
         }
 
         // Lower globals. Initializers can be any constant expression.
+        // Struct-literal initializers are expanded into per-field
+        // globals so each field gets its own `init_value`; the parent
+        // struct itself is still registered (size=0) so any later IR
+        // op referencing it by name still resolves. Array-literal
+        // initializers are lowered into `init_array` on the parent
+        // global — the IR codegen's startup loop emits one LDA/STA
+        // per byte into the global's base address.
         for var in &program.globals {
             let var_id = self.get_or_create_var(&var.name);
             let init = var.init.as_ref().and_then(|e| self.eval_const(e));
+            let init_array = match &var.init {
+                Some(Expr::ArrayLiteral(elems, _)) => elems
+                    .iter()
+                    .filter_map(|e| self.eval_const(e).map(|v| v as u8))
+                    .collect(),
+                _ => Vec::new(),
+            };
             self.globals.push(IrGlobal {
                 var_id,
                 name: var.name.clone(),
                 size: type_size(&var.var_type),
                 init_value: init,
+                init_array,
             });
+            if let Some(Expr::StructLiteral(_, fields, _)) = &var.init {
+                for (fname, fexpr) in fields {
+                    let full = format!("{}.{fname}", var.name);
+                    let fvid = self.get_or_create_var(&full);
+                    let fval = self.eval_const(fexpr);
+                    self.globals.push(IrGlobal {
+                        var_id: fvid,
+                        name: full,
+                        size: 1,
+                        init_value: fval,
+                        init_array: Vec::new(),
+                    });
+                }
+            }
         }
 
         // Lower user functions
@@ -278,12 +307,20 @@ impl LoweringContext {
     fn lower_handler(&mut self, name: &str, block: &Block, state: &StateDecl) {
         self.next_temp = 0;
         self.current_blocks = Vec::new();
-        let mut locals = Vec::new();
-
-        // Register state-local variables
+        // Seed `current_locals` with the state's declared locals so any
+        // `VarDecl` inside the handler body — tracked by
+        // `lower_statement` via `current_locals` — is appended alongside
+        // them. Without this, handler-local variables (e.g. a `var i`
+        // inside a `while`) would get orphaned: their `VarId` would be
+        // created by `get_or_create_var`, but the `IrFunction`'s
+        // `locals` list (which the IR codegen uses to allocate RAM
+        // addresses) would never see them. The result would be a
+        // silent `LoadVar`/`StoreVar` emit-nothing bug that leaves the
+        // temp slots uninitialized at runtime.
+        self.current_locals = Vec::new();
         for var in &state.locals {
             let var_id = self.get_or_create_var(&var.name);
-            locals.push(IrLocal {
+            self.current_locals.push(IrLocal {
                 var_id,
                 name: var.name.clone(),
                 size: type_size(&var.var_type),
@@ -298,7 +335,7 @@ impl LoweringContext {
         self.functions.push(IrFunction {
             name: name.to_string(),
             blocks: std::mem::take(&mut self.current_blocks),
-            locals,
+            locals: std::mem::take(&mut self.current_locals),
             param_count: 0,
             has_return: false,
             source_span: state.span,
@@ -364,6 +401,22 @@ impl LoweringContext {
                 //     var = start
                 //     while var < end { body; var = var + 1 }
                 let var_id = self.get_or_create_var(var);
+                // The loop variable is implicitly declared by the
+                // `for` statement — track it as a local so the IR
+                // codegen allocates backing storage. Without this
+                // the `StoreVar`/`LoadVar` ops for the counter are
+                // silently dropped by `IrCodeGen` (`var_addrs`
+                // has no entry), making the counter permanently 0
+                // and turning the loop into an infinite one. Same
+                // class of bug as handler-local `var` decls before
+                // the earlier fix.
+                if !self.current_locals.iter().any(|l| l.var_id == var_id) {
+                    self.current_locals.push(IrLocal {
+                        var_id,
+                        name: var.clone(),
+                        size: 1,
+                    });
+                }
                 let start_temp = self.lower_expr(start);
                 self.emit(IrOp::StoreVar(var_id, start_temp));
                 // Precompute the end value once outside the loop

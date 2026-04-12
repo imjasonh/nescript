@@ -14,7 +14,8 @@
 //! - `$03` `current_state`
 //! - `$04-$07` function call params
 //! - `$08` input P2
-//! - `$09-$0F` reserved
+//! - `$09` runtime OAM cursor (used by `draw` to assign slots)
+//! - `$0A-$0F` reserved
 //! - `$10+` user variables + IR temp slots
 //!
 //! IR temps are allocated starting at `TEMP_BASE` (`$80`), giving 128 bytes
@@ -26,6 +27,7 @@ use std::collections::HashMap;
 use crate::analyzer::VarAllocation;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
 use crate::ir::{IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator, VarId};
+use crate::runtime::ZP_OAM_CURSOR;
 
 /// Base zero-page address for IR temp slots.
 const TEMP_BASE: u8 = 0x80;
@@ -54,8 +56,6 @@ pub struct IrCodeGen<'a> {
     state_indices: HashMap<String, u8>,
     /// Set of function names defined in the IR program (for existence checks).
     function_names: std::collections::HashSet<String>,
-    /// Next OAM slot to allocate (0-63); reset at start of each frame handler.
-    next_oam_slot: u8,
     /// True while generating code inside a state frame handler.
     /// When set, `Return` terminators emit `JMP __ir_main_loop` instead of `RTS`.
     in_frame_handler: bool,
@@ -84,12 +84,22 @@ impl<'a> IrCodeGen<'a> {
         // disjoint across functions so nested calls don't corrupt
         // each other.
         let mut local_ram_next: u16 = 0x0300;
-        // Advance past any global addresses so we don't clobber them.
-        // This is conservative: scan existing var_addrs for the max.
-        if let Some(max_global) = var_addrs.values().copied().max() {
-            if max_global >= local_ram_next {
-                local_ram_next = max_global + 1;
-            }
+        // Advance past any RAM global so locals don't clobber them.
+        // Each global occupies `[address, address + size)` — for an
+        // array global at $0308 with size=4 that's $0308..$030C. We
+        // must advance past the END, not the base, otherwise
+        // subsequent locals overlap with the tail of the array.
+        // Globals are looked up by name against the analyzer's
+        // `allocations` (which has per-global sizes) rather than the
+        // `var_addrs` map, which only stores base addresses.
+        let max_ram_global_end = allocations
+            .iter()
+            .filter(|a| a.address >= 0x0100)
+            .map(|a| a.address + a.size.max(1))
+            .max()
+            .unwrap_or(0);
+        if max_ram_global_end > local_ram_next {
+            local_ram_next = max_ram_global_end;
         }
         for func in &ir.functions {
             for (i, local) in func.locals.iter().enumerate() {
@@ -112,7 +122,6 @@ impl<'a> IrCodeGen<'a> {
             sprite_tiles: HashMap::new(),
             state_indices: HashMap::new(),
             function_names,
-            next_oam_slot: 0,
             in_frame_handler: false,
             debug_mode: false,
             allocations,
@@ -188,15 +197,32 @@ impl<'a> IrCodeGen<'a> {
         }
 
         // 1. Variable initializers
+        //
+        // Scalars write a single byte from `init_value`. Array
+        // literals write N bytes from `init_array` at successive
+        // offsets from the global's base address. Uninitialized
+        // globals (neither set) stay at the $00 the RAM-clear left
+        // them.
         for global in &ir.globals {
-            if let Some(val) = global.init_value {
-                if let Some(&addr) = self.var_addrs.get(&global.var_id) {
-                    self.emit(LDA, AM::Immediate(val as u8));
+            let Some(&base) = self.var_addrs.get(&global.var_id) else {
+                continue;
+            };
+            if !global.init_array.is_empty() {
+                for (offset, &byte) in global.init_array.iter().enumerate() {
+                    let addr = base.wrapping_add(offset as u16);
+                    self.emit(LDA, AM::Immediate(byte));
                     if addr < 0x100 {
                         self.emit(STA, AM::ZeroPage(addr as u8));
                     } else {
                         self.emit(STA, AM::Absolute(addr));
                     }
+                }
+            } else if let Some(val) = global.init_value {
+                self.emit(LDA, AM::Immediate(val as u8));
+                if base < 0x100 {
+                    self.emit(STA, AM::ZeroPage(base as u8));
+                } else {
+                    self.emit(STA, AM::Absolute(base));
                 }
             }
         }
@@ -345,14 +371,10 @@ impl<'a> IrCodeGen<'a> {
     }
 
     fn gen_function(&mut self, func: &IrFunction) {
-        // Reset temp slot allocator per function
+        // Reset temp slot allocator per function.
         self.temp_slots.clear();
         self.next_temp_slot = 0;
-        // Reset OAM slot counter per frame handler
         self.in_frame_handler = func.name.ends_with("_frame");
-        if self.in_frame_handler {
-            self.next_oam_slot = 0;
-        }
 
         self.emit_label(&format!("__ir_fn_{}", func.name));
 
@@ -375,6 +397,14 @@ impl<'a> IrCodeGen<'a> {
             self.emit(INX, AM::Implied);
             self.emit(INX, AM::Implied);
             self.emit(BNE, AM::LabelRelative(clear_loop));
+
+            // Reset the runtime OAM cursor so the first `draw`
+            // writes to slot 0. Every subsequent `draw` in this
+            // handler bumps the cursor by 4 — including draws
+            // inside loops, which is why this replaces the old
+            // compile-time `next_oam_slot` bookkeeping.
+            self.emit(LDA, AM::Immediate(0));
+            self.emit(STA, AM::ZeroPage(ZP_OAM_CURSOR));
         }
 
         for block in &func.blocks {
@@ -541,20 +571,41 @@ impl<'a> IrCodeGen<'a> {
                 y,
                 frame,
             } => {
-                // Allocate an OAM slot from $0200-$02FF. Silently drop
-                // draws beyond slot 63 (OAM is full).
-                if self.next_oam_slot >= 64 {
-                    return;
-                }
-                let slot = self.next_oam_slot;
-                self.next_oam_slot = self.next_oam_slot.wrapping_add(1);
-                let base = 0x0200 + u16::from(slot) * 4;
+                // Runtime OAM-cursor-based draw. Each frame handler
+                // resets `ZP_OAM_CURSOR` to 0 after the OAM clear; a
+                // `draw` loads the cursor into Y, writes the four
+                // sprite bytes via `STA $0200,Y` / `$0201,Y` / etc.,
+                // then bumps the cursor by 4 so the next `draw`
+                // lands in the next slot.
+                //
+                // This lets `draw` inside a loop body actually
+                // write to a fresh slot on every iteration — with
+                // the old static `next_oam_slot` scheme every
+                // iteration of a loop clobbered the same 4 bytes,
+                // so only the last iteration was visible.
+                //
+                // At 64 slots the cursor naturally wraps (u8
+                // overflow) and subsequent draws overwrite the
+                // oldest slots — the classic NES "too many
+                // sprites" flicker behavior rather than a silent
+                // compile-time drop.
+                //
+                // Cost over the old static scheme is +1 `LDY`, +4
+                // `INC` (cursor bumps), so roughly +6 bytes per
+                // draw. Worth it for correct loop semantics.
 
-                // Y position at base+0
+                // Load the cursor into Y so the four stores below
+                // all index off the current slot. We do this
+                // once per draw — Y isn't preserved across JSRs
+                // or between unrelated ops, so each draw owns Y
+                // for its duration.
+                self.emit(LDY, AM::ZeroPage(ZP_OAM_CURSOR));
+
+                // Y position at cursor+0
                 self.load_temp(*y);
-                self.emit(STA, AM::Absolute(base));
+                self.emit(STA, AM::AbsoluteY(0x0200));
 
-                // Tile index at base+1 — frame override, sprite lookup, or 0
+                // Tile index at cursor+1 — frame override, sprite lookup, or 0
                 if let Some(f) = frame {
                     self.load_temp(*f);
                 } else if let Some(&tile) = self.sprite_tiles.get(sprite_name) {
@@ -562,15 +613,24 @@ impl<'a> IrCodeGen<'a> {
                 } else {
                     self.emit(LDA, AM::Immediate(0));
                 }
-                self.emit(STA, AM::Absolute(base + 1));
+                self.emit(STA, AM::AbsoluteY(0x0201));
 
-                // Attributes at base+2 (always 0)
+                // Attributes at cursor+2 (always 0)
                 self.emit(LDA, AM::Immediate(0));
-                self.emit(STA, AM::Absolute(base + 2));
+                self.emit(STA, AM::AbsoluteY(0x0202));
 
-                // X position at base+3
+                // X position at cursor+3
                 self.load_temp(*x);
-                self.emit(STA, AM::Absolute(base + 3));
+                self.emit(STA, AM::AbsoluteY(0x0203));
+
+                // Advance the cursor by 4. INC $zp is 2 cycles
+                // and 2 bytes — four of them are smaller and
+                // faster than LDA/CLC/ADC #4/STA. u8 overflow at
+                // slot 64 wraps naturally.
+                self.emit(INC, AM::ZeroPage(ZP_OAM_CURSOR));
+                self.emit(INC, AM::ZeroPage(ZP_OAM_CURSOR));
+                self.emit(INC, AM::ZeroPage(ZP_OAM_CURSOR));
+                self.emit(INC, AM::ZeroPage(ZP_OAM_CURSOR));
             }
             IrOp::ReadInput(dest, player) => {
                 // $01 = P1 input byte, $08 = P2 input byte
@@ -889,9 +949,21 @@ mod tests {
             start Main
         "#,
         );
-        // Should write to OAM slot 0
-        assert!(has_instruction(&insts, STA, &AM::Absolute(0x0200)));
-        assert!(has_instruction(&insts, STA, &AM::Absolute(0x0203)));
+        // The runtime OAM cursor approach writes the four bytes
+        // of each sprite via `STA $0200,Y` through `STA $0203,Y`
+        // with `Y` loaded from the `ZP_OAM_CURSOR` zero-page
+        // slot. Verify the full shape of a draw: the cursor
+        // load, the four indexed stores, and the cursor bump.
+        assert!(has_instruction(&insts, LDY, &AM::ZeroPage(0x09)));
+        assert!(has_instruction(&insts, STA, &AM::AbsoluteY(0x0200)));
+        assert!(has_instruction(&insts, STA, &AM::AbsoluteY(0x0201)));
+        assert!(has_instruction(&insts, STA, &AM::AbsoluteY(0x0202)));
+        assert!(has_instruction(&insts, STA, &AM::AbsoluteY(0x0203)));
+        let cursor_bumps = insts
+            .iter()
+            .filter(|i| i.opcode == INC && i.mode == AM::ZeroPage(0x09))
+            .count();
+        assert_eq!(cursor_bumps, 4, "draw should bump cursor by 4");
     }
 
     #[test]
@@ -1004,15 +1076,23 @@ mod more_tests {
             start Main
         "#,
         );
-        // Should write to OAM slot 0 ($0200) and slot 1 ($0204)
-        let writes_slot0 = insts
+        // With the runtime OAM cursor, sequential slots come for
+        // free at runtime: each `draw` bumps `ZP_OAM_CURSOR` by 4
+        // so the next draw's `STA $0200,Y` lands 4 bytes later.
+        // We can't check slot numbers statically any more, but
+        // we can check that (a) both draws emitted their cursor
+        // loads, and (b) the total cursor-bump count matches the
+        // number of draws.
+        let lda_cursor = insts
             .iter()
-            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x0200));
-        let writes_slot1 = insts
+            .filter(|i| i.opcode == LDY && i.mode == AM::ZeroPage(0x09))
+            .count();
+        let cursor_bumps = insts
             .iter()
-            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x0204));
-        assert!(writes_slot0, "first draw should use OAM slot 0");
-        assert!(writes_slot1, "second draw should use OAM slot 1");
+            .filter(|i| i.opcode == INC && i.mode == AM::ZeroPage(0x09))
+            .count();
+        assert_eq!(lda_cursor, 2, "each draw should LDY cursor once");
+        assert_eq!(cursor_bumps, 8, "each draw should bump cursor 4 times");
     }
 
     #[test]
@@ -1177,5 +1257,79 @@ mod more_tests {
         // Should emit a BRK for the fail path
         let has_brk = insts.iter().any(|i| i.opcode == BRK);
         assert!(has_brk, "debug.assert should emit BRK on failure path");
+    }
+
+    #[test]
+    fn ir_codegen_draw_in_loop_emits_one_cursor_based_draw_not_unrolled() {
+        // Regression test for bug B. A `draw` inside a `while`
+        // loop body must compile to ONE cursor-based draw that
+        // runs on every iteration — not zero draws (original
+        // bug when combined with handler-local VarDecl tracking)
+        // and not unrolled-per-slot static stores (the old bug
+        // where `next_oam_slot` was incremented at compile time,
+        // so only the last iteration was ever visible).
+        //
+        // Concretely: we should see exactly one `LDY $09` and
+        // four `INC $09` — the shape of a single draw — inside
+        // the loop body, and NO static `STA $0200` / `$0204` /
+        // `$0208` / `$020C` patterns (which would indicate the
+        // old compile-time slot bump).
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var xs: u8[4] = [10, 40, 80, 120]
+            on frame {
+                var i: u8 = 0
+                while i < 4 {
+                    draw Smiley at: (xs[i], xs[i])
+                    i += 1
+                }
+            }
+            start Main
+        "#,
+        );
+
+        let cursor_loads = insts
+            .iter()
+            .filter(|i| i.opcode == LDY && i.mode == AM::ZeroPage(0x09))
+            .count();
+        let cursor_bumps = insts
+            .iter()
+            .filter(|i| i.opcode == INC && i.mode == AM::ZeroPage(0x09))
+            .count();
+        assert_eq!(
+            cursor_loads, 1,
+            "a single `draw` in a loop should emit one `LDY cursor` (body is emitted once)"
+        );
+        assert_eq!(
+            cursor_bumps, 4,
+            "a single `draw` in a loop should emit 4 `INC cursor`"
+        );
+
+        // There must be AT LEAST ONE `STA $0200,Y` (the Y-byte
+        // store); other slot-0-absolute stores are a smell but
+        // allowed for non-draw code.
+        let has_abs_y_store = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::AbsoluteY(0x0200));
+        assert!(
+            has_abs_y_store,
+            "draw should emit `STA $0200,Y` (runtime-cursor indexed store)"
+        );
+
+        // No `STA $0204` / `$0208` / `$020C` — those would
+        // indicate the compiler allocated four separate static
+        // OAM slots for a single draw statement (bug B).
+        for slot in 1..16u16 {
+            let addr = 0x0200 + slot * 4;
+            let has_stale_static = insts
+                .iter()
+                .any(|i| i.opcode == STA && i.mode == AM::Absolute(addr));
+            assert!(
+                !has_stale_static,
+                "unexpected static OAM slot {slot} store at ${addr:04X} \
+                 — bug B regression (compile-time slot bumps are back)"
+            );
+        }
     }
 }
