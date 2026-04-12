@@ -765,6 +765,11 @@ impl Analyzer {
                 self.walk_expr_reads(cond);
                 self.check_expr_type(cond, &NesType::Bool);
             }
+            Statement::InlineAsm(_, _) => {
+                // Inline assembly is treated as an opaque block. The
+                // codegen parses and validates the body; analysis has
+                // nothing to check.
+            }
         }
     }
 
@@ -1001,7 +1006,8 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
         | Statement::Break(_)
         | Statement::Continue(_)
         | Statement::LoadBackground(_, _)
-        | Statement::SetPalette(_, _) => {}
+        | Statement::SetPalette(_, _)
+        | Statement::InlineAsm(_, _) => {}
     }
 }
 

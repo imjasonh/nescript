@@ -820,6 +820,22 @@ impl Parser {
                 Ok(Statement::Scroll(x, y, span))
             }
             TokenKind::KwDebug => self.parse_debug_statement(),
+            TokenKind::KwAsm => {
+                let span = self.current_span();
+                self.advance(); // KwAsm
+                                // The lexer emits an AsmBody token after `asm` when it
+                                // sees the opening brace. Consume it here.
+                if let TokenKind::AsmBody(body) = self.peek().clone() {
+                    self.advance();
+                    Ok(Statement::InlineAsm(body, span))
+                } else {
+                    Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        "expected `{` after `asm`",
+                        self.current_span(),
+                    ))
+                }
+            }
             TokenKind::Ident(_) => self.parse_assign_or_call(),
             _ => Err(Diagnostic::error(
                 ErrorCode::E0201,

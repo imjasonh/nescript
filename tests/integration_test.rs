@@ -142,6 +142,27 @@ fn program_with_functions() {
 }
 
 #[test]
+fn program_with_inline_asm() {
+    let source = r#"
+        game "Asm" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            asm {
+                LDA #$42
+                STA $10
+                INC $10
+                LSR A
+                CLC
+                ADC #$01
+            }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_while_loop() {
     let source = r#"
         game "Loops" { mapper: NROM }

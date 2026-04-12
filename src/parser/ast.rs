@@ -245,6 +245,9 @@ pub enum Statement {
     /// debug.assert(cond) — runtime check, halts on failure.
     /// Stripped in release mode.
     DebugAssert(Expr, Span),
+    /// Inline 6502 assembly captured verbatim. The body is parsed by
+    /// the codegen stage using `asm::parse_inline`.
+    InlineAsm(String, Span),
 }
 
 impl Statement {
@@ -266,7 +269,8 @@ impl Statement {
             | Self::SetPalette(_, s)
             | Self::Scroll(_, _, s)
             | Self::DebugLog(_, s)
-            | Self::DebugAssert(_, s) => *s,
+            | Self::DebugAssert(_, s)
+            | Self::InlineAsm(_, s) => *s,
         }
     }
 }

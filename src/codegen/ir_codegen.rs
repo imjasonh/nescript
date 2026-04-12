@@ -488,6 +488,20 @@ impl<'a> IrCodeGen<'a> {
                     self.emit_label(&pass_label);
                 }
             }
+            IrOp::InlineAsm(body) => {
+                // Parse the asm body with the shared inline parser and
+                // splice the resulting instructions directly into our
+                // output stream. Parse errors are emitted as `BRK` so
+                // the ROM still links — codegen is too late to return
+                // user-facing diagnostics cleanly.
+                match crate::asm::parse_inline(body) {
+                    Ok(parsed) => self.instructions.extend(parsed),
+                    Err(msg) => {
+                        eprintln!("inline asm error: {msg}");
+                        self.emit(BRK, AM::Implied);
+                    }
+                }
+            }
             IrOp::SourceLoc(_) => {
                 // No code for source location markers
             }

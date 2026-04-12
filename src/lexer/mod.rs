@@ -11,6 +11,10 @@ pub struct Lexer<'a> {
     pos: usize,
     file_id: u16,
     diagnostics: Vec<Diagnostic>,
+    /// When true, the next `{` that would normally be lexed as
+    /// `LBrace` triggers raw-text capture until the matching `}`. Set
+    /// right after emitting `KwAsm`.
+    asm_body_pending: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -20,6 +24,7 @@ impl<'a> Lexer<'a> {
             pos: 0,
             file_id,
             diagnostics: Vec::new(),
+            asm_body_pending: false,
         }
     }
 
@@ -87,6 +92,19 @@ impl<'a> Lexer<'a> {
     fn next_token(&mut self) -> Option<Token> {
         let start = self.pos;
         let ch = self.advance();
+
+        // If we're right after `asm` and see `{`, consume the entire
+        // body until the matching `}` as a single `AsmBody` token.
+        if self.asm_body_pending && ch == b'{' {
+            self.asm_body_pending = false;
+            return Some(self.capture_asm_body(start));
+        }
+        // Any non-`{` token clears the pending flag so we don't get
+        // confused by things like `asm ;` (which is a syntax error
+        // the parser will complain about).
+        if self.asm_body_pending {
+            self.asm_body_pending = false;
+        }
 
         match ch {
             b'(' => Some(self.make_token(TokenKind::LParen, start)),
@@ -440,7 +458,10 @@ impl<'a> Lexer<'a> {
             "load_background" => TokenKind::KwLoadBackground,
             "set_palette" => TokenKind::KwSetPalette,
             "scroll" => TokenKind::KwScroll,
-            "asm" => TokenKind::KwAsm,
+            "asm" => {
+                self.asm_body_pending = true;
+                TokenKind::KwAsm
+            }
             "raw" => TokenKind::KwRaw,
             "bank" => TokenKind::KwBank,
             "loop" => TokenKind::KwLoop,
@@ -457,6 +478,33 @@ impl<'a> Lexer<'a> {
             kind,
             span: self.span(start, self.pos),
         })
+    }
+}
+
+impl Lexer<'_> {
+    /// Capture everything between the `{` we just consumed and the
+    /// matching `}` as an `AsmBody` token. 6502 assembly has no
+    /// `{`/`}` in its syntax, so we can simply scan for the next `}`.
+    fn capture_asm_body(&mut self, start: usize) -> Token {
+        let body_start = self.pos;
+        while self.pos < self.source.len() && self.source[self.pos] != b'}' {
+            self.pos += 1;
+        }
+        let body = String::from_utf8_lossy(&self.source[body_start..self.pos]).into_owned();
+        if self.pos < self.source.len() {
+            // Consume the closing brace
+            self.pos += 1;
+        } else {
+            self.diagnostics.push(Diagnostic::error(
+                ErrorCode::E0101,
+                "unterminated `asm {` block",
+                self.span(start, self.pos),
+            ));
+        }
+        Token {
+            kind: TokenKind::AsmBody(body),
+            span: self.span(start, self.pos),
+        }
     }
 }
 

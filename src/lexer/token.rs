@@ -125,6 +125,11 @@ pub enum TokenKind {
     ShiftLeftAssign,
     ShiftRightAssign,
 
+    // Raw text from `asm { ... }` or `raw asm { ... }` blocks.
+    // The body is captured verbatim (including newlines) so the
+    // inline-asm parser can tokenize its own mnemonics.
+    AsmBody(String),
+
     // Special
     Eof,
 }
@@ -217,6 +222,7 @@ impl std::fmt::Display for TokenKind {
             Self::CaretAssign => write!(f, "^="),
             Self::ShiftLeftAssign => write!(f, "<<="),
             Self::ShiftRightAssign => write!(f, ">>="),
+            Self::AsmBody(_) => write!(f, "<asm body>"),
             Self::Eof => write!(f, "EOF"),
         }
     }

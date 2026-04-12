@@ -326,6 +326,9 @@ impl LoweringContext {
                 let t = self.lower_expr(cond);
                 self.emit(IrOp::DebugAssert(t));
             }
+            Statement::InlineAsm(body, _) => {
+                self.emit(IrOp::InlineAsm(body.clone()));
+            }
         }
     }
 

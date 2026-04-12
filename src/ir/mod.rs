@@ -137,6 +137,8 @@ pub enum IrOp {
     /// Debug: runtime assertion — if `cond` is zero, halt with debug marker.
     /// Stripped in release mode by the codegen.
     DebugAssert(IrTemp),
+    /// Raw 6502 assembly text; parsed and emitted by the codegen.
+    InlineAsm(String),
 
     // Source mapping
     SourceLoc(Span),

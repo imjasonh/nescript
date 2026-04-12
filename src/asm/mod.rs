@@ -1,7 +1,9 @@
+mod inline_parser;
 mod opcodes;
 #[cfg(test)]
 mod tests;
 
+pub use inline_parser::parse_inline;
 pub use opcodes::{AddressingMode, Instruction, Opcode};
 
 use std::collections::HashMap;

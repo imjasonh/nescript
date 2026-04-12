@@ -348,6 +348,13 @@ impl CodeGen {
                     self.emit_label(&pass_label);
                 }
             }
+            Statement::InlineAsm(body, _) => match crate::asm::parse_inline(body) {
+                Ok(parsed) => self.instructions.extend(parsed),
+                Err(msg) => {
+                    eprintln!("inline asm error: {msg}");
+                    self.emit(BRK, AM::Implied);
+                }
+            },
         }
     }
 
