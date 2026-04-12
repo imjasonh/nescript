@@ -361,6 +361,10 @@ impl Analyzer {
                     ));
                 }
             }
+            Statement::Scroll(x, y, _) => {
+                self.check_expr_type(x, &NesType::U8);
+                self.check_expr_type(y, &NesType::U8);
+            }
             Statement::Break(_)
             | Statement::Continue(_)
             | Statement::WaitFrame(_)
@@ -460,6 +464,7 @@ impl Analyzer {
                 })
             }
             Expr::ArrayLiteral(_, _) => Some(NesType::U8), // element type inferred from context
+            Expr::Cast(_, target, _) => Some(target.clone()),
         }
     }
 }
@@ -517,6 +522,10 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
                 collect_calls_expr(f, calls);
             }
         }
+        Statement::Scroll(x, y, _) => {
+            collect_calls_expr(x, calls);
+            collect_calls_expr(y, calls);
+        }
         Statement::Return(None, _)
         | Statement::Transition(_, _)
         | Statement::WaitFrame(_)
@@ -555,6 +564,9 @@ fn collect_calls_expr(expr: &Expr, calls: &mut Vec<String>) {
             for e in elems {
                 collect_calls_expr(e, calls);
             }
+        }
+        Expr::Cast(inner, _, _) => {
+            collect_calls_expr(inner, calls);
         }
         Expr::IntLiteral(_, _)
         | Expr::BoolLiteral(_, _)

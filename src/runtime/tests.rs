@@ -130,3 +130,69 @@ fn irq_handler_is_just_rti() {
     assert_eq!(irq.len(), 1);
     assert_eq!(irq[0].opcode, RTI);
 }
+
+#[test]
+fn multiply_routine_assembles() {
+    let mul = gen_multiply();
+    // Should have a reasonable number of instructions
+    assert!(
+        mul.len() > 5,
+        "multiply routine too short: {} instructions",
+        mul.len()
+    );
+    let result = asm::assemble(&mul, 0x8000);
+    assert!(
+        !result.bytes.is_empty(),
+        "multiply routine should produce bytes"
+    );
+    // Should be under 100 bytes (compact 6502 routine)
+    assert!(
+        result.bytes.len() < 100,
+        "multiply routine is {} bytes, expected < 100",
+        result.bytes.len()
+    );
+    // Should contain the __multiply label
+    assert!(
+        result.labels.contains_key("__multiply"),
+        "should define __multiply label"
+    );
+    // Should end with RTS
+    assert_eq!(
+        mul.last().unwrap().opcode,
+        RTS,
+        "multiply routine should end with RTS"
+    );
+}
+
+#[test]
+fn divide_routine_assembles() {
+    let div = gen_divide();
+    // Should have a reasonable number of instructions
+    assert!(
+        div.len() > 5,
+        "divide routine too short: {} instructions",
+        div.len()
+    );
+    let result = asm::assemble(&div, 0x8000);
+    assert!(
+        !result.bytes.is_empty(),
+        "divide routine should produce bytes"
+    );
+    // Should be under 100 bytes (compact 6502 routine)
+    assert!(
+        result.bytes.len() < 100,
+        "divide routine is {} bytes, expected < 100",
+        result.bytes.len()
+    );
+    // Should contain the __divide label
+    assert!(
+        result.labels.contains_key("__divide"),
+        "should define __divide label"
+    );
+    // Should end with RTS
+    assert_eq!(
+        div.last().unwrap().opcode,
+        RTS,
+        "divide routine should end with RTS"
+    );
+}

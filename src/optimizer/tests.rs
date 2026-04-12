@@ -158,3 +158,188 @@ fn optimize_preserves_used_ops() {
     // StoreVar has no dest so it's always kept.
     assert_eq!(block.ops.len(), 3, "expected 3 ops, got {:?}", block.ops);
 }
+
+// ---------------------------------------------------------------------------
+// Strength reduction tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn strength_reduce_power_of_2() {
+    // Mul(t2, t0, t1) where t1 = 4 -> ShiftLeft(t2, t0, 2)
+    let t0 = IrTemp(0);
+    let t1 = IrTemp(1);
+    let t2 = IrTemp(2);
+
+    let ops = vec![
+        IrOp::LoadImm(t0, 7),
+        IrOp::LoadImm(t1, 4),
+        IrOp::Mul(t2, t0, t1),
+    ];
+    let mut prog = make_program(ops, IrTerminator::Return(Some(t2)));
+    strength_reduce(&mut prog);
+
+    let block = &prog.functions[0].blocks[0];
+    // The Mul should have been replaced with ShiftLeft
+    let has_shift = block
+        .ops
+        .iter()
+        .any(|op| matches!(op, IrOp::ShiftLeft(d, s, 2) if *d == t2 && *s == t0));
+    assert!(
+        has_shift,
+        "expected ShiftLeft(t2, t0, 2), got {:?}",
+        block.ops
+    );
+    // No Mul should remain
+    let has_mul = block.ops.iter().any(|op| matches!(op, IrOp::Mul(..)));
+    assert!(!has_mul, "Mul should have been replaced");
+}
+
+#[test]
+fn strength_reduce_mul_by_3() {
+    // Mul(t2, t0, t1) where t1 = 3 -> Add chain
+    let t0 = IrTemp(0);
+    let t1 = IrTemp(1);
+    let t2 = IrTemp(2);
+
+    let ops = vec![
+        IrOp::LoadImm(t0, 5),
+        IrOp::LoadImm(t1, 3),
+        IrOp::Mul(t2, t0, t1),
+    ];
+    let mut prog = make_program(ops, IrTerminator::Return(Some(t2)));
+    strength_reduce(&mut prog);
+
+    let block = &prog.functions[0].blocks[0];
+    // Mul should have been replaced by two Add ops
+    let add_count = block
+        .ops
+        .iter()
+        .filter(|op| matches!(op, IrOp::Add(..)))
+        .count();
+    assert_eq!(
+        add_count, 2,
+        "expected 2 Add ops for mul-by-3, got {:?}",
+        block.ops
+    );
+    let has_mul = block.ops.iter().any(|op| matches!(op, IrOp::Mul(..)));
+    assert!(!has_mul, "Mul should have been replaced");
+}
+
+#[test]
+fn strength_reduce_leaves_non_power() {
+    // Mul by 5 should NOT be replaced
+    let t0 = IrTemp(0);
+    let t1 = IrTemp(1);
+    let t2 = IrTemp(2);
+
+    let ops = vec![
+        IrOp::LoadImm(t0, 7),
+        IrOp::LoadImm(t1, 5),
+        IrOp::Mul(t2, t0, t1),
+    ];
+    let mut prog = make_program(ops, IrTerminator::Return(Some(t2)));
+    strength_reduce(&mut prog);
+
+    let block = &prog.functions[0].blocks[0];
+    let has_mul = block.ops.iter().any(|op| matches!(op, IrOp::Mul(..)));
+    assert!(has_mul, "Mul by 5 should not be replaced");
+}
+
+// ---------------------------------------------------------------------------
+// Zero-page candidate analysis tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn zp_candidates_by_frequency() {
+    let v0 = VarId(0);
+    let v1 = VarId(1);
+    let v2 = VarId(2);
+    let t0 = IrTemp(0);
+    let t1 = IrTemp(1);
+
+    // v0 accessed 3 times, v1 accessed 1 time, v2 accessed 2 times
+    let ops = vec![
+        IrOp::LoadVar(t0, v0),
+        IrOp::StoreVar(v0, t0),
+        IrOp::LoadVar(t1, v0),
+        IrOp::LoadVar(t0, v2),
+        IrOp::StoreVar(v2, t0),
+        IrOp::LoadVar(t1, v1),
+    ];
+    let prog = make_program(ops, IrTerminator::Return(Some(t1)));
+    let candidates = analyze_zp_candidates(&prog);
+
+    assert!(!candidates.is_empty());
+    // First should be v0 with count 3
+    assert_eq!(candidates[0].0, v0);
+    assert_eq!(candidates[0].1, 3);
+    // v2 with count 2 should be before v1 with count 1
+    let v2_idx = candidates.iter().position(|(v, _)| *v == v2).unwrap();
+    let v1_idx = candidates.iter().position(|(v, _)| *v == v1).unwrap();
+    assert!(
+        v2_idx < v1_idx,
+        "v2 (count 2) should come before v1 (count 1)"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Function inlining tests
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inline_removes_trivial() {
+    // Create a program with a trivial (empty) function and a main function that calls it
+    let t0 = IrTemp(0);
+
+    let trivial_fn = IrFunction {
+        name: "trivial".to_string(),
+        blocks: vec![IrBasicBlock {
+            label: "entry".to_string(),
+            ops: vec![],
+            terminator: IrTerminator::Return(None),
+        }],
+        locals: vec![],
+        param_count: 0,
+        has_return: false,
+        source_span: Span::new(0, 0, 0),
+    };
+
+    let main_fn = IrFunction {
+        name: "main_fn".to_string(),
+        blocks: vec![IrBasicBlock {
+            label: "entry".to_string(),
+            ops: vec![
+                IrOp::Call(None, "trivial".to_string(), vec![]),
+                IrOp::LoadImm(t0, 42),
+            ],
+            terminator: IrTerminator::Return(Some(t0)),
+        }],
+        locals: vec![],
+        param_count: 0,
+        has_return: true,
+        source_span: Span::new(0, 0, 0),
+    };
+
+    let mut prog = IrProgram {
+        functions: vec![trivial_fn, main_fn],
+        globals: vec![],
+        rom_data: vec![],
+    };
+
+    inline_small_functions(&mut prog);
+
+    // The trivial function should be removed
+    assert_eq!(
+        prog.functions.len(),
+        1,
+        "trivial function should have been removed"
+    );
+    assert_eq!(prog.functions[0].name, "main_fn");
+
+    // The call to trivial should be removed from main_fn
+    let has_call = prog.functions[0].blocks[0]
+        .ops
+        .iter()
+        .any(|op| matches!(op, IrOp::Call(..)));
+    assert!(!has_call, "call to trivial function should be removed");
+}

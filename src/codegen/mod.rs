@@ -148,6 +148,9 @@ impl CodeGen {
             | Statement::Call(_, _, _) => {
                 // TODO: implement for later milestones
             }
+            Statement::Scroll(_, _, _) => {
+                // TODO: implement scroll hardware writes
+            }
             Statement::LoadBackground(_, _) | Statement::SetPalette(_, _) => {
                 // TODO: implement in asset pipeline
             }
@@ -397,6 +400,10 @@ impl CodeGen {
                 let mask = button_mask(button);
                 self.emit(LDA, AM::ZeroPage(self.input_addr));
                 self.emit(AND, AM::Immediate(mask));
+            }
+            Expr::Cast(inner, _, _) => {
+                // For now, just evaluate the inner expression
+                self.gen_expr(inner);
             }
             Expr::Call(_, _, _) | Expr::ArrayIndex(_, _, _) | Expr::ArrayLiteral(_, _) => {
                 // TODO: implement for later milestones

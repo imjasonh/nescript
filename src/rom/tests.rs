@@ -109,3 +109,30 @@ fn chr_data_is_padded() {
     assert_eq!(&rom[chr_start..chr_start + 16], &[0xBB; 16]);
     assert_eq!(rom[chr_start + 16], 0x00); // padded with zeros
 }
+
+#[test]
+fn mapper_mmc1_encoded() {
+    let mut builder = RomBuilder::new(Mirroring::Horizontal);
+    builder.set_mapper(crate::rom::mapper_number(crate::parser::ast::Mapper::MMC1));
+    let rom = builder.build();
+    let info = validate_ines(&rom).unwrap();
+    assert_eq!(info.mapper, 1);
+}
+
+#[test]
+fn mapper_uxrom_encoded() {
+    let mut builder = RomBuilder::new(Mirroring::Horizontal);
+    builder.set_mapper(crate::rom::mapper_number(crate::parser::ast::Mapper::UxROM));
+    let rom = builder.build();
+    let info = validate_ines(&rom).unwrap();
+    assert_eq!(info.mapper, 2);
+}
+
+#[test]
+fn mapper_mmc3_encoded() {
+    let mut builder = RomBuilder::new(Mirroring::Horizontal);
+    builder.set_mapper(crate::rom::mapper_number(crate::parser::ast::Mapper::MMC3));
+    let rom = builder.build();
+    let info = validate_ines(&rom).unwrap();
+    assert_eq!(info.mapper, 4);
+}

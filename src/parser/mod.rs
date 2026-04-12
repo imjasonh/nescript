@@ -114,6 +114,7 @@ impl Parser {
         let mut sprites = Vec::new();
         let mut palettes = Vec::new();
         let mut backgrounds = Vec::new();
+        let mut banks = Vec::new();
         let mut start_state = None;
         let mut on_frame = None;
         let span = self.current_span();
@@ -146,6 +147,9 @@ impl Parser {
                 }
                 TokenKind::KwBackground => {
                     backgrounds.push(self.parse_background_decl()?);
+                }
+                TokenKind::KwBank => {
+                    banks.push(self.parse_bank_decl()?);
                 }
                 TokenKind::KwOn => {
                     // Top-level `on frame` — implicit single state for M1
@@ -202,6 +206,7 @@ impl Parser {
             sprites,
             palettes,
             backgrounds,
+            banks,
             start_state,
             span,
         })
@@ -237,13 +242,16 @@ impl Parser {
                     let (val, _) = self.expect_ident()?;
                     mapper = match val.as_str() {
                         "NROM" => Mapper::NROM,
+                        "MMC1" => Mapper::MMC1,
+                        "UxROM" => Mapper::UxROM,
+                        "MMC3" => Mapper::MMC3,
                         _ => {
                             return Err(Diagnostic::error(
                                 ErrorCode::E0201,
                                 format!("unknown mapper '{val}'"),
                                 self.current_span(),
                             )
-                            .with_help("supported mappers for M1: NROM"));
+                            .with_help("supported mappers: NROM, MMC1, UxROM, MMC3"));
                         }
                     };
                 }
@@ -446,6 +454,32 @@ impl Parser {
             on_exit,
             on_frame,
             on_scanline,
+            span: Span::new(start.file_id, start.start, self.current_span().start),
+        })
+    }
+
+    // ── Bank declaration ──
+
+    fn parse_bank_decl(&mut self) -> Result<BankDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwBank)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::Colon)?;
+        let (type_str, _) = self.expect_ident()?;
+        let bank_type = match type_str.as_str() {
+            "prg" => BankType::Prg,
+            "chr" => BankType::Chr,
+            _ => {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!("expected 'prg' or 'chr', found '{type_str}'"),
+                    self.current_span(),
+                ));
+            }
+        };
+        Ok(BankDecl {
+            name,
+            bank_type,
             span: Span::new(start.file_id, start.start, self.current_span().start),
         })
     }
@@ -735,6 +769,16 @@ impl Parser {
                 self.advance();
                 let (name, _) = self.expect_ident()?;
                 Ok(Statement::SetPalette(name, span))
+            }
+            TokenKind::KwScroll => {
+                let span = self.current_span();
+                self.advance();
+                self.expect(&TokenKind::LParen)?;
+                let x = self.parse_expr()?;
+                self.expect(&TokenKind::Comma)?;
+                let y = self.parse_expr()?;
+                self.expect(&TokenKind::RParen)?;
+                Ok(Statement::Scroll(x, y, span))
             }
             TokenKind::Ident(_) => self.parse_assign_or_call(),
             _ => Err(Diagnostic::error(
@@ -1146,27 +1190,38 @@ impl Parser {
     }
 
     fn parse_unary(&mut self) -> Result<Expr, Diagnostic> {
-        match self.peek().clone() {
+        let expr = match self.peek().clone() {
             TokenKind::Minus => {
                 let span = self.current_span();
                 self.advance();
                 let expr = self.parse_unary()?;
-                Ok(Expr::UnaryOp(UnaryOp::Negate, Box::new(expr), span))
+                Expr::UnaryOp(UnaryOp::Negate, Box::new(expr), span)
             }
             TokenKind::KwNot => {
                 let span = self.current_span();
                 self.advance();
                 let expr = self.parse_unary()?;
-                Ok(Expr::UnaryOp(UnaryOp::Not, Box::new(expr), span))
+                Expr::UnaryOp(UnaryOp::Not, Box::new(expr), span)
             }
             TokenKind::Tilde => {
                 let span = self.current_span();
                 self.advance();
                 let expr = self.parse_unary()?;
-                Ok(Expr::UnaryOp(UnaryOp::BitNot, Box::new(expr), span))
+                Expr::UnaryOp(UnaryOp::BitNot, Box::new(expr), span)
             }
-            _ => self.parse_primary(),
+            _ => self.parse_primary()?,
+        };
+        self.parse_cast_suffix(expr)
+    }
+
+    fn parse_cast_suffix(&mut self, mut expr: Expr) -> Result<Expr, Diagnostic> {
+        while *self.peek() == TokenKind::KwAs {
+            let span = self.current_span();
+            self.advance();
+            let target_type = self.parse_type()?;
+            expr = Expr::Cast(Box::new(expr), target_type, span);
         }
+        Ok(expr)
     }
 
     fn parse_primary(&mut self) -> Result<Expr, Diagnostic> {

@@ -3,12 +3,157 @@ mod tests;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator};
+use crate::ir::{IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator, VarId};
 
 /// Run all optimization passes on the IR program.
 pub fn optimize(program: &mut IrProgram) {
+    strength_reduce(program);
+    inline_small_functions(program);
     const_fold(program);
     dead_code(program);
+}
+
+// ---------------------------------------------------------------------------
+// Zero-page promotion analysis
+// ---------------------------------------------------------------------------
+
+/// Analyze IR to count variable access frequency.
+/// Returns a list of `(VarId, count)` sorted by frequency (highest first).
+pub fn analyze_zp_candidates(program: &IrProgram) -> Vec<(VarId, u32)> {
+    let mut counts: HashMap<VarId, u32> = HashMap::new();
+
+    for func in &program.functions {
+        for block in &func.blocks {
+            for op in &block.ops {
+                match op {
+                    IrOp::LoadVar(_, var_id) | IrOp::StoreVar(var_id, _) => {
+                        *counts.entry(*var_id).or_insert(0) += 1;
+                    }
+                    IrOp::ArrayLoad(_, var_id, _) | IrOp::ArrayStore(var_id, _, _) => {
+                        *counts.entry(*var_id).or_insert(0) += 1;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let mut result: Vec<(VarId, u32)> = counts.into_iter().collect();
+    result.sort_by(|a, b| b.1.cmp(&a.1));
+    result
+}
+
+// ---------------------------------------------------------------------------
+// Function inlining
+// ---------------------------------------------------------------------------
+
+/// Inline small functions (< 8 ops) called from <= 2 sites.
+/// For now, just remove empty/trivial functions (those with 0 meaningful ops).
+pub fn inline_small_functions(program: &mut IrProgram) {
+    // Count call sites for each function
+    let mut call_counts: HashMap<String, u32> = HashMap::new();
+    for func in &program.functions {
+        for block in &func.blocks {
+            for op in &block.ops {
+                if let IrOp::Call(_, name, _) = op {
+                    *call_counts.entry(name.clone()).or_insert(0) += 1;
+                }
+            }
+        }
+    }
+
+    // Find functions that are trivial (0 meaningful ops, just return)
+    // and have <= 2 call sites and < 8 ops
+    let trivial_fns: HashSet<String> = program
+        .functions
+        .iter()
+        .filter(|f| {
+            let op_count = f.op_count();
+            let calls = call_counts.get(&f.name).copied().unwrap_or(0);
+            op_count < 8 && calls <= 2 && op_count == 0
+        })
+        .map(|f| f.name.clone())
+        .collect();
+
+    if trivial_fns.is_empty() {
+        return;
+    }
+
+    // Remove calls to trivial functions
+    for func in &mut program.functions {
+        for block in &mut func.blocks {
+            block
+                .ops
+                .retain(|op| !matches!(op, IrOp::Call(_, name, _) if trivial_fns.contains(name)));
+        }
+    }
+
+    // Remove the trivial functions themselves
+    program.functions.retain(|f| !trivial_fns.contains(&f.name));
+}
+
+// ---------------------------------------------------------------------------
+// Strength reduction
+// ---------------------------------------------------------------------------
+
+/// Replace multiply by power-of-2 with shifts, and multiply by 3 with add chain.
+fn strength_reduce(program: &mut IrProgram) {
+    for func in &mut program.functions {
+        for block in &mut func.blocks {
+            strength_reduce_block(block);
+        }
+    }
+}
+
+fn strength_reduce_block(block: &mut IrBasicBlock) {
+    // First, collect known constants from LoadImm ops
+    let mut constants: HashMap<IrTemp, u8> = HashMap::new();
+    for op in &block.ops {
+        if let IrOp::LoadImm(t, v) = op {
+            constants.insert(*t, *v);
+        }
+    }
+
+    // Now scan for Mul ops where one operand is a known constant
+    let mut replacements: Vec<(usize, Vec<IrOp>)> = Vec::new();
+
+    for (i, op) in block.ops.iter().enumerate() {
+        if let IrOp::Mul(dest, a, b) = op {
+            // Check if b is a known constant
+            if let Some(&val) = constants.get(b) {
+                if val.is_power_of_two() && val > 1 {
+                    let shift = val.trailing_zeros() as u8;
+                    replacements.push((i, vec![IrOp::ShiftLeft(*dest, *a, shift)]));
+                } else if val == 3 {
+                    // Mul by 3: tmp = a + a; dest = tmp + a
+                    // We reuse dest as tmp in first step, then compute final
+                    // Actually need a temp. Use dest for the intermediate.
+                    replacements.push((
+                        i,
+                        vec![IrOp::Add(*dest, *a, *a), IrOp::Add(*dest, *dest, *a)],
+                    ));
+                }
+                continue;
+            }
+            // Check if a is a known constant (commutative)
+            if let Some(&val) = constants.get(a) {
+                if val.is_power_of_two() && val > 1 {
+                    let shift = val.trailing_zeros() as u8;
+                    replacements.push((i, vec![IrOp::ShiftLeft(*dest, *b, shift)]));
+                } else if val == 3 {
+                    replacements.push((
+                        i,
+                        vec![IrOp::Add(*dest, *b, *b), IrOp::Add(*dest, *dest, *b)],
+                    ));
+                }
+            }
+        }
+    }
+
+    // Apply replacements in reverse order to maintain correct indices
+    for (i, new_ops) in replacements.into_iter().rev() {
+        block.ops.splice(i..=i, new_ops);
+    }
 }
 
 // ---------------------------------------------------------------------------

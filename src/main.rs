@@ -23,6 +23,10 @@ enum Cli {
         /// Enable debug mode (runtime checks, debug.log)
         #[arg(long)]
         debug: bool,
+
+        /// Dump generated 6502 assembly to stdout
+        #[arg(long)]
+        asm_dump: bool,
     },
     /// Type-check a source file without building
     Check {
@@ -39,9 +43,10 @@ fn main() {
             input,
             output,
             debug,
+            asm_dump,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
-            match compile(&input, debug) {
+            match compile(&input, debug, asm_dump) {
                 Ok(rom) => {
                     std::fs::write(&output, rom).unwrap_or_else(|e| {
                         eprintln!("error: failed to write {}: {e}", output.display());
@@ -64,7 +69,17 @@ fn main() {
     }
 }
 
-fn compile(input: &PathBuf, _debug: bool) -> Result<Vec<u8>, ()> {
+fn dump_asm(instructions: &[nescript::asm::Instruction]) {
+    for inst in instructions {
+        if let nescript::asm::AddressingMode::Label(name) = &inst.mode {
+            println!("{name}:");
+            continue;
+        }
+        println!("    {:?} {:?}", inst.opcode, inst.mode);
+    }
+}
+
+fn compile(input: &PathBuf, _debug: bool, asm_dump: bool) -> Result<Vec<u8>, ()> {
     let source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
     })?;
@@ -104,6 +119,10 @@ fn compile(input: &PathBuf, _debug: bool) -> Result<Vec<u8>, ()> {
     // Code generation (still AST-based for M2; IR codegen comes in M3)
     let codegen = CodeGen::new(&analysis.var_allocations, &program.constants);
     let instructions = codegen.generate(&program);
+
+    if asm_dump {
+        dump_asm(&instructions);
+    }
 
     // Link into ROM
     let linker = Linker::new(program.game.mirroring);

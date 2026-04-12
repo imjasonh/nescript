@@ -3,13 +3,14 @@ mod tests;
 
 use crate::asm;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
-use crate::parser::ast::Mirroring;
+use crate::parser::ast::{Mapper, Mirroring};
 use crate::rom::RomBuilder;
 use crate::runtime;
 
 /// Link compiled code into a complete NES ROM.
 pub struct Linker {
     mirroring: Mirroring,
+    mapper: Mapper,
 }
 
 /// A smiley face CHR tile for the default sprite (M1).
@@ -50,7 +51,14 @@ const DEFAULT_PALETTE: [u8; 32] = [
 
 impl Linker {
     pub fn new(mirroring: Mirroring) -> Self {
-        Self { mirroring }
+        Self {
+            mirroring,
+            mapper: Mapper::NROM,
+        }
+    }
+
+    pub fn with_mapper(mirroring: Mirroring, mapper: Mapper) -> Self {
+        Self { mirroring, mapper }
     }
 
     /// Link all code sections into a .nes ROM.
@@ -110,6 +118,7 @@ impl Linker {
 
         // Build ROM
         let mut builder = RomBuilder::new(self.mirroring);
+        builder.set_mapper(crate::rom::mapper_number(self.mapper));
         builder.set_prg(prg);
 
         // CHR ROM with default sprite tile

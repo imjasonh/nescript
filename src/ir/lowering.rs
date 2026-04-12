@@ -299,6 +299,9 @@ impl LoweringContext {
                 let arg_temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                 self.emit(IrOp::Call(None, name.clone(), arg_temps));
             }
+            Statement::Scroll(_, _, _) => {
+                // TODO: implement scroll hardware writes
+            }
             Statement::LoadBackground(_, _) | Statement::SetPalette(_, _) => {
                 // TODO: implement in asset pipeline
             }
@@ -536,6 +539,10 @@ impl LoweringContext {
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadImm(t, 0));
                 t
+            }
+            Expr::Cast(inner, _, _) => {
+                // For now, just evaluate the inner expression (truncation/extension is a no-op on 8-bit)
+                self.lower_expr(inner)
             }
         }
     }

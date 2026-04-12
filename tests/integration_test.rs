@@ -289,6 +289,26 @@ fn error_test_recursion_detected() {
     );
 }
 
+// ── M4 Tests ──
+
+#[test]
+fn program_with_scroll_and_cast() {
+    let source = r#"
+        game "M4 Test" { mapper: NROM }
+        var px: u8 = 0
+        var py: u8 = 0
+        var wide: u16 = 0
+        on frame {
+            if button.right { px += 1 }
+            wide = px as u16
+            scroll(px, py)
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
 // ── M3 Tests ──
 
 #[test]
@@ -328,4 +348,47 @@ fn program_with_sprites_and_palette() {
     "#;
     let rom_data = compile(source);
     rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+// ── M5 Tests ──
+
+/// Compile a source string using the mapper-aware linker.
+fn compile_with_mapper(source: &str) -> Vec<u8> {
+    let (program, diags) = nescript::parser::parse(source);
+    assert!(
+        diags.is_empty(),
+        "unexpected parse errors: {diags:?}\nsource:\n{source}"
+    );
+    let program = program.expect("parse should succeed");
+
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.diagnostics.iter().all(|d| !d.is_error()),
+        "unexpected analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut ir_program = ir::lower(&program, &analysis);
+    nescript::optimizer::optimize(&mut ir_program);
+
+    let codegen = nescript::codegen::CodeGen::new(&analysis.var_allocations, &program.constants);
+    let instructions = codegen.generate(&program);
+
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    linker.link(&instructions)
+}
+
+#[test]
+fn program_with_mmc1() {
+    let source = r#"
+        game "MMC1 Game" { mapper: MMC1 }
+        var px: u8 = 128
+        on frame {
+            if button.right { px += 2 }
+        }
+        start Main
+    "#;
+    let rom_data = compile_with_mapper(source);
+    let info = rom::validate_ines(&rom_data).expect("should be valid iNES");
+    assert_eq!(info.mapper, 1, "should be MMC1 (mapper 1)");
 }

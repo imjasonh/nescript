@@ -582,3 +582,99 @@ fn parse_set_palette_statement() {
         other => panic!("expected SetPalette, got {other:?}"),
     }
 }
+
+// ── Milestone 4: Optimization & Polish ──
+
+#[test]
+fn parse_cast_expression() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var x: u8 = 0
+        var y: u16 = 0
+        on frame {
+            y = x as u16
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    match &frame.statements[0] {
+        Statement::Assign(_, _, Expr::Cast(inner, target_type, _), _) => {
+            assert!(matches!(inner.as_ref(), Expr::Ident(name, _) if name == "x"));
+            assert_eq!(*target_type, NesType::U16);
+        }
+        other => panic!("expected assignment with Cast, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_scroll_statement() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var px: u8 = 0
+        var py: u8 = 0
+        on frame {
+            scroll(px, py)
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert_eq!(frame.statements.len(), 1);
+    match &frame.statements[0] {
+        Statement::Scroll(x, y, _) => {
+            assert!(matches!(x, Expr::Ident(name, _) if name == "px"));
+            assert!(matches!(y, Expr::Ident(name, _) if name == "py"));
+        }
+        other => panic!("expected Scroll, got {other:?}"),
+    }
+}
+
+// ── Milestone 5: Bank Switching & Release ──
+
+#[test]
+fn parse_mmc1_mapper() {
+    let src = r#"
+        game "Test" { mapper: MMC1 }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.game.mapper, Mapper::MMC1);
+}
+
+#[test]
+fn parse_uxrom_mapper() {
+    let src = r#"
+        game "Test" { mapper: UxROM }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.game.mapper, Mapper::UxROM);
+}
+
+#[test]
+fn parse_mmc3_mapper() {
+    let src = r#"
+        game "Test" { mapper: MMC3 }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.game.mapper, Mapper::MMC3);
+}
+
+#[test]
+fn parse_bank_decl() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        bank Level1Data: prg
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.banks.len(), 1);
+    assert_eq!(prog.banks[0].name, "Level1Data");
+    assert_eq!(prog.banks[0].bank_type, BankType::Prg);
+}

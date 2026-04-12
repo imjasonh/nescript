@@ -10,6 +10,7 @@ pub struct Program {
     pub sprites: Vec<SpriteDecl>,
     pub palettes: Vec<PaletteDecl>,
     pub backgrounds: Vec<BackgroundDecl>,
+    pub banks: Vec<BankDecl>,
     pub start_state: String,
     pub span: Span,
 }
@@ -53,12 +54,28 @@ pub struct GameDecl {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mapper {
     NROM,
+    MMC1,
+    UxROM,
+    MMC3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mirroring {
     Horizontal,
     Vertical,
+}
+
+#[derive(Debug, Clone)]
+pub struct BankDecl {
+    pub name: String,
+    pub bank_type: BankType,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BankType {
+    Prg,
+    Chr,
 }
 
 #[derive(Debug, Clone)]
@@ -150,6 +167,7 @@ pub enum Expr {
     Call(String, Vec<Expr>, Span),
     ButtonRead(Option<Player>, String, Span),
     ArrayLiteral(Vec<Expr>, Span),
+    Cast(Box<Expr>, NesType, Span),
 }
 
 impl Expr {
@@ -163,7 +181,8 @@ impl Expr {
             | Self::UnaryOp(_, _, s)
             | Self::Call(_, _, s)
             | Self::ButtonRead(_, _, s)
-            | Self::ArrayLiteral(_, s) => *s,
+            | Self::ArrayLiteral(_, s)
+            | Self::Cast(_, _, s) => *s,
         }
     }
 }
@@ -221,6 +240,7 @@ pub enum Statement {
     Call(String, Vec<Expr>, Span),
     LoadBackground(String, Span),
     SetPalette(String, Span),
+    Scroll(Expr, Expr, Span),
 }
 
 #[derive(Debug, Clone)]

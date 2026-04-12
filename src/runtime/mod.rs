@@ -143,3 +143,134 @@ pub fn gen_nmi() -> Vec<Instruction> {
 pub fn gen_irq() -> Vec<Instruction> {
     vec![Instruction::implied(RTI)]
 }
+
+/// Zero-page locations used by multiply/divide routines.
+const ZP_MUL_OPERAND: u8 = 0x02;
+const ZP_MUL_RESULT_HI: u8 = 0x03;
+const ZP_DIV_DIVISOR: u8 = 0x02;
+const ZP_DIV_REMAINDER: u8 = 0x03;
+
+/// Generate 8x8 -> 16 software multiply routine.
+///
+/// Input: A = multiplicand, zero-page $02 = multiplier
+/// Output: A = result low byte, $03 = result high byte
+///
+/// Algorithm: shift-and-add. For each bit of the multiplier, if set,
+/// add the (shifted) multiplicand to the result.
+pub fn gen_multiply() -> Vec<Instruction> {
+    let mut out = Vec::new();
+
+    // Label for the subroutine entry
+    out.push(Instruction::new(NOP, AM::Label("__multiply".into())));
+
+    // Store multiplicand in $04 (working copy)
+    out.push(Instruction::new(STA, AM::ZeroPage(0x04)));
+
+    // Clear result: A (low) and $03 (high)
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_MUL_RESULT_HI)));
+
+    // Loop counter: 8 bits
+    out.push(Instruction::new(LDX, AM::Immediate(0x08)));
+
+    // __mul_loop:
+    out.push(Instruction::new(NOP, AM::Label("__mul_loop".into())));
+
+    // Shift multiplier right, check carry (current bit)
+    out.push(Instruction::new(LSR, AM::ZeroPage(ZP_MUL_OPERAND)));
+    out.push(Instruction::new(
+        BCC,
+        AM::LabelRelative("__mul_no_add".into()),
+    ));
+
+    // Carry set: add multiplicand to result
+    // Add low byte
+    out.push(Instruction::implied(CLC));
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_MUL_RESULT_HI)));
+    out.push(Instruction::new(ADC, AM::ZeroPage(0x04)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_MUL_RESULT_HI)));
+
+    // __mul_no_add:
+    out.push(Instruction::new(NOP, AM::Label("__mul_no_add".into())));
+
+    // Shift multiplicand left (double it) for next bit position
+    out.push(Instruction::new(ASL, AM::ZeroPage(0x04)));
+
+    // Decrement counter
+    out.push(Instruction::implied(DEX));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__mul_loop".into()),
+    ));
+
+    // Load low byte of result into A
+    // For 8-bit result, just use the high byte accumulation
+    // (since we shifted the multiplicand left, result is in $03)
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_MUL_RESULT_HI)));
+
+    out.push(Instruction::implied(RTS));
+
+    out
+}
+
+/// Generate 8 / 8 -> 8 software divide routine (restoring division).
+///
+/// Input: A = dividend, zero-page $02 = divisor
+/// Output: A = quotient, $03 = remainder
+pub fn gen_divide() -> Vec<Instruction> {
+    let mut out = Vec::new();
+
+    // Label for the subroutine entry
+    out.push(Instruction::new(NOP, AM::Label("__divide".into())));
+
+    // Store dividend in $04
+    out.push(Instruction::new(STA, AM::ZeroPage(0x04)));
+
+    // Clear remainder
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_DIV_REMAINDER)));
+
+    // Loop counter: 8 bits
+    out.push(Instruction::new(LDX, AM::Immediate(0x08)));
+
+    // __div_loop:
+    out.push(Instruction::new(NOP, AM::Label("__div_loop".into())));
+
+    // Shift dividend left into remainder
+    out.push(Instruction::new(ASL, AM::ZeroPage(0x04)));
+    out.push(Instruction::new(ROL, AM::ZeroPage(ZP_DIV_REMAINDER)));
+
+    // Try to subtract divisor from remainder
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_DIV_REMAINDER)));
+    out.push(Instruction::implied(SEC));
+    out.push(Instruction::new(SBC, AM::ZeroPage(ZP_DIV_DIVISOR)));
+
+    // If remainder >= divisor (no borrow), keep subtraction
+    out.push(Instruction::new(
+        BCC,
+        AM::LabelRelative("__div_no_sub".into()),
+    ));
+
+    // Store updated remainder
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_DIV_REMAINDER)));
+
+    // Set bit 0 of quotient (in $04, which we shifted left)
+    out.push(Instruction::new(INC, AM::ZeroPage(0x04)));
+
+    // __div_no_sub:
+    out.push(Instruction::new(NOP, AM::Label("__div_no_sub".into())));
+
+    // Decrement counter
+    out.push(Instruction::implied(DEX));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__div_loop".into()),
+    ));
+
+    // Load quotient into A
+    out.push(Instruction::new(LDA, AM::ZeroPage(0x04)));
+
+    out.push(Instruction::implied(RTS));
+
+    out
+}

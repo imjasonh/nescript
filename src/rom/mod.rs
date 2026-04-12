@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod tests;
 
-use crate::parser::ast::Mirroring;
+use crate::parser::ast::{Mapper, Mirroring};
 
 /// iNES header magic bytes
 const INES_MAGIC: [u8; 4] = [0x4E, 0x45, 0x53, 0x1A]; // "NES\x1A"
@@ -136,4 +136,14 @@ pub struct RomInfo {
     pub chr_banks: usize,
     pub mapper: u8,
     pub mirroring: Mirroring,
+}
+
+/// Map a `Mapper` enum variant to its iNES mapper number.
+pub fn mapper_number(mapper: Mapper) -> u8 {
+    match mapper {
+        Mapper::NROM => 0,
+        Mapper::MMC1 => 1,
+        Mapper::UxROM => 2,
+        Mapper::MMC3 => 4,
+    }
 }
