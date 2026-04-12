@@ -2,14 +2,20 @@
 // through a local `jsnes` (wrapped by `harness.html` in a
 // puppeteer-driven headless Chrome), lets it render ~180 frames,
 // grabs the raw canvas pixels, and diffs them byte-for-byte against
-// a committed golden PNG under `goldens/`.
+// a committed golden PNG under `goldens/`. It also hashes the
+// audio samples jsnes produced during those frames and compares
+// them against a committed `<name>.audio.hash` golden in the same
+// directory — a one-line FNV-1a hash of the full int16 stereo
+// buffer. Silent programs all hash to the same well-known value;
+// audio-producing programs get a distinct hash that will trip as
+// soon as the audio driver changes behavior.
 //
 // The goldens are the whole contract. Any change to the compiler
 // (or any regression in jsnes, or any change to this harness that
-// affects rendering) will change at least one golden, and the diff
-// will fail CI loudly. That's the point — it's the only way to
-// catch "silently emits wrong code" bugs without writing a
-// full-fat CPU test vector per example.
+// affects rendering or audio) will change at least one golden,
+// and the diff will fail CI loudly. That's the point — it's the
+// only way to catch "silently emits wrong code" bugs without
+// writing a full-fat CPU test vector per example.
 //
 // Updating goldens:
 //
@@ -18,17 +24,21 @@
 //     node run_examples.mjs --update-goldens
 //
 // When a diff is legitimate, rerun with that flag. It rewrites the
-// PNGs in `goldens/` from whatever the harness just produced. Then
-// check the new PNGs in git — `git diff goldens/*.png` lets you eye
-// each change, and the commit message is where you document why.
+// PNGs and audio hashes in `goldens/` from whatever the harness
+// just produced. Then check the new files in git — `git diff
+// goldens/` lets you eye each change, and the commit message is
+// where you document why.
 //
 // When a diff is not legitimate, the runner writes:
 //
 //     actual/<name>.png       the actual pixels for this run
 //     actual/<name>.diff.png  red-highlighted pixel diff vs. golden
+//     actual/<name>.wav       the actual audio samples (stereo PCM)
 //
 // so you can upload them as CI artifacts or inspect locally. The
-// `actual/` directory is gitignored.
+// `actual/` directory is gitignored. Video diffs write the PNG +
+// diff PNG; audio diffs write the WAV so you can listen to what
+// actually came out of the emulator.
 
 import { promises as fs } from "node:fs";
 import path from "node:path";
@@ -128,6 +138,32 @@ function buildDiff(expected, actual) {
   return { mismatched, firstDiff, rgba: out };
 }
 
+// ── File helpers ───────────────────────────────────────────────
+
+// True if `filePath` exists and is readable. Used to decide
+// whether a golden needs to be created (missing) vs diffed.
+async function exists(filePath) {
+  try {
+    await fs.access(filePath);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Write an audio golden file. The format is a single line:
+//
+//     <hex-hash> <sample-count>
+//
+// chosen to be tiny (under 30 bytes per ROM), trivially diffable
+// by git, and human-readable. The sample count is a sanity check
+// — it catches the rare case where two runs produce differing
+// sample counts but the same hash (practically zero probability
+// with FNV-1a, but cheap insurance).
+async function writeAudioGolden(filePath, audio) {
+  await fs.writeFile(filePath, `${audio.hash} ${audio.samples}\n`);
+}
+
 // ── ROM discovery ──────────────────────────────────────────────
 
 async function listRoms() {
@@ -152,7 +188,7 @@ async function runRomInHarness(page, rom) {
     await page.evaluate((b64) => window.nesHarness.loadRomBase64(b64), romB64);
   } catch (err) {
     bootError = String(err);
-    return { bootError, rgba: null };
+    return { bootError, rgba: null, audio: null };
   }
 
   try {
@@ -163,7 +199,7 @@ async function runRomInHarness(page, rom) {
       FRAMES_TO_RUN,
     );
   } catch (err) {
-    return { bootError: String(err), rgba: null };
+    return { bootError: String(err), rgba: null, audio: null };
   }
   // Frame count here is a no-op marker kept for readability.
   void SCREENSHOT_FRAME;
@@ -174,9 +210,22 @@ async function runRomInHarness(page, rom) {
     return {
       bootError: `harness returned ${rgba.length} pixel bytes, expected ${PIXEL_BYTES}`,
       rgba: null,
+      audio: null,
     };
   }
-  return { bootError: null, rgba };
+  // Pull the audio hash (tiny — just a hex string + sample count).
+  // The WAV bytes themselves are only fetched on diff failure to
+  // keep the happy-path fast.
+  const audio = await page.evaluate(() => window.nesHarness.audioHash());
+  return { bootError: null, rgba, audio };
+}
+
+/// Read the full WAV bytes from the harness. Only called when an
+/// audio diff fails — we don't want to pay the round-trip cost on
+/// every ROM.
+async function fetchAudioWav(page) {
+  const wavB64 = await page.evaluate(() => window.nesHarness.audioWavBase64());
+  return Buffer.from(wavB64, "base64");
 }
 
 // ── Main ───────────────────────────────────────────────────────
@@ -218,10 +267,10 @@ async function main() {
         "window.nesHarness && document.getElementById('info').textContent === 'ready'",
       );
 
-      const { bootError, rgba } = await runRomInHarness(page, rom);
-      await page.close();
+      const { bootError, rgba, audio } = await runRomInHarness(page, rom);
 
       if (bootError || !rgba) {
+        await page.close();
         failures++;
         const reason = `boot error: ${bootError ?? "no pixels"}`;
         results.push({ name: rom.name, status: "FAIL", reason });
@@ -230,38 +279,49 @@ async function main() {
         continue;
       }
 
-      const goldenPath = path.join(goldensDir, `${rom.name}.png`);
-      let goldenExists = true;
-      try {
-        await fs.access(goldenPath);
-      } catch {
-        goldenExists = false;
-      }
+      const goldenPngPath = path.join(goldensDir, `${rom.name}.png`);
+      const goldenAudioPath = path.join(goldensDir, `${rom.name}.audio.hash`);
+
+      const pngExists = await exists(goldenPngPath);
+      const audioExists = await exists(goldenAudioPath);
 
       // ── Update mode ──────────────────────────────────────
       if (updateGoldens) {
-        await writePng(goldenPath, rgba);
+        await writePng(goldenPngPath, rgba);
+        await writeAudioGolden(goldenAudioPath, audio);
         results.push({ name: rom.name, status: "UPDATED", reason: null });
-        console.log(`UPD   ${rom.name.padEnd(28)} wrote golden`);
+        console.log(
+          `UPD   ${rom.name.padEnd(28)} wrote png + audio (hash=${audio.hash}, n=${audio.samples})`,
+        );
+        await page.close();
         continue;
       }
 
-      // ── Missing golden ──────────────────────────────────
-      if (!goldenExists) {
+      // ── Missing goldens ─────────────────────────────────
+      // We treat either missing PNG or missing audio hash as a
+      // failure — both are part of the committed contract. The
+      // user fixes both in one shot with UPDATE_GOLDENS=1.
+      if (!pngExists || !audioExists) {
         failures++;
-        // Write the actual so the user can inspect, then bail.
         await writePng(path.join(actualDir, `${rom.name}.png`), rgba);
-        const reason = `no golden at ${path.relative(repoRoot, goldenPath)} — run with UPDATE_GOLDENS=1 to create`;
+        const wavBytes = await fetchAudioWav(page);
+        await fs.writeFile(path.join(actualDir, `${rom.name}.wav`), wavBytes);
+        const missing = [];
+        if (!pngExists) missing.push("png");
+        if (!audioExists) missing.push("audio");
+        const reason = `missing golden(s): ${missing.join(", ")} — run with UPDATE_GOLDENS=1 to create`;
         results.push({ name: rom.name, status: "MISSING", reason });
         console.log(`MISS  ${rom.name.padEnd(28)} ${reason}`);
+        await page.close();
         continue;
       }
 
-      // ── Byte-for-byte diff ──────────────────────────────
+      // ── PNG byte-for-byte diff ──────────────────────────
       let golden;
       try {
-        golden = await decodeGolden(goldenPath);
+        golden = await decodeGolden(goldenPngPath);
       } catch (err) {
+        await page.close();
         failures++;
         const reason = `failed to decode golden: ${err.message}`;
         results.push({ name: rom.name, status: "FAIL", reason });
@@ -269,31 +329,54 @@ async function main() {
         continue;
       }
 
-      // `rgba.equals(golden)` is an O(n) native memcmp — fastest
-      // path when they match, which is the common case.
-      if (rgba.equals(golden)) {
+      const pixelsMatch = rgba.equals(golden);
+
+      // ── Audio hash diff ─────────────────────────────────
+      const expectedAudio = (await fs.readFile(goldenAudioPath, "utf8")).trim();
+      const actualAudioLine = `${audio.hash} ${audio.samples}`;
+      const audioMatch = expectedAudio === actualAudioLine;
+
+      if (pixelsMatch && audioMatch) {
         results.push({ name: rom.name, status: "OK", reason: null });
-        console.log(`OK    ${rom.name.padEnd(28)} exact match`);
+        console.log(`OK    ${rom.name.padEnd(28)} exact video + audio match`);
+        await page.close();
         continue;
       }
 
-      // Mismatch: write the actual and a diff PNG, record why.
-      const { mismatched, firstDiff, rgba: diffRgba } = buildDiff(golden, rgba);
-      const actualPath = path.join(actualDir, `${rom.name}.png`);
-      const diffPath = path.join(actualDir, `${rom.name}.diff.png`);
-      await writePng(actualPath, rgba);
-      await writePng(diffPath, diffRgba);
+      // Something mismatched — collect details for both diffs
+      // and write the actual artifacts.
+      const reasons = [];
+      const actualPngPath = path.join(actualDir, `${rom.name}.png`);
+      const actualWavPath = path.join(actualDir, `${rom.name}.wav`);
+      if (!pixelsMatch) {
+        const { mismatched, firstDiff, rgba: diffRgba } = buildDiff(golden, rgba);
+        const diffPath = path.join(actualDir, `${rom.name}.diff.png`);
+        await writePng(actualPngPath, rgba);
+        await writePng(diffPath, diffRgba);
+        reasons.push(
+          `${mismatched}/${WIDTH * HEIGHT} px differ; first at ` +
+            `(${firstDiff.x},${firstDiff.y}) expected [${firstDiff.expected.join(",")}] ` +
+            `got [${firstDiff.actual.join(",")}]`,
+        );
+      }
+      if (!audioMatch) {
+        const wavBytes = await fetchAudioWav(page);
+        await fs.writeFile(actualWavPath, wavBytes);
+        reasons.push(`audio hash ${expectedAudio} -> ${actualAudioLine}`);
+      }
 
       failures++;
-      const reason =
-        `${mismatched}/${WIDTH * HEIGHT} pixels differ; ` +
-        `first at (${firstDiff.x},${firstDiff.y}) ` +
-        `expected [${firstDiff.expected.join(",")}] ` +
-        `got [${firstDiff.actual.join(",")}]`;
+      const reason = reasons.join("; ");
       results.push({ name: rom.name, status: "DIFF", reason });
       console.log(`DIFF  ${rom.name.padEnd(28)} ${reason}`);
-      console.log(`        actual: ${path.relative(repoRoot, actualPath)}`);
-      console.log(`          diff: ${path.relative(repoRoot, diffPath)}`);
+      if (!pixelsMatch) {
+        console.log(`        actual png:  ${path.relative(repoRoot, actualPngPath)}`);
+        console.log(`        diff png:    ${path.relative(repoRoot, path.join(actualDir, `${rom.name}.diff.png`))}`);
+      }
+      if (!audioMatch) {
+        console.log(`        actual wav:  ${path.relative(repoRoot, actualWavPath)}`);
+      }
+      await page.close();
     }
   } finally {
     await browser.close();

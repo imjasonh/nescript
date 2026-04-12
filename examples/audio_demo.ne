@@ -23,6 +23,8 @@ game "Audio Demo" {
 
 var px: u8 = 128
 var py: u8 = 120
+var timer: u8 = 0
+var music_on: bool = false
 
 on frame {
     // Move the smiley so you can see the game is running.
@@ -41,6 +43,26 @@ on frame {
     // Start/stop the background music loop.
     if button.start { start_music theme }
     if button.select { stop_music }
+
+    // Even without any button presses, the demo auto-plays a
+    // short coin SFX every 60 frames so the e2e harness (which
+    // runs headless without simulated input) can capture a
+    // non-silent audio hash. This exercises the full play-path
+    // through the APU driver under CI.
+    timer += 1
+    if timer == 30 {
+        play coin
+    }
+    if timer == 60 {
+        timer = 0
+        if music_on {
+            stop_music
+            music_on = false
+        } else {
+            start_music theme
+            music_on = true
+        }
+    }
 
     draw Smiley at: (px, py)
 }
