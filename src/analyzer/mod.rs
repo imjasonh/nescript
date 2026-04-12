@@ -36,6 +36,15 @@ pub struct AnalysisResult {
 /// Default call stack depth limit for the NES runtime.
 const DEFAULT_STACK_DEPTH: u32 = 8;
 
+/// Upper bound (exclusive) for user-variable zero-page allocation.
+/// Addresses `$80-$FF` are reserved for IR codegen temp slots, so user
+/// globals must fit into `$10-$7F`.
+const ZP_USER_CAP: u8 = 0x80;
+
+/// Exclusive upper bound of usable RAM. The NES has 2 KB of internal
+/// RAM at `$0000-$07FF`; the allocator uses up through `$07FF`.
+const RAM_END: u16 = 0x0800;
+
 /// Analyze a parsed program for semantic errors.
 pub fn analyze(program: &Program) -> AnalysisResult {
     let mut analyzer = Analyzer {
@@ -403,7 +412,21 @@ impl Analyzer {
         }
 
         let size = type_size(&var.var_type);
-        let address = self.allocate_ram(size);
+        let Some(address) = self.allocate_ram(size, var.span) else {
+            // Allocation failed (E0301 already emitted) — still add the
+            // symbol so that later references don't cascade into E0502,
+            // but don't record a var_allocations entry.
+            self.symbols.insert(
+                var.name.clone(),
+                Symbol {
+                    name: var.name.clone(),
+                    sym_type: var.var_type.clone(),
+                    is_const: false,
+                    span: var.span,
+                },
+            );
+            return;
+        };
 
         self.symbols.insert(
             var.name.clone(),
@@ -446,17 +469,38 @@ impl Analyzer {
             .insert(fun.name.clone(), param_types);
     }
 
-    fn allocate_ram(&mut self, size: u16) -> u16 {
-        // For M1: simple linear allocator using zero-page for u8 vars
-        if size == 1 && self.next_zp_addr < 0xFF {
+    /// Attempt to allocate `size` bytes of RAM for a variable declared
+    /// at `span`. Returns `None` on overflow, emitting E0301. The
+    /// zero-page user region is bounded above by [`ZP_USER_CAP`] to
+    /// leave room for IR codegen temp slots starting at $80.
+    fn allocate_ram(&mut self, size: u16, span: Span) -> Option<u16> {
+        // Zero-page u8 allocation — bounded by ZP_USER_CAP to avoid
+        // colliding with the IR temp region at $80+.
+        if size == 1 && self.next_zp_addr < ZP_USER_CAP {
             let addr = u16::from(self.next_zp_addr);
             self.next_zp_addr = self.next_zp_addr.wrapping_add(1);
-            addr
-        } else {
-            let addr = self.next_ram_addr;
-            self.next_ram_addr += size;
-            addr
+            return Some(addr);
         }
+
+        // Larger / remaining allocations go into the main RAM region
+        // after the OAM buffer.
+        let end = self.next_ram_addr.checked_add(size)?;
+        if end > RAM_END {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    ErrorCode::E0301,
+                    "out of RAM: too many variables declared",
+                    span,
+                )
+                .with_help(
+                    "the NES only has 2 KB of RAM ($0000-$07FF); consider removing some globals",
+                ),
+            );
+            return None;
+        }
+        let addr = self.next_ram_addr;
+        self.next_ram_addr = end;
+        Some(addr)
     }
 
     fn build_call_graph(&mut self, program: &Program) {

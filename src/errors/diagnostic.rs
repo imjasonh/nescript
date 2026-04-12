@@ -24,8 +24,7 @@ pub enum ErrorCode {
     E0203, // invalid operation for type
 
     // E03xx: Memory errors
-    #[allow(dead_code)]
-    E0301, // zero-page overflow
+    E0301, // zero-page overflow / RAM exhausted
 
     // E04xx: Control flow errors
     E0401, // call depth exceeded

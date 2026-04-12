@@ -299,6 +299,24 @@ fn analyze_return_wrong_type() {
 }
 
 #[test]
+fn analyze_ram_overflow_emits_e0301() {
+    // Two arrays totalling >2 KB cannot fit in NES RAM, triggering
+    // E0301 at allocation time.
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var huge: u8[2000]
+        var also_huge: u8[2000]
+        on frame { wait_frame }
+        start Main
+    "#;
+    let errors = analyze_errors(src);
+    assert!(
+        errors.contains(&ErrorCode::E0301),
+        "RAM overflow should produce E0301, got: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_expensive_multiply_warns() {
     let errors = analyze_errors(
         r#"
