@@ -77,14 +77,29 @@ impl<'a> IrCodeGen<'a> {
             }
         }
         // Map each function's parameter VarIds to the zero-page
-        // parameter-passing slots $04-$07 (up to 4 params). The
-        // caller writes arguments to these slots before JSR and the
-        // callee reads them via `LoadVar(t, VarId)` through the same
-        // mapping.
+        // parameter-passing slots $04-$07 (up to 4 params). Map the
+        // rest of each function's locals into main RAM starting at
+        // `$0300` (after the OAM buffer). Locals don't overlap with
+        // globals (which were placed by the analyzer) and are
+        // disjoint across functions so nested calls don't corrupt
+        // each other.
+        let mut local_ram_next: u16 = 0x0300;
+        // Advance past any global addresses so we don't clobber them.
+        // This is conservative: scan existing var_addrs for the max.
+        if let Some(max_global) = var_addrs.values().copied().max() {
+            if max_global >= local_ram_next {
+                local_ram_next = max_global + 1;
+            }
+        }
         for func in &ir.functions {
-            for (i, local) in func.locals.iter().take(func.param_count).enumerate() {
-                if i < 4 {
-                    var_addrs.insert(local.var_id, 0x04 + i as u16);
+            for (i, local) in func.locals.iter().enumerate() {
+                if i < func.param_count {
+                    if i < 4 {
+                        var_addrs.insert(local.var_id, 0x04 + i as u16);
+                    }
+                } else {
+                    var_addrs.insert(local.var_id, local_ram_next);
+                    local_ram_next += local.size.max(1);
                 }
             }
         }

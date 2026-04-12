@@ -24,6 +24,7 @@ struct LoweringContext {
     current_blocks: Vec<IrBasicBlock>,
     current_ops: Vec<IrOp>,
     current_label: String,
+    current_locals: Vec<IrLocal>,
     // Loop context for break/continue
     loop_stack: Vec<LoopContext>,
     // State metadata captured from the AST
@@ -59,6 +60,7 @@ impl LoweringContext {
             current_blocks: Vec::new(),
             current_ops: Vec::new(),
             current_label: String::new(),
+            current_locals: Vec::new(),
             loop_stack: Vec::new(),
             state_names: Vec::new(),
             start_state: String::new(),
@@ -208,12 +210,12 @@ impl LoweringContext {
     fn lower_function(&mut self, fun: &FunDecl) {
         self.next_temp = 0;
         self.current_blocks = Vec::new();
-        let mut locals = Vec::new();
+        self.current_locals = Vec::new();
 
         // Register parameters as locals
         for param in &fun.params {
             let var_id = self.get_or_create_var(&param.name);
-            locals.push(IrLocal {
+            self.current_locals.push(IrLocal {
                 var_id,
                 name: param.name.clone(),
                 size: type_size(&param.param_type),
@@ -237,7 +239,7 @@ impl LoweringContext {
         self.functions.push(IrFunction {
             name: fun.name.clone(),
             blocks: std::mem::take(&mut self.current_blocks),
-            locals,
+            locals: std::mem::take(&mut self.current_locals),
             param_count: fun.params.len(),
             has_return: fun.return_type.is_some(),
             source_span: fun.span,
@@ -307,8 +309,18 @@ impl LoweringContext {
     fn lower_statement(&mut self, stmt: &Statement) {
         match stmt {
             Statement::VarDecl(var) => {
+                let var_id = self.get_or_create_var(&var.name);
+                // Track every local declared inside the current
+                // function so the IR codegen can allocate backing
+                // storage (e.g. RAM) for it.
+                if !self.current_locals.iter().any(|l| l.var_id == var_id) {
+                    self.current_locals.push(IrLocal {
+                        var_id,
+                        name: var.name.clone(),
+                        size: type_size(&var.var_type),
+                    });
+                }
                 if let Some(init) = &var.init {
-                    let var_id = self.get_or_create_var(&var.name);
                     let val = self.lower_expr(init);
                     self.emit(IrOp::StoreVar(var_id, val));
                 }

@@ -179,6 +179,37 @@ fn program_with_on_scanline_per_state() {
 }
 
 #[test]
+fn program_with_function_local_variables() {
+    // Functions with locally-declared variables should allocate
+    // their own backing storage and not corrupt caller state when
+    // nested.
+    let source = r#"
+        game "Locals" { mapper: NROM }
+        var out: u8 = 0
+
+        fun double(x: u8) -> u8 {
+            var t: u8 = x
+            t = t + t
+            return t
+        }
+
+        fun double_sum(a: u8, b: u8) -> u8 {
+            var s1: u8 = double(a)
+            var s2: u8 = double(b)
+            return s1 + s2
+        }
+
+        on frame {
+            out = double_sum(10, 20)
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_for_loop() {
     let source = r#"
         game "ForLoop" { mapper: NROM }
