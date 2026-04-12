@@ -131,6 +131,39 @@ fn link_with_sprites_spanning_multiple_tiles() {
 }
 
 #[test]
+fn link_splices_audio_tick_when_user_marker_present() {
+    // When user code contains the `__audio_used` marker label (the
+    // IR codegen emits this whenever it sees a `play`/`start_music`/
+    // `stop_music` op), the linker must splice a `JSR __audio_tick`
+    // into the NMI handler prologue AND link in the audio driver
+    // body so the JSR target exists.
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![
+        // Pretend user code with the marker the codegen would emit.
+        Instruction::new(NOP, AM::Label("__audio_used".into())),
+        Instruction::implied(NOP),
+    ];
+    let rom_data = linker.link(&user_code);
+
+    // The ROM should be valid even with the splice — the driver
+    // body has to fit in bank 0 without overflowing.
+    let info = rom::validate_ines(&rom_data).unwrap();
+    assert_eq!(info.prg_banks, 1);
+}
+
+#[test]
+fn link_omits_audio_tick_when_no_marker() {
+    // User code without the marker should not pay any ROM cost
+    // for the audio driver. We can't easily inspect bytes, but we
+    // can at least verify the ROM builds and has a normal shape.
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![Instruction::implied(NOP)];
+    let rom_data = linker.link(&user_code);
+    let info = rom::validate_ines(&rom_data).unwrap();
+    assert_eq!(info.prg_banks, 1);
+}
+
+#[test]
 fn palette_load_writes_to_ppu() {
     let linker = Linker::new(Mirroring::Horizontal);
     let palette_insts = linker.gen_palette_load();

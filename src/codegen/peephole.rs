@@ -19,6 +19,7 @@ pub fn optimize(instructions: &mut Vec<Instruction>) {
         remove_redundant_loads(instructions);
         fold_branch_over_jmp(instructions);
         remove_jmp_to_next_label(instructions);
+        fold_inc_dec(instructions);
         // Stop when no pass removed an instruction *and* the stream
         // is unchanged. Copy propagation doesn't shrink the stream —
         // it rewrites operands — so we need the content check too.
@@ -26,6 +27,78 @@ pub fn optimize(instructions: &mut Vec<Instruction>) {
             break;
         }
     }
+}
+
+/// Fold `LDA addr; CLC; ADC #1; STA addr` into `INC addr`, and
+/// `LDA addr; SEC; SBC #1; STA addr` into `DEC addr`. Both are
+/// shorter (2 bytes vs 7) and faster (5 cycles vs 10) than the
+/// ADC/SBC variants.
+///
+/// Safety: INC/DEC leave the carry flag alone, whereas the ADC
+/// version clears it via CLC first and then consumes+produces a
+/// new carry. The pattern we fold explicitly uses `CLC; ADC #1`
+/// (so the incoming carry is discarded) and the STA commits the
+/// result without reading flags, so anyone downstream relying on
+/// the Z/N flags still gets the right flags from the INC/DEC —
+/// both ops update N and Z from the new value just like ADC/SBC
+/// would. Any downstream code reading the carry flag from the
+/// original ADC/SBC would be depending on +1/-1 wrap arithmetic,
+/// which the folded form can't preserve; we conservatively
+/// require the pattern to be followed by an instruction that
+/// isn't a carry-reading branch.
+fn fold_inc_dec(instructions: &mut Vec<Instruction>) {
+    let mut out = Vec::with_capacity(instructions.len());
+    let mut idx = 0;
+    while idx < instructions.len() {
+        if idx + 3 < instructions.len() {
+            let lda = &instructions[idx];
+            let carry_op = &instructions[idx + 1];
+            let adc_or_sbc = &instructions[idx + 2];
+            let sta = &instructions[idx + 3];
+            // Must start with `LDA <addr>`.
+            let lda_addr = match (lda.opcode, &lda.mode) {
+                (Opcode::LDA, AddressingMode::ZeroPage(addr)) => {
+                    Some(AddressingMode::ZeroPage(*addr))
+                }
+                (Opcode::LDA, AddressingMode::Absolute(addr)) => {
+                    Some(AddressingMode::Absolute(*addr))
+                }
+                _ => None,
+            };
+            // STA of the same address.
+            let sta_matches = sta.opcode == Opcode::STA && Some(sta.mode.clone()) == lda_addr;
+            let is_clc_adc_1 = carry_op.opcode == Opcode::CLC
+                && adc_or_sbc.opcode == Opcode::ADC
+                && adc_or_sbc.mode == AddressingMode::Immediate(1);
+            let is_sec_sbc_1 = carry_op.opcode == Opcode::SEC
+                && adc_or_sbc.opcode == Opcode::SBC
+                && adc_or_sbc.mode == AddressingMode::Immediate(1);
+            // Only fold if the next instruction after the STA
+            // doesn't rely on the ADC's carry output. A BCC/BCS
+            // right after the pattern would break; anything else
+            // (including "no next instruction") is safe.
+            let next_is_carry_branch = instructions
+                .get(idx + 4)
+                .is_some_and(|n| matches!(n.opcode, Opcode::BCC | Opcode::BCS));
+            if let Some(addr) = lda_addr {
+                if sta_matches && !next_is_carry_branch {
+                    if is_clc_adc_1 {
+                        out.push(Instruction::new(Opcode::INC, addr));
+                        idx += 4;
+                        continue;
+                    }
+                    if is_sec_sbc_1 {
+                        out.push(Instruction::new(Opcode::DEC, addr));
+                        idx += 4;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(instructions[idx].clone());
+        idx += 1;
+    }
+    *instructions = out;
 }
 
 /// Fold `Bxx label1; JMP label2; label1:` into `Byy label2`, where
@@ -170,26 +243,49 @@ fn remove_dead_loads(instructions: &mut Vec<Instruction>) {
         if inst.opcode != Opcode::LDA {
             continue;
         }
-        // Find the next instruction that isn't a label definition.
+        // Walk forward looking for the next instruction that either
+        // reads A or overwrites it. If the first such instruction
+        // overwrites A without reading it, our LDA is dead.
+        //
+        // We can safely step across instructions that neither read
+        // nor write A — INC, DEC, STX, STY on memory, and label
+        // definitions — because they don't observe A and don't
+        // clobber it either. We must NOT step over any branch or
+        // jump: control flow at that point can reach code that
+        // reads A via a different path, and our local analysis
+        // can't see it.
         let mut j = i + 1;
+        let mut dead = false;
         while j < instructions.len() {
             let next = &instructions[j];
-            // Label definitions are passive markers; skip over them.
+            // Labels are passive markers.
             if next.opcode == Opcode::NOP && matches!(next.mode, AddressingMode::Label(_)) {
                 j += 1;
                 continue;
             }
+            // Instructions that don't touch A — skip over them.
+            // INC/DEC on memory, STX/STY — all leave A alone.
+            if matches!(
+                next.opcode,
+                Opcode::INC | Opcode::DEC | Opcode::STX | Opcode::STY
+            ) && !matches!(next.mode, AddressingMode::Accumulator)
+            {
+                j += 1;
+                continue;
+            }
+            // Instructions that overwrite A without reading it.
+            if matches!(
+                next.opcode,
+                Opcode::LDA | Opcode::PLA | Opcode::TXA | Opcode::TYA
+            ) {
+                dead = true;
+            }
+            // Any other instruction — might read A (STA, ADC,
+            // SBC, AND, …) or transfer control (JMP, Bxx, JSR,
+            // RTS) — stop scanning and leave the LDA alone.
             break;
         }
-        if j >= instructions.len() {
-            continue;
-        }
-        let next = &instructions[j];
-        if matches!(
-            next.opcode,
-            Opcode::LDA | Opcode::PLA | Opcode::TXA | Opcode::TYA
-        ) {
-            // A is about to be overwritten without being used.
+        if dead {
             keep[i] = false;
         }
     }
@@ -1029,6 +1125,71 @@ mod tests {
         assert_eq!(
             saw_lda_zero_before_tax, 2,
             "both TAXes must be preceded by a fresh LDA #0: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn folds_lda_clc_adc_sta_into_inc() {
+        // `LDA $10; CLC; ADC #1; STA $10` is a 4-instruction
+        // sequence (7 bytes, 10 cycles) that can be a single
+        // `INC $10` (2 bytes, 5 cycles). The peephole fold catches
+        // this for both zero-page and absolute addressing.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::ZeroPage(0x10)),
+            Instruction::new(CLC, AM::Implied),
+            Instruction::new(ADC, AM::Immediate(1)),
+            Instruction::new(STA, AM::ZeroPage(0x10)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        let has_inc = insts
+            .iter()
+            .any(|i| i.opcode == INC && i.mode == AM::ZeroPage(0x10));
+        assert!(has_inc, "should fold to INC $10: {insts:?}");
+        // None of the original 4 instructions should survive.
+        assert!(!insts.iter().any(|i| i.opcode == CLC));
+        assert!(!insts.iter().any(|i| i.opcode == ADC));
+    }
+
+    #[test]
+    fn folds_lda_sec_sbc_sta_into_dec() {
+        let mut insts = vec![
+            Instruction::new(LDA, AM::Absolute(0x0300)),
+            Instruction::new(SEC, AM::Implied),
+            Instruction::new(SBC, AM::Immediate(1)),
+            Instruction::new(STA, AM::Absolute(0x0300)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        let has_dec = insts
+            .iter()
+            .any(|i| i.opcode == DEC && i.mode == AM::Absolute(0x0300));
+        assert!(has_dec, "should fold to DEC $0300: {insts:?}");
+        assert!(!insts.iter().any(|i| i.opcode == SEC));
+        assert!(!insts.iter().any(|i| i.opcode == SBC));
+    }
+
+    #[test]
+    fn inc_fold_preserves_when_followed_by_carry_branch() {
+        // If the next instruction after the STA is a carry-dependent
+        // branch (BCC/BCS), the ADC/SBC → INC/DEC fold would change
+        // observable semantics — INC doesn't touch carry. Preserve
+        // the original sequence in that case.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::ZeroPage(0x10)),
+            Instruction::new(CLC, AM::Implied),
+            Instruction::new(ADC, AM::Immediate(1)),
+            Instruction::new(STA, AM::ZeroPage(0x10)),
+            Instruction::new(BCC, AM::LabelRelative("skip".into())),
+            Instruction::new(NOP, AM::Label("skip".into())),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // The ADC must still be present because the carry it
+        // produces is consumed by the BCC.
+        assert!(
+            insts.iter().any(|i| i.opcode == ADC),
+            "ADC must survive when followed by a carry-dependent branch: {insts:?}"
         );
     }
 }

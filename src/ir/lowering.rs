@@ -22,6 +22,10 @@ struct LoweringContext {
     rom_data: Vec<IrRomBlock>,
     var_map: HashMap<String, VarId>,
     const_values: HashMap<String, u16>,
+    /// Type of each named variable (resolved from the analyzer's
+    /// symbol table). Used to decide between 8-bit and 16-bit IR
+    /// ops for identifier reads/writes and binary operations.
+    var_types: HashMap<String, NesType>,
     next_var_id: u32,
     next_temp: u32,
     next_block: u32,
@@ -35,6 +39,13 @@ struct LoweringContext {
     // State metadata captured from the AST
     state_names: Vec<String>,
     start_state: String,
+    /// Map from a byte temp (used as the "low byte" of a wide
+    /// value) to the matching high byte temp. Temps not in the
+    /// map are plain 8-bit byte temps. Populated by
+    /// `lower_expr_wide` when it produces a u16 result; consumed
+    /// by binary-op, compare, and assignment lowering when they
+    /// need to decide between `Add`/`Add16`, etc.
+    wide_hi: HashMap<IrTemp, IrTemp>,
 }
 
 struct LoopContext {
@@ -53,12 +64,23 @@ impl LoweringContext {
             next_var_id += 1;
         }
 
+        // Capture the type of each named variable from the
+        // analyzer's symbol table. This lets the lowering decide
+        // whether an identifier read should expand to a Byte or
+        // Word value — which in turn controls whether binary ops
+        // emit 8-bit or 16-bit IR.
+        let mut var_types = HashMap::new();
+        for (name, sym) in &analysis.symbols {
+            var_types.insert(name.clone(), sym.sym_type.clone());
+        }
+
         Self {
             functions: Vec::new(),
             globals: Vec::new(),
             rom_data: Vec::new(),
             var_map,
             const_values: HashMap::new(),
+            var_types,
             next_var_id,
             next_temp: 0,
             next_block: 0,
@@ -69,7 +91,15 @@ impl LoweringContext {
             loop_stack: Vec::new(),
             state_names: Vec::new(),
             start_state: String::new(),
+            wide_hi: HashMap::new(),
         }
+    }
+
+    /// Register a function parameter's type in the `var_types` map
+    /// so that identifier reads inside the function body know
+    /// whether to load as a byte or a word.
+    fn register_param_type(&mut self, name: &str, ty: &NesType) {
+        self.var_types.insert(name.to_string(), ty.clone());
     }
 
     fn fresh_temp(&mut self) -> IrTemp {
@@ -254,6 +284,7 @@ impl LoweringContext {
                 name: param.name.clone(),
                 size: type_size(&param.param_type),
             });
+            self.register_param_type(&param.name, &param.param_type);
         }
 
         let entry = self.fresh_label(&format!("fn_{}_entry", fun.name));
@@ -362,6 +393,10 @@ impl LoweringContext {
                         size: type_size(&var.var_type),
                     });
                 }
+                // Seed the var_types map for local declarations so
+                // subsequent references lower with the right width.
+                self.var_types
+                    .insert(var.name.clone(), var.var_type.clone());
                 if let Some(init) = &var.init {
                     // Struct literal initializers expand to per-field
                     // stores on the synthetic field variables.
@@ -375,6 +410,12 @@ impl LoweringContext {
                     } else {
                         let val = self.lower_expr(init);
                         self.emit(IrOp::StoreVar(var_id, val));
+                        // u16 var: write the high byte too, zero-
+                        // extending narrow initializers.
+                        if matches!(var.var_type, NesType::U16) {
+                            let (_, hi) = self.widen(val);
+                            self.emit(IrOp::StoreVarHi(var_id, hi));
+                        }
                     }
                 }
             }
@@ -505,9 +546,14 @@ impl LoweringContext {
                 // adding a separate IrOp.
                 self.emit(IrOp::InlineAsm(format!("{RAW_ASM_PREFIX}{body}")));
             }
-            Statement::Play(_, _) | Statement::StartMusic(_, _) | Statement::StopMusic(_) => {
-                // No audio driver yet — these parse but produce no
-                // IR.
+            Statement::Play(name, _) => {
+                self.emit(IrOp::PlaySfx(name.clone()));
+            }
+            Statement::StartMusic(name, _) => {
+                self.emit(IrOp::StartMusic(name.clone()));
+            }
+            Statement::StopMusic(_) => {
+                self.emit(IrOp::StopMusic);
             }
         }
     }
@@ -531,28 +577,82 @@ impl LoweringContext {
         match lvalue {
             LValue::Var(name) => {
                 let var_id = self.get_or_create_var(name);
+                // Is the destination a u16 variable? Wide vars need
+                // both bytes written on every assignment, otherwise
+                // the high byte silently stays stale.
+                let dest_is_u16 = matches!(self.var_types.get(name), Some(NesType::U16));
                 match op {
                     AssignOp::Assign => {
                         let val = self.lower_expr(expr);
                         self.emit(IrOp::StoreVar(var_id, val));
+                        if dest_is_u16 {
+                            // Narrow value: zero-extend.
+                            let (_, val_hi) = self.widen(val);
+                            self.emit(IrOp::StoreVarHi(var_id, val_hi));
+                        }
                     }
                     _ => {
+                        // Load current value. For u16, load both bytes
+                        // and register as wide so binary-op lowering
+                        // uses the 16-bit path.
                         let current = self.fresh_temp();
                         self.emit(IrOp::LoadVar(current, var_id));
+                        if dest_is_u16 {
+                            let current_hi = self.fresh_temp();
+                            self.emit(IrOp::LoadVarHi(current_hi, var_id));
+                            self.make_wide(current, current_hi);
+                        }
                         let rhs = self.lower_expr(expr);
                         let result = self.fresh_temp();
-                        let ir_op = match op {
-                            AssignOp::PlusAssign => IrOp::Add(result, current, rhs),
-                            AssignOp::MinusAssign => IrOp::Sub(result, current, rhs),
-                            AssignOp::AmpAssign => IrOp::And(result, current, rhs),
-                            AssignOp::PipeAssign => IrOp::Or(result, current, rhs),
-                            AssignOp::CaretAssign => IrOp::Xor(result, current, rhs),
-                            AssignOp::ShiftLeftAssign => IrOp::ShiftLeft(result, current, 1),
-                            AssignOp::ShiftRightAssign => IrOp::ShiftRight(result, current, 1),
-                            AssignOp::Assign => unreachable!(),
-                        };
-                        self.emit(ir_op);
-                        self.emit(IrOp::StoreVar(var_id, result));
+                        let wide = dest_is_u16 || self.is_wide(current) || self.is_wide(rhs);
+                        if wide && matches!(op, AssignOp::PlusAssign | AssignOp::MinusAssign) {
+                            let (a_lo, a_hi) = self.widen(current);
+                            let (b_lo, b_hi) = self.widen(rhs);
+                            let d_hi = self.fresh_temp();
+                            match op {
+                                AssignOp::PlusAssign => self.emit(IrOp::Add16 {
+                                    d_lo: result,
+                                    d_hi,
+                                    a_lo,
+                                    a_hi,
+                                    b_lo,
+                                    b_hi,
+                                }),
+                                AssignOp::MinusAssign => self.emit(IrOp::Sub16 {
+                                    d_lo: result,
+                                    d_hi,
+                                    a_lo,
+                                    a_hi,
+                                    b_lo,
+                                    b_hi,
+                                }),
+                                _ => unreachable!(),
+                            }
+                            self.make_wide(result, d_hi);
+                            self.emit(IrOp::StoreVar(var_id, result));
+                            if dest_is_u16 {
+                                self.emit(IrOp::StoreVarHi(var_id, d_hi));
+                            }
+                        } else {
+                            let ir_op = match op {
+                                AssignOp::PlusAssign => IrOp::Add(result, current, rhs),
+                                AssignOp::MinusAssign => IrOp::Sub(result, current, rhs),
+                                AssignOp::AmpAssign => IrOp::And(result, current, rhs),
+                                AssignOp::PipeAssign => IrOp::Or(result, current, rhs),
+                                AssignOp::CaretAssign => IrOp::Xor(result, current, rhs),
+                                AssignOp::ShiftLeftAssign => IrOp::ShiftLeft(result, current, 1),
+                                AssignOp::ShiftRightAssign => IrOp::ShiftRight(result, current, 1),
+                                AssignOp::Assign => unreachable!(),
+                            };
+                            self.emit(ir_op);
+                            self.emit(IrOp::StoreVar(var_id, result));
+                            if dest_is_u16 {
+                                // High byte unchanged by 8-bit op; keep
+                                // the previously-loaded high byte.
+                                let (_, cur_hi) = self.widen(current);
+                                self.emit(IrOp::StoreVarHi(var_id, cur_hi));
+                            }
+                        }
                     }
                 }
             }
@@ -775,11 +875,45 @@ impl LoweringContext {
         self.start_block(&end_label);
     }
 
+    /// Mark a temp as the low byte of a wide (u16) value, with the
+    /// given high-byte temp. Consumers that care about 16-bit
+    /// semantics look up the high byte in `wide_hi`; consumers that
+    /// only need a byte ignore the map entirely (implicit truncation).
+    fn make_wide(&mut self, lo: IrTemp, hi: IrTemp) {
+        self.wide_hi.insert(lo, hi);
+    }
+
+    /// True if `t` was produced as the low byte of a wide value.
+    fn is_wide(&self, t: IrTemp) -> bool {
+        self.wide_hi.contains_key(&t)
+    }
+
+    /// Return the high-byte temp for a wide value. If `t` is not
+    /// wide, zero-extend it: allocate a fresh temp, emit `LoadImm 0`,
+    /// and return the pair. Used before emitting a 16-bit IR op when
+    /// one operand is narrow and the other is wide.
+    fn widen(&mut self, t: IrTemp) -> (IrTemp, IrTemp) {
+        if let Some(&hi) = self.wide_hi.get(&t) {
+            return (t, hi);
+        }
+        let hi = self.fresh_temp();
+        self.emit(IrOp::LoadImm(hi, 0));
+        (t, hi)
+    }
+
     fn lower_expr(&mut self, expr: &Expr) -> IrTemp {
         match expr {
             Expr::IntLiteral(v, _) => {
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadImm(t, *v as u8));
+                // For literals that don't fit in a byte, also emit
+                // the high byte and register the pair as wide so
+                // later assignment to a u16 var stores both halves.
+                if *v > 0xFF {
+                    let hi = self.fresh_temp();
+                    self.emit(IrOp::LoadImm(hi, (*v >> 8) as u8));
+                    self.make_wide(t, hi);
+                }
                 t
             }
             Expr::BoolLiteral(v, _) => {
@@ -797,6 +931,14 @@ impl LoweringContext {
                 let var_id = self.get_or_create_var(name);
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadVar(t, var_id));
+                // For u16 variables, also load the high byte and
+                // register the temp pair as wide so downstream ops
+                // can emit 16-bit IR when appropriate.
+                if matches!(self.var_types.get(name), Some(NesType::U16)) {
+                    let hi = self.fresh_temp();
+                    self.emit(IrOp::LoadVarHi(hi, var_id));
+                    self.make_wide(t, hi);
+                }
                 t
             }
             Expr::ArrayIndex(name, index, _) => {
@@ -896,7 +1038,113 @@ impl LoweringContext {
 
         let l = self.lower_expr(left);
         let r = self.lower_expr(right);
+        let wide = self.is_wide(l) || self.is_wide(r);
         let t = self.fresh_temp();
+
+        // 16-bit path: either operand is a wide value. Promote the
+        // narrower operand via zero-extension and emit the 16-bit
+        // IR op. Only add/sub/cmp are wide-aware today — other
+        // bitwise ops and multiply fall through to their 8-bit
+        // variants, which truncate to the low byte. (Multi-byte
+        // bitwise / multiply could be added later; today they're
+        // rare enough in NES code to defer.)
+        if wide {
+            let (a_lo, a_hi) = self.widen(l);
+            let (b_lo, b_hi) = self.widen(r);
+            match op {
+                BinOp::Add => {
+                    let d_hi = self.fresh_temp();
+                    self.emit(IrOp::Add16 {
+                        d_lo: t,
+                        d_hi,
+                        a_lo,
+                        a_hi,
+                        b_lo,
+                        b_hi,
+                    });
+                    self.make_wide(t, d_hi);
+                    return t;
+                }
+                BinOp::Sub => {
+                    let d_hi = self.fresh_temp();
+                    self.emit(IrOp::Sub16 {
+                        d_lo: t,
+                        d_hi,
+                        a_lo,
+                        a_hi,
+                        b_lo,
+                        b_hi,
+                    });
+                    self.make_wide(t, d_hi);
+                    return t;
+                }
+                BinOp::Eq => {
+                    self.emit(IrOp::CmpEq16 {
+                        dest: t,
+                        a_lo,
+                        a_hi,
+                        b_lo,
+                        b_hi,
+                    });
+                    return t;
+                }
+                BinOp::NotEq => {
+                    self.emit(IrOp::CmpNe16 {
+                        dest: t,
+                        a_lo,
+                        a_hi,
+                        b_lo,
+                        b_hi,
+                    });
+                    return t;
+                }
+                BinOp::Lt => {
+                    self.emit(IrOp::CmpLt16 {
+                        dest: t,
+                        a_lo,
+                        a_hi,
+                        b_lo,
+                        b_hi,
+                    });
+                    return t;
+                }
+                BinOp::Gt => {
+                    self.emit(IrOp::CmpGt16 {
+                        dest: t,
+                        a_lo,
+                        a_hi,
+                        b_lo,
+                        b_hi,
+                    });
+                    return t;
+                }
+                BinOp::LtEq => {
+                    self.emit(IrOp::CmpLtEq16 {
+                        dest: t,
+                        a_lo,
+                        a_hi,
+                        b_lo,
+                        b_hi,
+                    });
+                    return t;
+                }
+                BinOp::GtEq => {
+                    self.emit(IrOp::CmpGtEq16 {
+                        dest: t,
+                        a_lo,
+                        a_hi,
+                        b_lo,
+                        b_hi,
+                    });
+                    return t;
+                }
+                // Other operators fall through to the 8-bit path
+                // below, truncating the wide operand to its low
+                // byte. This is intentional for bitwise/shift ops
+                // which are rarely used on u16 values in NES code.
+                _ => {}
+            }
+        }
 
         match op {
             BinOp::Add => self.emit(IrOp::Add(t, l, r)),

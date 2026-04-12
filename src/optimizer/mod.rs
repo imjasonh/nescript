@@ -394,11 +394,79 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         IrOp::Poke(_, src) => {
             used.insert(*src);
         }
-        IrOp::ReadInput(_, _)
+        IrOp::StoreVarHi(_, src) => {
+            used.insert(*src);
+        }
+        IrOp::Add16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::Sub16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpEq16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpNe16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpLt16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpGt16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpLtEq16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        }
+        | IrOp::CmpGtEq16 {
+            a_lo,
+            a_hi,
+            b_lo,
+            b_hi,
+            ..
+        } => {
+            used.insert(*a_lo);
+            used.insert(*a_hi);
+            used.insert(*b_lo);
+            used.insert(*b_hi);
+        }
+        IrOp::LoadVarHi(_, _)
+        | IrOp::ReadInput(_, _)
         | IrOp::WaitFrame
         | IrOp::Transition(_)
         | IrOp::InlineAsm(_)
         | IrOp::Peek(_, _)
+        | IrOp::PlaySfx(_)
+        | IrOp::StartMusic(_)
+        | IrOp::StopMusic
         | IrOp::SourceLoc(_) => {}
     }
 }
@@ -429,6 +497,7 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         IrOp::ReadInput(d, _) => Some(*d),
         IrOp::Peek(d, _) => Some(*d),
         IrOp::StoreVar(_, _)
+        | IrOp::StoreVarHi(_, _)
         | IrOp::ArrayStore(_, _, _)
         | IrOp::DrawSprite { .. }
         | IrOp::WaitFrame
@@ -438,7 +507,25 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::DebugAssert(_)
         | IrOp::InlineAsm(_)
         | IrOp::Poke(_, _)
+        | IrOp::PlaySfx(_)
+        | IrOp::StartMusic(_)
+        | IrOp::StopMusic
         | IrOp::SourceLoc(_) => None,
+        // 16-bit ops have two destinations; the simple single-dest
+        // DCE below would incorrectly drop a 16-bit op whose low
+        // dest is unused even if its high dest is live. Returning
+        // `None` here preserves them unconditionally — they're
+        // rare enough that the lost DCE opportunity is a good
+        // trade for correctness.
+        IrOp::LoadVarHi(_, _)
+        | IrOp::Add16 { .. }
+        | IrOp::Sub16 { .. }
+        | IrOp::CmpEq16 { .. }
+        | IrOp::CmpNe16 { .. }
+        | IrOp::CmpLt16 { .. }
+        | IrOp::CmpGt16 { .. }
+        | IrOp::CmpLtEq16 { .. }
+        | IrOp::CmpGtEq16 { .. } => None,
     }
 }
 
