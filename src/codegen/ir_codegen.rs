@@ -356,6 +356,24 @@ impl<'a> IrCodeGen<'a> {
 
         self.emit_label(&format!("__ir_fn_{}", func.name));
 
+        // At the start of every frame handler, clear the OAM shadow
+        // buffer so stale sprites from the previous frame (or from a
+        // different state's handler) don't linger on screen. We set
+        // the Y position byte of every OAM entry to $FE (off-screen).
+        // The actual drawing code overwrites the slots it needs.
+        if self.in_frame_handler {
+            let clear_loop = format!("__ir_oam_clear_{}", func.name);
+            self.emit(LDX, AM::Immediate(0));
+            self.emit(LDA, AM::Immediate(0xFE));
+            self.emit_label(&clear_loop);
+            self.emit(STA, AM::AbsoluteX(0x0200));
+            self.emit(INX, AM::Implied);
+            self.emit(INX, AM::Implied);
+            self.emit(INX, AM::Implied);
+            self.emit(INX, AM::Implied);
+            self.emit(BNE, AM::LabelRelative(clear_loop));
+        }
+
         for block in &func.blocks {
             self.gen_block(block);
         }
