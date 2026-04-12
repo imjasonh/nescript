@@ -50,6 +50,8 @@ pub enum TokenKind {
     KwIf,
     KwElse,
     KwWhile,
+    KwFor,
+    KwIn,
     KwBreak,
     KwContinue,
     KwReturn,
@@ -98,6 +100,7 @@ pub enum TokenKind {
     Semicolon,
     Arrow,
     Dot,
+    DotDot,
     At,
 
     // Operators
@@ -154,6 +157,8 @@ impl std::fmt::Display for TokenKind {
             Self::KwIf => write!(f, "if"),
             Self::KwElse => write!(f, "else"),
             Self::KwWhile => write!(f, "while"),
+            Self::KwFor => write!(f, "for"),
+            Self::KwIn => write!(f, "in"),
             Self::KwBreak => write!(f, "break"),
             Self::KwContinue => write!(f, "continue"),
             Self::KwReturn => write!(f, "return"),
@@ -200,6 +205,7 @@ impl std::fmt::Display for TokenKind {
             Self::Semicolon => write!(f, ";"),
             Self::Arrow => write!(f, "->"),
             Self::Dot => write!(f, "."),
+            Self::DotDot => write!(f, ".."),
             Self::At => write!(f, "@"),
             Self::Plus => write!(f, "+"),
             Self::Minus => write!(f, "-"),

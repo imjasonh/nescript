@@ -484,6 +484,24 @@ while i < 10 {
 }
 ```
 
+### For Loop
+
+The `for` loop iterates over a half-open integer range `[start, end)`:
+
+```
+for i in 0..8 {
+    total += arr[i]
+}
+```
+
+The loop variable is a `u8` scoped to the loop body. Both bounds can
+be any expression that evaluates to `u8` at runtime, including
+constants or variables. The range is half-open, so `0..8` iterates
+`0, 1, 2, ..., 7` (8 iterations). For a closed range, use `0..9`.
+
+The loop is desugared into a `while` loop with an index variable, so
+`break` and `continue` work the same as in any loop body.
+
 ### Loop (Infinite)
 
 ```

@@ -843,6 +843,7 @@ impl Parser {
             }
             TokenKind::KwIf => self.parse_if(),
             TokenKind::KwWhile => self.parse_while(),
+            TokenKind::KwFor => self.parse_for(),
             TokenKind::KwLoop => self.parse_loop(),
             TokenKind::KwBreak => {
                 let span = self.current_span();
@@ -981,6 +982,24 @@ impl Parser {
         self.expect(&TokenKind::KwLoop)?;
         let body = self.parse_block()?;
         Ok(Statement::Loop(body, start))
+    }
+
+    fn parse_for(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwFor)?;
+        let (var, _) = self.expect_ident()?;
+        self.expect(&TokenKind::KwIn)?;
+        let start_expr = self.parse_expr()?;
+        self.expect(&TokenKind::DotDot)?;
+        let end_expr = self.parse_expr()?;
+        let body = self.parse_block()?;
+        Ok(Statement::For {
+            var,
+            start: start_expr,
+            end: end_expr,
+            body,
+            span: start,
+        })
     }
 
     fn parse_draw(&mut self) -> Result<Statement, Diagnostic> {

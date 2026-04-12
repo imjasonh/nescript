@@ -116,7 +116,14 @@ impl<'a> Lexer<'a> {
             b',' => Some(self.make_token(TokenKind::Comma, start)),
             b':' => Some(self.make_token(TokenKind::Colon, start)),
             b';' => Some(self.make_token(TokenKind::Semicolon, start)),
-            b'.' => Some(self.make_token(TokenKind::Dot, start)),
+            b'.' => {
+                if self.peek() == Some(b'.') {
+                    self.advance();
+                    Some(self.make_token(TokenKind::DotDot, start))
+                } else {
+                    Some(self.make_token(TokenKind::Dot, start))
+                }
+            }
             b'@' => Some(self.make_token(TokenKind::At, start)),
             b'~' => Some(self.make_token(TokenKind::Tilde, start)),
 
@@ -434,6 +441,8 @@ impl<'a> Lexer<'a> {
             "if" => TokenKind::KwIf,
             "else" => TokenKind::KwElse,
             "while" => TokenKind::KwWhile,
+            "for" => TokenKind::KwFor,
+            "in" => TokenKind::KwIn,
             "break" => TokenKind::KwBreak,
             "continue" => TokenKind::KwContinue,
             "return" => TokenKind::KwReturn,

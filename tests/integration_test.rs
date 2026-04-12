@@ -179,6 +179,25 @@ fn program_with_on_scanline_per_state() {
 }
 
 #[test]
+fn program_with_for_loop() {
+    let source = r#"
+        game "ForLoop" { mapper: NROM }
+        var arr: u8[8] = [0, 0, 0, 0, 0, 0, 0, 0]
+        var total: u8 = 0
+        on frame {
+            total = 0
+            for i in 0..8 {
+                total += arr[i]
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_structs() {
     let source = r#"
         game "Structs" { mapper: NROM }

@@ -267,6 +267,15 @@ pub enum Statement {
     If(Expr, Block, Vec<(Expr, Block)>, Option<Block>, Span),
     While(Expr, Block, Span),
     Loop(Block, Span),
+    /// `for NAME in START..END { BODY }` — half-open range.
+    /// Lowers to an index variable + while loop in IR.
+    For {
+        var: String,
+        start: Expr,
+        end: Expr,
+        body: Block,
+        span: Span,
+    },
     Break(Span),
     Continue(Span),
     Return(Option<Expr>, Span),
@@ -302,6 +311,7 @@ impl Statement {
         match self {
             Self::VarDecl(v) => v.span,
             Self::Draw(d) => d.span,
+            Self::For { span, .. } => *span,
             Self::Assign(_, _, _, s)
             | Self::If(_, _, _, _, s)
             | Self::While(_, _, s)

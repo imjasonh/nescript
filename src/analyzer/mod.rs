@@ -866,6 +866,50 @@ impl Analyzer {
                 self.check_block(body, state_names);
                 self.in_loop = was_in_loop;
             }
+            Statement::For {
+                var,
+                start,
+                end,
+                body,
+                span,
+            } => {
+                // Evaluate start/end (both u8) for reads and type
+                // checking, then register the loop variable as a u8
+                // for the duration of the body.
+                self.walk_expr_reads(start);
+                self.walk_expr_reads(end);
+                self.check_expr_type(start, &NesType::U8);
+                self.check_expr_type(end, &NesType::U8);
+                let was_shadowed = self.symbols.remove(var);
+                self.symbols.insert(
+                    var.clone(),
+                    Symbol {
+                        name: var.clone(),
+                        sym_type: NesType::U8,
+                        is_const: false,
+                        span: *span,
+                    },
+                );
+                // Synthesize a VarAllocation for the loop variable
+                // so IR lowering / codegen can treat it like any
+                // other u8 local.
+                let loop_var_addr = self.allocate_ram(1, *span).unwrap_or(0x10);
+                self.var_allocations.push(VarAllocation {
+                    name: var.clone(),
+                    address: loop_var_addr,
+                    size: 1,
+                });
+                // Loop variable is always "used" in the header.
+                self.mark_var_used(var);
+                let was_in_loop = self.in_loop;
+                self.in_loop = true;
+                self.check_block(body, state_names);
+                self.in_loop = was_in_loop;
+                self.symbols.remove(var);
+                if let Some(old) = was_shadowed {
+                    self.symbols.insert(var.clone(), old);
+                }
+            }
             Statement::Loop(body, span) => {
                 let was_in_loop = self.in_loop;
                 self.in_loop = true;
@@ -1148,6 +1192,9 @@ fn collect_transitions_stmt(stmt: &Statement, queue: &mut Vec<String>) {
         Statement::While(_, body, _) | Statement::Loop(body, _) => {
             collect_transitions_block(body, queue);
         }
+        Statement::For { body, .. } => {
+            collect_transitions_block(body, queue);
+        }
         _ => {}
     }
 }
@@ -1185,6 +1232,13 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
             collect_calls_block(body, calls);
         }
         Statement::Loop(body, _) => {
+            collect_calls_block(body, calls);
+        }
+        Statement::For {
+            start, end, body, ..
+        } => {
+            collect_calls_expr(start, calls);
+            collect_calls_expr(end, calls);
             collect_calls_block(body, calls);
         }
         Statement::Assign(_, _, expr, _) => {
@@ -1284,6 +1338,7 @@ fn stmt_can_exit_or_yield(stmt: &Statement) -> bool {
             // control, so check its body recursively.
             block_can_exit_or_yield(body)
         }
+        Statement::For { body, .. } => block_can_exit_or_yield(body),
         _ => false,
     }
 }

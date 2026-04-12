@@ -285,6 +285,12 @@ impl CodeGen {
                 self.emit_label(&end_label);
                 self.loop_stack.pop();
             }
+            Statement::For { .. } => {
+                // AST codegen is legacy; for loops are only supported
+                // through the IR codegen path. Emit nothing so the
+                // program still links — users should use `--use-ast`
+                // without for loops if they rely on this path.
+            }
             Statement::Draw(draw) => {
                 self.gen_draw(draw);
             }

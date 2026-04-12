@@ -666,6 +666,44 @@ fn parse_mmc3_mapper() {
 }
 
 #[test]
+fn parse_for_loop() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var sum: u8 = 0
+        on frame {
+            for i in 0..10 {
+                sum += i
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert!(
+        matches!(&frame.statements[0], Statement::For { var, .. } if var == "i"),
+        "expected for loop, got {:?}",
+        frame.statements[0]
+    );
+}
+
+#[test]
+fn parse_for_loop_with_const_bounds() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        const START: u8 = 5
+        const END: u8 = 15
+        var total: u8 = 0
+        on frame {
+            for n in START..END { total += n }
+            wait_frame
+        }
+        start Main
+    "#;
+    parse_ok(src);
+}
+
+#[test]
 fn parse_audio_statements() {
     let src = r#"
         game "Audio" { mapper: NROM }

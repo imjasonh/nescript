@@ -325,6 +325,24 @@ impl LoweringContext {
             Statement::Loop(body, _) => {
                 self.lower_loop(body);
             }
+            Statement::For {
+                var,
+                start,
+                end,
+                body,
+                ..
+            } => {
+                // Desugar `for var in start..end { body }` into:
+                //     var = start
+                //     while var < end { body; var = var + 1 }
+                let var_id = self.get_or_create_var(var);
+                let start_temp = self.lower_expr(start);
+                self.emit(IrOp::StoreVar(var_id, start_temp));
+                // Precompute the end value once outside the loop
+                // header so subsequent iterations don't recompute it.
+                // (For a literal, the optimizer collapses this.)
+                self.lower_for_body(var_id, end, body);
+            }
             Statement::Break(_) => {
                 if let Some(ctx) = self.loop_stack.last() {
                     let label = ctx.break_label.clone();
@@ -571,6 +589,55 @@ impl LoweringContext {
         let cond_label = &self.loop_stack.last().unwrap().continue_label.clone();
         self.end_block(IrTerminator::Jump(cond_label.clone()));
         self.loop_stack.pop();
+
+        self.start_block(&end_label);
+    }
+
+    /// Lower the loop body for a `for var in start..end { body }`.
+    /// Assumes `var` has already been initialized to the start
+    /// value. Emits the condition `var < end` each iteration and
+    /// increments `var` at the continue edge.
+    fn lower_for_body(&mut self, var_id: VarId, end: &Expr, body: &Block) {
+        let cond_label = self.fresh_label("for_cond");
+        let body_label = self.fresh_label("for_body");
+        let end_label = self.fresh_label("for_end");
+
+        self.end_block(IrTerminator::Jump(cond_label.clone()));
+
+        // Condition: var < end
+        self.start_block(&cond_label);
+        let var_temp = self.fresh_temp();
+        self.emit(IrOp::LoadVar(var_temp, var_id));
+        let end_temp = self.lower_expr(end);
+        let cmp_temp = self.fresh_temp();
+        self.emit(IrOp::CmpLt(cmp_temp, var_temp, end_temp));
+        self.end_block(IrTerminator::Branch(
+            cmp_temp,
+            body_label.clone(),
+            end_label.clone(),
+        ));
+
+        // Body + increment.
+        let step_label = self.fresh_label("for_step");
+        self.loop_stack.push(LoopContext {
+            continue_label: step_label.clone(),
+            break_label: end_label.clone(),
+        });
+        self.start_block(&body_label);
+        self.lower_block(body);
+        self.end_block(IrTerminator::Jump(step_label.clone()));
+        self.loop_stack.pop();
+
+        // Step: var = var + 1
+        self.start_block(&step_label);
+        let cur = self.fresh_temp();
+        self.emit(IrOp::LoadVar(cur, var_id));
+        let one = self.fresh_temp();
+        self.emit(IrOp::LoadImm(one, 1));
+        let next = self.fresh_temp();
+        self.emit(IrOp::Add(next, cur, one));
+        self.emit(IrOp::StoreVar(var_id, next));
+        self.end_block(IrTerminator::Jump(cond_label));
 
         self.start_block(&end_label);
     }
