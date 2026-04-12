@@ -352,16 +352,35 @@ These items were documented as future work but have since been implemented:
 - **Const assignment error** — E0203 for assigning to constants
 - **Break outside loop error** — E0203 for break/continue without enclosing loop
 - **Math routines wired into linker** — gen_multiply/gen_divide included in ROM
+- **Sprite name resolution** — sprite declarations map to CHR tile indices,
+  draw statements use the correct tile number
+- **Inline sprite CHR data** — sprite decls with `chr: [0x..., ...]` work
+- **Include directive** — `include "path"` inlines files at parse time,
+  with circular include detection
+- **Shift-assign operators** — `<<=` and `>>=` work in all contexts
+- **Player 2 controller** — `p1.button.X` / `p2.button.X` syntax, P2 input
+  read from $4017 into ZP $08
+- **Unused variable warning** — W0103 emits for declared-but-never-read
+  globals (underscore-prefix silences)
+- **Unreachable state warning** — W0104 emits for states not reachable from
+  the start state via transitions
+- **E0502 "did you mean" suggestions** — undefined variable errors include
+  a suggestion for nearby-named symbols
+- **debug.log / debug.assert** — parses into `Statement::DebugLog` /
+  `Statement::DebugAssert`, codegen emits runtime writes to $4800 when
+  `--debug` is set, stripped in release mode
+- **--debug CLI flag wired** — threads through `CodeGen::with_debug`
 
 ### Remaining priority order
 
 For someone picking up this codebase, the recommended order of work:
 
 1. **IR-based codegen** (#1) — enables optimizer to affect output
-2. **Sprite name resolution** (#3) — maps sprite names to CHR tile indices
-3. **Include directive** (#6) — enables multi-file projects
-4. **Asset pipeline wiring** (#9) — PNG assets compile into ROMs
-5. **Debug mode** (#7) — runtime debugging support
-6. **Error message polish** (#10) — unused error codes, missing validations
-7. **Audio** (#12) — SFX/music driver
-8. **Language features** (#13) — structs, enums, fixed-point
+2. **Asset pipeline wiring for PNG files** (#9) — `@chr("file.png")` and
+   `@binary("file.bin")` are parsed but not resolved at compile time
+   (only inline sprite data works)
+3. **Audio** (#12) — SFX/music driver
+4. **on_scanline for MMC3** (#11) — scanline IRQ handlers
+5. **Language features** (#13) — structs, enums, fixed-point
+6. **Register allocator** (#20) — proper A/X/Y allocation
+7. **Inline assembly** (#14) — `asm { }` blocks
