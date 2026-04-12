@@ -945,7 +945,6 @@ nescript build game.ne --dump-ir
 | `--dump-ir`     | Dump the lowered IR program (after optimization) to stdout     |
 | `--memory-map`  | Dump a memory map of variable allocations to stdout            |
 | `--call-graph`  | Dump a call graph (which handler/function calls which) to stdout |
-| `--use-ast`     | Use the legacy AST-based codegen (default is the IR codegen)   |
 
 ### Check
 
