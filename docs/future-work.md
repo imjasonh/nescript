@@ -419,31 +419,68 @@ These items were documented as future work but have since been implemented:
 - **Enum types** — `enum Name { V1, V2, ... }` declares u8 constants
   with values equal to declaration order. Variant names are flattened
   into the global symbol table
+- **Struct types** — `struct Vec2 { x: u8, y: u8 }` with field
+  access (`pos.x = 5`) and contiguous u8-only field layout. The
+  analyzer synthesizes per-field VarAllocations so the rest of the
+  compiler treats field access as ordinary variable access.
+- **`for i in start..end { ... }` loops** — half-open range with a
+  u8 index variable. Desugared in IR lowering to a while loop with
+  a proper continue-edge block so `break`/`continue` work.
+- **Audio statement parsing** — `play SfxName`, `start_music`,
+  `stop_music` parse and analyze as no-ops (no driver yet; users
+  can wire audio via inline `asm` blocks).
+- **Constant expression folding** — `const B: u8 = A + 3` evaluates
+  at compile time and feeds through to variable initializers too.
+- **`on scanline` codegen (minimal)** — MMC3 IRQ setup at startup
+  plus a `__irq_user` dispatcher that saves registers, ACKs via
+  `$E000`, dispatches on `current_state` to the right scanline
+  handler, and restores. `__ir_mmc3_reload` helper re-arms the
+  counter each frame from NMI.
 - **Peephole optimizer** — `src/codegen/peephole.rs` runs to fixed
-  point after codegen and includes: redundant STA/LDA pair removal
-  over IR temps, LDA-then-STA-same-address removal, dead store
-  elimination for IR temp slots, and A-value tracking for redundant
-  LDA elimination across straight-line code
+  point after codegen. Current passes:
+  - copy propagation for IR temps (rewrites loads to their source)
+  - dead-LDA elimination (drops overwritten LDAs)
+  - redundant STA/LDA pair removal
+  - LDA-then-STA-same-address removal
+  - dead-store elimination for IR temp slots (function-wide scan)
+  - A-value tracking eliminates redundant LDAs (ZP and absolute)
+  - branch folding: `Bxx L; JMP M; L:` → `Byy M`
+  - dead JMP to next label removal
 - **`--dump-ir` CLI flag** — prints the lowered IR program after the
   optimizer pass for debugging
+- **Function-local variables** — IR codegen allocates backing
+  storage for `var`s declared inside function bodies, using a
+  per-function RAM range at `$0300+` so nested calls don't clobber
+  each other.
+- **E0502 on assignment to undefined variable** — previously was
+  silently creating a new variable.
+- **Function call ABI fix** — IR codegen was JSRing to `__fn_name`
+  but functions were defined as `__ir_fn_name`, and param VarIds
+  weren't in `var_addrs` so callees read temp slots instead of
+  parameters. Both bugs are now fixed with an integration test
+  guard.
 
 ### Remaining priority order
 
 For someone picking up this codebase, the recommended order of work:
 
-1. **Delete AST codegen** — IR codegen is now the default and matches
-   all AST codegen features. Once confidence is high (e.g. a few weeks
-   of game-writing), remove `--use-ast` and `src/codegen/mod.rs`'s
-   AST-specific code. Keep the shared constants (`DEBUG_PORT`, ZP
-   layout) in a common module.
-2. **`on scanline` codegen** — parser and analyzer support are in
-   place, but the MMC3 IRQ vector is still stubbed. Need to install an
-   IRQ handler that dispatches to the right scanline block based on
-   the counter latched in `$C000`/`$C001`, write the initial scanline
-   count during state entry, and handle multi-scanline reload.
-3. **Audio** — SFX/music driver
-4. **Language features** — structs, fixed-point (enums already done)
-5. **Register allocator** — proper A/X/Y allocation to replace
-   zero-page spills used by the current IR codegen (partially
-   mitigated by the peephole passes but ideally the IR codegen would
-   not spill in the first place)
+1. **Delete AST codegen** — IR codegen is now the default and beats
+   the AST codegen in 5/7 examples. Once confidence is high, remove
+   `--use-ast` and `src/codegen/mod.rs`'s AST-specific code.
+2. **Struct literals** — `pos = Vec2 { x: 100, y: 50 }` as an
+   expression. Currently fields must be assigned individually.
+3. **u16 / array / nested struct fields** — current structs only
+   allow u8/i8/bool fields. The layout machinery is ready for more
+   types but the codegen only handles 1-byte loads/stores.
+4. **Audio driver** — the `play`/`start_music`/`stop_music`
+   statements parse but don't generate any code. A minimal NSF-style
+   driver running in NMI would unblock game projects.
+5. **Multi-scanline on_scanline reload** — the current codegen
+   supports one scanline per state but not a chain of handlers at
+   different scanlines in the same frame.
+6. **Register allocator** — proper A/X/Y allocation to replace
+   zero-page spills used by the current IR codegen. Partially
+   mitigated by peephole passes but still wasteful in some cases.
+7. **Match statement** — `match x { 0 => ... , 1 => ... }` would be
+   useful for state dispatch and enum-driven logic.
+8. **Text / HUD layer** — font sheet + layout system for scores.
