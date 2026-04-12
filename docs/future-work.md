@@ -370,17 +370,32 @@ These items were documented as future work but have since been implemented:
   `Statement::DebugAssert`, codegen emits runtime writes to $4800 when
   `--debug` is set, stripped in release mode
 - **--debug CLI flag wired** — threads through `CodeGen::with_debug`
+- **IR-based codegen** — `src/codegen/ir_codegen.rs` walks `IrProgram` and
+  emits 6502, handling all IR ops (load/store, arithmetic, comparisons,
+  arrays, calls, draws, input, control flow). Enabled via `--use-ir` flag;
+  all 7 examples compile through it. Default is still AST codegen while
+  IR path is experimental.
+- **IR lowering bug fixes** — `ReadInput` now has a destination temp,
+  `ButtonRead` uses the proper input temp, logical AND/OR use a new
+  `emit_move` helper instead of the buggy raw VarId temp storage
+- **Asset pipeline @binary / @chr loading** — `resolve_sprites()` reads
+  raw binary files and converts PNGs via `png_to_chr()`. Missing files
+  are silently skipped (documentation-friendly)
 
 ### Remaining priority order
 
 For someone picking up this codebase, the recommended order of work:
 
-1. **IR-based codegen** (#1) — enables optimizer to affect output
-2. **Asset pipeline wiring for PNG files** (#9) — `@chr("file.png")` and
-   `@binary("file.bin")` are parsed but not resolved at compile time
-   (only inline sprite data works)
-3. **Audio** (#12) — SFX/music driver
-4. **on_scanline for MMC3** (#11) — scanline IRQ handlers
-5. **Language features** (#13) — structs, enums, fixed-point
-6. **Register allocator** (#20) — proper A/X/Y allocation
-7. **Inline assembly** (#14) — `asm { }` blocks
+1. **Make IR codegen the default** — currently behind `--use-ir`. Once
+   it matches AST codegen for all code paths (state dispatch, multi-OAM,
+   debug statements), switch over and delete AST codegen.
+2. **IR codegen: state dispatch** — currently no main loop / dispatch
+   table; IR codegen only generates function bodies. Need to emit the
+   state machine dispatch like the AST codegen does.
+3. **IR codegen: multi-OAM** — currently all draws use slot 0
+4. **Audio** — SFX/music driver
+5. **on_scanline for MMC3** — scanline IRQ handlers
+6. **Language features** — structs, enums, fixed-point
+7. **Register allocator** — proper A/X/Y allocation to replace
+   zero-page spills used by the current IR codegen
+8. **Inline assembly** — `asm { }` blocks
