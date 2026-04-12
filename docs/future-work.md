@@ -371,13 +371,20 @@ These items were documented as future work but have since been implemented:
   `--debug` is set, stripped in release mode
 - **--debug CLI flag wired** — threads through `CodeGen::with_debug`
 - **IR-based codegen** — `src/codegen/ir_codegen.rs` walks `IrProgram` and
-  emits 6502, handling all IR ops (load/store, arithmetic, comparisons,
-  arrays, calls, draws, input, control flow). Enabled via `--use-ir` flag;
-  all 7 examples compile through it. Default is still AST codegen while
-  IR path is experimental.
+  emits 6502 for every IR op: load/store, arithmetic, comparisons, arrays,
+  calls, draws, input (P1 and P2), scroll, debug.log/assert, state
+  dispatch, multi-OAM slot allocation, transitions + on_enter handlers.
+  Now the default; `--use-ast` falls back to the legacy AST-based codegen.
 - **IR lowering bug fixes** — `ReadInput` now has a destination temp,
   `ButtonRead` uses the proper input temp, logical AND/OR use a new
   `emit_move` helper instead of the buggy raw VarId temp storage
+- **IR Player 2 controller** — `ReadInput(temp, player)` selects $01
+  or $08 based on player index
+- **IR scroll support** — `scroll(x, y)` lowers to `IrOp::Scroll(x, y)`
+  which emits two PPU $2005 writes in IR codegen
+- **IR debug.log / debug.assert** — new `IrOp::DebugLog(temps)` and
+  `IrOp::DebugAssert(cond)` variants, emitted as $4800 writes in debug
+  mode and stripped in release (same behavior as AST codegen)
 - **Asset pipeline @binary / @chr loading** — `resolve_sprites()` reads
   raw binary files and converts PNGs via `png_to_chr()`. Missing files
   are silently skipped (documentation-friendly)
@@ -386,16 +393,14 @@ These items were documented as future work but have since been implemented:
 
 For someone picking up this codebase, the recommended order of work:
 
-1. **Make IR codegen the default** — currently behind `--use-ir`. Once
-   it matches AST codegen for all code paths (state dispatch, multi-OAM,
-   debug statements), switch over and delete AST codegen.
-2. **IR codegen: state dispatch** — currently no main loop / dispatch
-   table; IR codegen only generates function bodies. Need to emit the
-   state machine dispatch like the AST codegen does.
-3. **IR codegen: multi-OAM** — currently all draws use slot 0
-4. **Audio** — SFX/music driver
-5. **on_scanline for MMC3** — scanline IRQ handlers
-6. **Language features** — structs, enums, fixed-point
-7. **Register allocator** — proper A/X/Y allocation to replace
+1. **Delete AST codegen** — IR codegen is now the default and matches
+   all AST codegen features. Once confidence is high (e.g. a few weeks
+   of game-writing), remove `--use-ast` and `src/codegen/mod.rs`'s
+   AST-specific code. Keep the shared constants (`DEBUG_PORT`, ZP
+   layout) in a common module.
+2. **Audio** — SFX/music driver
+3. **on_scanline for MMC3** — scanline IRQ handlers
+4. **Language features** — structs, enums, fixed-point
+5. **Register allocator** — proper A/X/Y allocation to replace
    zero-page spills used by the current IR codegen
-8. **Inline assembly** — `asm { }` blocks
+6. **Inline assembly** — `asm { }` blocks

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use nescript::analyzer;
 use nescript::assets;
-use nescript::codegen::CodeGen;
+use nescript::codegen::{CodeGen, IrCodeGen};
 use nescript::errors::render_diagnostics;
 use nescript::ir;
 use nescript::linker::Linker;
@@ -29,10 +29,10 @@ enum Cli {
         #[arg(long)]
         asm_dump: bool,
 
-        /// Use the experimental IR-based codegen instead of the
-        /// AST-based codegen. Enables optimizer passes on the output.
+        /// Use the legacy AST-based codegen. The default is the IR-based
+        /// codegen, which runs the optimizer passes before emitting 6502.
         #[arg(long)]
-        use_ir: bool,
+        use_ast: bool,
     },
     /// Type-check a source file without building
     Check {
@@ -50,10 +50,10 @@ fn main() {
             output,
             debug,
             asm_dump,
-            use_ir,
+            use_ast,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
-            match compile(&input, debug, asm_dump, use_ir) {
+            match compile(&input, debug, asm_dump, use_ast) {
                 Ok(rom) => {
                     std::fs::write(&output, rom).unwrap_or_else(|e| {
                         eprintln!("error: failed to write {}: {e}", output.display());
@@ -86,7 +86,7 @@ fn dump_asm(instructions: &[nescript::asm::Instruction]) {
     }
 }
 
-fn compile(input: &PathBuf, debug: bool, asm_dump: bool, use_ir: bool) -> Result<Vec<u8>, ()> {
+fn compile(input: &PathBuf, debug: bool, asm_dump: bool, use_ast: bool) -> Result<Vec<u8>, ()> {
     let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
     })?;
@@ -135,18 +135,18 @@ fn compile(input: &PathBuf, debug: bool, asm_dump: bool, use_ir: bool) -> Result
         eprintln!("error: {e}");
     })?;
 
-    // Code generation: choose between IR-based and AST-based codegen.
-    let instructions = if use_ir {
-        use nescript::codegen::IrCodeGen;
-        IrCodeGen::new(&analysis.var_allocations, &ir_program)
-            .with_sprites(&sprites)
-            .with_debug(debug)
-            .generate(&ir_program)
-    } else {
+    // Code generation: IR-based is the default. `--use-ast` switches to
+    // the legacy AST-based codegen for comparison and fallback.
+    let instructions = if use_ast {
         CodeGen::new(&analysis.var_allocations, &program.constants)
             .with_sprites(&sprites)
             .with_debug(debug)
             .generate(&program)
+    } else {
+        IrCodeGen::new(&analysis.var_allocations, &ir_program)
+            .with_sprites(&sprites)
+            .with_debug(debug)
+            .generate(&ir_program)
     };
 
     if asm_dump {
