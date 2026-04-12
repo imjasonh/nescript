@@ -830,6 +830,13 @@ impl Parser {
         let mut statements = Vec::new();
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             statements.push(self.parse_statement()?);
+            // Allow optional `;` between statements for readability.
+            // Newlines are still the primary separator, but `;` lets
+            // users put short statements on the same line:
+            //   `x += 1; y += 1`
+            while *self.peek() == TokenKind::Semicolon {
+                self.advance();
+            }
         }
         self.expect(&TokenKind::RBrace)?;
 

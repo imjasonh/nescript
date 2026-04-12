@@ -666,6 +666,27 @@ fn parse_mmc3_mapper() {
 }
 
 #[test]
+fn parse_semicolon_separators() {
+    // `;` should act as an optional statement separator so short
+    // statements can share a line.
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var a: u8 = 0
+        var b: u8 = 0
+        on frame {
+            a += 1; b += 2
+            if button.a { a -= 1; b -= 1 }
+            wait_frame
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    // Top-level statements: two assigns + if + wait_frame
+    assert_eq!(frame.statements.len(), 4);
+}
+
+#[test]
 fn parse_match_statement() {
     let src = r#"
         game "Test" { mapper: NROM }
