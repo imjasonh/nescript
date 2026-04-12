@@ -539,9 +539,13 @@ impl CodeGen {
     /// (non-zero = true, zero = false).
     fn gen_condition(&mut self, expr: &Expr) {
         match expr {
-            Expr::ButtonRead(_, button, _) => {
+            Expr::ButtonRead(player, button, _) => {
                 let mask = button_mask(button);
-                self.emit(LDA, AM::ZeroPage(self.input_addr));
+                let addr = match player {
+                    Some(Player::P2) => 0x08, // ZP_INPUT_P2
+                    _ => self.input_addr,     // P1 or default
+                };
+                self.emit(LDA, AM::ZeroPage(addr));
                 self.emit(AND, AM::Immediate(mask));
             }
             Expr::BinaryOp(left, op, right, _) => match op {
@@ -682,9 +686,13 @@ impl CodeGen {
                     }
                 }
             }
-            Expr::ButtonRead(_, button, _) => {
+            Expr::ButtonRead(player, button, _) => {
                 let mask = button_mask(button);
-                self.emit(LDA, AM::ZeroPage(self.input_addr));
+                let addr = match player {
+                    Some(Player::P2) => 0x08, // ZP_INPUT_P2
+                    _ => self.input_addr,
+                };
+                self.emit(LDA, AM::ZeroPage(addr));
                 self.emit(AND, AM::Immediate(mask));
             }
             Expr::Cast(inner, _, _) => {

@@ -16,6 +16,7 @@ const APU_FRAME: u16 = 0x4017;
 /// Zero-page locations used by the runtime.
 pub const ZP_FRAME_FLAG: u8 = 0x00;
 pub const ZP_INPUT_P1: u8 = 0x01;
+pub const ZP_INPUT_P2: u8 = 0x08;
 
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
@@ -110,12 +111,17 @@ pub fn gen_nmi() -> Vec<Instruction> {
     out.push(Instruction::new(LDA, AM::Immediate(0x00)));
     out.push(Instruction::new(STA, AM::Absolute(JOY1)));
 
-    // Read 8 button bits into ZP_INPUT_P1
+    // Read 8 button bits from controller 1 ($4016) into ZP_INPUT_P1
+    // and 8 button bits from controller 2 ($4017) into ZP_INPUT_P2
+    // simultaneously — shift each port's carry into its ZP byte.
     out.push(Instruction::new(LDX, AM::Immediate(0x08)));
     out.push(Instruction::new(NOP, AM::Label("__read_input".into())));
     out.push(Instruction::new(LDA, AM::Absolute(JOY1)));
     out.push(Instruction::new(LSR, AM::Accumulator));
     out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P1)));
+    out.push(Instruction::new(LDA, AM::Absolute(0x4017))); // JOY2
+    out.push(Instruction::new(LSR, AM::Accumulator));
+    out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P2)));
     out.push(Instruction::implied(DEX));
     out.push(Instruction::new(
         BNE,

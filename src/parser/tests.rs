@@ -943,3 +943,59 @@ fn array_index_compound_assign() {
     let frame = prog.states[0].on_frame.as_ref().unwrap();
     assert_eq!(frame.statements.len(), 3);
 }
+
+#[test]
+fn parse_p1_button_read() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            if p1.button.a { x += 1 }
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    match &frame.statements[0] {
+        Statement::If(Expr::ButtonRead(Some(Player::P1), button, _), _, _, _, _) => {
+            assert_eq!(button, "a");
+        }
+        other => panic!("expected P1 button read, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_p2_button_read() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            if p2.button.start { x += 1 }
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    match &frame.statements[0] {
+        Statement::If(Expr::ButtonRead(Some(Player::P2), button, _), _, _, _, _) => {
+            assert_eq!(button, "start");
+        }
+        other => panic!("expected P2 button read, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_shift_assign_operators() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 1
+        on frame {
+            x <<= 1
+            x >>= 1
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert_eq!(frame.statements.len(), 2);
+}

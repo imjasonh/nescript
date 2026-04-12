@@ -218,9 +218,7 @@ pub enum UnaryOp {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Player {
-    #[allow(dead_code)]
     P1,
-    #[allow(dead_code)]
     P2,
 }
 

@@ -1287,11 +1287,35 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
 
-                // Check for button.X
+                // Check for button.X (player 1 default)
                 if name == "button" && *self.peek() == TokenKind::Dot {
                     self.advance();
                     let (button, _) = self.expect_name()?;
                     return Ok(Expr::ButtonRead(None, button, span));
+                }
+
+                // Check for p1.button.X / p2.button.X
+                if (name == "p1" || name == "p2") && *self.peek() == TokenKind::Dot {
+                    self.advance();
+                    // Expect 'button'
+                    if let TokenKind::Ident(kw) = self.peek().clone() {
+                        if kw == "button" {
+                            self.advance();
+                            self.expect(&TokenKind::Dot)?;
+                            let (button, _) = self.expect_name()?;
+                            let player = if name == "p1" {
+                                Some(Player::P1)
+                            } else {
+                                Some(Player::P2)
+                            };
+                            return Ok(Expr::ButtonRead(player, button, span));
+                        }
+                    }
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        "expected 'button' after 'p1.' or 'p2.'",
+                        self.current_span(),
+                    ));
                 }
 
                 // Check for array index
