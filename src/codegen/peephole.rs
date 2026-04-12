@@ -9,15 +9,209 @@ use crate::asm::{AddressingMode, Instruction, Opcode};
 /// Run all peephole passes until fixed point.
 pub fn optimize(instructions: &mut Vec<Instruction>) {
     loop {
-        let before = instructions.len();
+        let before_len = instructions.len();
+        let before = snapshot(instructions);
+        copy_propagate_temps(instructions);
+        remove_dead_loads(instructions);
         remove_sta_then_lda(instructions);
         remove_lda_then_sta_same(instructions);
         remove_dead_temp_stores(instructions);
         remove_redundant_loads(instructions);
-        if instructions.len() == before {
+        // Stop when no pass removed an instruction *and* the stream
+        // is unchanged. Copy propagation doesn't shrink the stream —
+        // it rewrites operands — so we need the content check too.
+        if instructions.len() == before_len && !changed(&before, instructions) {
             break;
         }
     }
+}
+
+/// Remove `LDA …` instructions whose value is never read — the next
+/// instruction overwrites A without using the current value.
+///
+/// The heuristic looks one instruction ahead. If the next instruction
+/// is an A-clobbering load (`LDA`, `LDX`, `LDY`, `PLA`, `TXA`, `TYA`),
+/// the preceding `LDA` is dead. Shifts and arithmetic ops read A, so
+/// they don't qualify. A label or branch in between stops the scan
+/// (we can't prove A's dead across control flow).
+fn remove_dead_loads(instructions: &mut Vec<Instruction>) {
+    let mut keep = vec![true; instructions.len()];
+    for i in 0..instructions.len() {
+        let inst = &instructions[i];
+        if inst.opcode != Opcode::LDA {
+            continue;
+        }
+        // Find the next instruction that isn't a label definition.
+        let mut j = i + 1;
+        while j < instructions.len() {
+            let next = &instructions[j];
+            // Label definitions are passive markers; skip over them.
+            if next.opcode == Opcode::NOP && matches!(next.mode, AddressingMode::Label(_)) {
+                j += 1;
+                continue;
+            }
+            break;
+        }
+        if j >= instructions.len() {
+            continue;
+        }
+        let next = &instructions[j];
+        if matches!(
+            next.opcode,
+            Opcode::LDA | Opcode::PLA | Opcode::TXA | Opcode::TYA
+        ) {
+            // A is about to be overwritten without being used.
+            keep[i] = false;
+        }
+    }
+    let mut out = Vec::with_capacity(instructions.len());
+    for (i, inst) in instructions.iter().enumerate() {
+        if keep[i] {
+            out.push(inst.clone());
+        }
+    }
+    *instructions = out;
+}
+
+fn snapshot(instructions: &[Instruction]) -> Vec<(Opcode, AddressingMode)> {
+    instructions
+        .iter()
+        .map(|i| (i.opcode, i.mode.clone()))
+        .collect()
+}
+
+fn changed(before: &[(Opcode, AddressingMode)], after: &[Instruction]) -> bool {
+    if before.len() != after.len() {
+        return true;
+    }
+    before
+        .iter()
+        .zip(after.iter())
+        .any(|((op, mode), inst)| *op != inst.opcode || *mode != inst.mode)
+}
+
+/// Copy propagation for IR temp slots.
+///
+/// After the IR codegen, each temp produced by an IR op is spilled
+/// to a zero-page slot via `STA slot`. Any subsequent op that needs
+/// the temp emits `LDA slot`. Copy propagation notes the *source*
+/// of each temp store (e.g. "slot 128 was set from [slot 16]") and
+/// rewrites subsequent loads of that slot to load from the source
+/// directly. If the source is later written, the equivalence is
+/// invalidated before we see the consuming load. Immediate values
+/// are tracked the same way.
+///
+/// The rewrite doesn't remove anything — it just swaps the operand.
+/// The other peephole passes then pick up the now-dead `STA slot`
+/// and drop it.
+fn copy_propagate_temps(instructions: &mut [Instruction]) {
+    use std::collections::HashMap;
+
+    // slot -> source of the most recent STA into that slot.
+    let mut temp_source: HashMap<u8, Source> = HashMap::new();
+    // Track what A currently holds so we can decide whether an STA
+    // actually copies a known source into the slot.
+    let mut a: Option<Source> = None;
+
+    for inst in instructions.iter_mut() {
+        if instruction_crosses_block(inst) {
+            temp_source.clear();
+            a = None;
+            continue;
+        }
+        match (inst.opcode, inst.mode.clone()) {
+            (Opcode::LDA, AddressingMode::Immediate(v)) => {
+                a = Some(Source::Imm(v));
+            }
+            (Opcode::LDA, AddressingMode::ZeroPage(addr)) => {
+                // If addr is a temp whose source is tracked and the
+                // source still holds the intended value, rewrite the
+                // load to use the source directly.
+                if is_temp_slot_addr(addr) {
+                    if let Some(src) = temp_source.get(&addr).copied() {
+                        match src {
+                            Source::Imm(v) => {
+                                inst.mode = AddressingMode::Immediate(v);
+                                a = Some(Source::Imm(v));
+                                continue;
+                            }
+                            Source::Zp(orig) => {
+                                inst.mode = AddressingMode::ZeroPage(orig);
+                                a = Some(Source::Zp(orig));
+                                continue;
+                            }
+                        }
+                    }
+                }
+                a = Some(Source::Zp(addr));
+            }
+            // Arithmetic / logical ops that read a temp slot: rewrite
+            // the operand to the temp's tracked source. Clobbers A.
+            (
+                Opcode::ADC | Opcode::SBC | Opcode::AND | Opcode::ORA | Opcode::EOR | Opcode::CMP,
+                AddressingMode::ZeroPage(addr),
+            ) if is_temp_slot_addr(addr) => {
+                if let Some(src) = temp_source.get(&addr).copied() {
+                    inst.mode = match src {
+                        Source::Imm(v) => AddressingMode::Immediate(v),
+                        Source::Zp(orig) => AddressingMode::ZeroPage(orig),
+                    };
+                }
+                a = None;
+            }
+            (Opcode::STA, AddressingMode::ZeroPage(addr)) => {
+                // If we're storing to a temp slot and we know the
+                // source of the value in A, record the equivalence.
+                if is_temp_slot_addr(addr) {
+                    if let Some(src) = a {
+                        temp_source.insert(addr, src);
+                    } else {
+                        temp_source.remove(&addr);
+                    }
+                } else {
+                    // Storing to a non-temp ZP addr invalidates any
+                    // temp that was tracking [addr] as its source.
+                    temp_source.retain(|_, src| !matches!(*src, Source::Zp(a) if a == addr));
+                }
+            }
+            // Any op that reads a non-ZP location or clobbers A: just
+            // invalidate A; temps are unaffected.
+            _ => {
+                if modifies_a(inst.opcode) {
+                    a = None;
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Source {
+    Imm(u8),
+    Zp(u8),
+}
+
+fn is_temp_slot_addr(addr: u8) -> bool {
+    addr >= 0x80
+}
+
+fn modifies_a(op: Opcode) -> bool {
+    matches!(
+        op,
+        Opcode::LDA
+            | Opcode::ADC
+            | Opcode::SBC
+            | Opcode::AND
+            | Opcode::ORA
+            | Opcode::EOR
+            | Opcode::ASL
+            | Opcode::LSR
+            | Opcode::ROL
+            | Opcode::ROR
+            | Opcode::PLA
+            | Opcode::TXA
+            | Opcode::TYA
+    )
 }
 
 /// Track what `A` holds through a linear run of instructions and
@@ -128,8 +322,18 @@ enum AKnown {
 /// store-to-temp is dead.
 fn remove_dead_temp_stores(instructions: &mut Vec<Instruction>) {
     // Walk forward. For each `STA slot` where slot is a temp, look
-    // ahead to see if the slot is read before being either
-    // overwritten or invalidated by a control-flow boundary.
+    // ahead through the rest of the current function (bounded by the
+    // next `__ir_fn_` label or EOF). If no subsequent instruction
+    // reads the slot before the function ends or the slot is
+    // overwritten, the STA is dead.
+    //
+    // IR temp slots are assigned uniquely per IR op within a function
+    // (the IR codegen resets `next_temp_slot` to 0 at each function
+    // entry and never reuses slot numbers within a function), so it's
+    // safe to scan past labels and branches within the same function.
+    // Cross-function JSR can't read our temps because the callee also
+    // starts its own temp numbering from $80 — if it stomps on our
+    // slots, we can't have relied on them surviving the call anyway.
     let mut keep = vec![true; instructions.len()];
     for i in 0..instructions.len() {
         let inst = &instructions[i];
@@ -140,24 +344,18 @@ fn remove_dead_temp_stores(instructions: &mut Vec<Instruction>) {
             AddressingMode::ZeroPage(addr) if addr >= 0x80 => addr,
             _ => continue,
         };
-        // Scan forward until the slot is read, overwritten, or we hit
-        // a control-flow boundary that might branch to code we can't
-        // see.
-        let mut dead = false;
+        let mut dead = true;
         for next in instructions.iter().skip(i + 1) {
-            if instruction_crosses_block(next) {
-                // The slot might be read later; be conservative.
+            if is_function_boundary(next) {
                 break;
             }
             if reads_zero_page(next, slot) {
-                // A subsequent instruction reads from the slot, so
-                // the STA is live.
+                dead = false;
                 break;
             }
             if writes_zero_page(next, slot) {
-                // The slot is overwritten with no read in between —
-                // the original STA is dead.
-                dead = true;
+                // Overwritten with no read in between — our STA is
+                // dead. Stop scanning either way.
                 break;
             }
         }
@@ -172,6 +370,24 @@ fn remove_dead_temp_stores(instructions: &mut Vec<Instruction>) {
         }
     }
     *instructions = out;
+}
+
+/// True if `inst` marks the start of a new function. IR codegen emits
+/// function bodies with a `NOP Label("__ir_fn_…")` pseudo-instruction.
+/// A JSR to a function also transfers control away, but since each
+/// function starts its own temp slot allocation at $80 we don't rely
+/// on slot contents surviving calls.
+fn is_function_boundary(inst: &Instruction) -> bool {
+    if inst.opcode == Opcode::NOP {
+        if let AddressingMode::Label(name) = &inst.mode {
+            return name.starts_with("__ir_fn_")
+                || name.starts_with("__fn_")
+                || name == "__reset"
+                || name == "__nmi"
+                || name == "__irq";
+        }
+    }
+    matches!(inst.opcode, Opcode::RTS | Opcode::RTI)
 }
 
 /// True if the given instruction is a control-flow boundary — we can't
@@ -318,15 +534,41 @@ mod tests {
 
     #[test]
     fn removes_sta_then_lda_temp() {
+        // `STA $80; LDA $80; CLC; RTS` — the STA is dead (the slot
+        // is never read by anything reachable), and even if we did
+        // keep the STA the LDA would be eliminated by A-tracking
+        // since A already holds the value we just stored. Both get
+        // stripped, leaving just CLC + RTS.
         let mut insts = vec![
             Instruction::new(STA, AM::ZeroPage(0x80)),
             Instruction::new(LDA, AM::ZeroPage(0x80)),
             Instruction::new(CLC, AM::Implied),
+            Instruction::new(RTS, AM::Implied),
         ];
         optimize(&mut insts);
         assert_eq!(insts.len(), 2);
-        assert_eq!(insts[0].opcode, STA);
-        assert_eq!(insts[1].opcode, CLC);
+        assert_eq!(insts[0].opcode, CLC);
+        assert_eq!(insts[1].opcode, RTS);
+    }
+
+    #[test]
+    fn keeps_sta_when_temp_is_read_later() {
+        // STA $80; LDA #5; ORA $80 — the ORA reads slot $80, so
+        // the STA is live.
+        let mut insts = vec![
+            Instruction::new(STA, AM::ZeroPage(0x80)),
+            Instruction::new(LDA, AM::Immediate(5)),
+            Instruction::new(ORA, AM::ZeroPage(0x80)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // STA must remain because the ORA reads it.
+        assert!(
+            insts
+                .iter()
+                .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(0x80)),
+            "STA to $80 should be preserved: {insts:?}"
+        );
     }
 
     #[test]
@@ -373,13 +615,79 @@ mod tests {
     }
 
     #[test]
-    fn preserves_different_addresses() {
+    fn preserves_sta_when_slot_is_read() {
         let mut insts = vec![
             Instruction::new(STA, AM::ZeroPage(0x80)),
             Instruction::new(LDA, AM::ZeroPage(0x81)),
+            Instruction::new(CMP, AM::ZeroPage(0x80)),
+            Instruction::new(RTS, AM::Implied),
         ];
         optimize(&mut insts);
-        assert_eq!(insts.len(), 2);
+        // STA $80 is live because CMP reads it.
+        assert!(
+            insts
+                .iter()
+                .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(0x80)),
+            "STA should be preserved when slot is later read: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn copy_propagation_rewrites_temp_load_to_source() {
+        // LDA $10; STA $80; LDA $80 should become LDA $10; (stores
+        // trimmed by dead-store). End result: just a single LDA.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::ZeroPage(0x10)),
+            Instruction::new(STA, AM::ZeroPage(0x80)),
+            Instruction::new(LDA, AM::ZeroPage(0x80)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // After copy prop + dead store elim + A-tracking, the sequence
+        // collapses to a single LDA + RTS.
+        assert!(
+            insts
+                .iter()
+                .any(|i| i.opcode == LDA && i.mode == AM::ZeroPage(0x10)),
+            "should preserve original LDA: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn copy_propagation_rewrites_arithmetic_operand() {
+        // LDA #1; STA $80; LDA $10; CLC; ADC $80 — the ADC should be
+        // rewritten to `ADC #1` because $80 is a temp tracked to Imm(1).
+        let mut insts = vec![
+            Instruction::new(LDA, AM::Immediate(1)),
+            Instruction::new(STA, AM::ZeroPage(0x80)),
+            Instruction::new(LDA, AM::ZeroPage(0x10)),
+            Instruction::new(CLC, AM::Implied),
+            Instruction::new(ADC, AM::ZeroPage(0x80)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        assert!(
+            insts
+                .iter()
+                .any(|i| i.opcode == ADC && i.mode == AM::Immediate(1)),
+            "ADC should be rewritten to immediate: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn dead_load_elimination_drops_overwritten_lda() {
+        // LDA $10; LDA #0 — the first LDA is dead because A is
+        // overwritten before being used.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::ZeroPage(0x10)),
+            Instruction::new(LDA, AM::Immediate(0)),
+            Instruction::new(STA, AM::ZeroPage(0x10)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // First LDA dropped; result is LDA #0, STA $10, RTS
+        let lda_count = insts.iter().filter(|i| i.opcode == LDA).count();
+        assert_eq!(lda_count, 1, "expected one LDA, got: {insts:?}");
     }
 
     #[test]
