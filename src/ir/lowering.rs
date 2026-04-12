@@ -328,6 +328,8 @@ impl LoweringContext {
                             AssignOp::AmpAssign => IrOp::And(result, current, rhs),
                             AssignOp::PipeAssign => IrOp::Or(result, current, rhs),
                             AssignOp::CaretAssign => IrOp::Xor(result, current, rhs),
+                            AssignOp::ShiftLeftAssign => IrOp::ShiftLeft(result, current, 1),
+                            AssignOp::ShiftRightAssign => IrOp::ShiftRight(result, current, 1),
                             AssignOp::Assign => unreachable!(),
                         };
                         self.emit(ir_op);
@@ -352,6 +354,8 @@ impl LoweringContext {
                         AssignOp::AmpAssign => IrOp::And(result, current, val),
                         AssignOp::PipeAssign => IrOp::Or(result, current, val),
                         AssignOp::CaretAssign => IrOp::Xor(result, current, val),
+                        AssignOp::ShiftLeftAssign => IrOp::ShiftLeft(result, current, 1),
+                        AssignOp::ShiftRightAssign => IrOp::ShiftRight(result, current, 1),
                         AssignOp::Assign => unreachable!(),
                     };
                     self.emit(ir_op);

@@ -75,6 +75,62 @@ fn link_rom_size_correct() {
 }
 
 #[test]
+fn link_with_sprites_places_chr_data() {
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![Instruction::implied(NOP)];
+
+    let sprite_bytes: Vec<u8> = (0x20..0x30).collect(); // 16 bytes, one tile
+    let sprites = vec![SpriteData {
+        name: "Player".into(),
+        tile_index: 1,
+        chr_bytes: sprite_bytes.clone(),
+    }];
+
+    let rom_data = linker.link_with_assets(&user_code, &sprites);
+
+    // CHR starts right after the 16-byte iNES header and 16 KB PRG bank.
+    let chr_start = 16 + 16384;
+
+    // Tile 0 should still contain the built-in smiley (first 16 bytes, not
+    // all zero).
+    let tile0 = &rom_data[chr_start..chr_start + 16];
+    assert_ne!(
+        tile0, &[0u8; 16],
+        "default smiley should occupy tile index 0",
+    );
+
+    // Tile 1 (CHR offset 16) should contain the sprite's CHR bytes exactly.
+    let tile1 = &rom_data[chr_start + 16..chr_start + 32];
+    assert_eq!(tile1, sprite_bytes.as_slice());
+
+    // Tile 2 and beyond should be untouched (all zeros).
+    let tile2 = &rom_data[chr_start + 32..chr_start + 48];
+    assert_eq!(tile2, &[0u8; 16]);
+}
+
+#[test]
+fn link_with_sprites_spanning_multiple_tiles() {
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![Instruction::implied(NOP)];
+
+    // 32 bytes = 2 tiles. The linker should place them consecutively
+    // starting at the requested tile index.
+    let sprite_bytes: Vec<u8> = (0..32).collect();
+    let sprites = vec![SpriteData {
+        name: "Big".into(),
+        tile_index: 4,
+        chr_bytes: sprite_bytes.clone(),
+    }];
+
+    let rom_data = linker.link_with_assets(&user_code, &sprites);
+    let chr_start = 16 + 16384;
+
+    // Tile 4 starts at CHR offset 64.
+    let placed = &rom_data[chr_start + 64..chr_start + 64 + 32];
+    assert_eq!(placed, sprite_bytes.as_slice());
+}
+
+#[test]
 fn palette_load_writes_to_ppu() {
     let linker = Linker::new(Mirroring::Horizontal);
     let palette_insts = linker.gen_palette_load();

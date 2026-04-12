@@ -254,3 +254,179 @@ fn analyze_break_outside_loop() {
         "break outside loop should produce E0203, got: {errors:?}"
     );
 }
+
+#[test]
+fn analyze_unused_variable_warning() {
+    // `ghost` is declared but never read (only the initializer runs).
+    // It should trigger a W0103 warning.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "Test" { mapper: NROM }
+        var ghost: u8 = 0
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        result.diagnostics.iter().any(|d| d.code == ErrorCode::W0103
+            && d.level == crate::errors::Level::Warning
+            && d.message.contains("ghost")),
+        "expected W0103 for unused var 'ghost', got: {:?}",
+        result.diagnostics
+    );
+    // And no hard errors.
+    assert!(
+        result.diagnostics.iter().all(|d| !d.is_error()),
+        "unexpected hard errors: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_unused_variable_no_warning_when_read() {
+    // `counter` is both written and read (in the `if` condition),
+    // so W0103 should NOT fire for it.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "Test" { mapper: NROM }
+        var counter: u8 = 0
+        on frame {
+            counter = counter + 1
+            if counter > 60 { wait_frame }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0103 && d.message.contains("counter")),
+        "did not expect W0103 for read variable 'counter', got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_unused_variable_underscore_prefix_silences() {
+    // A leading underscore silences the W0103 warning, matching Rust's
+    // convention for intentionally-unused names.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "Test" { mapper: NROM }
+        var _reserved: u8 = 0
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0103),
+        "did not expect W0103 for underscore-prefixed var, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_unreachable_state_warning() {
+    // `Orphan` is never reached from `Main` — W0104 should fire.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "Test" { mapper: NROM }
+        state Main {
+            on frame { wait_frame }
+        }
+        state Orphan {
+            on frame { wait_frame }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0104 && d.message.contains("Orphan")),
+        "expected W0104 for unreachable state 'Orphan', got: {:?}",
+        result.diagnostics
+    );
+    // And no hard errors.
+    assert!(
+        result.diagnostics.iter().all(|d| !d.is_error()),
+        "unexpected hard errors: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_reachable_state_no_warning() {
+    // Both states are reachable: Main transitions to Other, and Other
+    // transitions back to Main. Neither should trigger W0104.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "Test" { mapper: NROM }
+        state Main {
+            on frame { transition Other }
+        }
+        state Other {
+            on frame { transition Main }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0104),
+        "did not expect any W0104 warnings, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_undefined_variable_emits_e0502() {
+    // `ghosy` does not exist; analyzer should emit E0502 and — thanks to
+    // the suggestion helper — hint at `ghost` which is the close match.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "Test" { mapper: NROM }
+        var ghost: u8 = 0
+        var score: u8 = 0
+        on frame {
+            score = ghosy + 1
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    let diag = result
+        .diagnostics
+        .iter()
+        .find(|d| d.code == ErrorCode::E0502)
+        .expect("expected E0502 for undefined variable 'ghosy'");
+    assert!(
+        diag.message.contains("ghosy"),
+        "E0502 message should mention 'ghosy', got: {}",
+        diag.message
+    );
+    assert_eq!(
+        diag.help.as_deref(),
+        Some("did you mean 'ghost'?"),
+        "expected suggestion for 'ghost', got: {:?}",
+        diag.help
+    );
+}

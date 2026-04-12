@@ -266,4 +266,6 @@ pub enum AssignOp {
     AmpAssign,
     PipeAssign,
     CaretAssign,
+    ShiftLeftAssign,
+    ShiftRightAssign,
 }

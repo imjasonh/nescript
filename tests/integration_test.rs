@@ -1,4 +1,7 @@
+use std::path::Path;
+
 use nescript::analyzer;
+use nescript::assets;
 use nescript::codegen::CodeGen;
 use nescript::ir;
 use nescript::linker::Linker;
@@ -25,11 +28,15 @@ fn compile(source: &str) -> Vec<u8> {
     let mut ir_program = ir::lower(&program, &analysis);
     optimizer::optimize(&mut ir_program);
 
-    let codegen = CodeGen::new(&analysis.var_allocations, &program.constants);
+    let sprites = assets::resolve_sprites(&program, Path::new("."))
+        .expect("sprite resolution should succeed");
+
+    let codegen =
+        CodeGen::new(&analysis.var_allocations, &program.constants).with_sprites(&sprites);
     let instructions = codegen.generate(&program);
 
     let linker = Linker::new(program.game.mirroring);
-    linker.link(&instructions)
+    linker.link_with_assets(&instructions, &sprites)
 }
 
 // ── M1 Tests ──
@@ -371,11 +378,77 @@ fn compile_with_mapper(source: &str) -> Vec<u8> {
     let mut ir_program = ir::lower(&program, &analysis);
     nescript::optimizer::optimize(&mut ir_program);
 
-    let codegen = nescript::codegen::CodeGen::new(&analysis.var_allocations, &program.constants);
+    let sprites = assets::resolve_sprites(&program, Path::new("."))
+        .expect("sprite resolution should succeed");
+
+    let codegen = nescript::codegen::CodeGen::new(&analysis.var_allocations, &program.constants)
+        .with_sprites(&sprites);
     let instructions = codegen.generate(&program);
 
     let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
-    linker.link(&instructions)
+    linker.link_with_assets(&instructions, &sprites)
+}
+
+#[test]
+fn sprite_resolution_uses_tile_index() {
+    // The Player sprite has 16 unique bytes of CHR data. Because tile index 0
+    // is reserved for the built-in smiley, the compiler should place Player
+    // at tile index 1 and `draw Player` should store that tile index in OAM.
+    //
+    // We check this in two ways:
+    //   1. The CHR ROM contains Player's bytes at tile 1 (offset 16).
+    //   2. The PRG ROM contains the immediate-load sequence `A9 01 8D 01 02`
+    //      (LDA #$01 ; STA $0201) — writing tile index 1 into OAM byte 1.
+    let source = r#"
+        game "SpriteTile" { mapper: NROM }
+
+        sprite Player {
+            chr: [0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+                  0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D, 0x1E, 0x1F]
+        }
+
+        var px: u8 = 128
+        var py: u8 = 120
+
+        state Title {
+            on frame {
+                draw Player at: (px, py)
+            }
+        }
+
+        start Title
+    "#;
+
+    let rom_data = compile(source);
+
+    // CHR ROM begins right after PRG ROM (16 header + 16384 PRG).
+    let chr_start = 16 + 16384;
+    // Tile 1 lives at CHR offset 16 (16 bytes per tile).
+    let tile1 = &rom_data[chr_start + 16..chr_start + 32];
+    assert_eq!(
+        tile1,
+        &[
+            0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1A, 0x1B, 0x1C, 0x1D,
+            0x1E, 0x1F
+        ],
+        "Player sprite CHR bytes should be placed at tile index 1",
+    );
+
+    // The default smiley tile at index 0 should still be non-zero (untouched).
+    let tile0 = &rom_data[chr_start..chr_start + 16];
+    assert_ne!(
+        tile0, &[0u8; 16],
+        "tile 0 should still contain the default smiley",
+    );
+
+    // In PRG ROM, look for `LDA #$01 ; STA $0201` which writes the Player's
+    // tile index (1) into the tile-index byte of the first OAM slot.
+    let prg = &rom_data[16..16 + 16384];
+    let pattern = [0xA9u8, 0x01, 0x8D, 0x01, 0x02];
+    assert!(
+        prg.windows(pattern.len()).any(|w| w == pattern),
+        "PRG ROM should contain LDA #$01 ; STA $0201 for draw Player",
+    );
 }
 
 #[test]

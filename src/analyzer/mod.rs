@@ -3,7 +3,7 @@ mod tests;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::errors::{Diagnostic, ErrorCode};
+use crate::errors::{Diagnostic, ErrorCode, Label, Level};
 use crate::lexer::Span;
 use crate::parser::ast::*;
 
@@ -48,6 +48,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         max_depths: HashMap::new(),
         stack_depth_limit: DEFAULT_STACK_DEPTH,
         in_loop: false,
+        used_vars: HashSet::new(),
     };
     analyzer.analyze_program(program);
 
@@ -70,6 +71,9 @@ struct Analyzer {
     max_depths: HashMap<String, u32>,
     stack_depth_limit: u32,
     in_loop: bool,
+    /// Names of variables that have been read somewhere in the program.
+    /// Used for the W0103 unused-variable warning.
+    used_vars: HashSet<String>,
 }
 
 impl Analyzer {
@@ -121,9 +125,34 @@ impl Analyzer {
             }
         }
 
-        // Type-check function bodies
+        // Type-check function bodies. Parameters are registered as
+        // symbols for the duration of the body check so that identifier
+        // references (and the W0103 used-variable tracker) can resolve
+        // them. They are unregistered afterwards to avoid leaking into
+        // the global scope. Parameters are also pre-marked as "used" so
+        // we do not emit W0103 for unused function arguments (which are
+        // a common and deliberate pattern).
         for fun in &program.functions {
+            let mut added_params = Vec::new();
+            for param in &fun.params {
+                if !self.symbols.contains_key(&param.name) {
+                    self.symbols.insert(
+                        param.name.clone(),
+                        Symbol {
+                            name: param.name.clone(),
+                            sym_type: param.param_type.clone(),
+                            is_const: false,
+                            span: fun.span,
+                        },
+                    );
+                    added_params.push(param.name.clone());
+                }
+                self.mark_var_used(&param.name);
+            }
             self.check_block(&fun.body, &state_names);
+            for name in &added_params {
+                self.symbols.remove(name);
+            }
         }
 
         // Build call graph
@@ -141,6 +170,145 @@ impl Analyzer {
 
         // Compute max call depths from entry points (state handlers)
         self.compute_max_depths(program);
+
+        // Check for unused global variables (W0103). Variables whose names
+        // start with '_' are exempt by convention. State-local variables are
+        // left out for now to avoid noise during early development.
+        for var in &program.globals {
+            if var.name.starts_with('_') {
+                continue;
+            }
+            if !self.used_vars.contains(&var.name) {
+                self.diagnostics.push(Diagnostic {
+                    level: Level::Warning,
+                    code: ErrorCode::W0103,
+                    message: format!("unused variable '{}'", var.name),
+                    span: var.span,
+                    labels: Vec::<Label>::new(),
+                    help: Some(
+                        "prefix with '_' to silence this warning, or remove the declaration".into(),
+                    ),
+                    note: None,
+                });
+            }
+        }
+
+        // Check for unreachable states (W0104).
+        self.check_unreachable_states(program);
+    }
+
+    /// Mark a variable name as having been read somewhere in the program.
+    fn mark_var_used(&mut self, name: &str) {
+        self.used_vars.insert(name.to_string());
+    }
+
+    /// Recursively walk an expression tree and mark every identifier that
+    /// appears as an `Expr::Ident` (or as an `Expr::ArrayIndex` base) as
+    /// "read". Used by the W0103 unused-variable analysis. Also emits
+    /// E0502 for any identifier that is not defined in the symbol table.
+    fn walk_expr_reads(&mut self, expr: &Expr) {
+        match expr {
+            Expr::Ident(name, span) => {
+                if self.symbols.contains_key(name) {
+                    self.mark_var_used(name);
+                } else {
+                    self.emit_undefined_var(name, *span);
+                }
+            }
+            Expr::ArrayIndex(name, idx, span) => {
+                // Array base is a read; index may contain more reads.
+                if self.symbols.contains_key(name) {
+                    self.mark_var_used(name);
+                } else {
+                    self.emit_undefined_var(name, *span);
+                }
+                self.walk_expr_reads(idx);
+            }
+            Expr::BinaryOp(lhs, _, rhs, _) => {
+                self.walk_expr_reads(lhs);
+                self.walk_expr_reads(rhs);
+            }
+            Expr::UnaryOp(_, inner, _) | Expr::Cast(inner, _, _) => {
+                self.walk_expr_reads(inner);
+            }
+            Expr::Call(_, args, _) => {
+                // Function name is validated separately via E0503; here we
+                // just recurse into argument expressions so their reads
+                // get tracked (and undefined-var errors surface).
+                for arg in args {
+                    self.walk_expr_reads(arg);
+                }
+            }
+            Expr::ArrayLiteral(elems, _) => {
+                for e in elems {
+                    self.walk_expr_reads(e);
+                }
+            }
+            Expr::IntLiteral(_, _) | Expr::BoolLiteral(_, _) | Expr::ButtonRead(_, _, _) => {}
+        }
+    }
+
+    /// Suggest a similarly-named symbol for undefined-variable errors.
+    /// Uses a simple heuristic: same first character and similar length.
+    fn suggest_var_name(&self, unknown: &str) -> Option<String> {
+        let first = unknown.chars().next()?;
+        self.symbols
+            .keys()
+            .filter(|name| {
+                name.starts_with(first)
+                    && name.len().abs_diff(unknown.len()) <= 2
+                    && name.as_str() != unknown
+            })
+            .min_by_key(|name| name.len().abs_diff(unknown.len()))
+            .cloned()
+    }
+
+    /// Emit E0502 for an undefined variable reference, with a "did you mean"
+    /// suggestion if a similar symbol exists.
+    fn emit_undefined_var(&mut self, name: &str, span: Span) {
+        let mut diag = Diagnostic::error(
+            ErrorCode::E0502,
+            format!("undefined variable '{name}'"),
+            span,
+        );
+        if let Some(suggestion) = self.suggest_var_name(name) {
+            diag = diag.with_help(format!("did you mean '{suggestion}'?"));
+        }
+        self.diagnostics.push(diag);
+    }
+
+    /// Reachability analysis for states. Performs a BFS from the start state
+    /// through every transition in state handlers and emits W0104 for any
+    /// state that is never reached.
+    fn check_unreachable_states(&mut self, program: &Program) {
+        let mut reachable: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = vec![program.start_state.clone()];
+
+        while let Some(state_name) = queue.pop() {
+            if !reachable.insert(state_name.clone()) {
+                continue;
+            }
+            if let Some(state) = program.states.iter().find(|s| s.name == state_name) {
+                collect_transitions_from_state(state, &mut queue);
+            }
+        }
+
+        for state in &program.states {
+            if !reachable.contains(&state.name) {
+                self.diagnostics.push(Diagnostic {
+                    level: Level::Warning,
+                    code: ErrorCode::W0104,
+                    message: format!("state '{}' is unreachable from start state", state.name),
+                    span: state.span,
+                    labels: Vec::<Label>::new(),
+                    help: Some(
+                        "add a 'transition' to this state from a reachable state, or remove it"
+                            .into(),
+                    ),
+                    note: None,
+                });
+            }
+        }
     }
 
     fn register_const(&mut self, c: &ConstDecl) {
@@ -307,6 +475,7 @@ impl Analyzer {
             Statement::VarDecl(var) => {
                 self.register_var(var);
                 if let Some(init) = &var.init {
+                    self.walk_expr_reads(init);
                     self.check_expr_type(init, &var.var_type);
                 }
             }
@@ -324,7 +493,7 @@ impl Analyzer {
                             }
                         }
                     }
-                    LValue::ArrayIndex(name, _) => {
+                    LValue::ArrayIndex(name, idx) => {
                         if let Some(sym) = self.symbols.get(name) {
                             if sym.is_const {
                                 self.diagnostics.push(Diagnostic::error(
@@ -334,17 +503,24 @@ impl Analyzer {
                                 ));
                             }
                         }
+                        // Indexing an array counts as a read of the array,
+                        // and the index expression itself may contain reads.
+                        self.mark_var_used(name);
+                        self.walk_expr_reads(idx);
                     }
                 }
+                self.walk_expr_reads(expr);
                 let ltype = self.lvalue_type(lvalue, *span);
                 if let Some(lt) = ltype {
                     self.check_expr_type(expr, &lt);
                 }
             }
             Statement::If(cond, then_block, else_ifs, else_block, _) => {
+                self.walk_expr_reads(cond);
                 self.check_expr_type(cond, &NesType::Bool);
                 self.check_block(then_block, state_names);
                 for (cond, block) in else_ifs {
+                    self.walk_expr_reads(cond);
                     self.check_expr_type(cond, &NesType::Bool);
                     self.check_block(block, state_names);
                 }
@@ -353,6 +529,7 @@ impl Analyzer {
                 }
             }
             Statement::While(cond, body, _) => {
+                self.walk_expr_reads(cond);
                 self.check_expr_type(cond, &NesType::Bool);
                 let was_in_loop = self.in_loop;
                 self.in_loop = true;
@@ -375,17 +552,21 @@ impl Analyzer {
                 }
             }
             Statement::Draw(draw) => {
+                self.walk_expr_reads(&draw.x);
+                self.walk_expr_reads(&draw.y);
                 self.check_expr_type(&draw.x, &NesType::U8);
                 self.check_expr_type(&draw.y, &NesType::U8);
                 if let Some(frame) = &draw.frame {
+                    self.walk_expr_reads(frame);
                     self.check_expr_type(frame, &NesType::U8);
                 }
             }
             Statement::Return(Some(expr), _) => {
                 // For M1, just validate the expression without checking return type
+                self.walk_expr_reads(expr);
                 let _ = self.infer_type(expr);
             }
-            Statement::Call(name, _args, span) => {
+            Statement::Call(name, args, span) => {
                 if !self.symbols.contains_key(name) {
                     self.diagnostics.push(Diagnostic::error(
                         ErrorCode::E0503,
@@ -393,8 +574,13 @@ impl Analyzer {
                         *span,
                     ));
                 }
+                for arg in args {
+                    self.walk_expr_reads(arg);
+                }
             }
             Statement::Scroll(x, y, _) => {
+                self.walk_expr_reads(x);
+                self.walk_expr_reads(y);
                 self.check_expr_type(x, &NesType::U8);
                 self.check_expr_type(y, &NesType::U8);
             }
@@ -515,6 +701,49 @@ impl Analyzer {
             Expr::ArrayLiteral(_, _) => Some(NesType::U8), // element type inferred from context
             Expr::Cast(_, target, _) => Some(target.clone()),
         }
+    }
+}
+
+/// Collect every state name mentioned in a transition statement inside the
+/// given state's handlers and append them to `queue`. Used by the W0104
+/// unreachable-state check.
+fn collect_transitions_from_state(state: &StateDecl, queue: &mut Vec<String>) {
+    if let Some(block) = &state.on_enter {
+        collect_transitions_block(block, queue);
+    }
+    if let Some(block) = &state.on_exit {
+        collect_transitions_block(block, queue);
+    }
+    if let Some(block) = &state.on_frame {
+        collect_transitions_block(block, queue);
+    }
+    for (_, block) in &state.on_scanline {
+        collect_transitions_block(block, queue);
+    }
+}
+
+fn collect_transitions_block(block: &Block, queue: &mut Vec<String>) {
+    for stmt in &block.statements {
+        collect_transitions_stmt(stmt, queue);
+    }
+}
+
+fn collect_transitions_stmt(stmt: &Statement, queue: &mut Vec<String>) {
+    match stmt {
+        Statement::Transition(name, _) => queue.push(name.clone()),
+        Statement::If(_, then_b, elifs, else_b, _) => {
+            collect_transitions_block(then_b, queue);
+            for (_, b) in elifs {
+                collect_transitions_block(b, queue);
+            }
+            if let Some(b) = else_b {
+                collect_transitions_block(b, queue);
+            }
+        }
+        Statement::While(_, body, _) | Statement::Loop(body, _) => {
+            collect_transitions_block(body, queue);
+        }
+        _ => {}
     }
 }
 

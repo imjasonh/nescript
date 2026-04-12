@@ -1,7 +1,8 @@
 use clap::Parser;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use nescript::analyzer;
+use nescript::assets;
 use nescript::codegen::CodeGen;
 use nescript::errors::render_diagnostics;
 use nescript::ir;
@@ -116,17 +117,25 @@ fn compile(input: &PathBuf, _debug: bool, asm_dump: bool) -> Result<Vec<u8>, ()>
     let mut ir_program = ir::lower(&program, &analysis);
     optimizer::optimize(&mut ir_program);
 
+    // Resolve sprite assets (CHR data + tile indices) relative to the
+    // source file's directory, so `@binary` / `@chr` paths work naturally.
+    let source_dir = input.parent().unwrap_or_else(|| Path::new("."));
+    let sprites = assets::resolve_sprites(&program, source_dir).map_err(|e| {
+        eprintln!("error: {e}");
+    })?;
+
     // Code generation (still AST-based for M2; IR codegen comes in M3)
-    let codegen = CodeGen::new(&analysis.var_allocations, &program.constants);
+    let codegen =
+        CodeGen::new(&analysis.var_allocations, &program.constants).with_sprites(&sprites);
     let instructions = codegen.generate(&program);
 
     if asm_dump {
         dump_asm(&instructions);
     }
 
-    // Link into ROM
+    // Link into ROM with sprite CHR data placed at each sprite's tile index.
     let linker = Linker::new(program.game.mirroring);
-    let rom = linker.link(&instructions);
+    let rom = linker.link_with_assets(&instructions, &sprites);
 
     Ok(rom)
 }

@@ -963,6 +963,26 @@ impl Parser {
                     start,
                 ))
             }
+            TokenKind::ShiftLeftAssign => {
+                self.advance();
+                let value = self.parse_expr()?;
+                Ok(Statement::Assign(
+                    LValue::Var(name),
+                    AssignOp::ShiftLeftAssign,
+                    value,
+                    start,
+                ))
+            }
+            TokenKind::ShiftRightAssign => {
+                self.advance();
+                let value = self.parse_expr()?;
+                Ok(Statement::Assign(
+                    LValue::Var(name),
+                    AssignOp::ShiftRightAssign,
+                    value,
+                    start,
+                ))
+            }
             TokenKind::LBracket => {
                 // Array index assignment: name[index] = value
                 self.advance();
@@ -1026,6 +1046,14 @@ impl Parser {
             TokenKind::CaretAssign => {
                 self.advance();
                 Ok(AssignOp::CaretAssign)
+            }
+            TokenKind::ShiftLeftAssign => {
+                self.advance();
+                Ok(AssignOp::ShiftLeftAssign)
+            }
+            TokenKind::ShiftRightAssign => {
+                self.advance();
+                Ok(AssignOp::ShiftRightAssign)
             }
             _ => Err(Diagnostic::error(
                 ErrorCode::E0201,

@@ -47,10 +47,8 @@ pub enum ErrorCode {
     W0101, // expensive multiply/divide operation
     #[allow(dead_code)]
     W0102, // loop without break or wait_frame
-    #[allow(dead_code)]
     W0103, // unused variable
-    #[allow(dead_code)]
-    W0104, // unreachable code
+    W0104, // unreachable state
 }
 
 impl fmt::Display for ErrorCode {

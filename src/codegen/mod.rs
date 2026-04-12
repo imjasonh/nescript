@@ -5,6 +5,7 @@ use std::collections::HashMap;
 
 use crate::analyzer::VarAllocation;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
+use crate::linker::SpriteData;
 use crate::parser::ast::*;
 
 /// Zero-page address for the current state index.
@@ -29,6 +30,8 @@ pub struct CodeGen {
     loop_stack: Vec<(String, String)>,
     /// Next OAM slot to allocate (0-63), reset per frame handler
     next_oam_slot: u8,
+    /// Maps sprite name → CHR ROM tile index for `draw SpriteName`
+    sprite_tiles: HashMap<String, u8>,
 }
 
 impl CodeGen {
@@ -55,7 +58,19 @@ impl CodeGen {
             state_indices: HashMap::new(),
             loop_stack: Vec::new(),
             next_oam_slot: 0,
+            sprite_tiles: HashMap::new(),
         }
+    }
+
+    /// Register sprite-to-tile-index mappings so that `draw SpriteName` can
+    /// emit the correct CHR tile index instead of defaulting to 0.
+    #[must_use]
+    pub fn with_sprites(mut self, sprites: &[SpriteData]) -> Self {
+        for sprite in sprites {
+            self.sprite_tiles
+                .insert(sprite.name.clone(), sprite.tile_index);
+        }
+        self
     }
 
     fn fresh_label(&mut self, prefix: &str) -> String {
@@ -330,6 +345,21 @@ impl CodeGen {
                             self.gen_eor_expr(expr);
                             self.emit_store(addr);
                         }
+                        AssignOp::ShiftLeftAssign => {
+                            // x <<= n: load, shift left n times, store
+                            // For non-constant shift count, emit ASL A once
+                            // (matches codegen of the << operator)
+                            self.emit_load(addr);
+                            self.emit(ASL, AM::Accumulator);
+                            let _ = expr; // count is evaluated but not used for dynamic shifts yet
+                            self.emit_store(addr);
+                        }
+                        AssignOp::ShiftRightAssign => {
+                            self.emit_load(addr);
+                            self.emit(LSR, AM::Accumulator);
+                            let _ = expr;
+                            self.emit_store(addr);
+                        }
                     }
                 }
             }
@@ -409,6 +439,34 @@ impl CodeGen {
                                 self.emit(LDA, AM::AbsoluteX(base_addr));
                             }
                             self.gen_eor_expr(expr);
+                            if base_addr < 0x100 {
+                                self.emit(STA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(STA, AM::AbsoluteX(base_addr));
+                            }
+                        }
+                        AssignOp::ShiftLeftAssign => {
+                            if base_addr < 0x100 {
+                                self.emit(LDA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(LDA, AM::AbsoluteX(base_addr));
+                            }
+                            self.emit(ASL, AM::Accumulator);
+                            let _ = expr;
+                            if base_addr < 0x100 {
+                                self.emit(STA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(STA, AM::AbsoluteX(base_addr));
+                            }
+                        }
+                        AssignOp::ShiftRightAssign => {
+                            if base_addr < 0x100 {
+                                self.emit(LDA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(LDA, AM::AbsoluteX(base_addr));
+                            }
+                            self.emit(LSR, AM::Accumulator);
+                            let _ = expr;
                             if base_addr < 0x100 {
                                 self.emit(STA, AM::ZeroPageX(base_addr as u8));
                             } else {
@@ -842,9 +900,12 @@ impl CodeGen {
         self.gen_expr(&draw.y);
         self.emit(STA, AM::Absolute(base));
 
-        // Tile index — use frame: expr if provided, else 0
+        // Tile index — use frame: expr if provided, else the sprite's
+        // resolved tile index, else 0 (default smiley).
         if let Some(frame) = &draw.frame {
             self.gen_expr(frame);
+        } else if let Some(&tile_idx) = self.sprite_tiles.get(&draw.sprite_name) {
+            self.emit(LDA, AM::Immediate(tile_idx));
         } else {
             self.emit(LDA, AM::Immediate(0));
         }

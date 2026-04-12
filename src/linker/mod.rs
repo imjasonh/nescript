@@ -13,6 +13,15 @@ pub struct Linker {
     mapper: Mapper,
 }
 
+/// CHR data for a sprite, placed at a specific tile index in CHR ROM.
+#[derive(Debug, Clone)]
+pub struct SpriteData {
+    pub name: String,
+    pub tile_index: u8,
+    /// Raw CHR bytes (16 bytes per 8x8 tile).
+    pub chr_bytes: Vec<u8>,
+}
+
 /// A smiley face CHR tile for the default sprite (M1).
 const DEFAULT_SPRITE_CHR: [u8; 16] = [
     // Plane 0 (low bits)
@@ -62,7 +71,17 @@ impl Linker {
     }
 
     /// Link all code sections into a .nes ROM.
+    ///
+    /// This is a thin wrapper around [`Linker::link_with_assets`] that passes
+    /// an empty sprite list, so the CHR ROM only contains the default smiley
+    /// tile at index 0.
     pub fn link(&self, user_code: &[Instruction]) -> Vec<u8> {
+        self.link_with_assets(user_code, &[])
+    }
+
+    /// Link all code sections into a .nes ROM, placing sprite CHR data at
+    /// specific tile indices.
+    pub fn link_with_assets(&self, user_code: &[Instruction], sprites: &[SpriteData]) -> Vec<u8> {
         // For NROM: everything fits in one 16 KB PRG bank ($C000-$FFFF)
         // Layout:
         //   $C000: RESET handler (init + palette load + user code)
@@ -125,9 +144,17 @@ impl Linker {
         builder.set_mapper(crate::rom::mapper_number(self.mapper));
         builder.set_prg(prg);
 
-        // CHR ROM with default sprite tile
+        // CHR ROM: tile 0 is reserved for the default smiley, followed by
+        // any user-declared sprites placed at their assigned tile indices.
         let mut chr = vec![0u8; 8192];
         chr[..16].copy_from_slice(&DEFAULT_SPRITE_CHR);
+        for sprite in sprites {
+            let offset = sprite.tile_index as usize * 16;
+            let end = offset + sprite.chr_bytes.len();
+            if end <= chr.len() {
+                chr[offset..end].copy_from_slice(&sprite.chr_bytes);
+            }
+        }
         builder.set_chr(chr);
 
         builder.build()
