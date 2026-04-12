@@ -312,3 +312,32 @@ fn lower_wait_frame() {
         .any(|op| matches!(op, IrOp::WaitFrame));
     assert!(has_wait, "should emit WaitFrame op");
 }
+
+#[test]
+fn array_literal_global_init_is_captured() {
+    // Regression test: `var xs: u8[4] = [1, 2, 3, 4]` used to lose
+    // its initializer because `eval_const` returns None for
+    // `Expr::ArrayLiteral` and `init_value` ended up `None`. The
+    // fix captures the per-element values in a new `init_array`
+    // field so the IR codegen can emit one `LDA #imm; STA base+i`
+    // per byte at startup.
+    let ir = lower_ok(
+        r#"
+        game "Arr" { mapper: NROM }
+        var xs: u8[4] = [1, 2, 3, 4]
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    let xs = ir
+        .globals
+        .iter()
+        .find(|g| g.name == "xs")
+        .expect("`xs` global should exist");
+    assert_eq!(
+        xs.init_array,
+        vec![1, 2, 3, 4],
+        "array literal initializer should populate init_array: {:?}",
+        xs.init_array
+    );
+}

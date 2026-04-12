@@ -84,12 +84,22 @@ impl<'a> IrCodeGen<'a> {
         // disjoint across functions so nested calls don't corrupt
         // each other.
         let mut local_ram_next: u16 = 0x0300;
-        // Advance past any global addresses so we don't clobber them.
-        // This is conservative: scan existing var_addrs for the max.
-        if let Some(max_global) = var_addrs.values().copied().max() {
-            if max_global >= local_ram_next {
-                local_ram_next = max_global + 1;
-            }
+        // Advance past any RAM global so locals don't clobber them.
+        // Each global occupies `[address, address + size)` — for an
+        // array global at $0308 with size=4 that's $0308..$030C. We
+        // must advance past the END, not the base, otherwise
+        // subsequent locals overlap with the tail of the array.
+        // Globals are looked up by name against the analyzer's
+        // `allocations` (which has per-global sizes) rather than the
+        // `var_addrs` map, which only stores base addresses.
+        let max_ram_global_end = allocations
+            .iter()
+            .filter(|a| a.address >= 0x0100)
+            .map(|a| a.address + a.size.max(1))
+            .max()
+            .unwrap_or(0);
+        if max_ram_global_end > local_ram_next {
+            local_ram_next = max_ram_global_end;
         }
         for func in &ir.functions {
             for (i, local) in func.locals.iter().enumerate() {
@@ -188,15 +198,32 @@ impl<'a> IrCodeGen<'a> {
         }
 
         // 1. Variable initializers
+        //
+        // Scalars write a single byte from `init_value`. Array
+        // literals write N bytes from `init_array` at successive
+        // offsets from the global's base address. Uninitialized
+        // globals (neither set) stay at the $00 the RAM-clear left
+        // them.
         for global in &ir.globals {
-            if let Some(val) = global.init_value {
-                if let Some(&addr) = self.var_addrs.get(&global.var_id) {
-                    self.emit(LDA, AM::Immediate(val as u8));
+            let Some(&base) = self.var_addrs.get(&global.var_id) else {
+                continue;
+            };
+            if !global.init_array.is_empty() {
+                for (offset, &byte) in global.init_array.iter().enumerate() {
+                    let addr = base.wrapping_add(offset as u16);
+                    self.emit(LDA, AM::Immediate(byte));
                     if addr < 0x100 {
                         self.emit(STA, AM::ZeroPage(addr as u8));
                     } else {
                         self.emit(STA, AM::Absolute(addr));
                     }
+                }
+            } else if let Some(val) = global.init_value {
+                self.emit(LDA, AM::Immediate(val as u8));
+                if base < 0x100 {
+                    self.emit(STA, AM::ZeroPage(base as u8));
+                } else {
+                    self.emit(STA, AM::Absolute(base));
                 }
             }
         }

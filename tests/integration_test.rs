@@ -854,3 +854,141 @@ fn ir_codegen_multi_oam() {
     let rom_data = compile_with_ir_codegen(source);
     rom::validate_ines(&rom_data).expect("should be valid iNES");
 }
+
+#[test]
+fn ir_codegen_array_literal_globals_emit_per_byte_init() {
+    // Regression test: `var xs: u8[4] = [10, 20, 30, 40]` used to
+    // compile to a zero-initialized array because `eval_const`
+    // returned `None` for `Expr::ArrayLiteral` and no startup
+    // stores were emitted. The fix captures the literal values
+    // in `IrGlobal::init_array` and has the IR codegen emit one
+    // `LDA #imm; STA base+i` per byte during startup.
+    use nescript::asm::{AddressingMode, Opcode};
+    use nescript::codegen::IrCodeGen;
+
+    let source = r#"
+        game "ArrLit" { mapper: NROM }
+        var xs: u8[4] = [10, 20, 30, 40]
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (prog, diags) = nescript::parser::parse(source);
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let prog = prog.unwrap();
+    let analysis = analyzer::analyze(&prog);
+    let mut ir_program = ir::lower(&prog, &analysis);
+    optimizer::optimize(&mut ir_program);
+
+    let xs_addr = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "xs")
+        .expect("xs should be allocated")
+        .address;
+
+    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
+    let instructions = codegen.generate(&ir_program);
+
+    // For each element, look for `LDA #val` followed shortly by
+    // `STA absolute(xs_addr + i)`. We don't require them to be
+    // adjacent because the peephole passes can reshuffle, but a
+    // store of the correct value to the correct address must
+    // exist.
+    for (i, &expected) in [10u8, 20, 30, 40].iter().enumerate() {
+        let target = xs_addr + i as u16;
+        let has_store = instructions.windows(2).any(|w| {
+            matches!(w[0].mode, AddressingMode::Immediate(v) if v == expected)
+                && w[0].opcode == Opcode::LDA
+                && w[1].opcode == Opcode::STA
+                && matches!(w[1].mode, AddressingMode::Absolute(a) if a == target)
+        });
+        assert!(
+            has_store,
+            "expected `LDA #{expected}; STA ${target:04X}` for xs[{i}] but did not find it"
+        );
+    }
+}
+
+#[test]
+fn ir_codegen_locals_do_not_overlap_array_globals() {
+    // Regression test for the local-allocator off-by-array-size
+    // bug. `IrCodeGen::new` used to start handler-local vars at
+    // `max_global_base + 1`, which for an array global at
+    // `$0300-$0303` put the first local at `$0301` — inside the
+    // array. Any store through that local then corrupted the
+    // array mid-frame. The fix advances past the global's END,
+    // not its base.
+    //
+    // We verify by asking the IR codegen what addresses it
+    // assigned. Since `var_addrs` is private, we check indirectly
+    // via emitted instructions: any `STA $030N` for N > 3 that
+    // isn't part of the startup init must be writing to a local
+    // whose address is outside the array. If the bug regressed,
+    // we'd see `STA $0302` or similar in the frame handler's
+    // computation code.
+    use nescript::asm::{AddressingMode, Opcode};
+    use nescript::codegen::IrCodeGen;
+
+    let source = r#"
+        game "LocalVsArr" { mapper: NROM }
+        var xs: u8[4] = [11, 22, 33, 44]
+        on frame {
+            var tmp: u8 = 0
+            tmp = xs[0]
+            tmp += 1
+            wait_frame
+        }
+        start Main
+    "#;
+    let (prog, diags) = nescript::parser::parse(source);
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let prog = prog.unwrap();
+    let analysis = analyzer::analyze(&prog);
+    let mut ir_program = ir::lower(&prog, &analysis);
+    optimizer::optimize(&mut ir_program);
+
+    let xs_alloc = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "xs")
+        .expect("xs should be allocated");
+    let xs_base = xs_alloc.address;
+    let xs_end = xs_base + xs_alloc.size; // one past last element
+
+    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
+    let instructions = codegen.generate(&ir_program);
+
+    // Collect the (ordered) list of `STA absolute` targets and
+    // immediate values preceding each store. The first four
+    // stores into `[xs_base, xs_end)` should be the `LDA #imm;
+    // STA addr` init pairs — those are fine. Any STA into the
+    // array AFTER the init sequence would indicate a local var
+    // was allocated inside the array.
+    let mut init_stores_seen = 0usize;
+    for w in instructions.windows(2) {
+        if w[1].opcode != Opcode::STA {
+            continue;
+        }
+        let AddressingMode::Absolute(addr) = w[1].mode else {
+            continue;
+        };
+        if addr < xs_base || addr >= xs_end {
+            continue;
+        }
+        if w[0].opcode == Opcode::LDA
+            && matches!(w[0].mode, AddressingMode::Immediate(_))
+            && init_stores_seen < 4
+        {
+            init_stores_seen += 1;
+            continue;
+        }
+        panic!(
+            "store into xs array (${addr:04X}) after init sequence — \
+             local probably overlapping with array global"
+        );
+    }
+    assert_eq!(
+        init_stores_seen, 4,
+        "expected 4 init stores for xs[0..4], found {init_stores_seen}"
+    );
+}

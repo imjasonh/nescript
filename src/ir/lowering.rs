@@ -193,15 +193,26 @@ impl LoweringContext {
         // Struct-literal initializers are expanded into per-field
         // globals so each field gets its own `init_value`; the parent
         // struct itself is still registered (size=0) so any later IR
-        // op referencing it by name still resolves.
+        // op referencing it by name still resolves. Array-literal
+        // initializers are lowered into `init_array` on the parent
+        // global — the IR codegen's startup loop emits one LDA/STA
+        // per byte into the global's base address.
         for var in &program.globals {
             let var_id = self.get_or_create_var(&var.name);
             let init = var.init.as_ref().and_then(|e| self.eval_const(e));
+            let init_array = match &var.init {
+                Some(Expr::ArrayLiteral(elems, _)) => elems
+                    .iter()
+                    .filter_map(|e| self.eval_const(e).map(|v| v as u8))
+                    .collect(),
+                _ => Vec::new(),
+            };
             self.globals.push(IrGlobal {
                 var_id,
                 name: var.name.clone(),
                 size: type_size(&var.var_type),
                 init_value: init,
+                init_array,
             });
             if let Some(Expr::StructLiteral(_, fields, _)) = &var.init {
                 for (fname, fexpr) in fields {
@@ -213,6 +224,7 @@ impl LoweringContext {
                         name: full,
                         size: 1,
                         init_value: fval,
+                        init_array: Vec::new(),
                     });
                 }
             }

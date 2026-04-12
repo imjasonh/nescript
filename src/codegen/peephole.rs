@@ -392,6 +392,24 @@ fn remove_redundant_loads(instructions: &mut Vec<Instruction>) {
                 eq.clear();
                 eq.push(AValue::Abs(*addr));
             }
+            // Indexed, indirect, and accumulator-mode LDAs clobber A
+            // but the value they load isn't trackable here (the
+            // effective address depends on a register or memory we
+            // don't track), so we can't add it to `eq`. We MUST still
+            // clear the tracker — otherwise a subsequent `LDA #v`
+            // might look redundant against a stale entry from before
+            // the indexed load, and get dropped. That's a miscompile,
+            // not an optimization.
+            (
+                Opcode::LDA,
+                AddressingMode::AbsoluteX(_)
+                | AddressingMode::AbsoluteY(_)
+                | AddressingMode::ZeroPageX(_)
+                | AddressingMode::IndirectX(_)
+                | AddressingMode::IndirectY(_),
+            ) => {
+                eq.clear();
+            }
             (Opcode::STA, AddressingMode::ZeroPage(addr)) => {
                 // A unchanged; address now holds A's value. Add the
                 // address to the equivalence class.
@@ -940,5 +958,77 @@ mod tests {
         let before = insts.len();
         optimize(&mut insts);
         assert_eq!(insts.len(), before);
+    }
+
+    #[test]
+    fn indexed_load_invalidates_redundant_load_tracker() {
+        // Regression test for a miscompile that affected every
+        // `draw Sprite at: (arr[i], arr[j])` pattern in the IR
+        // codegen. The original `remove_redundant_loads` only
+        // tracked `LDA Immediate/ZeroPage/Absolute`; indexed-mode
+        // loads like `LDA AbsoluteX(...)` fell through the match
+        // and left the A-equivalence tracker unchanged. A later
+        // `LDA #imm` that happened to match a stale entry from
+        // BEFORE the indexed load was then silently dropped as
+        // "already in A" — even though A really held the element
+        // the AbsoluteX just loaded.
+        //
+        // The buggy pattern: load 0 into A to index array1, load
+        // arr1[0], STASH it in a temp (so remove_dead_loads keeps
+        // the AbsoluteX), load 0 again to index array2, read
+        // arr2[0]. With the buggy pass, the second `LDA #0` was
+        // dropped as redundant because the tracker still said
+        // A = Imm(0) from before the AbsoluteX. Then TAX would
+        // push the arr1[0] value into X and the second array
+        // load would use an out-of-bounds index.
+        let stash = 0x90; // a temp slot addr >= 0x80
+        let mut insts = vec![
+            Instruction::new(LDA, AM::Immediate(0)),
+            Instruction::new(TAX, AM::Implied),
+            Instruction::new(LDA, AM::AbsoluteX(0x0300)),
+            Instruction::new(STA, AM::ZeroPage(stash)),
+            Instruction::new(LDA, AM::Immediate(0)),
+            Instruction::new(TAX, AM::Implied),
+            Instruction::new(LDA, AM::AbsoluteX(0x0308)),
+            Instruction::new(STA, AM::Absolute(0x0200)),
+            Instruction::new(LDA, AM::ZeroPage(stash)),
+            Instruction::new(STA, AM::Absolute(0x0203)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // The exact shape after optimization isn't the point —
+        // what matters is that there are still two `TAX`
+        // instructions each preceded by a fresh `LDA #0` so
+        // both AbsoluteX loads target index 0. If the optimizer
+        // dropped the second `LDA #0`, the second `TAX` would
+        // copy whatever arr1[0] was into X and the second
+        // AbsoluteX load would read arr2[arr1[0]] — wildly out
+        // of bounds.
+        let mut saw_lda_zero_before_tax = 0;
+        let mut saw_other_lda_before_tax = false;
+        let mut last_lda: Option<AM> = None;
+        for inst in &insts {
+            match inst.opcode {
+                LDA => {
+                    last_lda = Some(inst.mode.clone());
+                }
+                TAX => {
+                    match &last_lda {
+                        Some(AM::Immediate(0)) => saw_lda_zero_before_tax += 1,
+                        _ => saw_other_lda_before_tax = true,
+                    }
+                    last_lda = None;
+                }
+                _ => {}
+            }
+        }
+        assert!(
+            !saw_other_lda_before_tax,
+            "a TAX is preceded by a non-Imm(0) LDA — optimizer kept a stale index: {insts:?}"
+        );
+        assert_eq!(
+            saw_lda_zero_before_tax, 2,
+            "both TAXes must be preceded by a fresh LDA #0: {insts:?}"
+        );
     }
 }

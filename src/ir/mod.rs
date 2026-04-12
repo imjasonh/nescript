@@ -45,7 +45,18 @@ pub struct IrGlobal {
     pub var_id: VarId,
     pub name: String,
     pub size: u16,
+    /// Scalar initial value for single-byte globals. `None` means the
+    /// RAM-clear at reset leaves this global at 0.
     pub init_value: Option<u16>,
+    /// Per-byte initial contents for array-literal globals
+    /// (e.g. `var xs: u8[4] = [1,2,3,4]`). Empty for scalars or
+    /// uninitialized arrays. Each entry is the initial byte at offset
+    /// `i` from the global's base address; trailing bytes not covered
+    /// by the literal stay zero-filled by the hardware init's RAM
+    /// clear. Mutually exclusive with a meaningful `init_value` in
+    /// practice: `lower_program` takes one path for scalars and
+    /// another for array literals.
+    pub init_array: Vec<u8>,
 }
 
 /// A block of constant data to be placed in ROM.
