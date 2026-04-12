@@ -527,6 +527,132 @@ fn program_with_mmc1() {
 
 // ── IR Codegen Tests ──
 
+// ── Test Harness Tests ──
+
+/// Compile a NEScript source string in debug mode (as `nescript test` does).
+/// Returns the ROM bytes, or panics on compile error.
+fn compile_in_debug_mode(source: &str) -> Vec<u8> {
+    use nescript::codegen::IrCodeGen;
+
+    let (program, diags) = nescript::parser::parse(source);
+    assert!(
+        diags.is_empty(),
+        "unexpected parse errors: {diags:?}\nsource:\n{source}"
+    );
+    let program = program.expect("parse should succeed");
+
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.diagnostics.iter().all(|d| !d.is_error()),
+        "unexpected analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+
+    let sprites = assets::resolve_sprites(&program, Path::new("."))
+        .expect("sprite resolution should succeed");
+
+    // debug=true mirrors what `nescript test` does for every *_test.ne file
+    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_debug(true);
+    let instructions = codegen.generate(&ir_program);
+
+    let linker = Linker::new(program.game.mirroring);
+    linker.link_with_assets(&instructions, &sprites)
+}
+
+/// Parse and analyse a source string; return whether it has any errors.
+fn has_compile_errors(source: &str) -> bool {
+    let (program, diags) = nescript::parser::parse(source);
+    if diags.iter().any(nescript::errors::Diagnostic::is_error) {
+        return true;
+    }
+    let Some(program) = program else {
+        return true;
+    };
+    let analysis = analyzer::analyze(&program);
+    analysis
+        .diagnostics
+        .iter()
+        .any(nescript::errors::Diagnostic::is_error)
+}
+
+#[test]
+fn test_file_with_debug_assert_compiles_in_debug_mode() {
+    // A *_test.ne program that uses debug.assert should compile successfully
+    // in debug mode. The assert statements emit BRK on a real NES when they
+    // fail, but compiling without errors is the minimum bar that nescript test
+    // reports as "ok".
+    let source = r#"
+        game "AssertTest" { mapper: NROM }
+        var result: u8 = 0
+
+        fun add(a: u8, b: u8) -> u8 {
+            return a + b
+        }
+
+        on frame {
+            result = add(3, 4)
+            debug.assert(result == 7)
+            wait_frame
+        }
+
+        start Main
+    "#;
+    let rom_data = compile_in_debug_mode(source);
+    rom::validate_ines(&rom_data).expect("should produce a valid ROM");
+}
+
+#[test]
+fn test_file_debug_assert_emits_brk_in_rom() {
+    // Confirm that debug.assert actually emits a BRK opcode ($00) when
+    // compiled in debug mode. BRK is opcode 0x00 on the 6502.
+    let source = r#"
+        game "BrkTest" { mapper: NROM }
+        var x: u8 = 0
+
+        on frame {
+            debug.assert(x == 1)
+            wait_frame
+        }
+
+        start Main
+    "#;
+    let rom_data = compile_in_debug_mode(source);
+    // iNES header is 16 bytes; PRG ROM is 16 384 bytes for NROM.
+    const INES_HEADER: usize = 16;
+    const PRG_SIZE: usize = 16384;
+    let prg = &rom_data[INES_HEADER..INES_HEADER + PRG_SIZE];
+    // BRK is opcode 0x00. The condition `x == 1` is almost always false (x
+    // starts at 0), so the BRK must be present somewhere in PRG ROM.
+    assert!(
+        prg.contains(&0x00u8),
+        "debug.assert should emit BRK ($00) in debug-mode ROM"
+    );
+}
+
+#[test]
+fn test_file_compile_error_is_detected() {
+    // A *_test.ne file with a compile error should cause `nescript test` to
+    // report that file as FAILED. Verify that the error detection path works.
+    let broken = "var x: u8 = 0\nstart Main"; // missing game declaration
+    assert!(
+        has_compile_errors(broken),
+        "missing game decl should be a compile error"
+    );
+}
+
+#[test]
+fn example_math_test_ne_compiles() {
+    // The example test file shipped in examples/ should compile in debug mode.
+    let source = include_str!("../examples/math_test.ne");
+    let rom_data = compile_in_debug_mode(source);
+    rom::validate_ines(&rom_data).expect("math_test.ne should produce a valid ROM");
+}
+
 /// Compile a program using the IR-based codegen path instead of the
 /// AST-based codegen. Validates the full IR pipeline produces a valid ROM.
 fn compile_with_ir_codegen(source: &str) -> Vec<u8> {

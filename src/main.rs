@@ -43,6 +43,12 @@ enum Cli {
         /// Input source file
         input: PathBuf,
     },
+    /// Run all *_test.ne files in a directory (always compiled with debug mode)
+    Test {
+        /// Directory to search for test files (default: current directory)
+        #[arg(default_value = ".")]
+        dir: PathBuf,
+    },
 }
 
 fn main() {
@@ -86,6 +92,11 @@ fn main() {
             Ok(()) => println!("no errors found in {}", input.display()),
             Err(()) => std::process::exit(1),
         },
+        Cli::Test { dir } => {
+            if !run_tests(&dir) {
+                std::process::exit(1);
+            }
+        }
     }
 }
 
@@ -231,4 +242,80 @@ fn check(input: &PathBuf) -> Result<(), ()> {
     }
 
     Ok(())
+}
+
+/// Discover all `*_test.ne` files in `dir`, compile each in debug mode, and
+/// report results. Returns `true` if all tests passed (or none were found).
+fn run_tests(dir: &Path) -> bool {
+    // Collect all *_test.ne files in the given directory (non-recursive).
+    let mut test_files: Vec<PathBuf> = match std::fs::read_dir(dir) {
+        Ok(entries) => entries
+            .filter_map(|entry| {
+                let path = entry.ok()?.path();
+                if path.is_file()
+                    && path.extension().is_some_and(|ext| ext == "ne")
+                    && path
+                        .file_stem()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|name| name.ends_with("_test"))
+                {
+                    Some(path)
+                } else {
+                    None
+                }
+            })
+            .collect(),
+        Err(e) => {
+            eprintln!("error: failed to read directory {}: {e}", dir.display());
+            return false;
+        }
+    };
+
+    if test_files.is_empty() {
+        println!("no test files found in {}", dir.display());
+        return true;
+    }
+
+    test_files.sort();
+
+    let total = test_files.len();
+    let mut passed = 0usize;
+    let mut failed = 0usize;
+
+    println!("running {} test{}", total, if total == 1 { "" } else { "s" });
+
+    for path in &test_files {
+        let name = path.display().to_string();
+        print!("test {name} ... ");
+
+        let result = compile(
+            path,
+            &CompileOptions {
+                debug: true,
+                asm_dump: false,
+                dump_ir: false,
+                use_ast: false,
+            },
+        );
+
+        match result {
+            Ok(_) => {
+                println!("ok");
+                passed += 1;
+            }
+            Err(()) => {
+                println!("FAILED");
+                failed += 1;
+            }
+        }
+    }
+
+    println!();
+    if failed == 0 {
+        println!("test result: ok. {passed} passed; 0 failed");
+        true
+    } else {
+        println!("test result: FAILED. {passed} passed; {failed} failed");
+        false
+    }
 }
