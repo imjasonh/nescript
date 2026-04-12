@@ -179,6 +179,9 @@ impl<'a> Lexer<'a> {
                 if self.peek() == Some(b'=') {
                     self.advance();
                     Some(self.make_token(TokenKind::Eq, start))
+                } else if self.peek() == Some(b'>') {
+                    self.advance();
+                    Some(self.make_token(TokenKind::FatArrow, start))
                 } else {
                     Some(self.make_token(TokenKind::Assign, start))
                 }
@@ -443,6 +446,7 @@ impl<'a> Lexer<'a> {
             "while" => TokenKind::KwWhile,
             "for" => TokenKind::KwFor,
             "in" => TokenKind::KwIn,
+            "match" => TokenKind::KwMatch,
             "break" => TokenKind::KwBreak,
             "continue" => TokenKind::KwContinue,
             "return" => TokenKind::KwReturn,

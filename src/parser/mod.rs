@@ -850,6 +850,7 @@ impl Parser {
             TokenKind::KwIf => self.parse_if(),
             TokenKind::KwWhile => self.parse_while(),
             TokenKind::KwFor => self.parse_for(),
+            TokenKind::KwMatch => self.parse_match(),
             TokenKind::KwLoop => self.parse_loop(),
             TokenKind::KwBreak => {
                 let span = self.current_span();
@@ -996,6 +997,83 @@ impl Parser {
         self.expect(&TokenKind::KwLoop)?;
         let body = self.parse_block()?;
         Ok(Statement::Loop(body, start))
+    }
+
+    /// Parse `match expr { pat => { body }, pat => { body }, _ => { body } }`.
+    /// Desugars to a chain of `if expr == pat { body } else if ...`
+    /// at parse time — no dedicated AST variant needed.
+    fn parse_match(&mut self) -> Result<Statement, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwMatch)?;
+        let saved = self.restrict_struct_literals;
+        self.restrict_struct_literals = true;
+        let scrutinee = self.parse_expr()?;
+        self.restrict_struct_literals = saved;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut arms: Vec<(Expr, Block)> = Vec::new();
+        let mut default: Option<Block> = None;
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            // A default arm is `_ => { ... }`.
+            if let TokenKind::Ident(name) = self.peek().clone() {
+                if name == "_" {
+                    self.advance();
+                    self.expect(&TokenKind::FatArrow)?;
+                    let body = self.parse_block()?;
+                    default = Some(body);
+                    if *self.peek() == TokenKind::Comma {
+                        self.advance();
+                    }
+                    continue;
+                }
+            }
+            let pat_span = self.current_span();
+            let pat = self.parse_expr()?;
+            self.expect(&TokenKind::FatArrow)?;
+            let body = self.parse_block()?;
+            // Build `scrutinee == pat` as the branch condition.
+            let cond = Expr::BinaryOp(
+                Box::new(scrutinee.clone()),
+                BinOp::Eq,
+                Box::new(pat),
+                pat_span,
+            );
+            arms.push((cond, body));
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        if arms.is_empty() {
+            // `match x { _ => body }` or empty match — emit the
+            // default block directly, or an empty no-op.
+            if let Some(body) = default {
+                return Ok(Statement::If(
+                    Expr::BoolLiteral(true, start),
+                    body,
+                    Vec::new(),
+                    None,
+                    start,
+                ));
+            }
+            return Ok(Statement::If(
+                Expr::BoolLiteral(false, start),
+                Block {
+                    statements: Vec::new(),
+                    span: start,
+                },
+                Vec::new(),
+                None,
+                start,
+            ));
+        }
+
+        // Build an if/else-if chain. The first arm becomes the
+        // `then` block; subsequent arms become `else if` entries;
+        // the default arm (if any) becomes the final `else`.
+        let (first_cond, first_body) = arms.remove(0);
+        Ok(Statement::If(first_cond, first_body, arms, default, start))
     }
 
     fn parse_for(&mut self) -> Result<Statement, Diagnostic> {

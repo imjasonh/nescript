@@ -229,6 +229,36 @@ fn program_with_for_loop() {
 }
 
 #[test]
+fn program_with_match_statement() {
+    // Note: the parser doesn't support `;` as a statement separator,
+    // so each arm body uses newlines between statements.
+    let source = r#"
+        game "Match" { mapper: NROM }
+        enum Mode { Idle, Run, Jump }
+        var mode: u8 = Idle
+        var x: u8 = 0
+        on frame {
+            match mode {
+                Idle => { if button.a { mode = Run } }
+                Run => {
+                    x += 1
+                    if button.b { mode = Jump }
+                }
+                Jump => {
+                    x += 2
+                    if button.a { mode = Idle }
+                }
+                _ => {}
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_struct_literals() {
     let source = r#"
         game "Lit" { mapper: NROM }

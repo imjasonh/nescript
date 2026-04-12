@@ -666,6 +666,36 @@ fn parse_mmc3_mapper() {
 }
 
 #[test]
+fn parse_match_statement() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        enum State { Title, Playing, GameOver }
+        var s: u8 = Title
+        on frame {
+            match s {
+                Title => { s = Playing }
+                Playing => { s = GameOver }
+                _ => {}
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+    // Match desugars to an If, so after parsing the first statement
+    // inside the frame handler should be an If with two elifs and an
+    // else.
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    match &frame.statements[0] {
+        Statement::If(_, _, elifs, else_block, _) => {
+            assert_eq!(elifs.len(), 1, "expected 1 else-if, got {elifs:?}");
+            assert!(else_block.is_some(), "expected an else block for `_`");
+        }
+        _ => panic!("expected If, got {:?}", frame.statements[0]),
+    }
+}
+
+#[test]
 fn parse_for_loop() {
     let src = r#"
         game "Test" { mapper: NROM }

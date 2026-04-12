@@ -509,6 +509,37 @@ while i < 10 {
 }
 ```
 
+### Match Statement
+
+`match` matches a scrutinee against a sequence of patterns and
+executes the body of the first matching arm. Each arm's pattern is
+compared against the scrutinee with `==`. An underscore arm `_` acts
+as the catch-all:
+
+```
+enum State { Title, Playing, GameOver }
+var state: u8 = Title
+
+on frame {
+    match state {
+        Title => {
+            if button.start { state = Playing }
+        }
+        Playing => {
+            // ... game logic ...
+        }
+        GameOver => {
+            if button.a { state = Title }
+        }
+        _ => {}
+    }
+}
+```
+
+`match` desugars to an `if` / `else if` chain at parse time, so
+patterns can be any expression that produces a value comparable to
+the scrutinee.
+
 ### For Loop
 
 The `for` loop iterates over a half-open integer range `[start, end)`:
