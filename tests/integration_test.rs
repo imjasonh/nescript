@@ -529,7 +529,7 @@ fn program_with_mmc1() {
 
 // ── Test Harness Tests ──
 
-/// Compile a NEScript source string in debug mode (as `nescript test` does).
+/// Compile a `NEScript` source string in debug mode (as `nescript test` does).
 /// Returns the ROM bytes, or panics on compile error.
 fn compile_in_debug_mode(source: &str) -> Vec<u8> {
     use nescript::codegen::IrCodeGen;
@@ -608,6 +608,9 @@ fn test_file_with_debug_assert_compiles_in_debug_mode() {
 
 #[test]
 fn test_file_debug_assert_emits_brk_in_rom() {
+    // iNES header is 16 bytes; PRG ROM is 16 384 bytes for NROM.
+    const INES_HEADER: usize = 16;
+    const PRG_SIZE: usize = 16384;
     // Confirm that debug.assert actually emits a BRK opcode ($00) when
     // compiled in debug mode. BRK is opcode 0x00 on the 6502.
     let source = r#"
@@ -622,9 +625,6 @@ fn test_file_debug_assert_emits_brk_in_rom() {
         start Main
     "#;
     let rom_data = compile_in_debug_mode(source);
-    // iNES header is 16 bytes; PRG ROM is 16 384 bytes for NROM.
-    const INES_HEADER: usize = 16;
-    const PRG_SIZE: usize = 16384;
     let prg = &rom_data[INES_HEADER..INES_HEADER + PRG_SIZE];
     // BRK is opcode 0x00. The condition `x == 1` is almost always false (x
     // starts at 0), so the BRK must be present somewhere in PRG ROM.
