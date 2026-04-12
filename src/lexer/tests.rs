@@ -123,6 +123,7 @@ fn lex_all_keywords() {
         ("var", TokenKind::KwVar),
         ("const", TokenKind::KwConst),
         ("enum", TokenKind::KwEnum),
+        ("struct", TokenKind::KwStruct),
         ("if", TokenKind::KwIf),
         ("else", TokenKind::KwElse),
         ("while", TokenKind::KwWhile),

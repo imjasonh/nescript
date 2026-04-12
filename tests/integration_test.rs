@@ -142,6 +142,29 @@ fn program_with_functions() {
 }
 
 #[test]
+fn program_with_structs() {
+    let source = r#"
+        game "Structs" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        struct Player { health: u8, lives: u8 }
+
+        var pos: Vec2
+        var hero: Player
+
+        on frame {
+            pos.x = 100
+            pos.y = 50
+            hero.health = 3
+            hero.lives = 5
+            if button.right { pos.x += 1 }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_enums() {
     let source = r#"
         game "Enums" { mapper: NROM }

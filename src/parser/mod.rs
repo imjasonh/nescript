@@ -117,6 +117,7 @@ impl Parser {
         let mut globals = Vec::new();
         let mut constants = Vec::new();
         let mut enums: Vec<EnumDecl> = Vec::new();
+        let mut structs: Vec<StructDecl> = Vec::new();
         let mut functions = Vec::new();
         let mut states = Vec::new();
         let mut sprites = Vec::new();
@@ -146,6 +147,9 @@ impl Parser {
                 }
                 TokenKind::KwEnum => {
                     enums.push(self.parse_enum_decl()?);
+                }
+                TokenKind::KwStruct => {
+                    structs.push(self.parse_struct_decl()?);
                 }
                 TokenKind::KwState => {
                     states.push(self.parse_state_decl()?);
@@ -221,6 +225,7 @@ impl Parser {
             globals,
             constants,
             enums,
+            structs,
             functions,
             states,
             sprites,
@@ -229,6 +234,40 @@ impl Parser {
             banks,
             start_state,
             span,
+        })
+    }
+
+    fn parse_struct_decl(&mut self) -> Result<StructDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwStruct)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut fields = Vec::new();
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let field_span = self.current_span();
+            let (field_name, _) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            let field_type = self.parse_type()?;
+            fields.push(StructField {
+                name: field_name,
+                field_type,
+                span: field_span,
+            });
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            } else if *self.peek() != TokenKind::RBrace {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    "expected ',' or '}' in struct body",
+                    self.current_span(),
+                ));
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        Ok(StructDecl {
+            name,
+            fields,
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
@@ -1121,6 +1160,19 @@ impl Parser {
                     start,
                 ))
             }
+            TokenKind::Dot => {
+                // Field assignment: name.field = value
+                self.advance();
+                let (field, _) = self.expect_ident()?;
+                let op = self.parse_assign_op()?;
+                let value = self.parse_expr()?;
+                Ok(Statement::Assign(
+                    LValue::Field(name, field),
+                    op,
+                    value,
+                    start,
+                ))
+            }
             TokenKind::LParen => {
                 // Function call
                 self.advance();
@@ -1206,6 +1258,12 @@ impl Parser {
             TokenKind::KwBool => {
                 self.advance();
                 NesType::Bool
+            }
+            TokenKind::Ident(name) => {
+                // User-declared struct types are referenced by name.
+                // The analyzer validates that the name exists.
+                self.advance();
+                NesType::Struct(name)
             }
             _ => {
                 return Err(Diagnostic::error(
@@ -1462,6 +1520,13 @@ impl Parser {
                     }
                     self.expect(&TokenKind::RParen)?;
                     return Ok(Expr::Call(name, args, span));
+                }
+
+                // Check for field access: `name.field`
+                if *self.peek() == TokenKind::Dot {
+                    self.advance();
+                    let (field, _) = self.expect_ident()?;
+                    return Ok(Expr::FieldAccess(name, field, span));
                 }
 
                 Ok(Expr::Ident(name, span))

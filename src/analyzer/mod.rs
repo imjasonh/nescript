@@ -61,6 +61,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         function_signatures: HashMap::new(),
         current_return_type: None,
         in_function_body: false,
+        struct_layouts: HashMap::new(),
     };
     analyzer.analyze_program(program);
 
@@ -98,10 +99,26 @@ struct Analyzer {
     /// distinguish "void function" from "state handler" when checking
     /// `return value` statements.
     in_function_body: bool,
+    /// Struct name to layout. Each field has an offset in bytes from
+    /// the base address of the struct.
+    struct_layouts: HashMap<String, StructLayout>,
+}
+
+/// Layout info for a struct type.
+#[derive(Debug, Clone)]
+pub struct StructLayout {
+    pub size: u16,
+    pub fields: Vec<(String, NesType, u16)>, // (name, type, offset)
 }
 
 impl Analyzer {
     fn analyze_program(&mut self, program: &Program) {
+        // Register struct layouts first so later declarations can
+        // reference them (for variable sizing, etc.).
+        for s in &program.structs {
+            self.register_struct(s);
+        }
+
         // Register constants
         for c in &program.constants {
             self.register_const(c);
@@ -279,6 +296,24 @@ impl Analyzer {
                 }
                 self.walk_expr_reads(idx);
             }
+            Expr::FieldAccess(name, field, span) => {
+                // Resolve the struct variable and verify the field
+                // exists. Mark the synthetic `name.field` variable as
+                // used so W0103 doesn't fire.
+                let full_name = format!("{name}.{field}");
+                if self.symbols.contains_key(&full_name) {
+                    self.mark_var_used(name);
+                    self.mark_var_used(&full_name);
+                } else if !self.symbols.contains_key(name) {
+                    self.emit_undefined_var(name, *span);
+                } else {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("'{name}' has no field '{field}'"),
+                        *span,
+                    ));
+                }
+            }
             Expr::BinaryOp(lhs, op, rhs, span) => {
                 // W0101: warn about multiply/divide/modulo with a non-
                 // constant operand. These lower to calls into the
@@ -416,6 +451,49 @@ impl Analyzer {
         );
     }
 
+    /// Register a struct declaration. Computes each field's byte
+    /// offset from the base address (fields are laid out contiguously
+    /// in declaration order with no padding), and records the total
+    /// size. v1 structs only support primitive fields (u8/i8/bool).
+    fn register_struct(&mut self, s: &StructDecl) {
+        if self.struct_layouts.contains_key(&s.name) {
+            self.diagnostics.push(Diagnostic::error(
+                ErrorCode::E0501,
+                format!("duplicate struct declaration of '{}'", s.name),
+                s.span,
+            ));
+            return;
+        }
+        let mut fields = Vec::new();
+        let mut offset: u16 = 0;
+        for field in &s.fields {
+            // Reject non-primitive field types for now.
+            let size = match &field.field_type {
+                NesType::U8 | NesType::I8 | NesType::Bool => 1,
+                _ => {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!(
+                            "struct field '{}' has unsupported type '{}' (only u8/i8/bool allowed)",
+                            field.name, field.field_type
+                        ),
+                        field.span,
+                    ));
+                    continue;
+                }
+            };
+            fields.push((field.name.clone(), field.field_type.clone(), offset));
+            offset += size;
+        }
+        self.struct_layouts.insert(
+            s.name.clone(),
+            StructLayout {
+                size: offset,
+                fields,
+            },
+        );
+    }
+
     /// Register each variant of an enum declaration as a `u8` constant
     /// with a value equal to its declaration order. Variant names must
     /// be globally unique; a duplicate name emits E0501.
@@ -459,7 +537,24 @@ impl Analyzer {
             return;
         }
 
-        let size = type_size(&var.var_type);
+        // Validate struct type exists before sizing.
+        if let NesType::Struct(sname) = &var.var_type {
+            if !self.struct_layouts.contains_key(sname) {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!("unknown struct type '{sname}'"),
+                    var.span,
+                ));
+                return;
+            }
+        }
+
+        let struct_sizes: HashMap<String, u16> = self
+            .struct_layouts
+            .iter()
+            .map(|(n, l)| (n.clone(), l.size))
+            .collect();
+        let size = type_size_with(&var.var_type, &struct_sizes);
         let Some(address) = self.allocate_ram(size, var.span) else {
             // Allocation failed (E0301 already emitted) — still add the
             // symbol so that later references don't cascade into E0502,
@@ -475,6 +570,43 @@ impl Analyzer {
             );
             return;
         };
+
+        // For struct-typed variables, synthesize per-field entries in
+        // the symbol table and var_allocations. This lets the rest of
+        // the compiler treat `pos.x` and `pos.y` as ordinary variables
+        // at known addresses, without special-casing struct layout.
+        if let NesType::Struct(sname) = &var.var_type {
+            let layout = self.struct_layouts[sname].clone();
+            for (field_name, field_type, offset) in &layout.fields {
+                let full_name = format!("{}.{field_name}", var.name);
+                self.symbols.insert(
+                    full_name.clone(),
+                    Symbol {
+                        name: full_name.clone(),
+                        sym_type: field_type.clone(),
+                        is_const: false,
+                        span: var.span,
+                    },
+                );
+                self.var_allocations.push(VarAllocation {
+                    name: full_name,
+                    address: address + offset,
+                    size: 1,
+                });
+            }
+            // Also register the struct variable itself (as a symbol
+            // only — it doesn't have a single VarAllocation entry).
+            self.symbols.insert(
+                var.name.clone(),
+                Symbol {
+                    name: var.name.clone(),
+                    sym_type: var.var_type.clone(),
+                    is_const: false,
+                    span: var.span,
+                },
+            );
+            return;
+        }
 
         self.symbols.insert(
             var.name.clone(),
@@ -682,6 +814,23 @@ impl Analyzer {
                         self.mark_var_used(name);
                         self.walk_expr_reads(idx);
                     }
+                    LValue::Field(name, field) => {
+                        let full_name = format!("{name}.{field}");
+                        if self.symbols.contains_key(&full_name) {
+                            // Assigning to a field is a mutation; don't
+                            // mark the struct variable as "read" just
+                            // because we wrote to one of its fields.
+                            self.mark_var_used(&full_name);
+                        } else if self.symbols.contains_key(name) {
+                            self.diagnostics.push(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!("'{name}' has no field '{field}'"),
+                                *span,
+                            ));
+                        } else {
+                            self.emit_undefined_var(name, *span);
+                        }
+                    }
                 }
                 self.walk_expr_reads(expr);
                 let ltype = self.lvalue_type(lvalue, *span);
@@ -830,6 +979,10 @@ impl Analyzer {
                     _ => None,
                 })
             }
+            LValue::Field(name, field) => {
+                let full_name = format!("{name}.{field}");
+                self.symbols.get(&full_name).map(|s| s.sym_type.clone())
+            }
         }
     }
 
@@ -933,6 +1086,10 @@ impl Analyzer {
                     NesType::Array(elem, _) => Some(elem.as_ref().clone()),
                     _ => None,
                 })
+            }
+            Expr::FieldAccess(name, field, _) => {
+                let full_name = format!("{name}.{field}");
+                self.symbols.get(&full_name).map(|s| s.sym_type.clone())
             }
             Expr::ArrayLiteral(_, _) => Some(NesType::U8), // element type inferred from context
             Expr::Cast(_, target, _) => Some(target.clone()),
@@ -1145,6 +1302,7 @@ fn collect_calls_expr(expr: &Expr, calls: &mut Vec<String>) {
         Expr::IntLiteral(_, _)
         | Expr::BoolLiteral(_, _)
         | Expr::Ident(_, _)
+        | Expr::FieldAccess(_, _, _)
         | Expr::ButtonRead(_, _, _) => {}
     }
 }
@@ -1225,11 +1383,15 @@ fn compute_depth(
     depth
 }
 
-fn type_size(t: &NesType) -> u16 {
+/// Compute the byte size of a type. Struct types are looked up in
+/// `struct_sizes`; if absent, returns 0 (the analyzer will have
+/// reported an error already).
+fn type_size_with(t: &NesType, struct_sizes: &HashMap<String, u16>) -> u16 {
     match t {
         NesType::U8 | NesType::I8 | NesType::Bool => 1,
         NesType::U16 => 2,
-        NesType::Array(elem, count) => type_size(elem) * count,
+        NesType::Array(elem, count) => type_size_with(elem, struct_sizes) * count,
+        NesType::Struct(name) => struct_sizes.get(name).copied().unwrap_or(0),
     }
 }
 

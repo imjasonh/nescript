@@ -299,6 +299,68 @@ fn analyze_return_wrong_type() {
 }
 
 #[test]
+fn analyze_struct_variable_allocates_fields() {
+    let result = analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2
+        on frame {
+            pos.x = 10
+            pos.y = pos.x
+        }
+        start Main
+    "#,
+    );
+    // The analyzer should synthesize pos.x and pos.y as separate
+    // variables with consecutive addresses.
+    let px = result
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "pos.x")
+        .expect("pos.x should be allocated");
+    let py = result
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "pos.y")
+        .expect("pos.y should be allocated");
+    assert_eq!(py.address, px.address + 1);
+}
+
+#[test]
+fn analyze_struct_unknown_field_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2
+        on frame { pos.z = 5 }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "unknown field should emit E0201: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_unknown_struct_type_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        var pos: NoSuchStruct
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "unknown struct type should emit E0201: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_enum_variants_as_constants() {
     let result = analyze_ok(
         r#"

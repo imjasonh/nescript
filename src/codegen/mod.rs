@@ -427,6 +427,38 @@ impl CodeGen {
                     }
                 }
             }
+            LValue::Field(name, field) => {
+                // Treat `name.field` as a regular variable. The
+                // analyzer has already synthesized a VarAllocation
+                // entry under the name `"struct.field"`.
+                let full_name = format!("{name}.{field}");
+                if let Some(&addr) = self.var_addrs.get(&full_name) {
+                    match op {
+                        AssignOp::Assign => {
+                            self.gen_expr(expr);
+                            self.emit_store(addr);
+                        }
+                        AssignOp::PlusAssign => {
+                            self.emit_load(addr);
+                            self.emit(CLC, AM::Implied);
+                            self.gen_adc_expr(expr);
+                            self.emit_store(addr);
+                        }
+                        AssignOp::MinusAssign => {
+                            self.emit_load(addr);
+                            self.emit(SEC, AM::Implied);
+                            self.gen_sbc_expr(expr);
+                            self.emit_store(addr);
+                        }
+                        _ => {
+                            // Other compound ops: read, compute, store
+                            self.emit_load(addr);
+                            self.gen_expr(expr);
+                            self.emit_store(addr);
+                        }
+                    }
+                }
+            }
             LValue::ArrayIndex(name, index) => {
                 if let Some(&base_addr) = self.var_addrs.get(name) {
                     // Evaluate index into X register
@@ -772,6 +804,12 @@ impl CodeGen {
                     } else {
                         self.emit(LDA, AM::AbsoluteX(base_addr));
                     }
+                }
+            }
+            Expr::FieldAccess(name, field, _) => {
+                let full_name = format!("{name}.{field}");
+                if let Some(&addr) = self.var_addrs.get(&full_name) {
+                    self.emit_load(addr);
                 }
             }
             Expr::Call(_, _, _) => {

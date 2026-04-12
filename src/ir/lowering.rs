@@ -393,6 +393,38 @@ impl LoweringContext {
                     self.emit(IrOp::ArrayStore(var_id, idx, result));
                 }
             }
+            LValue::Field(name, field) => {
+                // The analyzer synthesizes a variable named
+                // `"struct.field"` for each struct field, so we can
+                // treat field assignment as a regular variable
+                // assignment to that synthetic name.
+                let full_name = format!("{name}.{field}");
+                let var_id = self.get_or_create_var(&full_name);
+                match op {
+                    AssignOp::Assign => {
+                        let val = self.lower_expr(expr);
+                        self.emit(IrOp::StoreVar(var_id, val));
+                    }
+                    _ => {
+                        let current = self.fresh_temp();
+                        self.emit(IrOp::LoadVar(current, var_id));
+                        let rhs = self.lower_expr(expr);
+                        let result = self.fresh_temp();
+                        let ir_op = match op {
+                            AssignOp::PlusAssign => IrOp::Add(result, current, rhs),
+                            AssignOp::MinusAssign => IrOp::Sub(result, current, rhs),
+                            AssignOp::AmpAssign => IrOp::And(result, current, rhs),
+                            AssignOp::PipeAssign => IrOp::Or(result, current, rhs),
+                            AssignOp::CaretAssign => IrOp::Xor(result, current, rhs),
+                            AssignOp::ShiftLeftAssign => IrOp::ShiftLeft(result, current, 1),
+                            AssignOp::ShiftRightAssign => IrOp::ShiftRight(result, current, 1),
+                            AssignOp::Assign => unreachable!(),
+                        };
+                        self.emit(ir_op);
+                        self.emit(IrOp::StoreVar(var_id, result));
+                    }
+                }
+            }
         }
     }
 
@@ -535,6 +567,16 @@ impl LoweringContext {
                 let idx = self.lower_expr(index);
                 let t = self.fresh_temp();
                 self.emit(IrOp::ArrayLoad(t, var_id, idx));
+                t
+            }
+            Expr::FieldAccess(name, field, _) => {
+                // Field access lowers to a plain load of the
+                // synthetic `"struct.field"` variable produced by the
+                // analyzer.
+                let full_name = format!("{name}.{field}");
+                let var_id = self.get_or_create_var(&full_name);
+                let t = self.fresh_temp();
+                self.emit(IrOp::LoadVar(t, var_id));
                 t
             }
             Expr::BinaryOp(left, op, right, _) => self.lower_binop(left, *op, right),
@@ -697,6 +739,10 @@ fn type_size(t: &NesType) -> u16 {
         NesType::U8 | NesType::I8 | NesType::Bool => 1,
         NesType::U16 => 2,
         NesType::Array(elem, count) => type_size(elem) * count,
+        // Struct sizes are resolved in the analyzer. IR lowering only
+        // sees struct types on `var` declarations, which are skipped
+        // below via the analyzer's synthetic field allocations.
+        NesType::Struct(_) => 0,
     }
 }
 

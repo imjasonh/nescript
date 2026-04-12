@@ -6,6 +6,7 @@ pub struct Program {
     pub globals: Vec<VarDecl>,
     pub constants: Vec<ConstDecl>,
     pub enums: Vec<EnumDecl>,
+    pub structs: Vec<StructDecl>,
     pub functions: Vec<FunDecl>,
     pub states: Vec<StateDecl>,
     pub sprites: Vec<SpriteDecl>,
@@ -24,6 +25,24 @@ pub struct Program {
 pub struct EnumDecl {
     pub name: String,
     pub variants: Vec<(String, Span)>,
+    pub span: Span,
+}
+
+/// `struct Name { field1: u8, field2: u8 }` — composite type with a
+/// known layout. Fields are stored contiguously in memory in
+/// declaration order (no padding). Only primitive-sized fields (u8,
+/// i8, bool) are supported in the v1 layout.
+#[derive(Debug, Clone)]
+pub struct StructDecl {
+    pub name: String,
+    pub fields: Vec<StructField>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+pub struct StructField {
+    pub name: String,
+    pub field_type: NesType,
     pub span: Span,
 }
 
@@ -148,6 +167,9 @@ pub enum NesType {
     U16,
     Bool,
     Array(Box<NesType>, u16),
+    /// A user-declared struct, identified by its name. The analyzer
+    /// looks up field layouts in the `StructDecl` table.
+    Struct(String),
 }
 
 impl std::fmt::Display for NesType {
@@ -158,6 +180,7 @@ impl std::fmt::Display for NesType {
             Self::U16 => write!(f, "u16"),
             Self::Bool => write!(f, "bool"),
             Self::Array(t, n) => write!(f, "{t}[{n}]"),
+            Self::Struct(name) => write!(f, "{name}"),
         }
     }
 }
@@ -174,6 +197,8 @@ pub enum Expr {
     BoolLiteral(bool, Span),
     Ident(String, Span),
     ArrayIndex(String, Box<Expr>, Span),
+    /// Field access on a struct variable: `pos.x`.
+    FieldAccess(String, String, Span),
     BinaryOp(Box<Expr>, BinOp, Box<Expr>, Span),
     UnaryOp(UnaryOp, Box<Expr>, Span),
     Call(String, Vec<Expr>, Span),
@@ -189,6 +214,7 @@ impl Expr {
             | Self::BoolLiteral(_, s)
             | Self::Ident(_, s)
             | Self::ArrayIndex(_, _, s)
+            | Self::FieldAccess(_, _, s)
             | Self::BinaryOp(_, _, _, s)
             | Self::UnaryOp(_, _, s)
             | Self::Call(_, _, s)
@@ -300,6 +326,9 @@ pub struct DrawStmt {
 pub enum LValue {
     Var(String),
     ArrayIndex(String, Box<Expr>),
+    /// Struct field: `pos.x = 5`. First string is the struct variable
+    /// name, second is the field name.
+    Field(String, String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

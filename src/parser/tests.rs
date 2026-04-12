@@ -666,6 +666,37 @@ fn parse_mmc3_mapper() {
 }
 
 #[test]
+fn parse_struct_decl() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.structs.len(), 1);
+    assert_eq!(prog.structs[0].name, "Vec2");
+    assert_eq!(prog.structs[0].fields.len(), 2);
+    assert_eq!(prog.structs[0].fields[0].name, "x");
+    assert_eq!(prog.structs[0].fields[1].name, "y");
+}
+
+#[test]
+fn parse_struct_field_access_expr() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2
+        on frame {
+            pos.x = 10
+            pos.y = pos.x
+        }
+        start Main
+    "#;
+    parse_ok(src);
+}
+
+#[test]
 fn parse_enum_decl() {
     let src = r#"
         game "Test" { mapper: NROM }
