@@ -17,12 +17,39 @@ const harnessUrl = pathToFileURL(path.join(__dirname, "harness.html")).toString(
 const FRAMES_TO_RUN = 180; // ~3 seconds at 60 fps, enough to get past a title/boot
 const SCREENSHOT_FRAME = 180;
 
+// Per-example non-black pixel floors, used to catch silent
+// render regressions. A bare smiley sprite contributes ~52
+// non-black pixels; the default floor below assumes one visible
+// sprite. Examples that draw more sprites override the floor
+// with a tighter value so bugs like "only one of the four
+// enemies actually shows up" fail CI instead of silently
+// slipping past the base `nonBlack > 0` check.
+//
+// Each entry is `[minNonBlack, note]`. The note is printed when
+// the floor fails so it's easy to tell what the example was
+// supposed to show.
+const DEFAULT_MIN_NON_BLACK = 40; // one small sprite, conservative
+const EXAMPLE_FLOORS = {
+  arrays_and_functions: [200, "player + 4 enemies drawn by a while loop"],
+  bitwise_ops: [150, "player + multiple flag/pip sprites across if branches and a while loop"],
+  loop_break_continue: [150, "player + 3 active hazards (one slot is inactive)"],
+  structs_enums_for: [200, "player + 4 enemies drawn by a `for` loop"],
+  sprites_and_palettes: [60, "custom CHR tiles visible"],
+  scanline_split: [80, "banner + player"],
+};
+
 async function listRoms() {
   const entries = await fs.readdir(examplesDir);
   return entries
     .filter((f) => f.endsWith(".nes"))
     .sort()
     .map((f) => ({ name: f.replace(/\.nes$/, ""), file: path.join(examplesDir, f) }));
+}
+
+function floorFor(name) {
+  const entry = EXAMPLE_FLOORS[name];
+  if (entry) return entry;
+  return [DEFAULT_MIN_NON_BLACK, "generic single-sprite floor"];
 }
 
 async function main() {
@@ -90,13 +117,25 @@ async function main() {
       }
 
       const lastStats = frameHashes[frameHashes.length - 1];
-      const firstStats = frameHashes[0];
       const uniqueHashes = new Set(frameHashes.map((h) => h.hash)).size;
       const rendered = booted && lastStats && lastStats.nonBlack > 0;
       const animated = uniqueHashes > 1;
 
-      const status = rendered ? "OK" : "FAIL";
-      if (!rendered) failures++;
+      const [minNonBlack, floorNote] = floorFor(rom.name);
+      const meetsFloor = rendered && lastStats.nonBlack >= minNonBlack;
+      const pass = rendered && meetsFloor;
+
+      const status = pass ? "OK" : "FAIL";
+      if (!pass) failures++;
+
+      let failReason = null;
+      if (!booted) {
+        failReason = `boot error: ${bootError ?? "unknown"}`;
+      } else if (!rendered) {
+        failReason = "rendered a fully black screen (nonBlack=0)";
+      } else if (!meetsFloor) {
+        failReason = `nonBlack=${lastStats.nonBlack} below floor=${minNonBlack} (${floorNote})`;
+      }
 
       results.push({
         name: rom.name,
@@ -104,6 +143,10 @@ async function main() {
         bootError,
         rendered,
         animated,
+        meetsFloor,
+        minNonBlack,
+        floorNote,
+        failReason,
         frames: frameHashes,
         consoleErrors,
         screenshot: booted ? path.relative(repoRoot, screenshotPath) : null,
@@ -112,9 +155,14 @@ async function main() {
       console.log(
         `${status.padEnd(4)} ${rom.name.padEnd(28)} ` +
           (rendered
-            ? `nonBlack=${lastStats.nonBlack}/${lastStats.totalPixels} uniqueHashes=${uniqueHashes} animated=${animated}`
+            ? `nonBlack=${lastStats.nonBlack}/${lastStats.totalPixels} (floor=${minNonBlack}) uniqueHashes=${uniqueHashes} animated=${animated}`
             : `boot=${booted} bootError=${bootError ?? "none"}`),
       );
+      if (failReason && !rendered) {
+        console.log(`    reason: ${failReason}`);
+      } else if (failReason) {
+        console.log(`    reason: ${failReason}`);
+      }
       if (consoleErrors.length > 0) {
         for (const e of consoleErrors) console.log("    console:", e);
       }

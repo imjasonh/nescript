@@ -401,6 +401,22 @@ impl LoweringContext {
                 //     var = start
                 //     while var < end { body; var = var + 1 }
                 let var_id = self.get_or_create_var(var);
+                // The loop variable is implicitly declared by the
+                // `for` statement — track it as a local so the IR
+                // codegen allocates backing storage. Without this
+                // the `StoreVar`/`LoadVar` ops for the counter are
+                // silently dropped by `IrCodeGen` (`var_addrs`
+                // has no entry), making the counter permanently 0
+                // and turning the loop into an infinite one. Same
+                // class of bug as handler-local `var` decls before
+                // the earlier fix.
+                if !self.current_locals.iter().any(|l| l.var_id == var_id) {
+                    self.current_locals.push(IrLocal {
+                        var_id,
+                        name: var.clone(),
+                        size: 1,
+                    });
+                }
                 let start_temp = self.lower_expr(start);
                 self.emit(IrOp::StoreVar(var_id, start_temp));
                 // Precompute the end value once outside the loop
