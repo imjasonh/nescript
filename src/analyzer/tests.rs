@@ -223,3 +223,34 @@ fn analyze_undefined_function() {
     );
     assert!(errors.contains(&ErrorCode::E0503));
 }
+
+#[test]
+fn analyze_const_assignment_error() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        const SPEED: u8 = 2
+        on frame { SPEED = 5 }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0203),
+        "assigning to const should produce E0203, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_break_outside_loop() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        on frame { break }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0203),
+        "break outside loop should produce E0203, got: {errors:?}"
+    );
+}

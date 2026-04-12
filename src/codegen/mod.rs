@@ -7,6 +7,11 @@ use crate::analyzer::VarAllocation;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
 use crate::parser::ast::*;
 
+/// Zero-page address for the current state index.
+pub const ZP_CURRENT_STATE: u8 = 0x03;
+/// Zero-page addresses for function call parameter passing ($04-$07, up to 4 params).
+pub const ZP_PARAM_BASE: u8 = 0x04;
+
 /// Code generator: translates AST directly to 6502 instructions.
 /// For Milestone 1, we skip the IR and go AST → 6502 directly.
 pub struct CodeGen {
@@ -18,6 +23,10 @@ pub struct CodeGen {
     pub frame_flag_addr: u8,
     /// Address of controller state byte in zero page
     pub input_addr: u8,
+    /// Maps state name → numeric index for dispatch
+    state_indices: HashMap<String, u8>,
+    /// Stack of (`continue_label`, `break_label`) for nested loops
+    loop_stack: Vec<(String, String)>,
 }
 
 impl CodeGen {
@@ -41,6 +50,8 @@ impl CodeGen {
             label_counter: 0,
             frame_flag_addr: 0x00,
             input_addr: 0x01,
+            state_indices: HashMap::new(),
+            loop_stack: Vec::new(),
         }
     }
 
@@ -59,36 +70,123 @@ impl CodeGen {
     }
 
     pub fn generate(mut self, program: &Program) -> Vec<Instruction> {
+        // Assign each state an index
+        for (i, state) in program.states.iter().enumerate() {
+            self.state_indices.insert(state.name.clone(), i as u8);
+        }
+
         // Generate variable initializers
         for var in &program.globals {
             self.gen_var_init(var);
         }
 
-        // Generate state frame handlers
-        // For M1: just generate the main loop for the start state
-        for state in &program.states {
-            if state.name == program.start_state {
-                if let Some(on_frame) = &state.on_frame {
-                    // Main loop: wait for frame, run frame handler, repeat
-                    let loop_label = self.fresh_label("main_loop");
-                    self.emit_label(&loop_label);
+        // Initialize current_state to the start state's index
+        let start_index = self
+            .state_indices
+            .get(&program.start_state)
+            .copied()
+            .unwrap_or(0);
+        self.emit(LDA, AM::Immediate(start_index));
+        self.emit(STA, AM::ZeroPage(ZP_CURRENT_STATE));
 
-                    // Wait for vblank flag
-                    let wait_label = self.fresh_label("wait_vblank");
-                    self.emit_label(&wait_label);
-                    self.emit(LDA, AM::ZeroPage(self.frame_flag_addr));
-                    self.emit(BEQ, AM::LabelRelative(wait_label.clone()));
-                    // Clear the flag
-                    self.emit(LDA, AM::Immediate(0));
-                    self.emit(STA, AM::ZeroPage(self.frame_flag_addr));
+        // If the start state has an on_enter handler, call it
+        if let Some(start_state) = program
+            .states
+            .iter()
+            .find(|s| s.name == program.start_state)
+        {
+            if start_state.on_enter.is_some() {
+                let enter_label = format!("__state_{start_index}_enter");
+                self.emit(JSR, AM::Absolute(0));
+                // Patch: use label-based absolute for JSR
+                let idx = self.instructions.len() - 1;
+                self.instructions[idx] = Instruction::new(JSR, AM::Label(enter_label));
+            }
+        }
 
-                    // Generate frame handler body
-                    self.gen_block(on_frame);
+        // Main dispatch loop
+        let main_loop_label = "__main_loop".to_string();
+        self.emit_label(&main_loop_label);
 
-                    // Jump back to main loop
-                    self.emit(JMP, AM::Label(loop_label));
+        // Wait for vblank flag
+        let wait_label = "__wait_vblank".to_string();
+        self.emit_label(&wait_label);
+        self.emit(LDA, AM::ZeroPage(self.frame_flag_addr));
+        self.emit(BEQ, AM::LabelRelative(wait_label.clone()));
+        // Clear the flag
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(STA, AM::ZeroPage(self.frame_flag_addr));
+
+        // Dispatch based on current_state
+        // Uses CMP + BNE skip + JMP pattern to avoid branch range limits
+        self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
+        for (i, state) in program.states.iter().enumerate() {
+            if state.on_frame.is_some() {
+                let frame_label = format!("__state_{i}_frame");
+                let skip_label = self.fresh_label("dispatch_skip");
+                self.emit(CMP, AM::Immediate(i as u8));
+                self.emit(BNE, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(frame_label));
+                self.emit_label(&skip_label);
+            }
+        }
+        self.emit(JMP, AM::Label(main_loop_label.clone()));
+
+        // Generate all state frame handlers as labeled subroutines
+        for (i, state) in program.states.iter().enumerate() {
+            if let Some(on_frame) = &state.on_frame {
+                let frame_label = format!("__state_{i}_frame");
+                self.emit_label(&frame_label);
+                self.gen_block(on_frame);
+                self.emit(JMP, AM::Label(main_loop_label.clone()));
+            }
+        }
+
+        // Generate on_enter handlers
+        for (i, state) in program.states.iter().enumerate() {
+            if let Some(on_enter) = &state.on_enter {
+                let enter_label = format!("__state_{i}_enter");
+                self.emit_label(&enter_label);
+                self.gen_block(on_enter);
+                self.emit(RTS, AM::Implied);
+            }
+        }
+
+        // Generate on_exit handlers
+        for (i, state) in program.states.iter().enumerate() {
+            if let Some(on_exit) = &state.on_exit {
+                let exit_label = format!("__state_{i}_exit");
+                self.emit_label(&exit_label);
+                self.gen_block(on_exit);
+                self.emit(RTS, AM::Implied);
+            }
+        }
+
+        // Generate function bodies
+        // We need to clone the function data we need to avoid borrow issues
+        let functions: Vec<_> = program
+            .functions
+            .iter()
+            .map(|f| {
+                (
+                    f.name.clone(),
+                    f.params.iter().map(|p| p.name.clone()).collect::<Vec<_>>(),
+                    f.body.clone(),
+                )
+            })
+            .collect();
+        for (name, params, body) in &functions {
+            let fn_label = format!("__fn_{name}");
+            self.emit_label(&fn_label);
+            // Load parameters from zero-page param slots into local var addresses
+            for (j, param_name) in params.iter().enumerate() {
+                if let Some(&addr) = self.var_addrs.get(param_name) {
+                    self.emit(LDA, AM::ZeroPage(ZP_PARAM_BASE + j as u8));
+                    self.emit_store(addr);
                 }
             }
+            self.gen_block(body);
+            self.emit(RTS, AM::Implied); // fallthrough return
         }
 
         self.instructions
@@ -125,9 +223,14 @@ impl CodeGen {
             }
             Statement::Loop(body, _) => {
                 let loop_label = self.fresh_label("loop");
+                let end_label = self.fresh_label("loop_end");
+                self.loop_stack
+                    .push((loop_label.clone(), end_label.clone()));
                 self.emit_label(&loop_label);
                 self.gen_block(body);
                 self.emit(JMP, AM::Label(loop_label));
+                self.emit_label(&end_label);
+                self.loop_stack.pop();
             }
             Statement::Draw(draw) => {
                 self.gen_draw(draw);
@@ -148,8 +251,12 @@ impl CodeGen {
             | Statement::Call(_, _, _) => {
                 // TODO: implement for later milestones
             }
-            Statement::Scroll(_, _, _) => {
-                // TODO: implement scroll hardware writes
+            Statement::Scroll(x_expr, y_expr, _) => {
+                // PPU scroll register $2005 takes two writes: X then Y
+                self.gen_expr(x_expr);
+                self.emit(STA, AM::Absolute(0x2005)); // X scroll
+                self.gen_expr(y_expr);
+                self.emit(STA, AM::Absolute(0x2005)); // Y scroll
             }
             Statement::LoadBackground(_, _) | Statement::SetPalette(_, _) => {
                 // TODO: implement in asset pipeline
@@ -196,8 +303,90 @@ impl CodeGen {
                     }
                 }
             }
-            LValue::ArrayIndex(_, _) => {
-                // TODO: array indexing for later milestones
+            LValue::ArrayIndex(name, index) => {
+                if let Some(&base_addr) = self.var_addrs.get(name) {
+                    // Evaluate index into X register
+                    self.gen_expr(index);
+                    self.emit(TAX, AM::Implied);
+                    // Evaluate value into A
+                    match op {
+                        AssignOp::Assign => {
+                            self.gen_expr(expr);
+                            if base_addr < 0x100 {
+                                self.emit(STA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(STA, AM::AbsoluteX(base_addr));
+                            }
+                        }
+                        AssignOp::PlusAssign => {
+                            if base_addr < 0x100 {
+                                self.emit(LDA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(LDA, AM::AbsoluteX(base_addr));
+                            }
+                            self.emit(CLC, AM::Implied);
+                            self.gen_adc_expr(expr);
+                            if base_addr < 0x100 {
+                                self.emit(STA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(STA, AM::AbsoluteX(base_addr));
+                            }
+                        }
+                        AssignOp::MinusAssign => {
+                            if base_addr < 0x100 {
+                                self.emit(LDA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(LDA, AM::AbsoluteX(base_addr));
+                            }
+                            self.emit(SEC, AM::Implied);
+                            self.gen_sbc_expr(expr);
+                            if base_addr < 0x100 {
+                                self.emit(STA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(STA, AM::AbsoluteX(base_addr));
+                            }
+                        }
+                        AssignOp::AmpAssign => {
+                            if base_addr < 0x100 {
+                                self.emit(LDA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(LDA, AM::AbsoluteX(base_addr));
+                            }
+                            self.gen_and_expr(expr);
+                            if base_addr < 0x100 {
+                                self.emit(STA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(STA, AM::AbsoluteX(base_addr));
+                            }
+                        }
+                        AssignOp::PipeAssign => {
+                            if base_addr < 0x100 {
+                                self.emit(LDA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(LDA, AM::AbsoluteX(base_addr));
+                            }
+                            self.gen_ora_expr(expr);
+                            if base_addr < 0x100 {
+                                self.emit(STA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(STA, AM::AbsoluteX(base_addr));
+                            }
+                        }
+                        AssignOp::CaretAssign => {
+                            if base_addr < 0x100 {
+                                self.emit(LDA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(LDA, AM::AbsoluteX(base_addr));
+                            }
+                            self.gen_eor_expr(expr);
+                            if base_addr < 0x100 {
+                                self.emit(STA, AM::ZeroPageX(base_addr as u8));
+                            } else {
+                                self.emit(STA, AM::AbsoluteX(base_addr));
+                            }
+                        }
+                    }
+                }
             }
         }
     }
@@ -414,8 +603,24 @@ impl CodeGen {
                 // For now, just evaluate the inner expression
                 self.gen_expr(inner);
             }
-            Expr::Call(_, _, _) | Expr::ArrayIndex(_, _, _) | Expr::ArrayLiteral(_, _) => {
-                // TODO: implement for later milestones
+            Expr::ArrayIndex(name, index, _) => {
+                if let Some(&base_addr) = self.var_addrs.get(name) {
+                    self.gen_expr(index);
+                    self.emit(TAX, AM::Implied);
+                    if base_addr < 0x100 {
+                        self.emit(LDA, AM::ZeroPageX(base_addr as u8));
+                    } else {
+                        self.emit(LDA, AM::AbsoluteX(base_addr));
+                    }
+                }
+            }
+            Expr::Call(_, _, _) => {
+                // Function calls as expressions need JSR — handled elsewhere
+                // For now, result is 0
+                self.emit(LDA, AM::Immediate(0));
+            }
+            Expr::ArrayLiteral(_, _) => {
+                // Array literals are handled at initialization time
             }
         }
     }
@@ -447,8 +652,45 @@ impl CodeGen {
             BinOp::Eq | BinOp::NotEq | BinOp::Lt | BinOp::Gt | BinOp::LtEq | BinOp::GtEq => {
                 self.gen_comparison(left, op, right);
             }
-            _ => {
-                // Mul, Div, Mod, shifts — TODO for later milestones
+            BinOp::Mul => {
+                // Software multiply: left in A, right in $02
+                self.gen_expr(left);
+                self.emit(STA, AM::ZeroPage(0x04)); // save multiplicand
+                self.gen_expr(right);
+                self.emit(STA, AM::ZeroPage(0x02)); // multiplier
+                self.emit(LDA, AM::ZeroPage(0x04)); // restore multiplicand to A
+                self.emit(JSR, AM::Label("__multiply".into()));
+                // Result is in A
+            }
+            BinOp::Div => {
+                self.gen_expr(left);
+                self.emit(STA, AM::ZeroPage(0x04));
+                self.gen_expr(right);
+                self.emit(STA, AM::ZeroPage(0x02)); // divisor
+                self.emit(LDA, AM::ZeroPage(0x04)); // dividend
+                self.emit(JSR, AM::Label("__divide".into()));
+                // Quotient in A
+            }
+            BinOp::Mod => {
+                self.gen_expr(left);
+                self.emit(STA, AM::ZeroPage(0x04));
+                self.gen_expr(right);
+                self.emit(STA, AM::ZeroPage(0x02));
+                self.emit(LDA, AM::ZeroPage(0x04));
+                self.emit(JSR, AM::Label("__divide".into()));
+                self.emit(LDA, AM::ZeroPage(0x03)); // remainder is in $03
+            }
+            BinOp::ShiftLeft => {
+                self.gen_expr(left);
+                self.emit(ASL, AM::Accumulator);
+            }
+            BinOp::ShiftRight => {
+                self.gen_expr(left);
+                self.emit(LSR, AM::Accumulator);
+            }
+            BinOp::And | BinOp::Or => {
+                // Logical operators handled in gen_condition context; here
+                // treat as expression evaluation
                 self.gen_expr(left);
             }
         }

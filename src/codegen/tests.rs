@@ -140,3 +140,95 @@ fn codegen_comparison() {
     let insts = compile_to_instructions(src);
     assert!(has_instruction(&insts, CMP, &AM::ZeroPage(0x02)));
 }
+
+#[test]
+fn codegen_array_index_read() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var arr: u8[4] = [1, 2, 3, 4]
+        var idx: u8 = 0
+        var result: u8 = 0
+        on frame {
+            result = arr[idx]
+        }
+        start Main
+    "#;
+    let insts = compile_to_instructions(src);
+    // Reading arr[idx] should use TAX + LDA,X
+    assert!(has_instruction(&insts, TAX, &AM::Implied));
+}
+
+#[test]
+fn codegen_array_index_write() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var arr: u8[4] = [1, 2, 3, 4]
+        var idx: u8 = 0
+        on frame {
+            arr[idx] = 42
+        }
+        start Main
+    "#;
+    let insts = compile_to_instructions(src);
+    // Writing arr[idx] = val should use TAX + STA,X
+    assert!(has_instruction(&insts, TAX, &AM::Implied));
+}
+
+#[test]
+fn codegen_scroll() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var sx: u8 = 0
+        var sy: u8 = 0
+        on frame {
+            scroll(sx, sy)
+        }
+        start Main
+    "#;
+    let insts = compile_to_instructions(src);
+    // scroll(x, y) should write to $2005 twice
+    let count_2005 = insts
+        .iter()
+        .filter(|i| i.opcode == STA && i.mode == AM::Absolute(0x2005))
+        .count();
+    assert_eq!(count_2005, 2, "scroll should write to $2005 twice");
+}
+
+#[test]
+fn codegen_multiply() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var a: u8 = 3
+        var b: u8 = 5
+        var result: u8 = 0
+        on frame {
+            result = a * b
+        }
+        start Main
+    "#;
+    let insts = compile_to_instructions(src);
+    // a * b should generate JSR __multiply
+    let has_jsr_multiply = insts
+        .iter()
+        .any(|i| i.opcode == JSR && matches!(&i.mode, AM::Label(l) if l == "__multiply"));
+    assert!(has_jsr_multiply, "multiply should generate JSR __multiply");
+}
+
+#[test]
+fn codegen_shift_left() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var x: u8 = 1
+        var result: u8 = 0
+        on frame {
+            result = x << 1
+        }
+        start Main
+    "#;
+    let insts = compile_to_instructions(src);
+    // x << 1 should generate ASL A
+    assert!(
+        has_instruction(&insts, ASL, &AM::Accumulator),
+        "shift left should generate ASL A"
+    );
+}

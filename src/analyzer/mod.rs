@@ -47,6 +47,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         call_graph: HashMap::new(),
         max_depths: HashMap::new(),
         stack_depth_limit: DEFAULT_STACK_DEPTH,
+        in_loop: false,
     };
     analyzer.analyze_program(program);
 
@@ -68,6 +69,7 @@ struct Analyzer {
     call_graph: HashMap<String, Vec<String>>,
     max_depths: HashMap<String, u32>,
     stack_depth_limit: u32,
+    in_loop: bool,
 }
 
 impl Analyzer {
@@ -309,6 +311,31 @@ impl Analyzer {
                 }
             }
             Statement::Assign(lvalue, _, expr, span) => {
+                // Check if trying to assign to a constant
+                match lvalue {
+                    LValue::Var(name) => {
+                        if let Some(sym) = self.symbols.get(name) {
+                            if sym.is_const {
+                                self.diagnostics.push(Diagnostic::error(
+                                    ErrorCode::E0203,
+                                    format!("cannot assign to constant '{name}'"),
+                                    *span,
+                                ));
+                            }
+                        }
+                    }
+                    LValue::ArrayIndex(name, _) => {
+                        if let Some(sym) = self.symbols.get(name) {
+                            if sym.is_const {
+                                self.diagnostics.push(Diagnostic::error(
+                                    ErrorCode::E0203,
+                                    format!("cannot assign to constant '{name}'"),
+                                    *span,
+                                ));
+                            }
+                        }
+                    }
+                }
                 let ltype = self.lvalue_type(lvalue, *span);
                 if let Some(lt) = ltype {
                     self.check_expr_type(expr, &lt);
@@ -327,10 +354,16 @@ impl Analyzer {
             }
             Statement::While(cond, body, _) => {
                 self.check_expr_type(cond, &NesType::Bool);
+                let was_in_loop = self.in_loop;
+                self.in_loop = true;
                 self.check_block(body, state_names);
+                self.in_loop = was_in_loop;
             }
             Statement::Loop(body, _) => {
+                let was_in_loop = self.in_loop;
+                self.in_loop = true;
                 self.check_block(body, state_names);
+                self.in_loop = was_in_loop;
             }
             Statement::Transition(name, span) => {
                 if !state_names.contains(&name.as_str()) {
@@ -365,9 +398,25 @@ impl Analyzer {
                 self.check_expr_type(x, &NesType::U8);
                 self.check_expr_type(y, &NesType::U8);
             }
-            Statement::Break(_)
-            | Statement::Continue(_)
-            | Statement::WaitFrame(_)
+            Statement::Break(span) => {
+                if !self.in_loop {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0203,
+                        "break outside of loop",
+                        *span,
+                    ));
+                }
+            }
+            Statement::Continue(span) => {
+                if !self.in_loop {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0203,
+                        "continue outside of loop",
+                        *span,
+                    ));
+                }
+            }
+            Statement::WaitFrame(_)
             | Statement::Return(None, _)
             | Statement::LoadBackground(_, _)
             | Statement::SetPalette(_, _) => {}

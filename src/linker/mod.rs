@@ -84,6 +84,10 @@ impl Linker {
         // User code (var init + main loop)
         all_instructions.extend(user_code.iter().cloned());
 
+        // Math runtime routines (included always for simplicity)
+        all_instructions.extend(runtime::gen_multiply());
+        all_instructions.extend(runtime::gen_divide());
+
         // NMI handler
         all_instructions.push(Instruction::new(NOP, AM::Label("__nmi".into())));
         all_instructions.extend(runtime::gen_nmi());

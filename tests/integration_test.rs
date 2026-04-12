@@ -379,6 +379,23 @@ fn compile_with_mapper(source: &str) -> Vec<u8> {
 }
 
 #[test]
+fn program_with_arrays_and_math() {
+    let source = r#"
+        game "ArrayMath" { mapper: NROM }
+        var arr: u8[4] = [10, 20, 30, 40]
+        var idx: u8 = 0
+        var result: u8 = 0
+        on frame {
+            result = arr[idx] * 2
+            idx += 1
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_mmc1() {
     let source = r#"
         game "MMC1 Game" { mapper: MMC1 }
