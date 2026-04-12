@@ -107,6 +107,40 @@ impl CodeGen {
         self
     }
 
+    /// Replace `{name}` placeholders in an inline-asm body with the
+    /// resolved zero-page or absolute hex address. Unknown names
+    /// pass through unchanged so the asm parser can surface a clear
+    /// error.
+    fn substitute_asm_vars(&self, body: &str) -> String {
+        use std::fmt::Write;
+        let mut out = String::with_capacity(body.len());
+        let bytes = body.as_bytes();
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == b'{' {
+                if let Some(end) = bytes[i + 1..].iter().position(|&b| b == b'}') {
+                    let name_start = i + 1;
+                    let name_end = i + 1 + end;
+                    let name = &body[name_start..name_end];
+                    if !name.is_empty() {
+                        if let Some(&addr) = self.var_addrs.get(name) {
+                            if addr < 0x100 {
+                                let _ = write!(out, "${addr:02X}");
+                            } else {
+                                let _ = write!(out, "${addr:04X}");
+                            }
+                            i = name_end + 1;
+                            continue;
+                        }
+                    }
+                }
+            }
+            out.push(bytes[i] as char);
+            i += 1;
+        }
+        out
+    }
+
     fn fresh_label(&mut self, prefix: &str) -> String {
         self.label_counter += 1;
         format!("__{prefix}_{}", self.label_counter)
@@ -369,13 +403,16 @@ impl CodeGen {
                     self.emit_label(&pass_label);
                 }
             }
-            Statement::InlineAsm(body, _) => match crate::asm::parse_inline(body) {
-                Ok(parsed) => self.instructions.extend(parsed),
-                Err(msg) => {
-                    eprintln!("inline asm error: {msg}");
-                    self.emit(BRK, AM::Implied);
+            Statement::InlineAsm(body, _) => {
+                let substituted = self.substitute_asm_vars(body);
+                match crate::asm::parse_inline(&substituted) {
+                    Ok(parsed) => self.instructions.extend(parsed),
+                    Err(msg) => {
+                        eprintln!("inline asm error: {msg}");
+                        self.emit(BRK, AM::Implied);
+                    }
                 }
-            },
+            }
             Statement::Play(_, _) | Statement::StartMusic(_, _) | Statement::StopMusic(_) => {
                 // Audio statements compile to no-ops for now.
             }

@@ -909,6 +909,44 @@ error[E0402]: recursion is not allowed
 
 ### Build
 
+## Inline Assembly
+
+`asm { ... }` blocks contain raw 6502 assembly that the compiler
+parses and splices directly into the output:
+
+```
+fun fast_add() -> u8 {
+    var x: u8 = 5
+    var y: u8 = 3
+    asm {
+        LDA {x}
+        CLC
+        ADC {y}
+        STA {x}
+    }
+    return x
+}
+```
+
+Within an asm block, `{name}` is replaced with the resolved
+zero-page or absolute address of the variable `name`. This lets
+handwritten assembly reference NEScript variables without knowing
+where the analyzer allocated them.
+
+Supported addressing modes (mirroring the generated codegen):
+
+- `LDA #$10` / `LDA #42` — immediate
+- `LDA $10` / `STA $20,X` — zero-page (+ indexed)
+- `LDA $2000` / `LDA $0200,Y` — absolute (+ indexed)
+- `LDA ($10,X)` / `LDA ($10),Y` — indirect-X / indirect-Y
+- `JMP ($FFFC)` — indirect
+- `CLC`, `SEC`, `NOP`, ... — implied
+- `LSR A` — accumulator
+- Labels: `loop_start:` defines a label; `BNE loop_start` branches
+  to it. Labels are local to the surrounding asm block.
+
+## Command Line
+
 Compile a `.ne` source file into a `.nes` ROM:
 
 ```

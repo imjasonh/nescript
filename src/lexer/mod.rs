@@ -498,11 +498,23 @@ impl<'a> Lexer<'a> {
 
 impl Lexer<'_> {
     /// Capture everything between the `{` we just consumed and the
-    /// matching `}` as an `AsmBody` token. 6502 assembly has no
-    /// `{`/`}` in its syntax, so we can simply scan for the next `}`.
+    /// matching `}` as an `AsmBody` token. Nested braces (e.g.
+    /// `{variable}` substitution placeholders) are balanced by
+    /// depth counting, so the body isn't cut short.
     fn capture_asm_body(&mut self, start: usize) -> Token {
         let body_start = self.pos;
-        while self.pos < self.source.len() && self.source[self.pos] != b'}' {
+        let mut depth = 1u32;
+        while self.pos < self.source.len() && depth > 0 {
+            match self.source[self.pos] {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                _ => {}
+            }
             self.pos += 1;
         }
         let body = String::from_utf8_lossy(&self.source[body_start..self.pos]).into_owned();

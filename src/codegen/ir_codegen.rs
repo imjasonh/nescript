@@ -62,7 +62,7 @@ pub struct IrCodeGen<'a> {
     /// When true, emit code for `debug.log` / `debug.assert`.
     /// When false, these ops are stripped entirely.
     debug_mode: bool,
-    _allocations: &'a [VarAllocation],
+    allocations: &'a [VarAllocation],
 }
 
 impl<'a> IrCodeGen<'a> {
@@ -115,7 +115,7 @@ impl<'a> IrCodeGen<'a> {
             next_oam_slot: 0,
             in_frame_handler: false,
             debug_mode: false,
-            _allocations: allocations,
+            allocations,
         }
     }
 
@@ -616,12 +616,19 @@ impl<'a> IrCodeGen<'a> {
                 }
             }
             IrOp::InlineAsm(body) => {
-                // Parse the asm body with the shared inline parser and
-                // splice the resulting instructions directly into our
-                // output stream. Parse errors are emitted as `BRK` so
-                // the ROM still links — codegen is too late to return
+                // Preprocess `{var}` substitutions, then parse with
+                // the shared inline parser and splice the resulting
+                // instructions. Parse errors emit `BRK` so the ROM
+                // still links — codegen is too late to return
                 // user-facing diagnostics cleanly.
-                match crate::asm::parse_inline(body) {
+                let substituted = substitute_asm_vars(body, |name| {
+                    // Look up by allocated name. Prefer exact match.
+                    self.allocations
+                        .iter()
+                        .find(|a| a.name == name)
+                        .map(|a| a.address)
+                });
+                match crate::asm::parse_inline(&substituted) {
                     Ok(parsed) => self.instructions.extend(parsed),
                     Err(msg) => {
                         eprintln!("inline asm error: {msg}");
@@ -708,6 +715,52 @@ enum CmpKind {
     Gt,
     LtEq,
     GtEq,
+}
+
+/// Replace `{name}` tokens in an inline-asm body with the resolved
+/// hex address from the given resolver. Unknown names and malformed
+/// placeholders are passed through unchanged (the asm parser will
+/// surface a clearer error than we could at this stage).
+///
+/// Addresses that fit in a byte become zero-page syntax (`$XX`),
+/// otherwise absolute (`$XXXX`). This lets users write
+/// `lda {score}` and have it resolve to `lda $10` or similar.
+fn substitute_asm_vars<F: Fn(&str) -> Option<u16>>(body: &str, resolver: F) -> String {
+    let mut out = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            // Find the closing `}`.
+            if let Some(end) = bytes[i + 1..].iter().position(|&b| b == b'}') {
+                let name_start = i + 1;
+                let name_end = i + 1 + end;
+                let name = &body[name_start..name_end];
+                // Only substitute bare identifiers.
+                let is_ident = !name.is_empty()
+                    && name
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                    && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+                if is_ident {
+                    if let Some(addr) = resolver(name) {
+                        use std::fmt::Write;
+                        if addr < 0x100 {
+                            let _ = write!(out, "${addr:02X}");
+                        } else {
+                            let _ = write!(out, "${addr:04X}");
+                        }
+                        i = name_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
 }
 
 /// Scan the IR functions for all scanline handlers (named

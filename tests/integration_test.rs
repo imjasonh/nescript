@@ -323,6 +323,26 @@ fn program_with_enums() {
 }
 
 #[test]
+fn program_with_inline_asm_variable_substitution() {
+    let source = r#"
+        game "AsmVar" { mapper: NROM }
+        var counter: u8 = 0
+        on frame {
+            asm {
+                LDA {counter}
+                CLC
+                ADC #$01
+                STA {counter}
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_inline_asm() {
     let source = r#"
         game "Asm" { mapper: NROM }
