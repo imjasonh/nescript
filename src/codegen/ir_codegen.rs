@@ -76,6 +76,18 @@ impl<'a> IrCodeGen<'a> {
                 var_addrs.insert(global.var_id, alloc.address);
             }
         }
+        // Map each function's parameter VarIds to the zero-page
+        // parameter-passing slots $04-$07 (up to 4 params). The
+        // caller writes arguments to these slots before JSR and the
+        // callee reads them via `LoadVar(t, VarId)` through the same
+        // mapping.
+        for func in &ir.functions {
+            for (i, local) in func.locals.iter().take(func.param_count).enumerate() {
+                if i < 4 {
+                    var_addrs.insert(local.var_id, 0x04 + i as u16);
+                }
+            }
+        }
         let function_names = ir.functions.iter().map(|f| f.name.clone()).collect();
         Self {
             instructions: Vec::new(),
@@ -473,11 +485,15 @@ impl<'a> IrCodeGen<'a> {
                 }
             }
             IrOp::Call(dest, name, args) => {
-                for (i, arg) in args.iter().enumerate() {
+                // Pass up to 4 arguments via zero-page slots $04-$07.
+                // Arguments beyond the fourth are silently dropped
+                // (the analyzer has already validated arity against
+                // the declared signature).
+                for (i, arg) in args.iter().enumerate().take(4) {
                     self.load_temp(*arg);
                     self.emit(STA, AM::ZeroPage(0x04 + i as u8));
                 }
-                self.emit(JSR, AM::Label(format!("__fn_{name}")));
+                self.emit(JSR, AM::Label(format!("__ir_fn_{name}")));
                 if let Some(d) = dest {
                     // Return value is in A
                     self.store_temp(*d);
@@ -879,6 +895,39 @@ mod more_tests {
             .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x0204));
         assert!(writes_slot0, "first draw should use OAM slot 0");
         assert!(writes_slot1, "second draw should use OAM slot 1");
+    }
+
+    #[test]
+    fn ir_codegen_function_call_uses_correct_label_and_params() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            fun sum(a: u8, b: u8) -> u8 { return a + b }
+            var x: u8 = 0
+            on frame { x = sum(3, 4) }
+            start Main
+        "#,
+        );
+        // Caller must store arg0 to $04 and arg1 to $05.
+        let writes_arg0 = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(0x04));
+        let writes_arg1 = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(0x05));
+        assert!(writes_arg0, "caller should store arg0 to $04");
+        assert!(writes_arg1, "caller should store arg1 to $05");
+        // Caller must JSR to __ir_fn_sum (not __fn_sum).
+        let has_jsr = insts
+            .iter()
+            .any(|i| i.opcode == JSR && i.mode == AM::Label("__ir_fn_sum".into()));
+        assert!(has_jsr, "caller should JSR to __ir_fn_sum");
+        // Callee must read parameters from $04 and $05, not from
+        // temp slots $80+.
+        let has_param_read = insts
+            .iter()
+            .any(|i| i.opcode == LDA && i.mode == AM::ZeroPage(0x04));
+        assert!(has_param_read, "callee should read parameters from $04");
     }
 
     #[test]
