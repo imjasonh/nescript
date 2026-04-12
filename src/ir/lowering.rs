@@ -215,6 +215,14 @@ impl LoweringContext {
         if let Some(on_frame) = &state.on_frame {
             self.lower_handler(&format!("{}_frame", state.name), on_frame, state);
         }
+
+        // Lower each scanline handler as a function named
+        // `{state}_scanline_{N}`. The IR codegen will generate the MMC3
+        // IRQ dispatch wrapper separately.
+        for (line, block) in &state.on_scanline {
+            let name = format!("{}_scanline_{line}", state.name);
+            self.lower_handler(&name, block, state);
+        }
     }
 
     fn lower_handler(&mut self, name: &str, block: &Block, state: &StateDecl) {

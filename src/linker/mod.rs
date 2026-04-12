@@ -130,10 +130,17 @@ impl Linker {
         }
         prg.resize(vector_offset, 0xFF);
 
-        // Write vector table
+        // Write vector table. IR codegen emits a richer IRQ handler
+        // under `__irq_user` when the program has scanline handlers;
+        // prefer that over the generic RTI stub at `__irq`.
         let nmi_addr = result.labels.get("__nmi").copied().unwrap_or(0xC000);
         let reset_addr = result.labels.get("__reset").copied().unwrap_or(0xC000);
-        let irq_addr = result.labels.get("__irq").copied().unwrap_or(0xC000);
+        let irq_addr = result
+            .labels
+            .get("__irq_user")
+            .or_else(|| result.labels.get("__irq"))
+            .copied()
+            .unwrap_or(0xC000);
 
         prg.extend_from_slice(&nmi_addr.to_le_bytes());
         prg.extend_from_slice(&reset_addr.to_le_bytes());

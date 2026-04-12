@@ -185,6 +185,22 @@ impl<'a> IrCodeGen<'a> {
             }
         }
 
+        // 2b. If the program has any `on scanline` handlers, set up
+        // the MMC3 IRQ counter. We pick the first scanline handler's
+        // line count as the latch value. Only supports a single-
+        // scanline-per-program setup for now.
+        let scanline_info = find_first_scanline_handler(ir);
+        if let Some((_state_name, line)) = &scanline_info {
+            // Write (line-1) to $C000 (scanline latch), any value to
+            // $C001 (reload counter), any value to $E001 (enable IRQ).
+            self.emit(LDA, AM::Immediate(line.saturating_sub(1)));
+            self.emit(STA, AM::Absolute(0xC000));
+            self.emit(STA, AM::Absolute(0xC001));
+            self.emit(STA, AM::Absolute(0xE001));
+            // Enable interrupts (CLI) so the IRQ can fire.
+            self.emit(CLI, AM::Implied);
+        }
+
         // 3. Main dispatch loop
         let main_loop = "__ir_main_loop".to_string();
         self.emit_label(&main_loop);
@@ -216,6 +232,36 @@ impl<'a> IrCodeGen<'a> {
         // 4. Emit each function body (state handlers + user functions)
         for func in &ir.functions {
             self.gen_function(func);
+        }
+
+        // 5. If we have scanline handlers, emit an IRQ handler that
+        // saves registers, ACKs the MMC3 IRQ, JSRs into the first
+        // scanline handler, restores registers, and RTIs. The linker
+        // picks up `__irq_user` and uses it as the IRQ vector instead
+        // of the default stub.
+        if let Some((state_name, line)) = scanline_info {
+            self.emit_label("__irq_user");
+            // Save registers onto the stack.
+            self.emit(PHA, AM::Implied);
+            self.emit(TXA, AM::Implied);
+            self.emit(PHA, AM::Implied);
+            self.emit(TYA, AM::Implied);
+            self.emit(PHA, AM::Implied);
+            // Acknowledge and reload the MMC3 IRQ counter.
+            self.emit(STA, AM::Absolute(0xE000)); // disable / ack
+            self.emit(STA, AM::Absolute(0xE001)); // re-enable
+                                                  // JSR into the scanline handler. We don't dispatch by
+                                                  // state yet — the first scanline handler found is used
+                                                  // unconditionally.
+            let handler = format!("{state_name}_scanline_{line}");
+            self.emit(JSR, AM::Label(format!("__ir_fn_{handler}")));
+            // Restore registers and return from interrupt.
+            self.emit(PLA, AM::Implied);
+            self.emit(TAY, AM::Implied);
+            self.emit(PLA, AM::Implied);
+            self.emit(TAX, AM::Implied);
+            self.emit(PLA, AM::Implied);
+            self.emit(RTI, AM::Implied);
         }
 
         self.instructions
@@ -583,6 +629,22 @@ enum CmpKind {
     GtEq,
 }
 
+/// Scan the IR functions for the first scanline handler (named
+/// `{state}_scanline_{line}`) and return the state name and line.
+fn find_first_scanline_handler(ir: &IrProgram) -> Option<(String, u8)> {
+    for func in &ir.functions {
+        // Match the pattern `<state>_scanline_<N>` by splitting on
+        // the last `_scanline_`. This keeps it simple and avoids
+        // re-threading scanline info through lowering.
+        if let Some((state_name, tail)) = func.name.rsplit_once("_scanline_") {
+            if let Ok(line) = tail.parse::<u8>() {
+                return Some((state_name.to_string(), line));
+            }
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -766,6 +828,35 @@ mod more_tests {
             .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x0204));
         assert!(writes_slot0, "first draw should use OAM slot 0");
         assert!(writes_slot1, "second draw should use OAM slot 1");
+    }
+
+    #[test]
+    fn ir_codegen_scanline_emits_mmc3_setup_and_irq_user() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: MMC3 }
+            state Main {
+                on frame { wait_frame }
+                on scanline(100) { wait_frame }
+            }
+            start Main
+        "#,
+        );
+        // MMC3 latch write (LDA #99; STA $C000)
+        let has_latch = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0xC000));
+        assert!(has_latch, "should write to MMC3 latch $C000");
+        // __irq_user label should be emitted
+        let has_irq_user = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__irq_user"));
+        assert!(has_irq_user, "should emit __irq_user label");
+        // The scanline handler function should exist
+        let has_handler = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__ir_fn_Main_scanline_100"));
+        assert!(has_handler, "should emit scanline handler function");
     }
 
     #[test]

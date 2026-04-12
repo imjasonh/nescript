@@ -142,6 +142,21 @@ fn program_with_functions() {
 }
 
 #[test]
+fn program_with_on_scanline_mmc3() {
+    let source = r#"
+        game "Scanline" { mapper: MMC3 }
+        var sx: u8 = 0
+        state Main {
+            on frame { wait_frame }
+            on scanline(120) { scroll(sx, 0) }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_structs() {
     let source = r#"
         game "Structs" { mapper: NROM }
