@@ -58,6 +58,8 @@ impl CodeGen {
                 const_values.insert(c.name.clone(), *v);
             }
         }
+        // Enum variants get wired in via `with_enums` below so that the
+        // main.rs call sites stay concise.
 
         Self {
             instructions: Vec::new(),
@@ -89,6 +91,18 @@ impl CodeGen {
         for sprite in sprites {
             self.sprite_tiles
                 .insert(sprite.name.clone(), sprite.tile_index);
+        }
+        self
+    }
+
+    /// Register enum variants as constants (each variant gets a u8
+    /// equal to its declaration order within the enum).
+    #[must_use]
+    pub fn with_enums(mut self, enums: &[EnumDecl]) -> Self {
+        for e in enums {
+            for (i, (variant, _)) in e.variants.iter().enumerate() {
+                self.const_values.insert(variant.clone(), i as u16);
+            }
         }
         self
     }

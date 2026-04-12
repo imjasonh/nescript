@@ -107,6 +107,11 @@ impl Analyzer {
             self.register_const(c);
         }
 
+        // Register enum variants as constants with values 0, 1, 2, ...
+        for e in &program.enums {
+            self.register_enum(e);
+        }
+
         // Register and allocate globals
         for var in &program.globals {
             self.register_var(var);
@@ -409,6 +414,39 @@ impl Analyzer {
                 span: c.span,
             },
         );
+    }
+
+    /// Register each variant of an enum declaration as a `u8` constant
+    /// with a value equal to its declaration order. Variant names must
+    /// be globally unique; a duplicate name emits E0501.
+    fn register_enum(&mut self, e: &EnumDecl) {
+        if self.symbols.contains_key(&e.name) {
+            self.diagnostics.push(Diagnostic::error(
+                ErrorCode::E0501,
+                format!("duplicate declaration of '{}'", e.name),
+                e.span,
+            ));
+            // Don't return — still register the variants.
+        }
+        for (variant_name, variant_span) in &e.variants {
+            if self.symbols.contains_key(variant_name) {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0501,
+                    format!("duplicate declaration of '{variant_name}'"),
+                    *variant_span,
+                ));
+                continue;
+            }
+            self.symbols.insert(
+                variant_name.clone(),
+                Symbol {
+                    name: variant_name.clone(),
+                    sym_type: NesType::U8,
+                    is_const: true,
+                    span: *variant_span,
+                },
+            );
+        }
     }
 
     fn register_var(&mut self, var: &VarDecl) {

@@ -126,6 +126,13 @@ impl LoweringContext {
             }
         }
 
+        // Register enum variants as constants (0, 1, 2, ... per enum)
+        for e in &program.enums {
+            for (i, (variant, _)) in e.variants.iter().enumerate() {
+                self.const_values.insert(variant.clone(), i as u16);
+            }
+        }
+
         // Lower globals
         for var in &program.globals {
             let var_id = self.get_or_create_var(&var.name);

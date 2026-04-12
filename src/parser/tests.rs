@@ -666,6 +666,34 @@ fn parse_mmc3_mapper() {
 }
 
 #[test]
+fn parse_enum_decl() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        enum Direction { Up, Down, Left, Right }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.enums.len(), 1);
+    assert_eq!(prog.enums[0].name, "Direction");
+    assert_eq!(prog.enums[0].variants.len(), 4);
+    assert_eq!(prog.enums[0].variants[0].0, "Up");
+    assert_eq!(prog.enums[0].variants[3].0, "Right");
+}
+
+#[test]
+fn parse_enum_trailing_comma_optional() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        enum Flag { On, Off, }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.enums[0].variants.len(), 2);
+}
+
+#[test]
 fn parse_multiple_start_declarations_error() {
     let src = r#"
         game "Test" { mapper: NROM }

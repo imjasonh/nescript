@@ -169,6 +169,7 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     let mut instructions = if use_ast {
         CodeGen::new(&analysis.var_allocations, &program.constants)
             .with_sprites(&sprites)
+            .with_enums(&program.enums)
             .with_debug(debug)
             .generate(&program)
     } else {

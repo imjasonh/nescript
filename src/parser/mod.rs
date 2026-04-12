@@ -116,6 +116,7 @@ impl Parser {
         let mut game = None;
         let mut globals = Vec::new();
         let mut constants = Vec::new();
+        let mut enums: Vec<EnumDecl> = Vec::new();
         let mut functions = Vec::new();
         let mut states = Vec::new();
         let mut sprites = Vec::new();
@@ -142,6 +143,9 @@ impl Parser {
                 }
                 TokenKind::KwConst => {
                     constants.push(self.parse_const_decl()?);
+                }
+                TokenKind::KwEnum => {
+                    enums.push(self.parse_enum_decl()?);
                 }
                 TokenKind::KwState => {
                     states.push(self.parse_state_decl()?);
@@ -216,6 +220,7 @@ impl Parser {
             game,
             globals,
             constants,
+            enums,
             functions,
             states,
             sprites,
@@ -224,6 +229,41 @@ impl Parser {
             banks,
             start_state,
             span,
+        })
+    }
+
+    fn parse_enum_decl(&mut self) -> Result<EnumDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwEnum)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+        let mut variants = Vec::new();
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let span = self.current_span();
+            let (vname, _) = self.expect_ident()?;
+            variants.push((vname, span));
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            } else if *self.peek() != TokenKind::RBrace {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    "expected ',' or '}' in enum body",
+                    self.current_span(),
+                ));
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+        if variants.len() > 256 {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                "enum has more than 256 variants (u8 overflow)",
+                start,
+            ));
+        }
+        Ok(EnumDecl {
+            name,
+            variants,
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 

@@ -429,6 +429,7 @@ impl<'a> Lexer<'a> {
             "fun" => TokenKind::KwFun,
             "var" => TokenKind::KwVar,
             "const" => TokenKind::KwConst,
+            "enum" => TokenKind::KwEnum,
             "if" => TokenKind::KwIf,
             "else" => TokenKind::KwElse,
             "while" => TokenKind::KwWhile,

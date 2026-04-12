@@ -5,6 +5,7 @@ pub struct Program {
     pub game: GameDecl,
     pub globals: Vec<VarDecl>,
     pub constants: Vec<ConstDecl>,
+    pub enums: Vec<EnumDecl>,
     pub functions: Vec<FunDecl>,
     pub states: Vec<StateDecl>,
     pub sprites: Vec<SpriteDecl>,
@@ -12,6 +13,17 @@ pub struct Program {
     pub backgrounds: Vec<BackgroundDecl>,
     pub banks: Vec<BankDecl>,
     pub start_state: String,
+    pub span: Span,
+}
+
+/// `enum Name { V1, V2, V3 }` — variants become u8 constants with
+/// values equal to their declaration order (0, 1, 2, ...). Variant
+/// names are global: they're flattened into the constants table so
+/// they can be referenced directly without namespacing.
+#[derive(Debug, Clone)]
+pub struct EnumDecl {
+    pub name: String,
+    pub variants: Vec<(String, Span)>,
     pub span: Span,
 }
 

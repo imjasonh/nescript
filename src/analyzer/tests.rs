@@ -299,6 +299,42 @@ fn analyze_return_wrong_type() {
 }
 
 #[test]
+fn analyze_enum_variants_as_constants() {
+    let result = analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        enum Color { Red, Green, Blue }
+        var c: u8 = Red
+        on frame {
+            if c == Blue { c = Green }
+        }
+        start Main
+    "#,
+    );
+    // Variants should be registered as constant symbols.
+    assert!(result.symbols.get("Red").is_some_and(|s| s.is_const));
+    assert!(result.symbols.get("Green").is_some_and(|s| s.is_const));
+    assert!(result.symbols.get("Blue").is_some_and(|s| s.is_const));
+}
+
+#[test]
+fn analyze_duplicate_enum_variant_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        enum A { Foo, Bar }
+        enum B { Baz, Bar }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0501),
+        "duplicate variant should emit E0501, got: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_dead_code_after_break() {
     let src = r#"
         game "Test" { mapper: NROM }
