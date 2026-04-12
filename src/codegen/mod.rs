@@ -27,6 +27,8 @@ pub struct CodeGen {
     state_indices: HashMap<String, u8>,
     /// Stack of (`continue_label`, `break_label`) for nested loops
     loop_stack: Vec<(String, String)>,
+    /// Next OAM slot to allocate (0-63), reset per frame handler
+    next_oam_slot: u8,
 }
 
 impl CodeGen {
@@ -52,6 +54,7 @@ impl CodeGen {
             input_addr: 0x01,
             state_indices: HashMap::new(),
             loop_stack: Vec::new(),
+            next_oam_slot: 0,
         }
     }
 
@@ -137,6 +140,7 @@ impl CodeGen {
             if let Some(on_frame) = &state.on_frame {
                 let frame_label = format!("__state_{i}_frame");
                 self.emit_label(&frame_label);
+                self.next_oam_slot = 0; // reset OAM allocation per frame
                 self.gen_block(on_frame);
                 self.emit(JMP, AM::Label(main_loop_label.clone()));
             }
@@ -244,12 +248,38 @@ impl CodeGen {
                 self.emit(LDA, AM::Immediate(0));
                 self.emit(STA, AM::ZeroPage(self.frame_flag_addr));
             }
-            Statement::Break(_)
-            | Statement::Continue(_)
-            | Statement::Return(_, _)
-            | Statement::Transition(_, _)
-            | Statement::Call(_, _, _) => {
-                // TODO: implement for later milestones
+            Statement::Break(_) => {
+                if let Some((_, break_label)) = self.loop_stack.last() {
+                    self.emit(JMP, AM::Label(break_label.clone()));
+                }
+            }
+            Statement::Continue(_) => {
+                if let Some((continue_label, _)) = self.loop_stack.last() {
+                    self.emit(JMP, AM::Label(continue_label.clone()));
+                }
+            }
+            Statement::Return(value, _) => {
+                if let Some(expr) = value {
+                    self.gen_expr(expr);
+                }
+                self.emit(RTS, AM::Implied);
+            }
+            Statement::Transition(name, _) => {
+                if let Some(&idx) = self.state_indices.get(name) {
+                    self.emit(LDA, AM::Immediate(idx));
+                    self.emit(STA, AM::ZeroPage(ZP_CURRENT_STATE));
+                    // Jump to main loop to start the new state's frame
+                    self.emit(JMP, AM::Label("__main_loop".into()));
+                }
+            }
+            Statement::Call(name, args, _) => {
+                // Pass arguments via zero-page param slots ($04-$07)
+                for (i, arg) in args.iter().enumerate() {
+                    self.gen_expr(arg);
+                    self.emit(STA, AM::ZeroPage(0x04 + i as u8));
+                }
+                let fn_label = format!("__fn_{name}");
+                self.emit(JSR, AM::Label(fn_label));
             }
             Statement::Scroll(x_expr, y_expr, _) => {
                 // PPU scroll register $2005 takes two writes: X then Y
@@ -799,31 +829,34 @@ impl CodeGen {
     }
 
     fn gen_draw(&mut self, draw: &DrawStmt) {
-        // OAM buffer is at $0200-$02FF
-        // Each sprite entry: Y, tile, attributes, X
-        // For M1: sprite name (draw.sprite_name) is parsed but ignored —
-        // all draws use OAM slot 0 with tile index 0 (the built-in CHR tile).
-        // Sprite name resolution and multiple OAM slots come in M2/M3.
-        let _ = &draw.sprite_name;
-        // Y position (stored at $0200)
-        self.gen_expr(&draw.y);
-        self.emit(STA, AM::Absolute(0x0200));
+        // OAM buffer at $0200-$02FF: 64 sprites, 4 bytes each
+        // Each entry: Y, tile_index, attributes, X
+        let slot = self.next_oam_slot;
+        if slot >= 64 {
+            return; // OAM full — silently skip (analyzer should warn)
+        }
+        self.next_oam_slot += 1;
+        let base = 0x0200 + u16::from(slot) * 4;
 
-        // Tile index (stored at $0201) — use 0 for default
+        // Y position
+        self.gen_expr(&draw.y);
+        self.emit(STA, AM::Absolute(base));
+
+        // Tile index — use frame: expr if provided, else 0
         if let Some(frame) = &draw.frame {
             self.gen_expr(frame);
         } else {
             self.emit(LDA, AM::Immediate(0));
         }
-        self.emit(STA, AM::Absolute(0x0201));
+        self.emit(STA, AM::Absolute(base + 1));
 
-        // Attributes (stored at $0202) — default 0
+        // Attributes — default 0
         self.emit(LDA, AM::Immediate(0));
-        self.emit(STA, AM::Absolute(0x0202));
+        self.emit(STA, AM::Absolute(base + 2));
 
-        // X position (stored at $0203)
+        // X position
         self.gen_expr(&draw.x);
-        self.emit(STA, AM::Absolute(0x0203));
+        self.emit(STA, AM::Absolute(base + 3));
     }
 
     fn emit_load(&mut self, addr: u16) {
