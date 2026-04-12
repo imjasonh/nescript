@@ -253,26 +253,19 @@ fn copy_propagate_temps(instructions: &mut [Instruction]) {
                 a = Some(Source::Imm(v));
             }
             (Opcode::LDA, AddressingMode::ZeroPage(addr)) => {
-                // If addr is a temp whose source is tracked and the
-                // source still holds the intended value, rewrite the
-                // load to use the source directly.
+                // If addr is a temp whose source is tracked, rewrite
+                // the load to use the source directly.
                 if is_temp_slot_addr(addr) {
                     if let Some(src) = temp_source.get(&addr).copied() {
-                        match src {
-                            Source::Imm(v) => {
-                                inst.mode = AddressingMode::Immediate(v);
-                                a = Some(Source::Imm(v));
-                                continue;
-                            }
-                            Source::Zp(orig) => {
-                                inst.mode = AddressingMode::ZeroPage(orig);
-                                a = Some(Source::Zp(orig));
-                                continue;
-                            }
-                        }
+                        inst.mode = source_to_mode(src);
+                        a = Some(src);
+                        continue;
                     }
                 }
                 a = Some(Source::Zp(addr));
+            }
+            (Opcode::LDA, AddressingMode::Absolute(addr)) => {
+                a = Some(Source::Abs(addr));
             }
             // Arithmetic / logical ops that read a temp slot: rewrite
             // the operand to the temp's tracked source. Clobbers A.
@@ -281,10 +274,7 @@ fn copy_propagate_temps(instructions: &mut [Instruction]) {
                 AddressingMode::ZeroPage(addr),
             ) if is_temp_slot_addr(addr) => {
                 if let Some(src) = temp_source.get(&addr).copied() {
-                    inst.mode = match src {
-                        Source::Imm(v) => AddressingMode::Immediate(v),
-                        Source::Zp(orig) => AddressingMode::ZeroPage(orig),
-                    };
+                    inst.mode = source_to_mode(src);
                 }
                 a = None;
             }
@@ -303,6 +293,10 @@ fn copy_propagate_temps(instructions: &mut [Instruction]) {
                     temp_source.retain(|_, src| !matches!(*src, Source::Zp(a) if a == addr));
                 }
             }
+            (Opcode::STA, AddressingMode::Absolute(addr)) => {
+                // Invalidate any temp tracking this absolute source.
+                temp_source.retain(|_, src| !matches!(*src, Source::Abs(a) if a == addr));
+            }
             // Any op that reads a non-ZP location or clobbers A: just
             // invalidate A; temps are unaffected.
             _ => {
@@ -314,10 +308,19 @@ fn copy_propagate_temps(instructions: &mut [Instruction]) {
     }
 }
 
+fn source_to_mode(src: Source) -> AddressingMode {
+    match src {
+        Source::Imm(v) => AddressingMode::Immediate(v),
+        Source::Zp(addr) => AddressingMode::ZeroPage(addr),
+        Source::Abs(addr) => AddressingMode::Absolute(addr),
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Source {
     Imm(u8),
     Zp(u8),
+    Abs(u16),
 }
 
 fn is_temp_slot_addr(addr: u8) -> bool {
@@ -376,29 +379,34 @@ fn remove_redundant_loads(instructions: &mut Vec<Instruction>) {
                 a = Imm(*v);
             }
             (Opcode::LDA, AddressingMode::ZeroPage(addr)) => {
-                if let Addr(existing) = a {
+                if let Zp(existing) = a {
                     if existing == *addr {
                         keep[i] = false;
                         continue;
                     }
                 }
-                a = Addr(*addr);
+                a = Zp(*addr);
             }
             (Opcode::LDA, AddressingMode::Absolute(addr)) => {
-                // We could track absolute addresses too, but don't
-                // try to unify them with ZP. Just record the value.
-                // Not going to eliminate against prior state.
-                let _ = addr;
-                a = None;
+                if let Abs(existing) = a {
+                    if existing == *addr {
+                        keep[i] = false;
+                        continue;
+                    }
+                }
+                a = Abs(*addr);
             }
             (Opcode::STA, AddressingMode::ZeroPage(addr)) => {
                 // After STA, A is unchanged. Additionally, `addr` now
                 // holds A's value. Remember that equivalence: a later
                 // `LDA addr` is redundant.
-                a = Addr(*addr);
+                a = Zp(*addr);
+            }
+            (Opcode::STA, AddressingMode::Absolute(addr)) => {
+                a = Abs(*addr);
             }
             (Opcode::STA, _) => {
-                // A unchanged, but we don't track non-ZP addresses.
+                // A unchanged, but we don't track exotic addressing modes.
             }
             // Ops that clobber A — clear tracker.
             (
@@ -436,7 +444,8 @@ fn remove_redundant_loads(instructions: &mut Vec<Instruction>) {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AKnown {
     None,
-    Addr(u8),
+    Zp(u8),
+    Abs(u16),
     Imm(u8),
 }
 
