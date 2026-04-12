@@ -271,6 +271,50 @@ fn analyze_call_arity_in_expr_context() {
 }
 
 #[test]
+fn analyze_return_type_ok() {
+    analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        fun get_five() -> u8 { return 5 }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_return_wrong_type() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        fun is_ok() -> bool { return 5 }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "returning wrong type should produce E0201, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_return_value_from_void_fn() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        fun do_nothing() { return 5 }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0203),
+        "returning value from void function should produce E0203, got: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_const_assignment_error() {
     let errors = analyze_errors(
         r#"

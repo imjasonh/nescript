@@ -50,6 +50,8 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         in_loop: false,
         used_vars: HashSet::new(),
         function_signatures: HashMap::new(),
+        current_return_type: None,
+        in_function_body: false,
     };
     analyzer.analyze_program(program);
 
@@ -78,6 +80,15 @@ struct Analyzer {
     /// Function name to parameter types (in order). Used to validate
     /// call arity and argument types.
     function_signatures: HashMap<String, Vec<NesType>>,
+    /// Return type of the function currently being analyzed, or None
+    /// when the function has no declared return type. Only meaningful
+    /// when `in_function_body` is true.
+    current_return_type: Option<NesType>,
+    /// True while analyzing a function body (as opposed to a state
+    /// handler's `on_enter` / `on_exit` / `on_frame` block). Used to
+    /// distinguish "void function" from "state handler" when checking
+    /// `return value` statements.
+    in_function_body: bool,
 }
 
 impl Analyzer {
@@ -153,7 +164,11 @@ impl Analyzer {
                 }
                 self.mark_var_used(&param.name);
             }
+            self.current_return_type.clone_from(&fun.return_type);
+            self.in_function_body = true;
             self.check_block(&fun.body, &state_names);
+            self.current_return_type = None;
+            self.in_function_body = false;
             for name in &added_params {
                 self.symbols.remove(name);
             }
@@ -571,10 +586,22 @@ impl Analyzer {
                     self.check_expr_type(frame, &NesType::U8);
                 }
             }
-            Statement::Return(Some(expr), _) => {
-                // For M1, just validate the expression without checking return type
+            Statement::Return(Some(expr), span) => {
                 self.walk_expr_reads(expr);
-                let _ = self.infer_type(expr);
+                if let Some(ret_ty) = self.current_return_type.clone() {
+                    // Function with declared return type — check the value.
+                    self.check_expr_type(expr, &ret_ty);
+                } else if self.in_function_body {
+                    // Function with no declared return type ("void"),
+                    // but the return statement has a value.
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0203,
+                        "return value in function with no declared return type",
+                        *span,
+                    ));
+                }
+                // State handlers (`in_function_body == false`) accept
+                // `return value` silently — the value is simply discarded.
             }
             Statement::Call(name, args, span) => {
                 if self.symbols.contains_key(name) {
