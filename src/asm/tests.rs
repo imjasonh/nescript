@@ -373,3 +373,29 @@ fn assemble_add_immediate() {
     let result = assemble(&instructions, 0x8000);
     assert_eq!(result.bytes, vec![0xA5, 0x10, 0x18, 0x69, 0x02, 0x85, 0x10]);
 }
+
+// ── Code review regression tests ──
+
+#[test]
+#[should_panic(expected = "branch offset")]
+fn branch_out_of_range_panics() {
+    // Regression: branch offsets > 127 bytes used to silently wrap
+    let mut instructions = vec![Instruction::new(NOP, AM::Label("start".into()))];
+    // Insert 200 NOPs to push the branch target out of range
+    for _ in 0..200 {
+        instructions.push(Instruction::implied(NOP));
+    }
+    instructions.push(Instruction::new(BEQ, AM::LabelRelative("start".into())));
+    let _ = assemble(&instructions, 0x8000);
+}
+
+#[test]
+#[should_panic(expected = "unresolved label")]
+fn unresolved_label_panics() {
+    // Regression: unresolved labels used to silently produce offset 0
+    let instructions = vec![Instruction::new(
+        BEQ,
+        AM::LabelRelative("nonexistent".into()),
+    )];
+    let _ = assemble(&instructions, 0x8000);
+}

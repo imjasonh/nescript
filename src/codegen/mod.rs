@@ -302,9 +302,18 @@ impl CodeGen {
                 self.emit(LDA, AM::Immediate(u8::from(*v)));
             }
             Expr::UnaryOp(UnaryOp::Not, inner, _) => {
+                // Logical NOT: if condition is nonzero → 0, if zero → 1
                 self.gen_condition(inner);
-                self.emit(EOR, AM::Immediate(0xFF));
-                self.emit(AND, AM::Immediate(0x01));
+                let true_label = self.fresh_label("not_true");
+                let end_label = self.fresh_label("not_end");
+                self.emit(BEQ, AM::LabelRelative(true_label.clone()));
+                // Condition was true (nonzero), result is false (0)
+                self.emit(LDA, AM::Immediate(0));
+                self.emit(JMP, AM::Label(end_label.clone()));
+                // Condition was false (zero), result is true (1)
+                self.emit_label(&true_label);
+                self.emit(LDA, AM::Immediate(1));
+                self.emit_label(&end_label);
             }
             _ => {
                 self.gen_expr(expr);

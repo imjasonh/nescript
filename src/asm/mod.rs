@@ -145,7 +145,12 @@ impl Assembler {
                         let from = i32::from(self.base_address) + fixup.offset as i32 + 1;
                         let to = i32::from(addr);
                         let offset = to - from;
-                        self.output[fixup.offset] = offset.cast_unsigned().to_le_bytes()[0];
+                        assert!(
+                            (-128..=127).contains(&offset),
+                            "branch offset {offset} out of range (-128..127) for label '{}'",
+                            fixup.label
+                        );
+                        self.output[fixup.offset] = (offset as i8).cast_unsigned();
                     }
                     FixupKind::Lo => {
                         self.output[fixup.offset] = addr as u8;
@@ -154,6 +159,8 @@ impl Assembler {
                         self.output[fixup.offset] = (addr >> 8) as u8;
                     }
                 }
+            } else {
+                panic!("unresolved label: '{}'", fixup.label);
             }
         }
     }

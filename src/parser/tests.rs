@@ -915,3 +915,31 @@ fn lexer_no_panic_on_garbage() {
         let _ = lex(input); // must not panic
     }
 }
+
+// ── Code review regression tests ──
+
+#[test]
+fn unterminated_call_args_no_hang() {
+    // Regression: parser used to infinite-loop on missing RParen in call args
+    let _ = parse(r#"game "T" { mapper: NROM } on frame { foo(1, 2 } start Main"#);
+    let _ = parse(r#"game "T" { mapper: NROM } var x: u8 = foo(1"#);
+    // Must return (possibly with errors), not hang
+}
+
+#[test]
+fn array_index_compound_assign() {
+    // Regression: parse_assign_op was missing &= |= ^= for array elements
+    let src = r#"
+        game "T" { mapper: NROM }
+        var buf: u8[4] = [0, 0, 0, 0]
+        on frame {
+            buf[0] &= 0x0F
+            buf[1] |= 0x80
+            buf[2] ^= 0xFF
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert_eq!(frame.statements.len(), 3);
+}

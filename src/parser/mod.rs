@@ -328,7 +328,7 @@ impl Parser {
             var_type,
             init,
             placement,
-            span: Span::new(start.file_id, start.start, self.current_span().start),
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
@@ -347,7 +347,7 @@ impl Parser {
             name,
             const_type,
             value,
-            span: Span::new(start.file_id, start.start, self.current_span().start),
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
@@ -395,7 +395,7 @@ impl Parser {
             return_type,
             body,
             is_inline,
-            span: Span::new(start.file_id, start.start, self.current_span().start),
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
@@ -458,7 +458,7 @@ impl Parser {
             on_exit,
             on_frame,
             on_scanline,
-            span: Span::new(start.file_id, start.start, self.current_span().start),
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
@@ -484,7 +484,7 @@ impl Parser {
         Ok(BankDecl {
             name,
             bank_type,
-            span: Span::new(start.file_id, start.start, self.current_span().start),
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
@@ -538,7 +538,7 @@ impl Parser {
         Ok(SpriteDecl {
             name,
             chr_source,
-            span: Span::new(start.file_id, start.start, self.current_span().start),
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
@@ -597,7 +597,7 @@ impl Parser {
         Ok(PaletteDecl {
             name,
             colors,
-            span: Span::new(start.file_id, start.start, self.current_span().start),
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
@@ -638,7 +638,7 @@ impl Parser {
         Ok(BackgroundDecl {
             name,
             chr_source,
-            span: Span::new(start.file_id, start.start, self.current_span().start),
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
@@ -715,7 +715,7 @@ impl Parser {
 
         Ok(Block {
             statements,
-            span: Span::new(start.file_id, start.start, self.current_span().start),
+            span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
@@ -981,7 +981,7 @@ impl Parser {
                 // Function call
                 self.advance();
                 let mut args = Vec::new();
-                while *self.peek() != TokenKind::RParen {
+                while *self.peek() != TokenKind::RParen && *self.peek() != TokenKind::Eof {
                     args.push(self.parse_expr()?);
                     if *self.peek() == TokenKind::Comma {
                         self.advance();
@@ -1014,6 +1014,18 @@ impl Parser {
             TokenKind::MinusAssign => {
                 self.advance();
                 Ok(AssignOp::MinusAssign)
+            }
+            TokenKind::AmpAssign => {
+                self.advance();
+                Ok(AssignOp::AmpAssign)
+            }
+            TokenKind::PipeAssign => {
+                self.advance();
+                Ok(AssignOp::PipeAssign)
+            }
+            TokenKind::CaretAssign => {
+                self.advance();
+                Ok(AssignOp::CaretAssign)
             }
             _ => Err(Diagnostic::error(
                 ErrorCode::E0201,
@@ -1266,7 +1278,7 @@ impl Parser {
                 if *self.peek() == TokenKind::LParen {
                     self.advance();
                     let mut args = Vec::new();
-                    while *self.peek() != TokenKind::RParen {
+                    while *self.peek() != TokenKind::RParen && *self.peek() != TokenKind::Eof {
                         args.push(self.parse_expr()?);
                         if *self.peek() == TokenKind::Comma {
                             self.advance();
