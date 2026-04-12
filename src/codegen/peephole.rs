@@ -17,6 +17,8 @@ pub fn optimize(instructions: &mut Vec<Instruction>) {
         remove_lda_then_sta_same(instructions);
         remove_dead_temp_stores(instructions);
         remove_redundant_loads(instructions);
+        fold_branch_over_jmp(instructions);
+        remove_jmp_to_next_label(instructions);
         // Stop when no pass removed an instruction *and* the stream
         // is unchanged. Copy propagation doesn't shrink the stream —
         // it rewrites operands — so we need the content check too.
@@ -24,6 +26,133 @@ pub fn optimize(instructions: &mut Vec<Instruction>) {
             break;
         }
     }
+}
+
+/// Fold `Bxx label1; JMP label2; label1:` into `Byy label2`, where
+/// `Byy` is the inversion of `Bxx`. This is emitted by the IR codegen
+/// for every `if` statement without an else clause — the `BNE taken;
+/// JMP fallthrough; taken: … fallthrough:` pattern collapses to
+/// `BEQ fallthrough; …`. Saves 2 instructions per if.
+///
+/// The fold is only safe when the JMP target is close enough to fit
+/// in a branch's signed 8-bit offset (-128..+127 bytes). We use a
+/// conservative estimate: scan forward up to 60 instructions (~120
+/// bytes) looking for the target label. If it's not found in that
+/// window, leave the JMP alone.
+fn fold_branch_over_jmp(instructions: &mut Vec<Instruction>) {
+    const MAX_LOOKAHEAD: usize = 60;
+    let mut out = Vec::with_capacity(instructions.len());
+    let mut i = 0;
+    while i < instructions.len() {
+        if i + 2 < instructions.len() {
+            let br = &instructions[i];
+            let jmp = &instructions[i + 1];
+            let lbl = &instructions[i + 2];
+            let inverted = invert_branch(br.opcode);
+            let is_branch = inverted.is_some();
+            let is_jmp = jmp.opcode == Opcode::JMP;
+            let is_label =
+                lbl.opcode == Opcode::NOP && matches!(lbl.mode, AddressingMode::Label(_));
+            if is_branch && is_jmp && is_label {
+                if let (AddressingMode::LabelRelative(br_tgt), AddressingMode::Label(lbl_name)) =
+                    (&br.mode, &lbl.mode)
+                {
+                    if br_tgt == lbl_name {
+                        let jmp_tgt = match &jmp.mode {
+                            AddressingMode::Label(n) => n.clone(),
+                            _ => {
+                                out.push(instructions[i].clone());
+                                i += 1;
+                                continue;
+                            }
+                        };
+                        // Confirm the target is reachable within a
+                        // short branch. Scan forward looking for the
+                        // label definition.
+                        let mut found = false;
+                        for (offset, ahead) in instructions
+                            .iter()
+                            .enumerate()
+                            .skip(i + 1)
+                            .take(MAX_LOOKAHEAD)
+                        {
+                            if ahead.opcode == Opcode::NOP {
+                                if let AddressingMode::Label(name) = &ahead.mode {
+                                    if name == &jmp_tgt {
+                                        found = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            // Stop scan if we walk off the end.
+                            let _ = offset;
+                        }
+                        if !found {
+                            out.push(instructions[i].clone());
+                            i += 1;
+                            continue;
+                        }
+                        out.push(Instruction::new(
+                            inverted.unwrap(),
+                            AddressingMode::LabelRelative(jmp_tgt),
+                        ));
+                        // Preserve the label definition.
+                        out.push(lbl.clone());
+                        i += 3;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(instructions[i].clone());
+        i += 1;
+    }
+    *instructions = out;
+}
+
+/// Remove `JMP label` when the very next instruction is the label
+/// definition itself. This is a dead jump left behind by IR codegen
+/// patterns like `if-else` and `while` that unconditionally jump to
+/// a label that's already directly following.
+fn remove_jmp_to_next_label(instructions: &mut Vec<Instruction>) {
+    let mut out = Vec::with_capacity(instructions.len());
+    let mut i = 0;
+    while i < instructions.len() {
+        if i + 1 < instructions.len() {
+            let jmp = &instructions[i];
+            let next = &instructions[i + 1];
+            if jmp.opcode == Opcode::JMP {
+                if let (AddressingMode::Label(tgt), AddressingMode::Label(name)) =
+                    (&jmp.mode, &next.mode)
+                {
+                    if next.opcode == Opcode::NOP && tgt == name {
+                        // Drop the JMP — fall through to the label.
+                        i += 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        out.push(instructions[i].clone());
+        i += 1;
+    }
+    *instructions = out;
+}
+
+/// Return the logical inverse of a branch opcode, or None if the
+/// opcode isn't a conditional branch.
+fn invert_branch(op: Opcode) -> Option<Opcode> {
+    Some(match op {
+        Opcode::BEQ => Opcode::BNE,
+        Opcode::BNE => Opcode::BEQ,
+        Opcode::BCC => Opcode::BCS,
+        Opcode::BCS => Opcode::BCC,
+        Opcode::BMI => Opcode::BPL,
+        Opcode::BPL => Opcode::BMI,
+        Opcode::BVC => Opcode::BVS,
+        Opcode::BVS => Opcode::BVC,
+        _ => return None,
+    })
 }
 
 /// Remove `LDA …` instructions whose value is never read — the next
@@ -688,6 +817,76 @@ mod tests {
         // First LDA dropped; result is LDA #0, STA $10, RTS
         let lda_count = insts.iter().filter(|i| i.opcode == LDA).count();
         assert_eq!(lda_count, 1, "expected one LDA, got: {insts:?}");
+    }
+
+    #[test]
+    fn folds_branch_over_jmp_to_nearby_label() {
+        // BNE taken; JMP fallthrough; taken:
+        // becomes: BEQ fallthrough; taken:
+        // (and taken: is harmless even without a corresponding JSR).
+        let mut insts = vec![
+            Instruction::new(LDA, AM::Immediate(0)),
+            Instruction::new(BNE, AM::LabelRelative("taken".into())),
+            Instruction::new(JMP, AM::Label("fallthrough".into())),
+            Instruction::new(NOP, AM::Label("taken".into())),
+            Instruction::new(NOP, AM::Implied),
+            Instruction::new(NOP, AM::Label("fallthrough".into())),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        // The BNE should have been rewritten to BEQ fallthrough.
+        let has_beq_fallthrough = insts
+            .iter()
+            .any(|i| i.opcode == BEQ && i.mode == AM::LabelRelative("fallthrough".into()));
+        assert!(
+            has_beq_fallthrough,
+            "expected BEQ fallthrough after folding: {insts:?}"
+        );
+        // The JMP fallthrough should be gone.
+        let has_jmp = insts
+            .iter()
+            .any(|i| i.opcode == JMP && i.mode == AM::Label("fallthrough".into()));
+        assert!(!has_jmp, "JMP should be folded away: {insts:?}");
+    }
+
+    #[test]
+    fn skips_branch_fold_for_distant_labels() {
+        // Same pattern but the target label is too far away (beyond
+        // the lookahead window). The fold should be skipped.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::Immediate(0)),
+            Instruction::new(BNE, AM::LabelRelative("taken".into())),
+            Instruction::new(JMP, AM::Label("far_label".into())),
+            Instruction::new(NOP, AM::Label("taken".into())),
+        ];
+        // Pad with 100 NOPs.
+        for _ in 0..100 {
+            insts.push(Instruction::new(NOP, AM::Implied));
+        }
+        insts.push(Instruction::new(NOP, AM::Label("far_label".into())));
+        insts.push(Instruction::new(RTS, AM::Implied));
+        optimize(&mut insts);
+        // The BNE should NOT have been rewritten — far_label is too
+        // far to reach with a short branch.
+        let has_beq_far = insts
+            .iter()
+            .any(|i| i.opcode == BEQ && i.mode == AM::LabelRelative("far_label".into()));
+        assert!(
+            !has_beq_far,
+            "BNE should not be folded when target is far: {insts:?}"
+        );
+    }
+
+    #[test]
+    fn removes_jmp_to_immediately_following_label() {
+        let mut insts = vec![
+            Instruction::new(JMP, AM::Label("next".into())),
+            Instruction::new(NOP, AM::Label("next".into())),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        let has_jmp = insts.iter().any(|i| i.opcode == JMP);
+        assert!(!has_jmp, "JMP to next label should be removed: {insts:?}");
     }
 
     #[test]
