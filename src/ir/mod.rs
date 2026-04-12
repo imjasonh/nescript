@@ -139,6 +139,10 @@ pub enum IrOp {
     DebugAssert(IrTemp),
     /// Raw 6502 assembly text; parsed and emitted by the codegen.
     InlineAsm(String),
+    /// `poke(addr, value)` — STA value to a fixed absolute address.
+    Poke(u16, IrTemp),
+    /// `peek(addr)` — LDA from a fixed absolute address into a temp.
+    Peek(IrTemp, u16),
 
     // Source mapping
     SourceLoc(Span),

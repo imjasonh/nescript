@@ -323,6 +323,26 @@ fn program_with_enums() {
 }
 
 #[test]
+fn program_with_poke_peek_intrinsics() {
+    let source = r#"
+        game "Hardware" { mapper: NROM }
+        var status: u8 = 0
+        on frame {
+            // Write to PPU address / data registers directly.
+            poke(0x2006, 0x3F)
+            poke(0x2006, 0x00)
+            poke(0x2007, 0x0F)
+            // Read PPU status.
+            status = peek(0x2002)
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_raw_asm_block() {
     // `raw asm` bypasses `{var}` substitution so the body is passed
     // to the inline parser unchanged.

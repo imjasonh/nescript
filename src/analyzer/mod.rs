@@ -991,7 +991,9 @@ impl Analyzer {
                 // `return value` silently — the value is simply discarded.
             }
             Statement::Call(name, args, span) => {
-                if self.symbols.contains_key(name) {
+                if is_intrinsic(name) {
+                    self.check_intrinsic_args(name, args, *span);
+                } else if self.symbols.contains_key(name) {
                     self.check_call_signature(name, args, *span);
                 } else {
                     self.diagnostics.push(Diagnostic::error(
@@ -1334,6 +1336,44 @@ fn collect_calls_block(block: &Block, calls: &mut Vec<String>) {
 /// handled by strength reduction (e.g. `x * 2`, `x / 4`).
 fn is_small_constant(expr: &Expr) -> bool {
     matches!(expr, Expr::IntLiteral(_, _))
+}
+
+/// True if `name` is a built-in intrinsic function recognized by the
+/// compiler. Intrinsics don't need a declaration and may have
+/// special codegen (e.g. \`poke\` / \`peek\` write to raw addresses).
+fn is_intrinsic(name: &str) -> bool {
+    matches!(name, "poke" | "peek")
+}
+
+impl Analyzer {
+    /// Validate the arguments to a built-in intrinsic. Emits
+    /// diagnostics for mismatched arity or non-constant addresses.
+    fn check_intrinsic_args(&mut self, name: &str, args: &[Expr], span: Span) {
+        match name {
+            "poke" => {
+                if args.len() != 2 {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0203,
+                        format!(
+                            "`poke` takes exactly 2 arguments (addr, value), got {}",
+                            args.len()
+                        ),
+                        span,
+                    ));
+                }
+            }
+            "peek" => {
+                if args.len() != 1 {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0203,
+                        format!("`peek` takes exactly 1 argument (addr), got {}", args.len()),
+                        span,
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 /// True if this statement unconditionally ends block execution —

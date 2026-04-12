@@ -795,36 +795,56 @@ In debug mode, the compiler inserts:
 
 ---
 
+## Hardware Intrinsics
+
+For the common case of reading or writing a single PPU/APU/mapper
+register, NEScript provides two built-in intrinsics:
+
+```
+poke(0x2006, 0x3F)        // write $3F to PPU address register
+poke(0x2006, 0x00)        // (second half of the address)
+poke(0x2007, 0x0F)        // write a palette byte to PPU data
+
+var status: u8 = peek(0x2002)  // read PPU status register
+```
+
+The address argument to both is a compile-time constant. Zero-page
+addresses compile to `STA $XX` / `LDA $XX`; anything larger compiles
+to absolute addressing.
+
 ## Inline Assembly
 
-For performance-critical code, drop to 6502 assembly:
-
-### Bound Assembly
+For more elaborate sequences, use `asm { ... }` blocks:
 
 ```
 fun fast_shift(input: u8) -> u8 {
+    var result: u8 = 0
     asm {
-        lda {input}
-        asl a
-        asl a
-        sta {return}
+        LDA {input}
+        ASL A
+        ASL A
+        STA {result}
     }
+    return result
 }
 ```
 
-`{variable_name}` resolves to the variable's memory address. `{return}` is the return value location.
+Inside an `asm` block, `{name}` is replaced with the resolved
+zero-page or absolute address of the variable `name`. Labels
+defined with `name:` are local to the block.
 
 ### Raw Assembly
 
 ```
 raw asm {
-    .org $C000
-    nop
-    rti
+    LDA #$42
+    STA $2007
 }
 ```
 
-Raw blocks bypass all compiler management. Use with extreme caution.
+`raw asm` skips variable substitution — `{name}` is passed through
+verbatim. Useful for completely unmanaged snippets that don't
+reference NEScript variables.
 
 ---
 
@@ -904,46 +924,6 @@ error[E0402]: recursion is not allowed
 ```
 
 ---
-
-## Compiler Commands
-
-### Build
-
-## Inline Assembly
-
-`asm { ... }` blocks contain raw 6502 assembly that the compiler
-parses and splices directly into the output:
-
-```
-fun fast_add() -> u8 {
-    var x: u8 = 5
-    var y: u8 = 3
-    asm {
-        LDA {x}
-        CLC
-        ADC {y}
-        STA {x}
-    }
-    return x
-}
-```
-
-Within an asm block, `{name}` is replaced with the resolved
-zero-page or absolute address of the variable `name`. This lets
-handwritten assembly reference NEScript variables without knowing
-where the analyzer allocated them.
-
-Supported addressing modes (mirroring the generated codegen):
-
-- `LDA #$10` / `LDA #42` — immediate
-- `LDA $10` / `STA $20,X` — zero-page (+ indexed)
-- `LDA $2000` / `LDA $0200,Y` — absolute (+ indexed)
-- `LDA ($10,X)` / `LDA ($10),Y` — indirect-X / indirect-Y
-- `JMP ($FFFC)` — indirect
-- `CLC`, `SEC`, `NOP`, ... — implied
-- `LSR A` — accumulator
-- Labels: `loop_start:` defines a label; `BNE loop_start` branches
-  to it. Labels are local to the surrounding asm block.
 
 ## Command Line
 

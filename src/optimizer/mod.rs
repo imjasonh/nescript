@@ -391,10 +391,14 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         IrOp::DebugAssert(cond) => {
             used.insert(*cond);
         }
+        IrOp::Poke(_, src) => {
+            used.insert(*src);
+        }
         IrOp::ReadInput(_, _)
         | IrOp::WaitFrame
         | IrOp::Transition(_)
         | IrOp::InlineAsm(_)
+        | IrOp::Peek(_, _)
         | IrOp::SourceLoc(_) => {}
     }
 }
@@ -423,6 +427,7 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::ArrayLoad(d, _, _) => Some(*d),
         IrOp::Call(dest, _, _) => *dest,
         IrOp::ReadInput(d, _) => Some(*d),
+        IrOp::Peek(d, _) => Some(*d),
         IrOp::StoreVar(_, _)
         | IrOp::ArrayStore(_, _, _)
         | IrOp::DrawSprite { .. }
@@ -432,6 +437,7 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::DebugLog(_)
         | IrOp::DebugAssert(_)
         | IrOp::InlineAsm(_)
+        | IrOp::Poke(_, _)
         | IrOp::SourceLoc(_) => None,
     }
 }

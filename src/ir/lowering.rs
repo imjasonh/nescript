@@ -411,8 +411,20 @@ impl LoweringContext {
                 self.emit(IrOp::WaitFrame);
             }
             Statement::Call(name, args, _) => {
-                let arg_temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
-                self.emit(IrOp::Call(None, name.clone(), arg_temps));
+                match name.as_str() {
+                    // Built-in `poke(addr, value)` — write a byte to
+                    // a compile-time-constant address.
+                    "poke" if args.len() == 2 => {
+                        if let Some(addr) = self.eval_const(&args[0]) {
+                            let val = self.lower_expr(&args[1]);
+                            self.emit(IrOp::Poke(addr, val));
+                        }
+                    }
+                    _ => {
+                        let arg_temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
+                        self.emit(IrOp::Call(None, name.clone(), arg_temps));
+                    }
+                }
             }
             Statement::Scroll(x_expr, y_expr, _) => {
                 let x = self.lower_expr(x_expr);
@@ -768,6 +780,15 @@ impl LoweringContext {
                 t
             }
             Expr::Call(name, args, _) => {
+                // Built-in `peek(addr)` reads a byte from a fixed
+                // absolute address at compile time.
+                if name == "peek" && args.len() == 1 {
+                    if let Some(addr) = self.eval_const(&args[0]) {
+                        let t = self.fresh_temp();
+                        self.emit(IrOp::Peek(t, addr));
+                        return t;
+                    }
+                }
                 let arg_temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let t = self.fresh_temp();
                 self.emit(IrOp::Call(Some(t), name.clone(), arg_temps));

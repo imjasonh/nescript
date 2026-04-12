@@ -639,6 +639,22 @@ impl<'a> IrCodeGen<'a> {
                     }
                 }
             }
+            IrOp::Poke(addr, src) => {
+                self.load_temp(*src);
+                if *addr < 0x100 {
+                    self.emit(STA, AM::ZeroPage(*addr as u8));
+                } else {
+                    self.emit(STA, AM::Absolute(*addr));
+                }
+            }
+            IrOp::Peek(dest, addr) => {
+                if *addr < 0x100 {
+                    self.emit(LDA, AM::ZeroPage(*addr as u8));
+                } else {
+                    self.emit(LDA, AM::Absolute(*addr));
+                }
+                self.store_temp(*dest);
+            }
             IrOp::SourceLoc(_) => {
                 // No code for source location markers
             }
