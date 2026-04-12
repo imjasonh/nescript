@@ -206,6 +206,43 @@ fn lower_constants_become_immediates() {
 }
 
 #[test]
+fn lower_const_expressions_constant_fold() {
+    // Constants may reference earlier constants and use arithmetic.
+    // `B` resolves to `A + 3` = 8 at lowering time.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        const A: u8 = 5
+        const B: u8 = A + 3
+        var x: u8 = B
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    let x_global = ir.globals.iter().find(|g| g.name == "x").unwrap();
+    assert_eq!(x_global.init_value, Some(8));
+}
+
+#[test]
+fn lower_const_bit_ops() {
+    // Bitwise constant folding should work for things like defining
+    // flags or masks based on other constants.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        const FLAG_A: u8 = 1
+        const FLAG_B: u8 = 2
+        const BOTH: u8 = FLAG_A | FLAG_B
+        var x: u8 = BOTH
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    let x_global = ir.globals.iter().find(|g| g.name == "x").unwrap();
+    assert_eq!(x_global.init_value, Some(3));
+}
+
+#[test]
 fn lower_multiple_states() {
     let ir = lower_ok(
         r#"

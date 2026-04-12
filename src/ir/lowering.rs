@@ -87,6 +87,53 @@ impl LoweringContext {
         }
     }
 
+    /// Try to evaluate an expression at compile time, using the
+    /// already-registered constants as operands. Returns `None` if
+    /// the expression references something that isn't known at this
+    /// point (e.g. a runtime variable) or contains an operator we
+    /// don't constant-fold. The result is a u16 to keep the same
+    /// range as the AST integer literal type.
+    fn eval_const(&self, expr: &Expr) -> Option<u16> {
+        match expr {
+            Expr::IntLiteral(v, _) => Some(*v),
+            Expr::BoolLiteral(b, _) => Some(u16::from(*b)),
+            Expr::Ident(name, _) => self.const_values.get(name).copied(),
+            Expr::BinaryOp(lhs, op, rhs, _) => {
+                let l = self.eval_const(lhs)?;
+                let r = self.eval_const(rhs)?;
+                match op {
+                    BinOp::Add => Some(l.wrapping_add(r)),
+                    BinOp::Sub => Some(l.wrapping_sub(r)),
+                    BinOp::Mul => Some(l.wrapping_mul(r)),
+                    BinOp::Div if r != 0 => Some(l / r),
+                    BinOp::Mod if r != 0 => Some(l % r),
+                    BinOp::BitwiseAnd => Some(l & r),
+                    BinOp::BitwiseOr => Some(l | r),
+                    BinOp::BitwiseXor => Some(l ^ r),
+                    BinOp::ShiftLeft => Some(l.wrapping_shl(u32::from(r))),
+                    BinOp::ShiftRight => Some(l.wrapping_shr(u32::from(r))),
+                    BinOp::Eq => Some(u16::from(l == r)),
+                    BinOp::NotEq => Some(u16::from(l != r)),
+                    BinOp::Lt => Some(u16::from(l < r)),
+                    BinOp::Gt => Some(u16::from(l > r)),
+                    BinOp::LtEq => Some(u16::from(l <= r)),
+                    BinOp::GtEq => Some(u16::from(l >= r)),
+                    _ => None,
+                }
+            }
+            Expr::UnaryOp(op, inner, _) => {
+                let v = self.eval_const(inner)?;
+                match op {
+                    UnaryOp::Negate => Some(v.wrapping_neg()),
+                    UnaryOp::BitNot => Some(!v),
+                    UnaryOp::Not => Some(u16::from(v == 0)),
+                }
+            }
+            Expr::Cast(inner, _, _) => self.eval_const(inner),
+            _ => None,
+        }
+    }
+
     fn emit(&mut self, op: IrOp) {
         self.current_ops.push(op);
     }
@@ -119,30 +166,26 @@ impl LoweringContext {
         self.state_names = program.states.iter().map(|s| s.name.clone()).collect();
         program.start_state.clone_into(&mut self.start_state);
 
-        // Register constants
-        for c in &program.constants {
-            if let Expr::IntLiteral(v, _) = &c.value {
-                self.const_values.insert(c.name.clone(), *v);
-            }
-        }
-
-        // Register enum variants as constants (0, 1, 2, ... per enum)
+        // Register enum variants first so constants that reference
+        // them (e.g. `const FIRST: u8 = VariantA`) can resolve.
         for e in &program.enums {
             for (i, (variant, _)) in e.variants.iter().enumerate() {
                 self.const_values.insert(variant.clone(), i as u16);
             }
         }
 
-        // Lower globals
+        // Register constants with constant-evaluation. Each const
+        // may reference earlier constants.
+        for c in &program.constants {
+            if let Some(v) = self.eval_const(&c.value) {
+                self.const_values.insert(c.name.clone(), v);
+            }
+        }
+
+        // Lower globals. Initializers can be any constant expression.
         for var in &program.globals {
             let var_id = self.get_or_create_var(&var.name);
-            let init = var.init.as_ref().and_then(|e| {
-                if let Expr::IntLiteral(v, _) = e {
-                    Some(*v)
-                } else {
-                    None
-                }
-            });
+            let init = var.init.as_ref().and_then(|e| self.eval_const(e));
             self.globals.push(IrGlobal {
                 var_id,
                 name: var.name.clone(),
