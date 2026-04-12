@@ -1030,8 +1030,18 @@ impl Analyzer {
                     ));
                 }
             }
+            Statement::Return(None, span) => {
+                // Bare `return` in a function with a declared return
+                // type is an error — the caller expects a value.
+                if self.in_function_body && self.current_return_type.is_some() {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0203,
+                        "missing return value in function with declared return type",
+                        *span,
+                    ));
+                }
+            }
             Statement::WaitFrame(_)
-            | Statement::Return(None, _)
             | Statement::LoadBackground(_, _)
             | Statement::SetPalette(_, _) => {}
             Statement::DebugLog(args, _) => {

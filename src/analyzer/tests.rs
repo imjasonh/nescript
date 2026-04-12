@@ -602,6 +602,26 @@ fn analyze_loop_with_break_ok() {
 }
 
 #[test]
+fn analyze_bare_return_from_typed_fn_errors() {
+    // A `return` with no value inside a function that has a declared
+    // return type should produce E0203.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        fun get_five() -> u8 {
+            return
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0203),
+        "bare return from typed fn should produce E0203, got: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_return_value_from_void_fn() {
     let errors = analyze_errors(
         r#"
