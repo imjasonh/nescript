@@ -797,6 +797,11 @@ impl Analyzer {
                                     *span,
                                 ));
                             }
+                        } else {
+                            // Assigning to an undeclared name is an
+                            // error — the lowering would otherwise
+                            // silently synthesize a VarId for it.
+                            self.emit_undefined_var(name, *span);
                         }
                     }
                     LValue::ArrayIndex(name, idx) => {
@@ -808,6 +813,8 @@ impl Analyzer {
                                     *span,
                                 ));
                             }
+                        } else {
+                            self.emit_undefined_var(name, *span);
                         }
                         // Indexing an array counts as a read of the array,
                         // and the index expression itself may contain reads.

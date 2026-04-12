@@ -361,6 +361,23 @@ fn analyze_unknown_struct_type_errors() {
 }
 
 #[test]
+fn analyze_assign_to_undefined_var_errors() {
+    // Assigning to an undeclared variable must produce E0502
+    // rather than silently creating the variable.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        on frame { nope = 5 }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0502),
+        "assignment to undefined var should produce E0502, got: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_enum_variants_as_constants() {
     let result = analyze_ok(
         r#"
