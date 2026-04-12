@@ -416,6 +416,16 @@ These items were documented as future work but have since been implemented:
   minimal 6502 mnemonic parser that handles every addressing mode the
   codegen emits. Both IR and AST codegen splice parsed instructions
   directly into the output stream
+- **Enum types** — `enum Name { V1, V2, ... }` declares u8 constants
+  with values equal to declaration order. Variant names are flattened
+  into the global symbol table
+- **Peephole optimizer** — `src/codegen/peephole.rs` runs to fixed
+  point after codegen and includes: redundant STA/LDA pair removal
+  over IR temps, LDA-then-STA-same-address removal, dead store
+  elimination for IR temp slots, and A-value tracking for redundant
+  LDA elimination across straight-line code
+- **`--dump-ir` CLI flag** — prints the lowered IR program after the
+  optimizer pass for debugging
 
 ### Remaining priority order
 
@@ -429,8 +439,11 @@ For someone picking up this codebase, the recommended order of work:
 2. **`on scanline` codegen** — parser and analyzer support are in
    place, but the MMC3 IRQ vector is still stubbed. Need to install an
    IRQ handler that dispatches to the right scanline block based on
-   the counter latched in `$C000`/`$C001`.
+   the counter latched in `$C000`/`$C001`, write the initial scanline
+   count during state entry, and handle multi-scanline reload.
 3. **Audio** — SFX/music driver
-4. **Language features** — structs, enums, fixed-point
+4. **Language features** — structs, fixed-point (enums already done)
 5. **Register allocator** — proper A/X/Y allocation to replace
-   zero-page spills used by the current IR codegen
+   zero-page spills used by the current IR codegen (partially
+   mitigated by the peephole passes but ideally the IR codegen would
+   not spill in the first place)
