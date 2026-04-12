@@ -38,6 +38,10 @@ enum Cli {
         #[arg(long)]
         memory_map: bool,
 
+        /// Dump a call graph showing which functions call which.
+        #[arg(long)]
+        call_graph: bool,
+
         /// Use the legacy AST-based codegen. The default is the IR-based
         /// codegen, which runs the optimizer passes before emitting 6502.
         #[arg(long)]
@@ -61,6 +65,7 @@ fn main() {
             asm_dump,
             dump_ir,
             memory_map,
+            call_graph,
             use_ast,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
@@ -71,6 +76,7 @@ fn main() {
                     asm_dump,
                     dump_ir,
                     memory_map,
+                    call_graph,
                     use_ast,
                 },
             ) {
@@ -155,6 +161,46 @@ fn print_memory_map(analysis: &nescript::analyzer::AnalysisResult) {
     println!("Main RAM:  {ram_used}/1280 bytes used");
 }
 
+/// Print a human-readable call graph of the analyzed program.
+/// Entries show the max call depth reached from each entry point
+/// (state handler) and the transitive callees.
+fn print_call_graph(analysis: &nescript::analyzer::AnalysisResult) {
+    use std::collections::BTreeMap;
+
+    let sorted: BTreeMap<_, _> = analysis
+        .call_graph
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    let max_depth = analysis.max_depths.values().copied().max().unwrap_or(0);
+
+    println!("=== Call Graph (max depth: {max_depth} / 8) ===");
+    if sorted.is_empty() {
+        println!("  (no functions or handlers)");
+        return;
+    }
+    for (caller, callees) in &sorted {
+        if let Some(depth) = analysis.max_depths.get(caller) {
+            println!("{caller} (max depth {depth})");
+        } else {
+            println!("{caller}");
+        }
+        if callees.is_empty() {
+            println!("  └── (leaf)");
+        } else {
+            let count = callees.len();
+            for (i, callee) in callees.iter().enumerate() {
+                let branch = if i + 1 == count {
+                    "└──"
+                } else {
+                    "├──"
+                };
+                println!("  {branch} {callee}");
+            }
+        }
+    }
+}
+
 fn dump_asm(instructions: &[nescript::asm::Instruction]) {
     use nescript::asm::{AddressingMode, Opcode};
     for inst in instructions {
@@ -179,6 +225,7 @@ struct CompileOptions {
     asm_dump: bool,
     dump_ir: bool,
     memory_map: bool,
+    call_graph: bool,
     use_ast: bool,
 }
 
@@ -187,6 +234,7 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     let asm_dump = opts.asm_dump;
     let dump_ir = opts.dump_ir;
     let memory_map = opts.memory_map;
+    let call_graph = opts.call_graph;
     let use_ast = opts.use_ast;
     let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
@@ -235,6 +283,10 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
 
     if memory_map {
         print_memory_map(&analysis);
+    }
+
+    if call_graph {
+        print_call_graph(&analysis);
     }
 
     // Resolve sprite assets (CHR data + tile indices) relative to the
