@@ -1,4 +1,5 @@
 pub mod ir_codegen;
+pub mod peephole;
 
 #[cfg(test)]
 mod tests;

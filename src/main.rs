@@ -137,7 +137,7 @@ fn compile(input: &PathBuf, debug: bool, asm_dump: bool, use_ast: bool) -> Resul
 
     // Code generation: IR-based is the default. `--use-ast` switches to
     // the legacy AST-based codegen for comparison and fallback.
-    let instructions = if use_ast {
+    let mut instructions = if use_ast {
         CodeGen::new(&analysis.var_allocations, &program.constants)
             .with_sprites(&sprites)
             .with_debug(debug)
@@ -148,6 +148,11 @@ fn compile(input: &PathBuf, debug: bool, asm_dump: bool, use_ast: bool) -> Resul
             .with_debug(debug)
             .generate(&ir_program)
     };
+
+    // Peephole optimization: cheap pass that removes redundant
+    // store-then-load pairs over IR temp slots. Biggest win for the
+    // IR codegen, but safe for the AST codegen too.
+    nescript::codegen::peephole::optimize(&mut instructions);
 
     if asm_dump {
         dump_asm(&instructions);
