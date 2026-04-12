@@ -321,8 +321,19 @@ impl LoweringContext {
                     });
                 }
                 if let Some(init) = &var.init {
-                    let val = self.lower_expr(init);
-                    self.emit(IrOp::StoreVar(var_id, val));
+                    // Struct literal initializers expand to per-field
+                    // stores on the synthetic field variables.
+                    if let Expr::StructLiteral(_, fields, _) = init {
+                        for (fname, fexpr) in fields {
+                            let full = format!("{}.{fname}", var.name);
+                            let fvid = self.get_or_create_var(&full);
+                            let val = self.lower_expr(fexpr);
+                            self.emit(IrOp::StoreVar(fvid, val));
+                        }
+                    } else {
+                        let val = self.lower_expr(init);
+                        self.emit(IrOp::StoreVar(var_id, val));
+                    }
                 }
             }
             Statement::Assign(lvalue, op, expr, _) => {
@@ -425,6 +436,21 @@ impl LoweringContext {
     }
 
     fn lower_assign(&mut self, lvalue: &LValue, op: AssignOp, expr: &Expr) {
+        // Special case: `var = StructLiteral { ... }` expands to
+        // per-field stores against the analyzer-synthesized field
+        // variables. This avoids needing struct values as IR temps.
+        if let (LValue::Var(name), AssignOp::Assign, Expr::StructLiteral(_, fields, _)) =
+            (lvalue, op, expr)
+        {
+            for (fname, fexpr) in fields {
+                let full = format!("{name}.{fname}");
+                let field_var = self.get_or_create_var(&full);
+                let val = self.lower_expr(fexpr);
+                self.emit(IrOp::StoreVar(field_var, val));
+            }
+            return;
+        }
+
         match lvalue {
             LValue::Var(name) => {
                 let var_id = self.get_or_create_var(name);
@@ -753,6 +779,16 @@ impl LoweringContext {
             }
             Expr::ArrayLiteral(_, _) => {
                 // Array literals are handled during initialization, not as general expressions
+                let t = self.fresh_temp();
+                self.emit(IrOp::LoadImm(t, 0));
+                t
+            }
+            Expr::StructLiteral(_, _, _) => {
+                // Struct literals are only supported as the right
+                // hand side of a plain assignment (see lower_assign).
+                // Falling through here means the literal was used in
+                // an expression context the lowering can't handle;
+                // emit zero so the build still produces a ROM.
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadImm(t, 0));
                 t

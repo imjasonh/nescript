@@ -229,6 +229,26 @@ fn program_with_for_loop() {
 }
 
 #[test]
+fn program_with_struct_literals() {
+    let source = r#"
+        game "Lit" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2 = Vec2 { x: 10, y: 20 }
+        on frame {
+            pos = Vec2 { x: 100, y: 50 }
+            if button.right {
+                pos = Vec2 { x: pos.x + 1, y: pos.y }
+            }
+            draw Smiley at: (pos.x, pos.y)
+            wait_frame
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_structs() {
     let source = r#"
         game "Structs" { mapper: NROM }

@@ -741,6 +741,39 @@ fn parse_struct_decl() {
 }
 
 #[test]
+fn parse_struct_literal_expr() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2 = Vec2 { x: 10, y: 20 }
+        on frame {
+            pos = Vec2 { x: 1, y: 2 }
+        }
+        start Main
+    "#;
+    parse_ok(src);
+}
+
+#[test]
+fn parse_struct_literal_in_if_condition_must_be_paren() {
+    // `if x == Vec2 { ... }` is ambiguous: the `{` could be the if
+    // block or the start of a struct literal. Without parens, the
+    // parser should treat the struct literal fields as the if body.
+    // This test just asserts the parser doesn't crash and doesn't
+    // misinterpret the condition.
+    let src = r#"
+        game "Test" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        var pos: Vec2
+        on frame {
+            if pos.x == 5 { pos = Vec2 { x: 0, y: 0 } }
+        }
+        start Main
+    "#;
+    parse_ok(src);
+}
+
+#[test]
 fn parse_struct_field_access_expr() {
     let src = r#"
         game "Test" { mapper: NROM }

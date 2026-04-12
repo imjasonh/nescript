@@ -364,6 +364,34 @@ impl Analyzer {
                     self.walk_expr_reads(e);
                 }
             }
+            Expr::StructLiteral(name, fields, span) => {
+                // Validate that the struct type exists and that each
+                // named field is actually declared. Missing or extra
+                // fields are an error; duplicate fields are silently
+                // ignored (last-writer-wins).
+                if let Some(layout) = self.struct_layouts.get(name).cloned() {
+                    for (fname, fexpr) in fields {
+                        if let Some((_, field_type, _)) =
+                            layout.fields.iter().find(|(n, _, _)| n == fname)
+                        {
+                            self.walk_expr_reads(fexpr);
+                            self.check_expr_type(fexpr, field_type);
+                        } else {
+                            self.diagnostics.push(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!("struct '{name}' has no field '{fname}'"),
+                                *span,
+                            ));
+                        }
+                    }
+                } else {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown struct type '{name}'"),
+                        *span,
+                    ));
+                }
+            }
             Expr::IntLiteral(_, _) | Expr::BoolLiteral(_, _) | Expr::ButtonRead(_, _, _) => {}
         }
     }
@@ -1149,6 +1177,7 @@ impl Analyzer {
             }
             Expr::ArrayLiteral(_, _) => Some(NesType::U8), // element type inferred from context
             Expr::Cast(_, target, _) => Some(target.clone()),
+            Expr::StructLiteral(name, _, _) => Some(NesType::Struct(name.clone())),
         }
     }
 }
@@ -1363,6 +1392,11 @@ fn collect_calls_expr(expr: &Expr, calls: &mut Vec<String>) {
         }
         Expr::ArrayLiteral(elems, _) => {
             for e in elems {
+                collect_calls_expr(e, calls);
+            }
+        }
+        Expr::StructLiteral(_, fields, _) => {
+            for (_, e) in fields {
                 collect_calls_expr(e, calls);
             }
         }

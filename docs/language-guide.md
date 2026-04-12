@@ -187,6 +187,31 @@ Fields are laid out contiguously in declaration order. A variable of
 struct type allocates enough contiguous bytes to hold all its fields;
 each field is accessible via the dot operator.
 
+Struct literals initialize or assign all fields at once:
+
+```
+struct Vec2 { x: u8, y: u8 }
+
+// as an initializer
+var pos: Vec2 = Vec2 { x: 100, y: 50 }
+
+// as an assignment
+on frame {
+    pos = Vec2 { x: 0, y: 0 }
+    if button.right {
+        pos = Vec2 { x: pos.x + 1, y: pos.y }
+    }
+}
+```
+
+Inside `if`, `while`, and `for` conditions the struct literal syntax
+is reserved for the following block, so wrap the literal in parens if
+you ever need one in a condition:
+
+```
+if pos == (Vec2 { x: 0, y: 0 }) { /* ... */ }
+```
+
 In v0.1 only primitive field types (`u8`, `i8`, `bool`) are supported —
 nested structs, `u16`, and array fields are not yet allowed.
 

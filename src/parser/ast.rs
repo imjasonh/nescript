@@ -205,6 +205,11 @@ pub enum Expr {
     ButtonRead(Option<Player>, String, Span),
     ArrayLiteral(Vec<Expr>, Span),
     Cast(Box<Expr>, NesType, Span),
+    /// Struct literal: `Name { field1: expr, field2: expr, ... }`.
+    /// Only allowed in non-condition expression positions — the
+    /// parser bans them inside `if`/`while`/`for` conditions to
+    /// avoid ambiguity with the following block.
+    StructLiteral(String, Vec<(String, Expr)>, Span),
 }
 
 impl Expr {
@@ -220,7 +225,8 @@ impl Expr {
             | Self::Call(_, _, s)
             | Self::ButtonRead(_, _, s)
             | Self::ArrayLiteral(_, s)
-            | Self::Cast(_, _, s) => *s,
+            | Self::Cast(_, _, s)
+            | Self::StructLiteral(_, _, s) => *s,
         }
     }
 }

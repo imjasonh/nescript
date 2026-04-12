@@ -829,6 +829,11 @@ impl CodeGen {
             Expr::ArrayLiteral(_, _) => {
                 // Array literals are handled at initialization time
             }
+            Expr::StructLiteral(_, _, _) => {
+                // Struct literals only appear in assignments on the
+                // IR codegen path. Legacy AST codegen treats them as
+                // no-ops.
+            }
         }
     }
 

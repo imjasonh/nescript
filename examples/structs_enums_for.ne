@@ -28,7 +28,16 @@ struct Player {
     alive: bool,
 }
 
-var player: Player
+// Struct literal initializer in declaration.
+var player: Player = Player {
+    x: 120,
+    y: 112,
+    vx: 0,
+    vy: 0,
+    facing: Down,
+    frame: Idle,
+    alive: true,
+}
 
 // A small fixed-size array of enemy x-positions. In a real game this
 // would be an array of structs once those are supported.
@@ -38,15 +47,6 @@ var enemy_y: u8 = 100
 const SPEED: u8 = 1
 
 on frame {
-    // Initialize the player once on the very first frame.
-    if player.alive == false {
-        player.x = 120
-        player.y = 112
-        player.facing = Down
-        player.frame = Idle
-        player.alive = true
-    }
-
     // Read controls and update position. Velocities are u8 so we
     // treat them as signed by adding/subtracting SPEED.
     if button.left {

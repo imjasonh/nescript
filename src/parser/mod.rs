@@ -13,6 +13,11 @@ pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
+    /// When true, `parse_primary` refuses to consume an `Ident {`
+    /// pattern as a struct literal — the `{` is reserved for the
+    /// following `if` / `while` / `for` block. Struct literals in
+    /// conditions must be parenthesized: `if x == (Foo { a: 1 })`.
+    restrict_struct_literals: bool,
 }
 
 impl Parser {
@@ -21,6 +26,7 @@ impl Parser {
             tokens,
             pos: 0,
             diagnostics: Vec::new(),
+            restrict_struct_literals: false,
         }
     }
 
@@ -945,7 +951,10 @@ impl Parser {
     fn parse_if(&mut self) -> Result<Statement, Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwIf)?;
+        let saved = self.restrict_struct_literals;
+        self.restrict_struct_literals = true;
         let condition = self.parse_expr()?;
+        self.restrict_struct_literals = saved;
         let then_block = self.parse_block()?;
 
         let mut else_ifs = Vec::new();
@@ -955,7 +964,9 @@ impl Parser {
             self.advance();
             if *self.peek() == TokenKind::KwIf {
                 self.advance();
+                self.restrict_struct_literals = true;
                 let cond = self.parse_expr()?;
+                self.restrict_struct_literals = saved;
                 let block = self.parse_block()?;
                 else_ifs.push((cond, block));
             } else {
@@ -972,7 +983,10 @@ impl Parser {
     fn parse_while(&mut self) -> Result<Statement, Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwWhile)?;
+        let saved = self.restrict_struct_literals;
+        self.restrict_struct_literals = true;
         let condition = self.parse_expr()?;
+        self.restrict_struct_literals = saved;
         let body = self.parse_block()?;
         Ok(Statement::While(condition, body, start))
     }
@@ -989,9 +1003,12 @@ impl Parser {
         self.expect(&TokenKind::KwFor)?;
         let (var, _) = self.expect_ident()?;
         self.expect(&TokenKind::KwIn)?;
+        let saved = self.restrict_struct_literals;
+        self.restrict_struct_literals = true;
         let start_expr = self.parse_expr()?;
         self.expect(&TokenKind::DotDot)?;
         let end_expr = self.parse_expr()?;
+        self.restrict_struct_literals = saved;
         let body = self.parse_block()?;
         Ok(Statement::For {
             var,
@@ -1563,6 +1580,38 @@ impl Parser {
                     self.advance();
                     let (field, _) = self.expect_ident()?;
                     return Ok(Expr::FieldAccess(name, field, span));
+                }
+
+                // Check for struct literal: `Name { field: expr, ... }`.
+                // Disabled in condition contexts to keep parsing
+                // unambiguous for `if`/`while`/`for`.
+                if !self.restrict_struct_literals && *self.peek() == TokenKind::LBrace {
+                    self.advance();
+                    let mut fields = Vec::new();
+                    while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+                        let (field_name, _) = self.expect_ident()?;
+                        self.expect(&TokenKind::Colon)?;
+                        // Struct literal field values can contain
+                        // their own nested struct literals, so we
+                        // temporarily allow them regardless of the
+                        // outer restriction.
+                        let saved = self.restrict_struct_literals;
+                        self.restrict_struct_literals = false;
+                        let value = self.parse_expr()?;
+                        self.restrict_struct_literals = saved;
+                        fields.push((field_name, value));
+                        if *self.peek() == TokenKind::Comma {
+                            self.advance();
+                        } else if *self.peek() != TokenKind::RBrace {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                "expected ',' or '}' in struct literal",
+                                self.current_span(),
+                            ));
+                        }
+                    }
+                    self.expect(&TokenKind::RBrace)?;
+                    return Ok(Expr::StructLiteral(name, fields, span));
                 }
 
                 Ok(Expr::Ident(name, span))
