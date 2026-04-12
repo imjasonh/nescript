@@ -157,6 +157,28 @@ fn program_with_on_scanline_mmc3() {
 }
 
 #[test]
+fn program_with_on_scanline_per_state() {
+    // Two states, each with its own scanline handler at a different
+    // position. The IR codegen should emit per-state dispatch in
+    // both `__irq_user` and `__ir_mmc3_reload`.
+    let source = r#"
+        game "MultiSL" { mapper: MMC3 }
+        var s: u8 = 0
+        state A {
+            on frame { wait_frame }
+            on scanline(64) { scroll(0, 0) }
+        }
+        state B {
+            on frame { wait_frame }
+            on scanline(192) { scroll(0, 0) }
+        }
+        start A
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
 fn program_with_structs() {
     let source = r#"
         game "Structs" { mapper: NROM }

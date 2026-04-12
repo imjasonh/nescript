@@ -186,11 +186,22 @@ impl<'a> IrCodeGen<'a> {
         }
 
         // 2b. If the program has any `on scanline` handlers, set up
-        // the MMC3 IRQ counter. We pick the first scanline handler's
-        // line count as the latch value. Only supports a single-
-        // scanline-per-program setup for now.
-        let scanline_info = find_first_scanline_handler(ir);
-        if let Some((_state_name, line)) = &scanline_info {
+        // the MMC3 IRQ counter using the scanline count of the
+        // *start* state (if it has one). Per-state scanline switching
+        // is then handled by writing to `$C000`/`$C001`/`$E001` at
+        // the top of each on_enter handler via inline asm (future).
+        // For now we always set up with the first scanline found in
+        // the start state, or any scanline in the program as a
+        // fallback.
+        let scanline_handlers = collect_scanline_handlers(ir);
+        if !scanline_handlers.is_empty() {
+            // Prefer a scanline in the start state; otherwise use the
+            // first one found.
+            let (_state_name, line) = scanline_handlers
+                .iter()
+                .find(|(s, _)| *s == ir.start_state)
+                .or_else(|| scanline_handlers.first())
+                .unwrap();
             // Write (line-1) to $C000 (scanline latch), any value to
             // $C001 (reload counter), any value to $E001 (enable IRQ).
             self.emit(LDA, AM::Immediate(line.saturating_sub(1)));
@@ -235,11 +246,11 @@ impl<'a> IrCodeGen<'a> {
         }
 
         // 5. If we have scanline handlers, emit an IRQ handler that
-        // saves registers, ACKs the MMC3 IRQ, JSRs into the first
-        // scanline handler, restores registers, and RTIs. The linker
-        // picks up `__irq_user` and uses it as the IRQ vector instead
-        // of the default stub.
-        if let Some((state_name, line)) = scanline_info {
+        // saves registers, ACKs the MMC3 IRQ, dispatches to the
+        // current state's scanline handler (if any), restores
+        // registers, and RTIs. The linker picks up `__irq_user` and
+        // uses it as the IRQ vector instead of the default stub.
+        if !scanline_handlers.is_empty() {
             self.emit_label("__irq_user");
             // Save registers onto the stack.
             self.emit(PHA, AM::Implied);
@@ -247,14 +258,25 @@ impl<'a> IrCodeGen<'a> {
             self.emit(PHA, AM::Implied);
             self.emit(TYA, AM::Implied);
             self.emit(PHA, AM::Implied);
-            // Acknowledge and reload the MMC3 IRQ counter.
-            self.emit(STA, AM::Absolute(0xE000)); // disable / ack
-            self.emit(STA, AM::Absolute(0xE001)); // re-enable
-                                                  // JSR into the scanline handler. We don't dispatch by
-                                                  // state yet — the first scanline handler found is used
-                                                  // unconditionally.
-            let handler = format!("{state_name}_scanline_{line}");
-            self.emit(JSR, AM::Label(format!("__ir_fn_{handler}")));
+            // Acknowledge the MMC3 IRQ ($E000 = disable/ack). NMI
+            // will re-enable each frame by reloading the counter.
+            self.emit(LDA, AM::Immediate(0));
+            self.emit(STA, AM::Absolute(0xE000));
+            // Dispatch by current_state: for each state with a
+            // scanline handler, CMP and JSR.
+            self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
+            let done_label = "__irq_user_done".to_string();
+            for (i, (state_name, line)) in scanline_handlers.iter().enumerate() {
+                let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
+                let skip_label = format!("__irq_disp_skip_{i}");
+                self.emit(CMP, AM::Immediate(state_idx));
+                self.emit(BNE, AM::LabelRelative(skip_label.clone()));
+                let handler = format!("{state_name}_scanline_{line}");
+                self.emit(JSR, AM::Label(format!("__ir_fn_{handler}")));
+                self.emit(JMP, AM::Label(done_label.clone()));
+                self.emit_label(&skip_label);
+            }
+            self.emit_label(&done_label);
             // Restore registers and return from interrupt.
             self.emit(PLA, AM::Implied);
             self.emit(TAY, AM::Implied);
@@ -262,6 +284,34 @@ impl<'a> IrCodeGen<'a> {
             self.emit(TAX, AM::Implied);
             self.emit(PLA, AM::Implied);
             self.emit(RTI, AM::Implied);
+
+            // Also emit a helper that the NMI handler can use to
+            // reload the MMC3 counter each frame. Linker extends the
+            // NMI with a JSR into this when `__ir_mmc3_reload` exists.
+            self.emit_label("__ir_mmc3_reload");
+            // Dispatch on current_state to pick the right scanline
+            // count, write (count-1) to $C000, reload $C001, enable
+            // $E001. States without a scanline handler fall through
+            // to disable ($E000).
+            self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
+            let reload_done = "__ir_mmc3_reload_done".to_string();
+            for (i, (state_name, line)) in scanline_handlers.iter().enumerate() {
+                let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
+                let skip_label = format!("__ir_reload_skip_{i}");
+                self.emit(CMP, AM::Immediate(state_idx));
+                self.emit(BNE, AM::LabelRelative(skip_label.clone()));
+                self.emit(LDA, AM::Immediate(line.saturating_sub(1)));
+                self.emit(STA, AM::Absolute(0xC000));
+                self.emit(STA, AM::Absolute(0xC001));
+                self.emit(STA, AM::Absolute(0xE001));
+                self.emit(JMP, AM::Label(reload_done.clone()));
+                self.emit_label(&skip_label);
+            }
+            // No matching state — disable IRQ for this frame.
+            self.emit(LDA, AM::Immediate(0));
+            self.emit(STA, AM::Absolute(0xE000));
+            self.emit_label(&reload_done);
+            self.emit(RTS, AM::Implied);
         }
 
         self.instructions
@@ -629,20 +679,21 @@ enum CmpKind {
     GtEq,
 }
 
-/// Scan the IR functions for the first scanline handler (named
-/// `{state}_scanline_{line}`) and return the state name and line.
-fn find_first_scanline_handler(ir: &IrProgram) -> Option<(String, u8)> {
+/// Scan the IR functions for all scanline handlers (named
+/// `{state}_scanline_{line}`) and return them in IR function order.
+fn collect_scanline_handlers(ir: &IrProgram) -> Vec<(String, u8)> {
+    let mut out = Vec::new();
     for func in &ir.functions {
         // Match the pattern `<state>_scanline_<N>` by splitting on
         // the last `_scanline_`. This keeps it simple and avoids
         // re-threading scanline info through lowering.
         if let Some((state_name, tail)) = func.name.rsplit_once("_scanline_") {
             if let Ok(line) = tail.parse::<u8>() {
-                return Some((state_name.to_string(), line));
+                out.push((state_name.to_string(), line));
             }
         }
     }
-    None
+    out
 }
 
 #[cfg(test)]

@@ -90,10 +90,18 @@ fn main() {
 }
 
 fn dump_asm(instructions: &[nescript::asm::Instruction]) {
+    use nescript::asm::{AddressingMode, Opcode};
     for inst in instructions {
-        if let nescript::asm::AddressingMode::Label(name) = &inst.mode {
-            println!("{name}:");
-            continue;
+        // A bare `NOP` with a `Label` operand is a label *definition*
+        // (the pseudo-instruction the codegen emits when marking a
+        // position). Any other opcode with `Label` mode is an actual
+        // instruction like `JSR foo` or `JMP bar`, so we show the
+        // opcode + target.
+        if inst.opcode == Opcode::NOP {
+            if let AddressingMode::Label(name) = &inst.mode {
+                println!("{name}:");
+                continue;
+            }
         }
         println!("    {:?} {:?}", inst.opcode, inst.mode);
     }

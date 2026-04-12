@@ -22,6 +22,15 @@ pub struct SpriteData {
     pub chr_bytes: Vec<u8>,
 }
 
+/// True if `instructions` contains a label definition with the given
+/// name. Labels are emitted as `NOP` pseudo-instructions whose mode
+/// is `AddressingMode::Label(name)`.
+fn has_label(instructions: &[Instruction], name: &str) -> bool {
+    instructions
+        .iter()
+        .any(|i| matches!(&i.mode, AM::Label(n) if n == name))
+}
+
 /// A smiley face CHR tile for the default sprite (M1).
 const DEFAULT_SPRITE_CHR: [u8; 16] = [
     // Plane 0 (low bits)
@@ -109,6 +118,17 @@ impl Linker {
 
         // NMI handler
         all_instructions.push(Instruction::new(NOP, AM::Label("__nmi".into())));
+        // If user code emits an MMC3 reload hook, splice in a JSR
+        // before the regular NMI runs. This reloads the scanline IRQ
+        // counter each frame so the handler fires at the right line.
+        // The presence of the `__ir_mmc3_reload` label is detected
+        // during assembly via the labels map; we unconditionally
+        // emit a conditional JSR whose target is resolved at link
+        // time. The helper emits an RTS so it's safe to call even
+        // when there's no work to do.
+        if has_label(user_code, "__ir_mmc3_reload") {
+            all_instructions.push(Instruction::new(JSR, AM::Label("__ir_mmc3_reload".into())));
+        }
         all_instructions.extend(runtime::gen_nmi());
 
         // IRQ handler
