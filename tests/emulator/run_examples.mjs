@@ -36,6 +36,13 @@ const EXAMPLE_FLOORS = {
   structs_enums_for: [200, "player + 4 enemies drawn by a `for` loop"],
   sprites_and_palettes: [60, "custom CHR tiles visible"],
   scanline_split: [80, "banner + player"],
+  mmc3_per_state_split: [80, "marker + player in the split-screen state"],
+  two_player: [100, "two player sprites drawn independently"],
+  function_chain: [100, "player swept by chained function return + a static marker"],
+  // `comparisons` has at least `value != MIDPOINT` true for 255 of
+  // 256 frames, plus either `<`/`<=` or `>`/`>=`, plus the player.
+  // That's 4+ sprites on most frames.
+  comparisons: [150, "player + pips for each true comparison against MIDPOINT"],
 };
 
 async function listRoms() {
