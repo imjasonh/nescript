@@ -826,6 +826,77 @@ Type-check a source file without producing a ROM:
 nescript check game.ne
 ```
 
+### Test
+
+Discover and compile all `*_test.ne` files in a directory (default: current directory):
+
+```
+nescript test
+nescript test examples/
+```
+
+Each `*_test.ne` file is compiled with debug mode enabled. A test **passes** when the file compiles without errors; it **fails** when the compiler reports any error. Results are printed in `cargo test` style and the command exits with code 1 if any test fails.
+
+```
+running 2 tests
+test examples/math_test.ne ... ok
+test examples/broken_test.ne ... FAILED
+
+test result: FAILED. 1 passed; 1 failed
+```
+
+See the [Testing](#testing) section for how to write test files.
+
+---
+
+## Testing
+
+NEScript has a built-in test runner modelled on `go test` and `cargo test`. Any file whose name ends in `_test.ne` is a test file.
+
+### Writing Test Files
+
+Test files follow the same syntax as regular NEScript programs. The key difference is that they are always compiled with debug mode enabled, so `debug.assert` calls are active.
+
+A test **passes** when the file compiles without errors. A test **fails** when the compiler reports any error (syntax, type, or other compile-time error).
+
+Use `debug.assert` to document expected runtime behaviour. A failing assertion halts the NES with a `BRK` instruction (`$00`) during execution:
+
+```
+game "MathTest" { mapper: NROM }
+
+fun add(a: u8, b: u8) -> u8 {
+    return a + b
+}
+
+var result: u8 = 0
+
+on frame {
+    result = add(10, 5)
+    debug.assert(result == 15)   // emits BRK if false at runtime
+    wait_frame
+}
+
+start Main
+```
+
+### Running Tests
+
+```
+nescript test              # search current directory
+nescript test examples/    # search a specific directory
+```
+
+Test files are discovered recursively (files matching `*_test.ne`), sorted alphabetically, and compiled in order. The exit code is 0 when all tests pass and 1 when any test fails.
+
+### Example Output
+
+```
+running 1 test
+test examples/math_test.ne ... ok
+
+test result: ok. 1 passed; 0 failed
+```
+
 ---
 
 ## Complete Example
