@@ -33,6 +33,10 @@ pub struct IrProgram {
     pub functions: Vec<IrFunction>,
     pub globals: Vec<IrGlobal>,
     pub rom_data: Vec<IrRomBlock>,
+    /// Ordered list of state names (index = state dispatch number).
+    pub states: Vec<String>,
+    /// Name of the initial state when the ROM boots.
+    pub start_state: String,
 }
 
 /// A global variable in the IR.

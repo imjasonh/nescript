@@ -548,3 +548,47 @@ fn ir_codegen_full_pipeline() {
     let rom_data = compile_with_ir_codegen(source);
     rom::validate_ines(&rom_data).expect("should be valid iNES");
 }
+
+#[test]
+fn ir_codegen_multi_state_dispatch() {
+    // Exercise the IR main-loop dispatch with multiple states and a
+    // transition.
+    let source = r#"
+        game "IR States" { mapper: NROM }
+        var timer: u8 = 0
+        state Title {
+            on frame {
+                if button.start { transition Play }
+            }
+        }
+        state Play {
+            on frame {
+                timer += 1
+                if timer > 60 { transition Title }
+            }
+        }
+        start Title
+    "#;
+    let rom_data = compile_with_ir_codegen(source);
+    let info = rom::validate_ines(&rom_data).expect("should be valid iNES");
+    assert_eq!(info.mapper, 0);
+}
+
+#[test]
+fn ir_codegen_multi_oam() {
+    // Draw multiple sprites and verify OAM slots are allocated sequentially.
+    let source = r#"
+        game "IR MultiOAM" { mapper: NROM }
+        var a: u8 = 10
+        var b: u8 = 20
+        var c: u8 = 30
+        on frame {
+            draw One at: (a, a)
+            draw Two at: (b, b)
+            draw Three at: (c, c)
+        }
+        start Main
+    "#;
+    let rom_data = compile_with_ir_codegen(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}

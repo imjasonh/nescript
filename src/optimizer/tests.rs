@@ -19,6 +19,8 @@ fn make_program(ops: Vec<IrOp>, terminator: IrTerminator) -> IrProgram {
         }],
         globals: vec![],
         rom_data: vec![],
+        states: vec![],
+        start_state: String::new(),
     }
 }
 
@@ -324,6 +326,8 @@ fn inline_removes_trivial() {
         functions: vec![trivial_fn, main_fn],
         globals: vec![],
         rom_data: vec![],
+        states: vec![],
+        start_state: String::new(),
     };
 
     inline_small_functions(&mut prog);

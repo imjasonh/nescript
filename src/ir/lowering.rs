@@ -26,6 +26,9 @@ struct LoweringContext {
     current_label: String,
     // Loop context for break/continue
     loop_stack: Vec<LoopContext>,
+    // State metadata captured from the AST
+    state_names: Vec<String>,
+    start_state: String,
 }
 
 struct LoopContext {
@@ -57,6 +60,8 @@ impl LoweringContext {
             current_ops: Vec::new(),
             current_label: String::new(),
             loop_stack: Vec::new(),
+            state_names: Vec::new(),
+            start_state: String::new(),
         }
     }
 
@@ -104,10 +109,16 @@ impl LoweringContext {
             functions: self.functions,
             globals: self.globals,
             rom_data: self.rom_data,
+            states: self.state_names,
+            start_state: self.start_state,
         }
     }
 
     fn lower_program(&mut self, program: &Program) {
+        // Capture state metadata before lowering
+        self.state_names = program.states.iter().map(|s| s.name.clone()).collect();
+        program.start_state.clone_into(&mut self.start_state);
+
         // Register constants
         for c in &program.constants {
             if let Expr::IntLiteral(v, _) = &c.value {

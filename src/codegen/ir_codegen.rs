@@ -30,6 +30,10 @@ use crate::ir::{IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator,
 /// Base zero-page address for IR temp slots.
 const TEMP_BASE: u8 = 0x80;
 
+/// Zero-page addresses (shared with AST codegen).
+const ZP_FRAME_FLAG: u8 = 0x00;
+const ZP_CURRENT_STATE: u8 = 0x03;
+
 /// IR codegen that produces 6502 instructions from an `IrProgram`.
 pub struct IrCodeGen<'a> {
     instructions: Vec<Instruction>,
@@ -41,6 +45,10 @@ pub struct IrCodeGen<'a> {
     next_temp_slot: u8,
     /// Sprite name to tile index mapping.
     sprite_tiles: HashMap<String, u8>,
+    /// State name to dispatch index mapping.
+    state_indices: HashMap<String, u8>,
+    /// Next OAM slot to allocate (0-63); reset at start of each frame handler.
+    next_oam_slot: u8,
     _allocations: &'a [VarAllocation],
 }
 
@@ -61,6 +69,8 @@ impl<'a> IrCodeGen<'a> {
             temp_slots: HashMap::new(),
             next_temp_slot: 0,
             sprite_tiles: HashMap::new(),
+            state_indices: HashMap::new(),
+            next_oam_slot: 0,
             _allocations: allocations,
         }
     }
@@ -108,10 +118,20 @@ impl<'a> IrCodeGen<'a> {
     }
 
     /// Generate instructions for an entire IR program.
-    /// Returns the flat list of 6502 instructions in the same order
-    /// expected by the linker (variable init → main loop → function bodies).
+    ///
+    /// Layout:
+    /// 1. Variable initializers (globals with literal init values)
+    /// 2. `current_state` initialization to start state index
+    /// 3. Main dispatch loop (wait vblank, then `JMP` to state's frame handler)
+    /// 4. State frame handlers (each ends with `JMP` to main loop)
+    /// 5. User function bodies (end with `RTS`)
     pub fn generate(mut self, ir: &IrProgram) -> Vec<Instruction> {
-        // Emit variable initializers for globals with literal init values.
+        // Populate state indices
+        for (i, name) in ir.states.iter().enumerate() {
+            self.state_indices.insert(name.clone(), i as u8);
+        }
+
+        // 1. Variable initializers
         for global in &ir.globals {
             if let Some(val) = global.init_value {
                 if let Some(&addr) = self.var_addrs.get(&global.var_id) {
@@ -125,7 +145,41 @@ impl<'a> IrCodeGen<'a> {
             }
         }
 
-        // Emit each function body
+        // 2. Initialize current_state to start state index
+        if let Some(&start_idx) = self.state_indices.get(&ir.start_state) {
+            self.emit(LDA, AM::Immediate(start_idx));
+            self.emit(STA, AM::ZeroPage(ZP_CURRENT_STATE));
+        }
+
+        // 3. Main dispatch loop
+        let main_loop = "__ir_main_loop".to_string();
+        self.emit_label(&main_loop);
+
+        // Wait for vblank flag
+        let wait_label = "__ir_wait_vblank".to_string();
+        self.emit_label(&wait_label);
+        self.emit(LDA, AM::ZeroPage(ZP_FRAME_FLAG));
+        self.emit(BEQ, AM::LabelRelative(wait_label));
+        // Clear the flag
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(STA, AM::ZeroPage(ZP_FRAME_FLAG));
+
+        // Dispatch on current_state using CMP + BNE + JMP trampoline
+        self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
+        for (i, state_name) in ir.states.iter().enumerate() {
+            let frame_handler = format!("{state_name}_frame");
+            // Only dispatch if the state has a frame handler
+            if ir.functions.iter().any(|f| f.name == frame_handler) {
+                let skip_label = format!("__ir_disp_skip_{i}");
+                self.emit(CMP, AM::Immediate(i as u8));
+                self.emit(BNE, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(format!("__ir_fn_{frame_handler}")));
+                self.emit_label(&skip_label);
+            }
+        }
+        self.emit(JMP, AM::Label(main_loop));
+
+        // 4. Emit each function body (state handlers + user functions)
         for func in &ir.functions {
             self.gen_function(func);
         }
@@ -137,11 +191,21 @@ impl<'a> IrCodeGen<'a> {
         // Reset temp slot allocator per function
         self.temp_slots.clear();
         self.next_temp_slot = 0;
+        // Reset OAM slot counter per frame handler
+        if func.name.ends_with("_frame") {
+            self.next_oam_slot = 0;
+        }
 
         self.emit_label(&format!("__ir_fn_{}", func.name));
 
         for block in &func.blocks {
             self.gen_block(block);
+        }
+
+        // Frame handlers end with JMP to main loop; other functions end
+        // with RTS (emitted by the Return terminator in IR).
+        if func.name.ends_with("_frame") {
+            self.emit(JMP, AM::Label("__ir_main_loop".into()));
         }
     }
 
@@ -298,10 +362,20 @@ impl<'a> IrCodeGen<'a> {
                 y,
                 frame,
             } => {
-                // Writes to OAM slot 0 for IR codegen (simple, single sprite).
-                // Multi-OAM would require a slot counter like the AST codegen.
+                // Allocate an OAM slot from $0200-$02FF. Silently drop
+                // draws beyond slot 63 (OAM is full).
+                if self.next_oam_slot >= 64 {
+                    return;
+                }
+                let slot = self.next_oam_slot;
+                self.next_oam_slot = self.next_oam_slot.wrapping_add(1);
+                let base = 0x0200 + u16::from(slot) * 4;
+
+                // Y position at base+0
                 self.load_temp(*y);
-                self.emit(STA, AM::Absolute(0x0200));
+                self.emit(STA, AM::Absolute(base));
+
+                // Tile index at base+1 — frame override, sprite lookup, or 0
                 if let Some(f) = frame {
                     self.load_temp(*f);
                 } else if let Some(&tile) = self.sprite_tiles.get(sprite_name) {
@@ -309,11 +383,15 @@ impl<'a> IrCodeGen<'a> {
                 } else {
                     self.emit(LDA, AM::Immediate(0));
                 }
-                self.emit(STA, AM::Absolute(0x0201));
+                self.emit(STA, AM::Absolute(base + 1));
+
+                // Attributes at base+2 (always 0)
                 self.emit(LDA, AM::Immediate(0));
-                self.emit(STA, AM::Absolute(0x0202));
+                self.emit(STA, AM::Absolute(base + 2));
+
+                // X position at base+3
                 self.load_temp(*x);
-                self.emit(STA, AM::Absolute(0x0203));
+                self.emit(STA, AM::Absolute(base + 3));
             }
             IrOp::ReadInput(dest) => {
                 self.emit(LDA, AM::ZeroPage(0x01)); // ZP_INPUT_P1
@@ -323,16 +401,20 @@ impl<'a> IrCodeGen<'a> {
                 // Poll frame flag at $00 until nonzero, then clear it
                 let wait_label = format!("__ir_wait_{}", self.instructions.len());
                 self.emit_label(&wait_label);
-                self.emit(LDA, AM::ZeroPage(0x00));
+                self.emit(LDA, AM::ZeroPage(ZP_FRAME_FLAG));
                 self.emit(BEQ, AM::LabelRelative(wait_label));
                 self.emit(LDA, AM::Immediate(0));
-                self.emit(STA, AM::ZeroPage(0x00));
+                self.emit(STA, AM::ZeroPage(ZP_FRAME_FLAG));
             }
             IrOp::Transition(name) => {
-                // Write state index 0 as a placeholder — the AST codegen
-                // does the real state index mapping. For IR codegen demo
-                // purposes we emit a no-op transition here.
-                let _ = name;
+                // Write the target state's index to current_state, then
+                // JMP back to main loop to run the new state's frame
+                // handler on the next dispatch cycle.
+                if let Some(&idx) = self.state_indices.get(name) {
+                    self.emit(LDA, AM::Immediate(idx));
+                    self.emit(STA, AM::ZeroPage(ZP_CURRENT_STATE));
+                    self.emit(JMP, AM::Label("__ir_main_loop".into()));
+                }
             }
             IrOp::SourceLoc(_) => {
                 // No code for source location markers
@@ -535,5 +617,83 @@ mod tests {
         );
         // Should emit CMP + branch
         assert!(insts.iter().any(|i| i.opcode == CMP));
+    }
+}
+
+#[cfg(test)]
+mod more_tests {
+    use super::*;
+    use crate::analyzer;
+    use crate::ir;
+    use crate::parser;
+
+    fn lower_and_gen(source: &str) -> Vec<Instruction> {
+        let (prog, _) = parser::parse(source);
+        let prog = prog.unwrap();
+        let analysis = analyzer::analyze(&prog);
+        let ir_program = ir::lower(&prog, &analysis);
+        IrCodeGen::new(&analysis.var_allocations, &ir_program).generate(&ir_program)
+    }
+
+    #[test]
+    fn ir_codegen_state_dispatch_emits_main_loop() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        // Should contain the __ir_main_loop label
+        let has_main_loop = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__ir_main_loop"));
+        assert!(has_main_loop, "IR codegen should emit main loop label");
+    }
+
+    #[test]
+    fn ir_codegen_multi_oam_uses_sequential_slots() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var a: u8 = 10
+            var b: u8 = 20
+            on frame {
+                draw First at: (a, a)
+                draw Second at: (b, b)
+            }
+            start Main
+        "#,
+        );
+        // Should write to OAM slot 0 ($0200) and slot 1 ($0204)
+        let writes_slot0 = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x0200));
+        let writes_slot1 = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x0204));
+        assert!(writes_slot0, "first draw should use OAM slot 0");
+        assert!(writes_slot1, "second draw should use OAM slot 1");
+    }
+
+    #[test]
+    fn ir_codegen_transition_writes_state_index() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            state A {
+                on frame { transition B }
+            }
+            state B {
+                on frame { wait_frame }
+            }
+            start A
+        "#,
+        );
+        // Should write state index 1 (B is second state) to ZP $03
+        let has_store_state = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(0x03));
+        assert!(has_store_state, "transition should write to current_state");
     }
 }
