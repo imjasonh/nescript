@@ -666,6 +666,27 @@ fn parse_mmc3_mapper() {
 }
 
 #[test]
+fn parse_audio_statements() {
+    let src = r#"
+        game "Audio" { mapper: NROM }
+        on frame {
+            play JumpSfx
+            start_music MainTheme
+            stop_music
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert!(matches!(frame.statements[0], Statement::Play(ref n, _) if n == "JumpSfx"));
+    assert!(matches!(
+        frame.statements[1],
+        Statement::StartMusic(ref n, _) if n == "MainTheme"
+    ));
+    assert!(matches!(frame.statements[2], Statement::StopMusic(_)));
+}
+
+#[test]
 fn parse_struct_decl() {
     let src = r#"
         game "Test" { mapper: NROM }

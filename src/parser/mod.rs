@@ -899,6 +899,23 @@ impl Parser {
                 Ok(Statement::Scroll(x, y, span))
             }
             TokenKind::KwDebug => self.parse_debug_statement(),
+            TokenKind::KwPlay => {
+                let span = self.current_span();
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                Ok(Statement::Play(name, span))
+            }
+            TokenKind::KwStartMusic => {
+                let span = self.current_span();
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                Ok(Statement::StartMusic(name, span))
+            }
+            TokenKind::KwStopMusic => {
+                let span = self.current_span();
+                self.advance();
+                Ok(Statement::StopMusic(span))
+            }
             TokenKind::KwAsm => {
                 let span = self.current_span();
                 self.advance(); // KwAsm

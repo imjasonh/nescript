@@ -286,6 +286,15 @@ pub enum Statement {
     /// Inline 6502 assembly captured verbatim. The body is parsed by
     /// the codegen stage using `asm::parse_inline`.
     InlineAsm(String, Span),
+    /// Audio: `play SfxName` — trigger a one-shot sound effect.
+    /// Currently a no-op at codegen time; no audio driver exists.
+    Play(String, Span),
+    /// Audio: `start_music TrackName` — begin playing background music.
+    /// Currently a no-op at codegen time.
+    StartMusic(String, Span),
+    /// Audio: `stop_music` — stop any currently-playing music.
+    /// Currently a no-op at codegen time.
+    StopMusic(Span),
 }
 
 impl Statement {
@@ -308,7 +317,10 @@ impl Statement {
             | Self::Scroll(_, _, s)
             | Self::DebugLog(_, s)
             | Self::DebugAssert(_, s)
-            | Self::InlineAsm(_, s) => *s,
+            | Self::InlineAsm(_, s)
+            | Self::Play(_, s)
+            | Self::StartMusic(_, s)
+            | Self::StopMusic(s) => *s,
         }
     }
 }

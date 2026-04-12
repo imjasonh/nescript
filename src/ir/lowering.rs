@@ -344,6 +344,10 @@ impl LoweringContext {
             Statement::InlineAsm(body, _) => {
                 self.emit(IrOp::InlineAsm(body.clone()));
             }
+            Statement::Play(_, _) | Statement::StartMusic(_, _) | Statement::StopMusic(_) => {
+                // No audio driver yet — these parse but produce no
+                // IR.
+            }
         }
     }
 

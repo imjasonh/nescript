@@ -974,6 +974,11 @@ impl Analyzer {
                 // codegen parses and validates the body; analysis has
                 // nothing to check.
             }
+            Statement::Play(_, _) | Statement::StartMusic(_, _) | Statement::StopMusic(_) => {
+                // Audio statements are parsed and recognized but
+                // currently generate no code — no audio driver exists.
+                // Users who need audio can use inline `asm` blocks.
+            }
         }
     }
 
@@ -1219,7 +1224,10 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
         | Statement::Continue(_)
         | Statement::LoadBackground(_, _)
         | Statement::SetPalette(_, _)
-        | Statement::InlineAsm(_, _) => {}
+        | Statement::InlineAsm(_, _)
+        | Statement::Play(_, _)
+        | Statement::StartMusic(_, _)
+        | Statement::StopMusic(_) => {}
     }
 }
 

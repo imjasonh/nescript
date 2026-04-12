@@ -370,6 +370,9 @@ impl CodeGen {
                     self.emit(BRK, AM::Implied);
                 }
             },
+            Statement::Play(_, _) | Statement::StartMusic(_, _) | Statement::StopMusic(_) => {
+                // Audio statements compile to no-ops for now.
+            }
         }
     }
 
