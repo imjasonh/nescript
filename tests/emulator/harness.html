@@ -72,6 +72,20 @@
       }
       return { nonBlack, hash: (hash >>> 0).toString(16), totalPixels: 256 * 240 };
     },
+    // Raw canvas pixels as a base64-encoded RGBA buffer
+    // (256 * 240 * 4 bytes). Used by the golden-diff runner to
+    // compare pixel-for-pixel against a decoded PNG golden file.
+    // Base64 is cheap and avoids any puppeteer JSON-serialization
+    // pitfalls with typed arrays.
+    rawPixelsBase64() {
+      const data = ctx.getImageData(0, 0, 256, 240).data;
+      const chunks = [];
+      // Chunk to stay under String.fromCharCode's argument limit.
+      for (let i = 0; i < data.length; i += 4096) {
+        chunks.push(String.fromCharCode.apply(null, data.subarray(i, i + 4096)));
+      }
+      return btoa(chunks.join(""));
+    },
   };
 
   // Controller button enum constants (from jsnes Controller).

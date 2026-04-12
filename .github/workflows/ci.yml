@@ -121,14 +121,20 @@ jobs:
       - name: Install emulator harness dependencies
         working-directory: tests/emulator
         run: npm ci
-      - name: Run each ROM in jsnes and verify it renders
+      - name: Diff each ROM's framebuffer against its committed golden
         working-directory: tests/emulator
         run: node run_examples.mjs
-      - name: Upload emulator screenshots on failure
+      - name: Upload actual + diff PNGs on failure
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: emulator-screenshots
+          name: emulator-diff
+          # `actual/` holds the run's output and red-highlighted diff
+          # PNGs for any ROM that didn't match its golden. `report.json`
+          # has the per-example pass/fail/diff counts. `goldens/` is
+          # included too so reviewers can compare the three side by side
+          # without cloning the repo.
           path: |
-            tests/emulator/screenshots/
+            tests/emulator/actual/
+            tests/emulator/goldens/
             tests/emulator/report.json
