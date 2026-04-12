@@ -544,11 +544,15 @@ impl LoweringContext {
                 self.emit(IrOp::Call(Some(t), name.clone(), arg_temps));
                 t
             }
-            Expr::ButtonRead(_, button, _) => {
+            Expr::ButtonRead(player, button, _) => {
                 // Button reads: read the input byte, mask with the button bit.
-                // (Player selection is ignored here; IR codegen handles it.)
+                // Player 1 reads from $01, player 2 reads from $08.
+                let player_index = match player {
+                    Some(Player::P2) => 1u8,
+                    _ => 0u8,
+                };
                 let input = self.fresh_temp();
-                self.emit(IrOp::ReadInput(input));
+                self.emit(IrOp::ReadInput(input, player_index));
                 let mask = button_mask(button);
                 let mask_temp = self.fresh_temp();
                 self.emit(IrOp::LoadImm(mask_temp, mask));

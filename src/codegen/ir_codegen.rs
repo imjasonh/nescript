@@ -407,8 +407,10 @@ impl<'a> IrCodeGen<'a> {
                 self.load_temp(*x);
                 self.emit(STA, AM::Absolute(base + 3));
             }
-            IrOp::ReadInput(dest) => {
-                self.emit(LDA, AM::ZeroPage(0x01)); // ZP_INPUT_P1
+            IrOp::ReadInput(dest, player) => {
+                // $01 = P1 input byte, $08 = P2 input byte
+                let addr = if *player == 1 { 0x08 } else { 0x01 };
+                self.emit(LDA, AM::ZeroPage(addr));
                 self.store_temp(*dest);
             }
             IrOp::WaitFrame => {

@@ -379,7 +379,7 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
                 used.insert(*f);
             }
         }
-        IrOp::ReadInput(_) | IrOp::WaitFrame | IrOp::Transition(_) | IrOp::SourceLoc(_) => {}
+        IrOp::ReadInput(_, _) | IrOp::WaitFrame | IrOp::Transition(_) | IrOp::SourceLoc(_) => {}
     }
 }
 
@@ -406,7 +406,7 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::CmpGtEq(d, _, _)
         | IrOp::ArrayLoad(d, _, _) => Some(*d),
         IrOp::Call(dest, _, _) => *dest,
-        IrOp::ReadInput(d) => Some(*d),
+        IrOp::ReadInput(d, _) => Some(*d),
         IrOp::StoreVar(_, _)
         | IrOp::ArrayStore(_, _, _)
         | IrOp::DrawSprite { .. }

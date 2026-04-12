@@ -124,8 +124,9 @@ pub enum IrOp {
         y: IrTemp,
         frame: Option<IrTemp>,
     },
-    /// Read the current player 1 input byte into a temp.
-    ReadInput(IrTemp),
+    /// Read a controller input byte into a temp.
+    /// Second arg: 0 for player 1, 1 for player 2.
+    ReadInput(IrTemp, u8),
     WaitFrame,
     Transition(String),
 
