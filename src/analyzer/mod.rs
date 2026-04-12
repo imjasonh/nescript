@@ -211,25 +211,15 @@ impl Analyzer {
         // Compute max call depths from entry points (state handlers)
         self.compute_max_depths(program);
 
-        // Check for unused global variables (W0103). Variables whose names
-        // start with '_' are exempt by convention. State-local variables are
-        // left out for now to avoid noise during early development.
+        // Check for unused variables (W0103). Variables whose names
+        // start with '_' are exempt by convention. Both globals and
+        // state-local variables are checked.
         for var in &program.globals {
-            if var.name.starts_with('_') {
-                continue;
-            }
-            if !self.used_vars.contains(&var.name) {
-                self.diagnostics.push(Diagnostic {
-                    level: Level::Warning,
-                    code: ErrorCode::W0103,
-                    message: format!("unused variable '{}'", var.name),
-                    span: var.span,
-                    labels: Vec::<Label>::new(),
-                    help: Some(
-                        "prefix with '_' to silence this warning, or remove the declaration".into(),
-                    ),
-                    note: None,
-                });
+            self.check_unused_var(var);
+        }
+        for state in &program.states {
+            for var in &state.locals {
+                self.check_unused_var(var);
             }
         }
 
@@ -240,6 +230,26 @@ impl Analyzer {
     /// Mark a variable name as having been read somewhere in the program.
     fn mark_var_used(&mut self, name: &str) {
         self.used_vars.insert(name.to_string());
+    }
+
+    /// Emit W0103 if `var` is never read anywhere. Variables named
+    /// with a leading `_` are exempt by convention.
+    fn check_unused_var(&mut self, var: &VarDecl) {
+        if var.name.starts_with('_') {
+            return;
+        }
+        if self.used_vars.contains(&var.name) {
+            return;
+        }
+        self.diagnostics.push(Diagnostic {
+            level: Level::Warning,
+            code: ErrorCode::W0103,
+            message: format!("unused variable '{}'", var.name),
+            span: var.span,
+            labels: Vec::<Label>::new(),
+            help: Some("prefix with '_' to silence this warning, or remove the declaration".into()),
+            note: None,
+        });
     }
 
     /// Recursively walk an expression tree and mark every identifier that

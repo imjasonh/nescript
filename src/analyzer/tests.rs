@@ -563,6 +563,31 @@ fn analyze_unused_variable_warning() {
 }
 
 #[test]
+fn analyze_unused_state_local_warning() {
+    // State-local `bonus` is declared but never read — W0103 should fire.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "Test" { mapper: NROM }
+        state Main {
+            var bonus: u8 = 0
+            on frame { wait_frame }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0103 && d.message.contains("bonus")),
+        "expected W0103 for unused state-local 'bonus', got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
 fn analyze_unused_variable_no_warning_when_read() {
     // `counter` is both written and read (in the `if` condition),
     // so W0103 should NOT fire for it.
