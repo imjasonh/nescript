@@ -1,0 +1,895 @@
+# NEScript Language Guide
+
+NEScript is a statically-typed, compiled language designed for NES game development. It compiles directly to 6502 machine code packaged as iNES-format ROMs -- no external assembler or tooling required.
+
+This guide covers every language feature with practical examples.
+
+---
+
+## Program Structure
+
+Every NEScript program consists of a game declaration, top-level definitions, and a start declaration.
+
+```
+game "My Game" {
+    mapper: NROM
+    mirroring: vertical
+}
+
+const SPEED: u8 = 2
+
+var score: u8 = 0
+
+fun helper() -> u8 {
+    return 42
+}
+
+state Title {
+    on frame {
+        draw Logo at: (100, 100)
+        if button.start {
+            transition Playing
+        }
+    }
+}
+
+state Playing {
+    on enter {
+        score = 0
+    }
+    on frame {
+        // game logic here
+    }
+}
+
+start Title
+```
+
+### Game Declaration
+
+The `game` block is required and must appear first. It names the game and sets hardware configuration.
+
+```
+game "Coin Cavern" {
+    mapper: NROM
+    mirroring: vertical
+}
+```
+
+Available properties:
+
+| Property     | Values                           | Default      |
+|--------------|----------------------------------|--------------|
+| `mapper`     | `NROM`, `MMC1`, `UxROM`, `MMC3`  | required     |
+| `mirroring`  | `horizontal`, `vertical`         | `horizontal` |
+
+### Start Declaration
+
+Exactly one `start` declaration must exist. It names the initial state entered on power-on.
+
+```
+start Title
+```
+
+---
+
+## Types
+
+NEScript has four primitive types and fixed-size arrays.
+
+### Primitive Types
+
+| Type   | Size    | Range           | Description                        |
+|--------|---------|-----------------|------------------------------------|
+| `u8`   | 1 byte  | 0 to 255        | Unsigned 8-bit integer             |
+| `i8`   | 1 byte  | -128 to 127     | Signed 8-bit integer               |
+| `u16`  | 2 bytes | 0 to 65535      | Unsigned 16-bit integer            |
+| `bool` | 1 byte  | `true` / `false`| Boolean                            |
+
+### Arrays
+
+Arrays are fixed-size, homogeneous, and zero-indexed. The size must be a compile-time constant. Maximum 256 elements.
+
+```
+var enemies: u8[8]
+const TABLE: u8[4] = [10, 20, 30, 40]
+```
+
+### Type Casting
+
+NEScript has no implicit coercion. All conversions use `as`:
+
+```
+var a: u8 = 200
+var b: u16 = a as u16       // zero-extend: 200
+var c: i8 = a as i8         // reinterpret bits
+var d: u8 = b as u8         // truncate to low byte
+```
+
+---
+
+## Variables
+
+### Variable Declarations
+
+Variables are declared with `var` and must have an explicit type:
+
+```
+var x: u8                   // uninitialized (zeroed on state entry)
+var y: u8 = 100             // initialized
+var pos: u16 = 0x0400       // 16-bit value
+var alive: bool = true
+var scores: u8[4] = [0, 0, 0, 0]
+```
+
+### Constants
+
+Constants are evaluated at compile time and stored in ROM:
+
+```
+const MAX_ENEMIES: u8 = 5
+const SPEED: u8 = 3
+const SIN_TABLE: u8[8] = [0, 49, 90, 117, 127, 117, 90, 49]
+```
+
+### Memory Placement Hints
+
+The NES has 256 bytes of zero-page RAM with faster access. You can hint where variables should be placed:
+
+```
+fast var px: u8             // prefer zero-page (faster instructions)
+slow var high_score: u16    // prefer upper RAM (saves zero-page space)
+var normal: u8              // compiler decides automatically
+```
+
+If zero-page is exhausted and `fast` variables cannot be placed, the compiler emits error `E0301`.
+
+### Scope
+
+| Scope    | Declared In    | Lifetime                                   |
+|----------|----------------|---------------------------------------------|
+| Global   | Top level      | Entire program, permanent RAM allocation    |
+| State    | `state` block  | Active while state is active; RAM reusable  |
+| Function | `fun` block    | Duration of function call                   |
+| Block    | `if`/`while`   | Enclosing block, shares parent allocation   |
+
+---
+
+## Functions
+
+### Declaration
+
+Functions use `fun`, with optional parameters and return type:
+
+```
+fun add(a: u8, b: u8) -> u8 {
+    return a + b
+}
+
+fun reset_score() {
+    score = 0
+}
+```
+
+### Inline Functions
+
+The `inline` keyword hints the compiler to inline the function at call sites:
+
+```
+inline fun clamp(val: u8, max: u8) -> u8 {
+    if val > max {
+        return max
+    }
+    return val
+}
+```
+
+`inline` is a hint -- the compiler may decline for large functions.
+
+### Calling Functions
+
+```
+var result: u8 = add(10, 20)
+reset_score()
+```
+
+### Restrictions
+
+- **No recursion.** Both direct and indirect recursion are compile errors (`E0402`).
+- **Call depth limit.** The default maximum call depth is 8. Exceeding it produces error `E0401`.
+
+---
+
+## States
+
+States are the top-level organizational unit. Exactly one state is active at any time.
+
+### State Declaration
+
+```
+state Playing {
+    var timer: u8 = 0           // state-local variable
+
+    on enter {
+        // runs once when entering this state
+        timer = 60
+    }
+
+    on exit {
+        // runs once when leaving this state
+    }
+
+    on frame {
+        // runs every frame (60 Hz) while this state is active
+        timer -= 1
+        draw Player at: (player_x, player_y)
+    }
+}
+```
+
+`on frame` is syntactic sugar for a loop with an implicit `wait_frame()` at the end. A state can have any combination of `on enter`, `on exit`, and `on frame`.
+
+### State Transitions
+
+```
+transition GameOver
+```
+
+Transitions are immediate. The current state's `on exit` runs, then the target state's `on enter` runs. The remainder of the current frame handler does not execute.
+
+---
+
+## Expressions
+
+### Literals
+
+```
+42              // decimal integer
+0xFF            // hexadecimal
+0b10110001      // binary
+1_000           // underscores allowed for readability (if supported)
+true            // boolean
+false           // boolean
+[1, 2, 3]      // array literal
+```
+
+All integer literals must fit in `u16` (0-65535). The compiler narrows to the required type at usage.
+
+### Arithmetic Operators
+
+| Operator | Description    | Example      |
+|----------|----------------|--------------|
+| `+`      | Addition       | `a + b`      |
+| `-`      | Subtraction    | `a - b`      |
+| `*`      | Multiplication | `a * b`      |
+| `/`      | Division       | `a / b`      |
+| `%`      | Modulo         | `a % b`      |
+
+`*`, `/`, and `%` are available but expensive on the 6502 (software routines). The compiler optimizes power-of-two operations to shifts and warns on non-power-of-two multiply/divide.
+
+### Bitwise Operators
+
+| Operator | Description    | Example      |
+|----------|----------------|--------------|
+| `&`      | Bitwise AND    | `a & 0x0F`   |
+| `\|`     | Bitwise OR     | `a \| 0x80`  |
+| `^`      | Bitwise XOR    | `a ^ mask`   |
+| `~`      | Bitwise NOT    | `~a`         |
+| `<<`     | Shift left     | `a << 2`     |
+| `>>`     | Shift right    | `a >> 1`     |
+
+### Comparison Operators
+
+| Operator | Description       | Example      |
+|----------|-------------------|--------------|
+| `==`     | Equal             | `a == 0`     |
+| `!=`     | Not equal         | `a != b`     |
+| `<`      | Less than         | `a < 10`     |
+| `>`      | Greater than      | `a > max`    |
+| `<=`     | Less or equal     | `a <= 255`   |
+| `>=`     | Greater or equal  | `a >= min`   |
+
+### Logical Operators
+
+NEScript uses keyword-based logical operators:
+
+```
+if alive and (health > 0) {
+    // ...
+}
+if not paused or force_update {
+    // ...
+}
+```
+
+| Operator | Description   |
+|----------|---------------|
+| `and`    | Logical AND   |
+| `or`     | Logical OR    |
+| `not`    | Logical NOT   |
+
+### Operator Precedence
+
+From highest to lowest:
+
+| Level | Operators                          | Associativity |
+|-------|------------------------------------|---------------|
+| 1     | `()` grouping                      | --            |
+| 2     | `-` (unary), `~`, `not`            | right         |
+| 3     | `*`, `/`, `%`                      | left          |
+| 4     | `+`, `-`                           | left          |
+| 5     | `<<`, `>>`                         | left          |
+| 6     | `&`                                | left          |
+| 7     | `^`                                | left          |
+| 8     | `\|`                               | left          |
+| 9     | `==`, `!=`, `<`, `>`, `<=`, `>=`   | left          |
+| 10    | `and`                              | left          |
+| 11    | `or`                               | left          |
+
+### Button Reads
+
+Read controller input as boolean expressions:
+
+```
+if button.right {
+    player_x += SPEED
+}
+if button.a {
+    jump()
+}
+```
+
+Available buttons: `up`, `down`, `left`, `right`, `a`, `b`, `start`, `select`.
+
+For two-player games, prefix with the player:
+
+```
+if p1.button.a { /* player 1 */ }
+if p2.button.right { /* player 2 */ }
+```
+
+Without a prefix, `button` refers to player 1.
+
+### Function Calls in Expressions
+
+```
+var clamped: u8 = clamp_x(player_x + SPEED)
+```
+
+### Array Indexing
+
+```
+var val: u8 = table[i]
+table[i] = 0
+```
+
+### Type Casting
+
+```
+var wide: u16 = narrow as u16
+```
+
+---
+
+## Statements
+
+### Assignment
+
+```
+x = 10
+x += 5
+x -= 1
+x &= 0x0F
+x |= 0x80
+x ^= mask
+```
+
+All assignment operators:
+
+| Operator | Description         |
+|----------|---------------------|
+| `=`      | Assign              |
+| `+=`     | Add and assign      |
+| `-=`     | Subtract and assign |
+| `&=`     | AND and assign      |
+| `\|=`    | OR and assign       |
+| `^=`     | XOR and assign      |
+
+Array element assignment:
+
+```
+enemies[i] = 0
+scores[player] += 10
+```
+
+### If / Else If / Else
+
+Braces are always required. No ternary operator.
+
+```
+if health == 0 {
+    transition GameOver
+} else if health < 3 {
+    flash_warning()
+} else {
+    // normal gameplay
+}
+```
+
+### While Loop
+
+```
+var i: u8 = 0
+while i < 10 {
+    enemies[i] = 0
+    i += 1
+}
+```
+
+### Loop (Infinite)
+
+```
+loop {
+    wait_frame()
+    if button.start {
+        break
+    }
+}
+```
+
+The compiler warns if a `loop` contains neither `break`, `wait_frame`, nor `transition`.
+
+### Break and Continue
+
+```
+var i: u8 = 0
+while i < 20 {
+    i += 1
+    if enemies[i] == 0 {
+        continue            // skip inactive enemies
+    }
+    if i > 10 {
+        break               // stop processing
+    }
+    update_enemy(i)
+}
+```
+
+### Return
+
+```
+fun abs_diff(a: u8, b: u8) -> u8 {
+    if a > b {
+        return a - b
+    }
+    return b - a
+}
+```
+
+Functions without a return type use `return` with no value (or simply reach the end of the function body).
+
+### Draw
+
+Render a sprite to the screen:
+
+```
+draw Player at: (player_x, player_y)
+draw Coin at: (COIN_X, COIN_Y) frame: anim_frame
+```
+
+The `draw` statement writes to the OAM shadow buffer. The NES supports up to 64 sprites per frame.
+
+Syntax: `draw SpriteName at: (x_expr, y_expr) [frame: expr]`
+
+### Transition
+
+Switch to another state immediately:
+
+```
+transition GameOver
+```
+
+The current state's `on exit` runs, then the target state's `on enter` runs.
+
+### Wait Frame
+
+Yield execution until the next vertical blank (NMI). Synchronizes to the 60 Hz display refresh.
+
+```
+wait_frame()
+```
+
+This triggers OAM DMA transfer and PPU updates before yielding. Inside `on frame`, a `wait_frame()` is implicit at the end of each frame.
+
+### Scroll
+
+Set the PPU scroll position:
+
+```
+scroll(scroll_x, scroll_y)
+```
+
+### Load Background
+
+Load a background nametable:
+
+```
+load_background TitleBG
+```
+
+### Set Palette
+
+Apply a palette:
+
+```
+set_palette GamePalette
+```
+
+### Function Calls as Statements
+
+```
+reset_score()
+update_physics(player_x, player_y)
+```
+
+---
+
+## Assets
+
+### Sprite Declarations
+
+```
+sprite Player {
+    chr: @chr("assets/player.png")
+}
+
+sprite Coin {
+    chr: @binary("assets/coin.bin")
+}
+```
+
+### Palette Declarations
+
+Define color palettes using NES PPU color indices (`$00`-`$3F`):
+
+```
+palette GamePalette {
+    colors: [0x0F, 0x00, 0x10, 0x30,
+             0x0F, 0x07, 0x17, 0x27,
+             0x0F, 0x09, 0x19, 0x29,
+             0x0F, 0x01, 0x11, 0x21]
+}
+```
+
+Each group of 4 values is a sub-palette. The first color is typically `0x0F` (black) as the shared background color.
+
+### Background Declarations
+
+```
+background TitleBG {
+    chr: @chr("assets/title_screen.png")
+}
+```
+
+### Asset Sources
+
+Three ways to provide asset data:
+
+| Source                     | Description                           |
+|----------------------------|---------------------------------------|
+| `@chr("file.png")`        | Convert PNG to CHR tile data          |
+| `@binary("file.bin")`     | Include raw binary data verbatim      |
+| Inline `[0x00, 0x7E, ...]`| Hex byte array directly in source     |
+
+---
+
+## Mappers
+
+The mapper determines cartridge hardware and available ROM size.
+
+| Mapper  | PRG ROM       | CHR ROM        | Features                         |
+|---------|---------------|----------------|----------------------------------|
+| `NROM`  | 16 or 32 KB   | 8 KB           | No banking, simplest             |
+| `MMC1`  | Up to 256 KB  | Up to 128 KB   | Switchable banks                 |
+| `UxROM` | Up to 256 KB  | 8 KB CHR RAM   | PRG banking only                 |
+| `MMC3`  | Up to 512 KB  | Up to 256 KB   | Scanline counter, banking        |
+
+### Bank Declarations
+
+For mappers with bank switching:
+
+```
+bank MainCode {
+    // Always-resident code (NMI handler, core engine)
+}
+
+bank Level1 {
+    state Level1 { ... }
+    background Level1BG { ... }
+}
+```
+
+Banks can hold `prg` (code/data) or `chr` (graphics) content. Transitions between states in different banks automatically emit bank-switch and trampoline code.
+
+---
+
+## Comments
+
+```
+// Line comment -- extends to end of line
+
+/* Block comment
+   spans multiple lines */
+```
+
+---
+
+## Includes
+
+Split your game across multiple files:
+
+```
+include "physics.ne"
+include "enemies.ne"
+```
+
+Includes are resolved relative to the including file. Circular includes are a compile error. Duplicate includes are skipped automatically.
+
+---
+
+## Debug Mode
+
+Compile with `--debug` to enable runtime instrumentation. All debug features are stripped completely in release builds (zero bytes, zero cycles).
+
+### Debug Logging
+
+```
+debug.log("Player position: ", px, ", ", py)
+```
+
+### Debug Assertions
+
+```
+debug.assert(lives > 0, "Lives should never be negative")
+```
+
+### Runtime Checks (Debug Only)
+
+In debug mode, the compiler inserts:
+- Array bounds checking on indexed access
+- Arithmetic overflow warnings
+- Stack depth monitoring at function entry
+- Frame overrun detection (warns if frame handler exceeds vblank period)
+
+---
+
+## Inline Assembly
+
+For performance-critical code, drop to 6502 assembly:
+
+### Bound Assembly
+
+```
+fun fast_shift(input: u8) -> u8 {
+    asm {
+        lda {input}
+        asl a
+        asl a
+        sta {return}
+    }
+}
+```
+
+`{variable_name}` resolves to the variable's memory address. `{return}` is the return value location.
+
+### Raw Assembly
+
+```
+raw asm {
+    .org $C000
+    nop
+    rti
+}
+```
+
+Raw blocks bypass all compiler management. Use with extreme caution.
+
+---
+
+## Error Codes
+
+### Lexer Errors (E01xx)
+
+| Code   | Description                |
+|--------|----------------------------|
+| E0101  | Unterminated string literal |
+| E0102  | Invalid character           |
+| E0103  | Number literal overflow     |
+
+### Type Errors (E02xx)
+
+| Code   | Description                |
+|--------|----------------------------|
+| E0201  | Type mismatch              |
+| E0202  | Invalid cast               |
+| E0203  | Invalid operation for type |
+
+### Memory Errors (E03xx)
+
+| Code   | Description                |
+|--------|----------------------------|
+| E0301  | Zero-page overflow         |
+
+### Control Flow Errors (E04xx)
+
+| Code   | Description                |
+|--------|----------------------------|
+| E0401  | Call depth exceeded        |
+| E0402  | Recursion detected         |
+| E0403  | Unreachable state          |
+| E0404  | Transition to undefined state |
+
+### Declaration Errors (E05xx)
+
+| Code   | Description                |
+|--------|----------------------------|
+| E0501  | Duplicate declaration      |
+| E0502  | Undefined variable         |
+| E0503  | Undefined function         |
+| E0504  | Missing start declaration  |
+| E0505  | Multiple start declarations|
+
+### Warnings (W01xx)
+
+| Code   | Description                              |
+|--------|------------------------------------------|
+| W0101  | Expensive multiply/divide operation      |
+| W0102  | Loop without break or wait_frame         |
+| W0103  | Unused variable                          |
+| W0104  | Unreachable code                         |
+
+### Example Error Output
+
+```
+error[E0201]: type mismatch
+  --> game.ne:42:15
+   |
+42 |   var x: u8 = -5
+   |               ^^ expected u8, found negative integer
+   |
+   = help: use i8 if you need negative values: var x: i8 = -5
+```
+
+```
+error[E0402]: recursion is not allowed
+  --> game.ne:55:5
+   |
+55 |     flood_fill(x + 1, y)
+   |     ^^^^^^^^^^^^^^^^^^^^
+   |
+   = note: flood_fill calls itself (directly recursive)
+   = help: the NES has only 256 bytes of stack; use an iterative algorithm instead
+```
+
+---
+
+## Compiler Commands
+
+### Build
+
+Compile a `.ne` source file into a `.nes` ROM:
+
+```
+nescript build game.ne
+nescript build game.ne --output my_game.nes
+nescript build game.ne --debug
+nescript build game.ne --asm-dump
+```
+
+| Flag          | Description                                    |
+|---------------|------------------------------------------------|
+| `--output`    | Set output ROM file path (default: input.nes)  |
+| `--debug`     | Enable debug mode with runtime checks          |
+| `--asm-dump`  | Dump generated 6502 assembly to stdout         |
+
+### Check
+
+Type-check a source file without producing a ROM:
+
+```
+nescript check game.ne
+```
+
+---
+
+## Complete Example
+
+A full game demonstrating states, input, functions, constants, and transitions:
+
+```
+game "Coin Cavern" {
+    mapper: NROM
+}
+
+const SPEED: u8 = 2
+const SCREEN_RIGHT: u8 = 240
+const COIN_X: u8 = 180
+const COIN_Y: u8 = 100
+
+var player_x: u8 = 40
+var player_y: u8 = 200
+var score: u8 = 0
+var coins_left: u8 = 3
+
+fun clamp_x(val: u8) -> u8 {
+    if val > SCREEN_RIGHT {
+        return 0
+    }
+    return val
+}
+
+state Title {
+    on frame {
+        draw Logo at: (100, 100)
+        if button.start {
+            transition Playing
+        }
+    }
+}
+
+state Playing {
+    on enter {
+        player_x = 40
+        player_y = 200
+        score = 0
+        coins_left = 3
+    }
+
+    on frame {
+        if button.right {
+            player_x += SPEED
+            if player_x > SCREEN_RIGHT {
+                player_x = SCREEN_RIGHT
+            }
+        }
+        if button.left {
+            if player_x >= SPEED {
+                player_x -= SPEED
+            } else {
+                player_x = 0
+            }
+        }
+
+        if player_x >= COIN_X {
+            if player_y >= COIN_Y {
+                score += 1
+                coins_left -= 1
+                if coins_left == 0 {
+                    transition GameOver
+                }
+            }
+        }
+
+        draw Player at: (player_x, player_y)
+        draw Coin at: (COIN_X, COIN_Y)
+    }
+}
+
+state GameOver {
+    on frame {
+        draw Trophy at: (120, 100)
+        if button.start {
+            transition Title
+        }
+    }
+}
+
+start Title
+```
+
+Build and run:
+
+```
+nescript build coin_cavern.ne
+# produces coin_cavern.nes -- open in any NES emulator
+```
