@@ -313,8 +313,13 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     }
 
     // Link into ROM with both graphic assets (sprite CHR) and audio
-    // assets (sfx envelopes, music note streams) spliced in.
-    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    // assets (sfx envelopes, music note streams) spliced in. Note:
+    // `Linker::new` hardcodes the mapper byte to NROM regardless of
+    // the source's `mapper:` declaration — that's a pre-existing
+    // bug separate from the audio work, and fixing it would change
+    // the iNES header of committed MMC1/MMC3 example ROMs. Left as
+    // `new` here to keep this PR focused on audio.
+    let linker = Linker::new(program.game.mirroring);
     let rom = linker.link_with_all_assets(&instructions, &sprites, &sfx, &music);
 
     Ok(rom)
