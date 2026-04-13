@@ -968,3 +968,183 @@ fn analyze_stop_music_needs_no_name_and_is_always_valid() {
     "#,
     );
 }
+
+// ── Palette / background validation ──
+
+#[test]
+fn analyze_accepts_declared_palette() {
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        palette Cool { colors: [0x0F, 0x01, 0x11, 0x21] }
+        on frame { set_palette Cool }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_rejects_unknown_palette() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        on frame { set_palette Ghost }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0502),
+        "expected E0502 for unknown palette, got {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_accepts_declared_background() {
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        background Stage { tiles: [0, 1, 2] }
+        on frame { load_background Stage }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_rejects_unknown_background() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        on frame { load_background Ghost }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0502),
+        "expected E0502 for unknown background, got {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_rejects_palette_color_out_of_range() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        palette Bad { colors: [0x0F, 0x40] }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for out-of-range NES color, got {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_rejects_palette_too_long() {
+    // 33 bytes > 32-byte PPU palette RAM limit.
+    let colors = (0..33)
+        .map(|_| "0x0F".to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let src = format!(
+        r#"
+        game "T" {{ mapper: NROM }}
+        palette Big {{ colors: [{colors}] }}
+        on frame {{ wait_frame }}
+        start Main
+    "#
+    );
+    let errors = analyze_errors(&src);
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for >32-byte palette, got {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_rejects_background_tiles_too_long() {
+    // 961 bytes > 960-byte nametable.
+    let tiles = (0..961)
+        .map(|_| "0".to_string())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let src = format!(
+        r#"
+        game "T" {{ mapper: NROM }}
+        background Big {{ tiles: [{tiles}] }}
+        on frame {{ wait_frame }}
+        start Main
+    "#
+    );
+    let errors = analyze_errors(&src);
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for >960-byte nametable, got {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_rejects_duplicate_palette_name() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        palette Dup { colors: [0x0F] }
+        palette Dup { colors: [0x10] }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0501),
+        "expected E0501 for duplicate palette name, got {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_reserves_zero_page_when_palette_declared() {
+    // When a program declares any palette or background, the
+    // analyzer bumps the user zero-page start from $10 to $18 so
+    // the runtime can own $11-$17 for the vblank update handshake.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        palette P { colors: [0x0F] }
+        var x: u8 = 0
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    let x = result
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "x")
+        .expect("x should be allocated");
+    assert!(
+        x.address >= 0x18,
+        "user var `x` should land at $18+ when palette is declared (got ${:02X})",
+        x.address
+    );
+}
+
+#[test]
+fn analyze_does_not_reserve_zero_page_without_palette_or_bg() {
+    // Programs that don't declare palette/background keep the old
+    // user-ZP start at $10 so existing examples (and their
+    // goldens) don't shift.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    let x = result
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "x")
+        .expect("x should be allocated");
+    assert_eq!(x.address, 0x10);
+}

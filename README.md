@@ -41,7 +41,7 @@ start Main
 
 ## Features
 
-- **Game-aware syntax** -- states, sprites, and input are first-class constructs
+- **Game-aware syntax** -- states, sprites, palettes, backgrounds, and input are first-class constructs
 - **Full type system** -- `u8`, `i8`, `u16`, `bool`, fixed-size arrays (`u8[N]`), `enum`, `struct`
 - **Rich control flow** -- `if`/`else`, `while`, `for i in 0..N`, `loop`, `match`
 - **Functions** -- with parameters, return types, `inline` hint, recursion detection
@@ -51,6 +51,7 @@ start Main
 - **Full 16-bit arithmetic** -- u16 add/sub/compare lower to carry-propagating paired operations
 - **Multiple mappers** -- NROM, MMC1, UxROM, MMC3 (including multi-scanline IRQ dispatch per state)
 - **Audio subsystem** -- frame-walking pulse driver with user-declared `sfx`/`music` blocks, builtin effects and tracks, period table, and zero-cost elision when unused
+- **Palette & background pipeline** -- `palette` and `background` blocks, initial values loaded at reset, vblank-safe `set_palette` / `load_background` runtime swaps
 - **Asset pipeline** -- PNG-to-CHR conversion, inline tile data, sfx envelopes, music note streams
 - **Inline assembly** -- `asm { ... }` with `{var}` substitution, plus `raw asm { ... }` for verbatim blocks
 - **Hardware intrinsics** -- `poke(addr, value)` / `peek(addr)` for direct register access
@@ -76,6 +77,7 @@ start Main
 | [`state_machine.ne`](examples/state_machine.ne) | State transitions, on enter/exit, timers |
 | [`sprites_and_palettes.ne`](examples/sprites_and_palettes.ne) | Inline CHR data, scroll, type casting |
 | [`mmc1_banked.ne`](examples/mmc1_banked.ne) | MMC1 mapper, bank declarations, multiply |
+| [`palette_and_background.ne`](examples/palette_and_background.ne) | Palette and background declarations, reset-time load, vblank-safe `set_palette` / `load_background` swaps |
 | [`structs_enums_for.ne`](examples/structs_enums_for.ne) | Structs, enums, `for` loops, struct literals |
 | [`inline_asm_demo.ne`](examples/inline_asm_demo.ne) | Inline asm with `{var}` substitution, `poke`/`peek` |
 | [`audio_demo.ne`](examples/audio_demo.ne) | Audio subsystem: user `sfx`/`music` blocks, builtin effects, `play`/`start_music`/`stop_music` |

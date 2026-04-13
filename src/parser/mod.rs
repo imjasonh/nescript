@@ -127,6 +127,8 @@ impl Parser {
         let mut functions = Vec::new();
         let mut states = Vec::new();
         let mut sprites = Vec::new();
+        let mut palettes = Vec::new();
+        let mut backgrounds = Vec::new();
         let mut sfx = Vec::new();
         let mut music = Vec::new();
         let mut banks = Vec::new();
@@ -162,6 +164,12 @@ impl Parser {
                 }
                 TokenKind::KwSprite => {
                     sprites.push(self.parse_sprite_decl()?);
+                }
+                TokenKind::KwPalette => {
+                    palettes.push(self.parse_palette_decl()?);
+                }
+                TokenKind::KwBackground => {
+                    backgrounds.push(self.parse_background_decl()?);
                 }
                 TokenKind::KwSfx => {
                     sfx.push(self.parse_sfx_decl()?);
@@ -235,6 +243,8 @@ impl Parser {
             functions,
             states,
             sprites,
+            palettes,
+            backgrounds,
             sfx,
             music,
             banks,
@@ -662,6 +672,107 @@ impl Parser {
         })
     }
 
+    // ── Palette / Background declarations ──
+
+    /// `palette Name { colors: [c0, c1, ..., c31] }` — declares a
+    /// 32-byte PPU palette. Colors shorter than 32 are zero-padded
+    /// by the analyzer; colors longer than 32 are rejected.
+    fn parse_palette_decl(&mut self) -> Result<PaletteDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwPalette)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut colors: Option<Vec<u8>> = None;
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let (key, key_span) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "colors" => {
+                    colors = Some(self.parse_byte_array("colors")?);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown palette property '{key}'"),
+                        key_span,
+                    ));
+                }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let colors = colors.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                "palette requires 'colors' property",
+                start,
+            )
+        })?;
+
+        Ok(PaletteDecl {
+            name,
+            colors,
+            span: Span::new(start.file_id, start.start, self.current_span().end),
+        })
+    }
+
+    /// `background Name { tiles: [...], attributes: [...] }` — the
+    /// tiles array is the 32×30 nametable (up to 960 bytes); the
+    /// attributes array is the 8×8 attribute table (up to 64 bytes).
+    /// Both shorter and omitted arrays are zero-padded by the
+    /// analyzer. Longer arrays are rejected.
+    fn parse_background_decl(&mut self) -> Result<BackgroundDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwBackground)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut tiles: Option<Vec<u8>> = None;
+        let mut attributes: Option<Vec<u8>> = None;
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let (key, key_span) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "tiles" => {
+                    tiles = Some(self.parse_byte_array("tiles")?);
+                }
+                "attributes" => {
+                    attributes = Some(self.parse_byte_array("attributes")?);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown background property '{key}'"),
+                        key_span,
+                    ));
+                }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let tiles = tiles.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                "background requires 'tiles' property",
+                start,
+            )
+        })?;
+
+        Ok(BackgroundDecl {
+            name,
+            tiles,
+            attributes: attributes.unwrap_or_default(),
+            span: Span::new(start.file_id, start.start, self.current_span().end),
+        })
+    }
+
     // ── SFX / Music declarations ──
 
     /// `sfx Name { duty: N, pitch: [..], volume: [..] }`. Pitch and
@@ -1059,6 +1170,18 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
                 Ok(Statement::WaitFrame(span))
+            }
+            TokenKind::KwLoadBackground => {
+                let span = self.current_span();
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                Ok(Statement::LoadBackground(name, span))
+            }
+            TokenKind::KwSetPalette => {
+                let span = self.current_span();
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                Ok(Statement::SetPalette(name, span))
             }
             TokenKind::KwScroll => {
                 let span = self.current_span();

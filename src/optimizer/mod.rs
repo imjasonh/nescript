@@ -556,6 +556,8 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         | IrOp::PlaySfx(_)
         | IrOp::StartMusic(_)
         | IrOp::StopMusic
+        | IrOp::SetPalette(_)
+        | IrOp::LoadBackground(_)
         | IrOp::SourceLoc(_) => {}
     }
 }
@@ -603,6 +605,8 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::PlaySfx(_)
         | IrOp::StartMusic(_)
         | IrOp::StopMusic
+        | IrOp::SetPalette(_)
+        | IrOp::LoadBackground(_)
         | IrOp::SourceLoc(_) => None,
         // 16-bit ops have two destinations; the simple single-dest
         // DCE below would incorrectly drop a 16-bit op whose low

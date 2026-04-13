@@ -298,6 +298,13 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         eprintln!("error: {e}");
     })?;
 
+    // Resolve palette and background declarations into fixed-size
+    // ROM data blobs. These are purely compile-time — the byte
+    // arrays came from the parser and all the analyzer validation
+    // has already run.
+    let palettes = assets::resolve_palettes(&program);
+    let backgrounds = assets::resolve_backgrounds(&program);
+
     // IR-based code generation. Lower → optimize → emit 6502.
     let mut instructions = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
@@ -334,7 +341,15 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         .filter(|b| b.bank_type == BankType::Prg)
         .map(|b| PrgBank::empty(&b.name))
         .collect();
-    let rom = linker.link_banked(&instructions, &sprites, &sfx, &music, &switchable_banks);
+    let rom = linker.link_banked_with_ppu(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &switchable_banks,
+    );
 
     Ok(rom)
 }

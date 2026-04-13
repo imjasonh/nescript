@@ -489,6 +489,8 @@ mod tests {
             functions: Vec::new(),
             states: Vec::new(),
             sprites: Vec::new(),
+            palettes: Vec::new(),
+            backgrounds: Vec::new(),
             sfx: Vec::new(),
             music: Vec::new(),
             banks: Vec::new(),

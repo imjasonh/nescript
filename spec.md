@@ -63,8 +63,9 @@ if        else      while     for       in        match
 break     continue  return
 true      false     not       and       or
 fast      slow      include   start     transition
-sprite    sfx       music
+sprite    background palette   sfx       music
 draw      play      stop_music start_music
+load_background set_palette
 asm       raw       bank
 loop      wait_frame
 u8        i8        u16       bool
@@ -498,7 +499,24 @@ The compiler auto-generates the controller read routine and previous-frame track
 
 ### 10.1 Palettes
 
-The NES has 4 background palettes and 4 sprite palettes, each containing 4 colors selected from the NES's 64-color master palette. First-class `palette` declarations and `set_palette` / `load_background` statements are not yet in the language — see `docs/future-work.md`. Until then, push palette and nametable bytes directly via `poke(0x2006, ...)` / `poke(0x2007, ...)` inside an `on frame` handler (immediately after vblank).
+The NES has 4 background palettes and 4 sprite palettes, each containing 4 colors selected from the NES's 64-color master palette. A `palette` declaration provides all 32 bytes at once:
+
+```
+palette my_palette {
+    colors: [0x0F, 0x00, 0x10, 0x30,   // bg sub-palette 0
+             0x0F, 0x07, 0x17, 0x27,   // bg sub-palette 1
+             0x0F, 0x09, 0x19, 0x29,   // bg sub-palette 2
+             0x0F, 0x01, 0x11, 0x21,   // bg sub-palette 3
+             0x0F, 0x00, 0x10, 0x30,   // sprite sub-palette 0
+             0x0F, 0x14, 0x24, 0x34,   // sprite sub-palette 1
+             0x0F, 0x1A, 0x2A, 0x3A,   // sprite sub-palette 2
+             0x0F, 0x12, 0x22, 0x32]   // sprite sub-palette 3
+}
+
+set_palette my_palette          // queued for next vblank
+```
+
+The first declared palette is loaded at reset time, before rendering is enabled. Subsequent declarations live in PRG ROM as named blobs and become active via `set_palette`, which queues the write for the next vblank via the NMI handler.
 
 ### 10.2 Sprites
 
@@ -525,7 +543,16 @@ The `draw` statement writes to the OAM shadow buffer. The compiler manages OAM s
 
 ### 10.3 Backgrounds
 
-First-class `background` declarations and `load_background` are not yet in the language. See `docs/future-work.md` for the roadmap; for now, use `poke` inside a frame handler to push nametable bytes directly to PPU `$2006/$2007`.
+```
+background TitleScreen {
+    tiles:      [0x00, 0x01, 0x02, /* ... up to 960 bytes ... */]
+    attributes: [0xFF, 0x55,       /* ... up to 64 bytes  ... */]
+}
+
+load_background TitleScreen     // queued for next vblank
+```
+
+`tiles` is a 32×30 nametable (up to 960 bytes, in row-major order); `attributes` is the 8×8 attribute table (up to 64 bytes). Shorter lists are zero-padded; omitted `attributes` default to all-zero. The first declared background is loaded at reset time and background rendering is enabled automatically.
 
 ### 10.4 Scrolling
 
@@ -847,7 +874,8 @@ game_prop       = IDENT ":" ( IDENT | INTEGER ) ;
 include         = "include" STRING ;
 
 top_level_decl  = var_decl | const_decl | fun_decl | state_decl
-                | sprite_decl | sfx_decl | music_decl | bank_decl ;
+                | sprite_decl | palette_decl | background_decl
+                | sfx_decl | music_decl | bank_decl ;
 
 var_decl        = ["fast" | "slow"] "var" IDENT ":" type ["=" expr] ;
 const_decl      = "const" IDENT ":" type "=" expr ;
@@ -866,6 +894,10 @@ event_kind      = "enter" | "exit" | "frame" | "scanline" "(" INTEGER ")" ;
 sprite_decl     = "sprite" IDENT "{" { sprite_prop } "}" ;
 sprite_prop     = IDENT ":" expr ;
 
+palette_decl    = "palette" IDENT "{" "colors" ":" "[" int_list "]" "}" ;
+background_decl = "background" IDENT "{" bg_prop { bg_prop } "}" ;
+bg_prop         = ("tiles" | "attributes") ":" "[" int_list "]" ;
+
 sfx_decl        = "sfx" IDENT "{" sfx_prop { sfx_prop } "}" ;
 sfx_prop        = ("duty" ":" INTEGER | "pitch" ":" "[" int_list "]" | "volume" ":" "[" int_list "]") ;
 music_decl      = "music" IDENT "{" music_prop { music_prop } "}" ;
@@ -881,7 +913,7 @@ statement       = var_decl | const_decl | assign_stmt | if_stmt | while_stmt
                 | for_stmt | loop_stmt | return_stmt | break_stmt | continue_stmt
                 | draw_stmt | play_stmt | transition_stmt | fun_call
                 | asm_block | debug_stmt | music_stmt | scroll_stmt
-                | wait_frame_stmt ;
+                | load_bg_stmt | set_palette_stmt | wait_frame_stmt ;
 
 if_stmt         = "if" expr block { "else" "if" expr block } [ "else" block ] ;
 while_stmt      = "while" expr block ;
@@ -898,6 +930,8 @@ play_stmt       = "play" IDENT ;
 music_stmt      = ("start_music" | "stop_music") [IDENT] ;
 transition_stmt = "transition" IDENT ;
 scroll_stmt     = "scroll" "(" expr "," expr ")" ;
+load_bg_stmt    = "load_background" IDENT ;
+set_palette_stmt= "set_palette" IDENT ;
 wait_frame_stmt = "wait_frame" "(" ")" ;
 
 debug_stmt      = "debug" "." ( "log" | "assert" ) "(" expr { "," expr } ")" ;

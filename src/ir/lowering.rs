@@ -525,6 +525,12 @@ impl LoweringContext {
                 let y = self.lower_expr(y_expr);
                 self.emit(IrOp::Scroll(x, y));
             }
+            Statement::SetPalette(name, _) => {
+                self.emit(IrOp::SetPalette(name.clone()));
+            }
+            Statement::LoadBackground(name, _) => {
+                self.emit(IrOp::LoadBackground(name.clone()));
+            }
             Statement::DebugLog(args, _) => {
                 let temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                 self.emit(IrOp::DebugLog(temps));

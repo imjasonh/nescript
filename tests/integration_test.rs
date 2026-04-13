@@ -828,6 +828,126 @@ fn program_with_inline_sprite_chr() {
     rom::validate_ines(&rom_data).expect("should be valid iNES");
 }
 
+#[test]
+fn program_with_palette_compiles_and_blob_is_in_prg() {
+    let source = r#"
+        game "PalTest" { mapper: NROM }
+        palette Cool {
+            colors: [0x0F, 0x01, 0x11, 0x21,
+                     0x0F, 0x02, 0x12, 0x22,
+                     0x0F, 0x0C, 0x1C, 0x2C,
+                     0x0F, 0x0B, 0x1B, 0x2B,
+                     0x0F, 0x01, 0x11, 0x21,
+                     0x0F, 0x16, 0x27, 0x30,
+                     0x0F, 0x14, 0x24, 0x34,
+                     0x0F, 0x0B, 0x1B, 0x2B]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom_data = compile_banked(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+    // The 32-byte palette blob lands verbatim inside PRG ROM.
+    // Search for a distinctive 8-byte subsequence from sub-palette 3
+    // that doesn't collide with any of the other blobs or init
+    // sequences the linker emits.
+    let needle = [0x0F, 0x16, 0x27, 0x30, 0x0F, 0x14, 0x24, 0x34];
+    let found = rom_data.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        found,
+        "palette bytes should be spliced into PRG ROM verbatim"
+    );
+}
+
+#[test]
+fn program_with_set_palette_queues_update_at_runtime() {
+    // A program with a `set_palette Name` statement should emit
+    // the `__ppu_update_used` marker (so the linker pulls in the
+    // NMI helper) and must contain the zero-page write sequence
+    // that stores the palette label pointer into $12/$13.
+    let source = r#"
+        game "PalRuntime" { mapper: NROM }
+        palette Swap { colors: [0x0F, 0x01, 0x11, 0x21] }
+        on frame { set_palette Swap }
+        start Main
+    "#;
+    let rom_data = compile_banked(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+    // $12 == ZP_PENDING_PALETTE_LO, so the code will contain
+    // `STA $12` (opcode 85 12) somewhere in PRG.
+    let sta_12 = [0x85u8, 0x12];
+    let found = rom_data.windows(sta_12.len()).any(|w| w == sta_12);
+    assert!(
+        found,
+        "set_palette codegen should emit `STA $12` (ZP_PENDING_PALETTE_LO)"
+    );
+}
+
+#[test]
+fn program_with_background_compiles_and_tiles_spliced() {
+    let source = r#"
+        game "BgTest" { mapper: NROM }
+        background Stage {
+            tiles: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom_data = compile_banked(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+    // The distinctive 5-byte prefix of the tiles blob should be in
+    // PRG verbatim (the resolver zero-pads to 960 bytes so the tail
+    // is mostly zero).
+    let needle = [0xAA, 0xBB, 0xCC, 0xDD, 0xEE];
+    let found = rom_data.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        found,
+        "background tile bytes should be spliced into PRG ROM verbatim"
+    );
+}
+
+#[test]
+fn program_with_load_background_queues_update() {
+    let source = r#"
+        game "BgRuntime" { mapper: NROM }
+        background Stage { tiles: [1, 2, 3] }
+        on frame { load_background Stage }
+        start Main
+    "#;
+    let rom_data = compile_banked(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+    // $14 == ZP_PENDING_BG_TILES_LO.
+    let sta_14 = [0x85u8, 0x14];
+    let found = rom_data.windows(sta_14.len()).any(|w| w == sta_14);
+    assert!(
+        found,
+        "load_background codegen should emit `STA $14` (ZP_PENDING_BG_TILES_LO)"
+    );
+}
+
+#[test]
+fn program_without_palette_does_not_reserve_ppu_zero_page() {
+    // Regression guard: programs that don't declare palette or
+    // background should keep user vars starting at $10, same as
+    // they always did, so existing emulator goldens don't shift.
+    let source = r#"
+        game "NoPal" { mapper: NROM }
+        var x: u8 = 42
+        on frame { x += 1 }
+        start Main
+    "#;
+    let rom_data = compile_banked(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+    // `STA $10` (85 10) corresponds to writing to the first user
+    // var slot. Guarantees `x` is still allocated at $10.
+    let sta_10 = [0x85u8, 0x10];
+    let found = rom_data.windows(sta_10.len()).any(|w| w == sta_10);
+    assert!(
+        found,
+        "user var should still land at $10 when no palette/bg declared"
+    );
+}
+
 // ── M5 Tests ──
 
 /// Compile a source string using the mapper-aware linker.
@@ -860,6 +980,8 @@ fn compile_banked(source: &str) -> Vec<u8> {
         .expect("sprite resolution should succeed");
     let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
     let music = assets::resolve_music(&program).expect("music resolution should succeed");
+    let palettes = assets::resolve_palettes(&program);
+    let backgrounds = assets::resolve_backgrounds(&program);
 
     let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
@@ -874,7 +996,15 @@ fn compile_banked(source: &str) -> Vec<u8> {
         .filter(|b| b.bank_type == BankType::Prg)
         .map(|b| PrgBank::empty(&b.name))
         .collect();
-    linker.link_banked(&instructions, &sprites, &sfx, &music, &switchable_banks)
+    linker.link_banked_with_ppu(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &switchable_banks,
+    )
 }
 
 #[test]

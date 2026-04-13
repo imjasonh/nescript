@@ -6,31 +6,29 @@ tested is omitted — `git log` is the authoritative record of what shipped.
 
 ---
 
-## Runtime palette / nametable updates
+## PNG-sourced palette and nametable assets
 
-**Status.** Parsed away. Previously the compiler accepted `palette Name
-{ colors: [...] }`, `background Name { chr: @chr(...) }`, `load_background
-Name`, and `set_palette Name` statements, but the lowering silently dropped
-them: the declarations were never resolved into CHR or palette blobs and the
-statements emitted zero instructions. They were removed during cleanup to
-avoid quietly misleading users.
+**What ships today.** `palette Name { colors: [...] }` and
+`background Name { tiles: [...], attributes: [...] }` declarations with
+inline byte arrays. The first declared palette / background is loaded
+at reset time (before rendering enables), and both blocks get named
+data blobs in PRG ROM so `set_palette Name` / `load_background Name`
+can queue a vblank-safe swap via the NMI handler. See
+`examples/palette_and_background.ne`.
 
-**What a proper implementation needs.**
-- New AST declarations for palette and background/nametable data, with
-  analyzer validation for color indices and nametable dimensions.
-- An asset pipeline pass that compiles PNG or inline byte data into a
-  ROM-resident blob with a known label.
-- Runtime helpers that write to PPU `$2006/$2007` during vblank from a
-  source pointer.
-- IR ops `LoadBackground(BlobId)` and `SetPalette(BlobId)` that the
-  codegen emits inside an NMI-safe window.
-- A `--memory-map` breakdown that shows palette and nametable budgets,
-  since they eat into the PRG-ROM cost model that `memory_map` reports
-  for CHR bytes.
-
-Until this exists, programs should use `poke(0x2006, ...)` / `poke(0x2007, ...)`
-directly inside an `on frame` handler (runs immediately after vblank) to push
-palette or nametable updates.
+**Still TODO.**
+- `@palette("file.png")` — analyze image colours and map to nearest
+  NES master-palette indices. `nearest_nes_color()` already lives in
+  `src/assets/palette.rs` but is not wired through the resolver.
+- `@nametable("file.png")` — convert a 256×240 image into a 960-byte
+  nametable plus 64-byte attribute table with automatic tile
+  deduplication (max 256 unique tiles per pattern table).
+- Per-state background rendering control — programs currently get a
+  single fixed nametable at reset; per-state swaps work but are
+  limited by the NMI-time write budget (~2273 cycles, enough for a
+  palette but not a full 1024-byte nametable).
+- `--memory-map` should report palette and background PRG ROM usage
+  alongside the variable layout.
 
 ---
 

@@ -10,6 +10,8 @@ pub struct Program {
     pub functions: Vec<FunDecl>,
     pub states: Vec<StateDecl>,
     pub sprites: Vec<SpriteDecl>,
+    pub palettes: Vec<PaletteDecl>,
+    pub backgrounds: Vec<BackgroundDecl>,
     pub sfx: Vec<SfxDecl>,
     pub music: Vec<MusicDecl>,
     pub banks: Vec<BankDecl>,
@@ -50,6 +52,41 @@ pub struct StructField {
 pub struct SpriteDecl {
     pub name: String,
     pub chr_source: AssetSource,
+    pub span: Span,
+}
+
+/// `palette Name { colors: [c0, c1, ..., c31] }` — declares a
+/// 32-byte PPU palette (16 bytes background + 16 bytes sprite, in
+/// the standard `$3F00-$3F1F` layout). Colors are NES master-palette
+/// indices, `$00-$3F`. Shorter lists are zero-padded; longer lists
+/// are rejected by the analyzer.
+///
+/// The first `palette` declared in a program is loaded into VRAM at
+/// reset time. Other declarations sit in PRG ROM as named data
+/// blobs and become active via `set_palette Name`, which queues the
+/// write for the next vblank.
+#[derive(Debug, Clone)]
+pub struct PaletteDecl {
+    pub name: String,
+    pub colors: Vec<u8>,
+    pub span: Span,
+}
+
+/// `background Name { tiles: [960 bytes], attributes: [64 bytes] }`
+/// — declares a full-screen nametable. `tiles` is a 32×30 grid of
+/// CHR tile indices (`$0000-$03BF` of a nametable); `attributes` is
+/// the 8×8 attribute table (`$03C0-$03FF`). Shorter lists are
+/// zero-padded to fill the nametable; longer lists are rejected.
+///
+/// The first `background` declared in a program is loaded into
+/// nametable 0 at reset time. Other declarations become active via
+/// `load_background Name`, which queues the write for the next
+/// vblank.
+#[derive(Debug, Clone)]
+pub struct BackgroundDecl {
+    pub name: String,
+    pub tiles: Vec<u8>,
+    pub attributes: Vec<u8>,
     pub span: Span,
 }
 
@@ -327,6 +364,14 @@ pub enum Statement {
     Transition(String, Span),
     WaitFrame(Span),
     Call(String, Vec<Expr>, Span),
+    /// `load_background Name` — queue the named background for a
+    /// vblank-safe copy into nametable 0. Lowered to
+    /// [`IrOp::LoadBackground`].
+    LoadBackground(String, Span),
+    /// `set_palette Name` — queue the named palette for a
+    /// vblank-safe copy into `$3F00-$3F1F`. Lowered to
+    /// [`IrOp::SetPalette`].
+    SetPalette(String, Span),
     Scroll(Expr, Expr, Span),
     /// debug.log(expr, ...) — writes values to the emulator debug port.
     /// Stripped in release mode.
@@ -366,6 +411,8 @@ impl Statement {
             | Self::Transition(_, s)
             | Self::WaitFrame(s)
             | Self::Call(_, _, s)
+            | Self::LoadBackground(_, s)
+            | Self::SetPalette(_, s)
             | Self::Scroll(_, _, s)
             | Self::DebugLog(_, s)
             | Self::DebugAssert(_, s)

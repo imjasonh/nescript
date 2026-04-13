@@ -3,7 +3,7 @@ mod tests;
 
 use crate::asm;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
-use crate::assets::{MusicData, SfxData};
+use crate::assets::{BackgroundData, MusicData, PaletteData, SfxData};
 use crate::parser::ast::{Mapper, Mirroring};
 use crate::rom::RomBuilder;
 use crate::runtime;
@@ -177,20 +177,52 @@ impl Linker {
         music: &[MusicData],
         switchable_banks: &[PrgBank],
     ) -> Vec<u8> {
+        self.link_banked_with_ppu(user_code, sprites, sfx, music, &[], &[], switchable_banks)
+    }
+
+    /// Link with full asset pipeline including palette and
+    /// background data blobs. Palettes and backgrounds each emit a
+    /// labelled data block inside PRG ROM; the first declared
+    /// palette / background is loaded at reset time before
+    /// rendering is enabled, and any additional ones become
+    /// addressable via `set_palette` / `load_background` (which
+    /// queue a vblank-safe write).
+    #[allow(clippy::too_many_arguments)]
+    pub fn link_banked_with_ppu(
+        &self,
+        user_code: &[Instruction],
+        sprites: &[SpriteData],
+        sfx: &[SfxData],
+        music: &[MusicData],
+        palettes: &[PaletteData],
+        backgrounds: &[BackgroundData],
+        switchable_banks: &[PrgBank],
+    ) -> Vec<u8> {
         assert!(
             switchable_banks.is_empty() || self.mapper != Mapper::NROM,
             "NROM does not support switchable PRG banks (got {} banks)",
             switchable_banks.len()
         );
-        self.link_banked_inner(user_code, sprites, sfx, music, switchable_banks)
+        self.link_banked_inner(
+            user_code,
+            sprites,
+            sfx,
+            music,
+            palettes,
+            backgrounds,
+            switchable_banks,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn link_banked_inner(
         &self,
         user_code: &[Instruction],
         sprites: &[SpriteData],
         sfx: &[SfxData],
         music: &[MusicData],
+        palettes: &[PaletteData],
+        backgrounds: &[BackgroundData],
         switchable_banks: &[PrgBank],
     ) -> Vec<u8> {
         // ROM layout.
@@ -225,8 +257,30 @@ impl Linker {
             total_banks,
         ));
 
-        // Load default palette
-        all_instructions.extend(self.gen_palette_load());
+        // Load the initial palette. If the program declared any
+        // `palette` blocks, use the first one; otherwise fall back
+        // to the built-in default palette so sprites show up in a
+        // reasonable colour scheme without any user setup.
+        if let Some(first_palette) = palettes.first() {
+            all_instructions.extend(runtime::gen_initial_palette_load(&first_palette.label()));
+        } else {
+            all_instructions.extend(self.gen_palette_load());
+        }
+
+        // Load the initial background if the program declared any.
+        // Most programs don't, so the common case emits nothing
+        // here and leaves nametable 0 zero-filled.
+        if let Some(first_bg) = backgrounds.first() {
+            all_instructions.extend(runtime::gen_initial_background_load(
+                &first_bg.tiles_label(),
+                &first_bg.attrs_label(),
+            ));
+            // Enable background rendering. Default init only turns
+            // on sprites (`$10`), so OR in the background bit
+            // (`$08`) when a user background is present.
+            all_instructions.push(Instruction::new(LDA, AM::Immediate(0x1E)));
+            all_instructions.push(Instruction::new(STA, AM::Absolute(0x2001)));
+        }
 
         // User code (var init + main loop)
         all_instructions.extend(user_code.iter().cloned());
@@ -299,6 +353,40 @@ impl Linker {
             }
         }
 
+        // Palette and background data blobs. Each palette is a
+        // 32-byte block labelled `__palette_Name`; backgrounds are
+        // split into two blocks (`__bg_tiles_Name`, `__bg_attrs_Name`)
+        // so the reset loader and the NMI update helper can push
+        // them with independent pointers. We always splice the
+        // blobs whenever the program declares any palette or
+        // background — there's no equivalent of `__audio_used`
+        // because simply *declaring* a palette is enough to need
+        // its bytes in ROM (the reset loader reads them).
+        for pal in palettes {
+            all_instructions.extend(runtime::gen_data_block(&pal.label(), pal.colors.to_vec()));
+        }
+        for bg in backgrounds {
+            all_instructions.extend(runtime::gen_data_block(
+                &bg.tiles_label(),
+                bg.tiles.to_vec(),
+            ));
+            all_instructions.extend(runtime::gen_data_block(
+                &bg.attrs_label(),
+                bg.attrs.to_vec(),
+            ));
+        }
+
+        // The NMI needs the palette/nametable update helper whenever
+        // the program declared any palette or background, or the
+        // IR codegen emitted the `__ppu_update_used` marker (which
+        // signals that user code contains a `set_palette` or
+        // `load_background` statement). Either condition brings in
+        // the ~70-byte helper; programs that touch neither pay
+        // zero bytes.
+        let has_ppu_updates = !palettes.is_empty()
+            || !backgrounds.is_empty()
+            || has_label(user_code, "__ppu_update_used");
+
         // NMI handler
         all_instructions.push(Instruction::new(NOP, AM::Label("__nmi".into())));
         // If user code emits an MMC3 reload hook, splice in a JSR
@@ -320,7 +408,7 @@ impl Linker {
         if has_audio {
             all_instructions.push(Instruction::new(JSR, AM::Label("__audio_tick".into())));
         }
-        all_instructions.extend(runtime::gen_nmi());
+        all_instructions.extend(runtime::gen_nmi(has_ppu_updates));
 
         // IRQ handler
         all_instructions.push(Instruction::new(NOP, AM::Label("__irq".into())));

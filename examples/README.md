@@ -26,6 +26,7 @@ Open any `.nes` file in an NES emulator ([Mesen](https://www.mesen.ca/), [FCEUX]
 | `state_machine.ne` | on enter/exit, transitions | Multi-state flow with timers |
 | `sprites_and_palettes.ne` | sprites, scroll, cast | Inline CHR data, PPU scroll writes, type casting |
 | `mmc1_banked.ne` | MMC1, banks, multiply | Banked mapper with software multiply |
+| `palette_and_background.ne` | palette, background, set_palette, load_background | Reset-time initial load plus vblank-safe runtime swaps |
 
 ## Emulator Controls
 

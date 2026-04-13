@@ -480,6 +480,51 @@ fn lower_divide_emits_div_op_not_load_imm_zero() {
 }
 
 #[test]
+fn lower_set_palette_emits_ir_op() {
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        palette Cool { colors: [0x0F, 0x01, 0x11, 0x21] }
+        palette Warm { colors: [0x0F, 0x06, 0x16, 0x26] }
+        on frame { set_palette Warm }
+        start Main
+    "#,
+    );
+    let has_set_palette = ir
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::SetPalette(name) if name == "Warm"));
+    assert!(
+        has_set_palette,
+        "expected IrOp::SetPalette(Warm) in lowered IR"
+    );
+}
+
+#[test]
+fn lower_load_background_emits_ir_op() {
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        background Stage { tiles: [0, 1, 2] }
+        on frame { load_background Stage }
+        start Main
+    "#,
+    );
+    let has_load_bg = ir
+        .functions
+        .iter()
+        .flat_map(|f| &f.blocks)
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::LoadBackground(name) if name == "Stage"));
+    assert!(
+        has_load_bg,
+        "expected IrOp::LoadBackground(Stage) in lowered IR"
+    );
+}
+
+#[test]
 fn lower_modulo_emits_mod_op_not_load_imm_zero() {
     let ir = lower_ok(
         r#"

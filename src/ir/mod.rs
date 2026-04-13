@@ -257,6 +257,17 @@ pub enum IrOp {
         b_hi: IrTemp,
     },
 
+    /// `set_palette Name` — queues a palette update for the next
+    /// vblank. Codegen writes the palette's ROM label pointer into
+    /// the runtime-reserved ZP slot and sets a pending bit; the NMI
+    /// handler applies the write at the next vblank.
+    SetPalette(String),
+    /// `load_background Name` — queues a nametable update for the
+    /// next vblank. Codegen writes both the tiles and attributes
+    /// label pointers into their ZP slots and sets a pending bit;
+    /// the NMI handler applies the writes at the next vblank.
+    LoadBackground(String),
+
     // Audio ops — map to the minimal APU driver emitted by the linker.
     /// `play SfxName` — trigger a one-shot sound effect on pulse 1.
     /// The sfx name is looked up in a builtin table; unrecognized names

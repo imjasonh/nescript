@@ -30,7 +30,9 @@ use crate::assets::{MusicData, SfxData};
 use crate::ir::{IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator, VarId};
 use crate::runtime::{
     ZP_MUSIC_BASE_HI, ZP_MUSIC_BASE_LO, ZP_MUSIC_COUNTER, ZP_MUSIC_PTR_HI, ZP_MUSIC_PTR_LO,
-    ZP_MUSIC_STATE, ZP_OAM_CURSOR, ZP_SFX_COUNTER, ZP_SFX_PTR_HI, ZP_SFX_PTR_LO,
+    ZP_MUSIC_STATE, ZP_OAM_CURSOR, ZP_PENDING_BG_ATTRS_HI, ZP_PENDING_BG_ATTRS_LO,
+    ZP_PENDING_BG_TILES_HI, ZP_PENDING_BG_TILES_LO, ZP_PENDING_PALETTE_HI, ZP_PENDING_PALETTE_LO,
+    ZP_PPU_UPDATE_FLAGS, ZP_SFX_COUNTER, ZP_SFX_PTR_HI, ZP_SFX_PTR_LO,
 };
 
 /// Base zero-page address for IR temp slots.
@@ -52,6 +54,7 @@ const ZP_SCANLINE_STEP: u8 = 0x0C;
 const DEBUG_PORT: u16 = 0x4800;
 
 /// IR codegen that produces 6502 instructions from an `IrProgram`.
+#[allow(clippy::struct_excessive_bools)]
 pub struct IrCodeGen<'a> {
     instructions: Vec<Instruction>,
     /// Map from IR `VarId` to zero-page address.
@@ -100,6 +103,11 @@ pub struct IrCodeGen<'a> {
     /// marker label at most once per program so the linker can
     /// decide whether to splice the audio tick into NMI.
     audio_used: bool,
+    /// Set to true the first time we emit any PPU update op
+    /// (`set_palette` / `load_background`). The linker uses the
+    /// resulting `__ppu_update_used` marker label to decide whether
+    /// to splice the in-NMI palette/nametable update helper.
+    ppu_update_used: bool,
     allocations: &'a [VarAllocation],
 }
 
@@ -167,6 +175,7 @@ impl<'a> IrCodeGen<'a> {
             in_frame_handler: false,
             debug_mode: false,
             audio_used: false,
+            ppu_update_used: false,
             allocations,
         }
     }
@@ -895,6 +904,8 @@ impl<'a> IrCodeGen<'a> {
             IrOp::PlaySfx(name) => self.gen_play_sfx(name),
             IrOp::StartMusic(name) => self.gen_start_music(name),
             IrOp::StopMusic => self.gen_stop_music(),
+            IrOp::SetPalette(name) => self.gen_set_palette(name),
+            IrOp::LoadBackground(name) => self.gen_load_background(name),
             IrOp::LoadVarHi(dest, var) => {
                 if let Some(&base) = self.var_addrs.get(var) {
                     let addr = base.wrapping_add(1);
@@ -1107,6 +1118,64 @@ impl<'a> IrCodeGen<'a> {
         if !self.audio_used {
             self.emit_label("__audio_used");
             self.audio_used = true;
+        }
+    }
+
+    /// Emit the `set_palette Name` sequence.
+    ///
+    /// Writes the palette's ROM label pointer into the runtime
+    /// `ZP_PENDING_PALETTE_{LO,HI}` slots and sets bit 0 of
+    /// `ZP_PPU_UPDATE_FLAGS`. The NMI handler picks these up and
+    /// copies 32 bytes from the label to PPU `$3F00-$3F1F` inside
+    /// vblank.
+    fn gen_set_palette(&mut self, name: &str) {
+        self.emit_ppu_update_marker();
+        let label = format!("__palette_{name}");
+        // Pointer LO/HI
+        self.emit(LDA, AM::SymbolLo(label.clone()));
+        self.emit(STA, AM::ZeroPage(ZP_PENDING_PALETTE_LO));
+        self.emit(LDA, AM::SymbolHi(label));
+        self.emit(STA, AM::ZeroPage(ZP_PENDING_PALETTE_HI));
+        // Set bit 0 of the flags byte without disturbing other bits.
+        self.emit(LDA, AM::ZeroPage(ZP_PPU_UPDATE_FLAGS));
+        self.emit(ORA, AM::Immediate(0x01));
+        self.emit(STA, AM::ZeroPage(ZP_PPU_UPDATE_FLAGS));
+    }
+
+    /// Emit the `load_background Name` sequence. Writes both the
+    /// tiles and attributes label pointers and sets bit 1 of the
+    /// PPU update flags; the NMI handler then pushes 960+64 bytes
+    /// to nametable 0 inside vblank. Large updates may not fit in
+    /// a single vblank — the helper writes linearly so the visible
+    /// effect is a progressive update.
+    fn gen_load_background(&mut self, name: &str) {
+        self.emit_ppu_update_marker();
+        let tiles_label = format!("__bg_tiles_{name}");
+        let attrs_label = format!("__bg_attrs_{name}");
+        self.emit(LDA, AM::SymbolLo(tiles_label.clone()));
+        self.emit(STA, AM::ZeroPage(ZP_PENDING_BG_TILES_LO));
+        self.emit(LDA, AM::SymbolHi(tiles_label));
+        self.emit(STA, AM::ZeroPage(ZP_PENDING_BG_TILES_HI));
+        self.emit(LDA, AM::SymbolLo(attrs_label.clone()));
+        self.emit(STA, AM::ZeroPage(ZP_PENDING_BG_ATTRS_LO));
+        self.emit(LDA, AM::SymbolHi(attrs_label));
+        self.emit(STA, AM::ZeroPage(ZP_PENDING_BG_ATTRS_HI));
+        self.emit(LDA, AM::ZeroPage(ZP_PPU_UPDATE_FLAGS));
+        self.emit(ORA, AM::Immediate(0x02));
+        self.emit(STA, AM::ZeroPage(ZP_PPU_UPDATE_FLAGS));
+    }
+
+    /// Emit the `__ppu_update_used` marker label at most once per
+    /// program. The linker scans for this label to decide whether
+    /// to splice the PPU update helper into NMI. Programs that
+    /// declare palette/background blocks but never call
+    /// `set_palette`/`load_background` don't need the marker —
+    /// the linker already includes the helper when there are
+    /// declarations (for the reset-time initial load).
+    fn emit_ppu_update_marker(&mut self) {
+        if !self.ppu_update_used {
+            self.emit_label("__ppu_update_used");
+            self.ppu_update_used = true;
         }
     }
 
@@ -1580,6 +1649,8 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
         | IrOp::PlaySfx(_)
         | IrOp::StartMusic(_)
         | IrOp::StopMusic
+        | IrOp::SetPalette(_)
+        | IrOp::LoadBackground(_)
         | IrOp::SourceLoc(_) => Vec::new(),
     }
 }
