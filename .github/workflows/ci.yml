@@ -58,12 +58,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: cargo build --release
-      - name: Compile all .ne examples
+      - name: Verify committed ROMs match their .ne sources
+        # Every example has a committed .nes file under examples/. The
+        # compiler is deterministic (verified: same input → byte-identical
+        # output), so rebuilding each example into a tmp directory and
+        # diffing against the committed ROM catches "someone edited a .ne
+        # file but forgot to regenerate the ROM" at PR time.
         run: |
+          mkdir -p /tmp/reprotest
+          fail=0
           for f in examples/*.ne; do
-            echo "==> Compiling $f"
-            cargo run --release -- build "$f"
+            name=$(basename "$f" .ne)
+            ./target/release/nescript build "$f" --output "/tmp/reprotest/$name.nes"
+            if ! cmp -s "examples/$name.nes" "/tmp/reprotest/$name.nes"; then
+              echo "::error file=examples/$name.ne::committed examples/$name.nes is stale; rerun \`cargo run --release -- build examples/$name.ne\` and commit the new ROM"
+              fail=1
+            fi
           done
+          if [ $fail -ne 0 ]; then
+            exit 1
+          fi
       - name: Verify ROMs are valid iNES
         run: |
           for f in examples/*.nes; do
@@ -83,8 +97,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -110,14 +122,9 @@ jobs:
             libxkbcommon0 \
             libxrandr2 \
             libasound2t64
-      - name: Build compiler
-        run: cargo build --release
-      - name: Compile all .ne examples
-        run: |
-          for f in examples/*.ne; do
-            echo "==> Compiling $f"
-            ./target/release/nescript build "$f"
-          done
+      # No compiler build needed — the `.nes` files are committed
+      # alongside their `.ne` sources, and the `examples` CI job
+      # fails on any stale ROM, so the emulator job can trust them.
       - name: Install emulator harness dependencies
         working-directory: tests/emulator
         run: npm ci

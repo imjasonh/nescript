@@ -15,6 +15,13 @@ re-derive the project conventions from scratch.
   pipeline.
 - Examples live in `examples/*.ne`. Every example is expected to compile
   cleanly and has a pinned emulator golden — see below.
+- **`examples/*.nes` is committed.** The compiler is deterministic
+  (same source → byte-identical ROM), so the ROMs travel with the
+  repo. If you edit any `.ne` file you **must** rebuild its `.nes`
+  in the same commit — CI's `examples` job rebuilds each ROM into a
+  tmp path and fails if the committed version differs, pointing at
+  the exact `cargo run -- build examples/<name>.ne` to run. The
+  pre-commit hook under `scripts/pre-commit` catches this locally.
 - `docs/future-work.md` lists the remaining gaps. If you implement
   something from that file, update the doc in the same PR.
 
@@ -63,20 +70,28 @@ tests/emulator/
 The harness is **separate** from `cargo test`. You have to run it by hand:
 
 ```bash
-# 1. Build every example first. The harness reads pre-built .nes files
-#    from examples/ — it will not invoke cargo.
-cargo build --release
-for f in examples/*.ne; do ./target/release/nescript build "$f"; done
-
-# 2. Install node deps (once per worktree; node_modules/ is gitignored).
+# 1. Install node deps (once per worktree; node_modules/ is gitignored).
 cd tests/emulator
 npm install          # or `npm ci` in CI
 
-# 3. Verify every example still matches its golden.
+# 2. Verify every committed ROM still matches its golden.
 node run_examples.mjs
-# → "21/21 ROMs match their goldens" on success
+# → "22/22 ROMs match their goldens" on success
 # → FAIL / MISS lines + `actual/<name>.png`, `actual/<name>.diff.png`,
 #   `actual/<name>.wav` written for any ROM that mismatched
+```
+
+The harness reads the committed `examples/*.nes` files directly —
+since those are rebuilt and diffed by the `examples` CI job, the
+emulator job doesn't need a compiler toolchain at all. If you're
+iterating on the compiler locally, rebuild the example ROM(s) you
+care about before re-running the harness:
+
+```bash
+cargo build --release
+./target/release/nescript build examples/hello_sprite.ne
+# then:
+(cd tests/emulator && node run_examples.mjs)
 ```
 
 ### Updating goldens
