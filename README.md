@@ -4,6 +4,10 @@ A statically-typed, compiled programming language for NES game development.
 
 NEScript compiles `.ne` source files directly into playable iNES ROM files, with no external assembler or linker dependencies. The compiler handles everything from source text to a ROM you can run in any NES emulator.
 
+![Platformer demo](docs/platformer.gif)
+
+_Source: [`examples/platformer.ne`](examples/platformer.ne)_
+
 ## Quick Start
 
 ```bash
@@ -81,6 +85,7 @@ start Main
 | [`structs_enums_for.ne`](examples/structs_enums_for.ne) | Structs, enums, `for` loops, struct literals |
 | [`inline_asm_demo.ne`](examples/inline_asm_demo.ne) | Inline asm with `{var}` substitution, `poke`/`peek` |
 | [`audio_demo.ne`](examples/audio_demo.ne) | Audio subsystem: user `sfx`/`music` blocks, builtin effects, `play`/`start_music`/`stop_music` |
+| [`platformer.ne`](examples/platformer.ne) | **End-to-end side-scroller** — custom CHR tileset, full background nametable, metasprite player with gravity/jump physics, wrap-around scrolling, enemies, coins, user-declared SFX + music, and a Title → Playing state machine with auto-play for the headless harness |
 
 ## Compiler Commands
 
@@ -121,7 +126,7 @@ NEScript implements all five planned milestones:
 | M4: Optimization | Done | Strength reduction, ZP promotion, type casting, asm-dump |
 | M5: Bank Switching | Done | MMC1/UxROM/MMC3, bank declarations, software mul/div |
 
-465 tests across the lexer, parser, analyzer, IR, optimizer, codegen, assembler, linker, runtime, ROM, and asset modules, with CI running fmt, clippy, test, and example compilation on every push.
+497 tests across the lexer, parser, analyzer, IR, optimizer, codegen, assembler, linker, runtime, ROM, and asset modules, with CI running fmt, clippy, test, and example compilation on every push.
 
 ## License
 

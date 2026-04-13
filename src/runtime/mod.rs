@@ -160,13 +160,37 @@ pub fn gen_init() -> Vec<Instruction> {
         AM::LabelRelative("__vblankwait2".into()),
     ));
 
-    // Enable PPU (sprites from pattern table 0, enable NMI)
+    // Enable NMI so the frame handshake fires every vblank. We
+    // deliberately leave PPU_MASK at 0 (rendering fully disabled)
+    // here — the linker splices in palette and background loads
+    // after this init, and $2007 writes during active rendering
+    // corrupt their target addresses via the PPU's v-register
+    // auto-increment glitch. Rendering is enabled by the linker
+    // *after* all initial VRAM loads complete, via `gen_enable_rendering`.
     out.push(Instruction::new(LDA, AM::Immediate(0x80))); // enable NMI
     out.push(Instruction::new(STA, AM::Absolute(PPU_CTRL)));
-    out.push(Instruction::new(LDA, AM::Immediate(0x10))); // show sprites
-    out.push(Instruction::new(STA, AM::Absolute(PPU_MASK)));
 
     out
+}
+
+/// Emit the `PPU_MASK` write that turns on rendering. Called by
+/// the linker at the very end of the reset path, after all
+/// initial palette / background loads are done, so the initial
+/// VRAM writes are never corrupted by a mid-frame `$2007` glitch.
+///
+/// `show_background` controls whether the background layer is
+/// enabled alongside the sprite layer — programs that declare a
+/// `background` block want both, programs that don't can skip
+/// the background bit to match the pre-fix behaviour.
+#[must_use]
+pub fn gen_enable_rendering(show_background: bool) -> Vec<Instruction> {
+    // $1E = show bg + sprites + left-8-px for both
+    // $10 = show sprites only (no bg)
+    let mask = if show_background { 0x1E } else { 0x10 };
+    vec![
+        Instruction::new(LDA, AM::Immediate(mask)),
+        Instruction::new(STA, AM::Absolute(PPU_MASK)),
+    ]
 }
 
 /// Generate the NMI handler.
@@ -176,8 +200,17 @@ pub fn gen_init() -> Vec<Instruction> {
 /// palette / nametable update helper. When false, the handler skips
 /// that block entirely so programs that never call `set_palette` /
 /// `load_background` pay zero cycles or bytes for the feature.
+///
+/// `has_audio` controls whether the handler calls the audio tick.
+/// When true, the JSR to `__audio_tick` is emitted *after* the
+/// register and scratch-slot saves, so the tick is free to trash
+/// A/X/Y and the mul/state ZP scratch ($02/$03) without corrupting
+/// the user's main-loop state. Placing the JSR outside the
+/// save/restore window used to silently clobber `ZP_CURRENT_STATE`
+/// whenever a music note was played (the tick's period-table
+/// lookup stashes the table's high byte into $03).
 #[must_use]
-pub fn gen_nmi(has_ppu_updates: bool) -> Vec<Instruction> {
+pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool) -> Vec<Instruction> {
     let mut out = Vec::new();
 
     // Save registers
@@ -186,6 +219,24 @@ pub fn gen_nmi(has_ppu_updates: bool) -> Vec<Instruction> {
     out.push(Instruction::implied(PHA));
     out.push(Instruction::implied(TYA));
     out.push(Instruction::implied(PHA));
+
+    // Save the multiply/divide scratch slots ($02/$03). $03 doubles
+    // as `ZP_CURRENT_STATE` for the state dispatch, and user code
+    // mid-multiply/divide has both slots live; preserving them here
+    // keeps the invariant that NMI never clobbers user-visible ZP
+    // state.
+    out.push(Instruction::new(LDA, AM::ZeroPage(0x02)));
+    out.push(Instruction::implied(PHA));
+    out.push(Instruction::new(LDA, AM::ZeroPage(0x03)));
+    out.push(Instruction::implied(PHA));
+
+    // Run the audio driver's per-frame tick *after* the saves so it
+    // can freely reuse A/X/Y and the $02/$03 scratch slots without
+    // corrupting anything the main loop cares about. Programs that
+    // never touch audio skip this splice entirely — no ROM cost.
+    if has_audio {
+        out.push(Instruction::new(JSR, AM::Label("__audio_tick".into())));
+    }
 
     // OAM DMA — transfer sprite data from $0200
     out.push(Instruction::new(LDA, AM::Immediate(0x00)));
@@ -227,6 +278,13 @@ pub fn gen_nmi(has_ppu_updates: bool) -> Vec<Instruction> {
     // Set frame-ready flag
     out.push(Instruction::new(LDA, AM::Immediate(0x01)));
     out.push(Instruction::new(STA, AM::ZeroPage(ZP_FRAME_FLAG)));
+
+    // Restore the mul/state scratch slots ($03 then $02, reverse
+    // order of the PHA pushes above).
+    out.push(Instruction::implied(PLA));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+    out.push(Instruction::implied(PLA));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
 
     // Restore registers
     out.push(Instruction::implied(PLA));
