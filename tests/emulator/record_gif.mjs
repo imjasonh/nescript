@@ -12,6 +12,18 @@
 // At stride=2 we end up with a 30 fps GIF that maps 1:1 to every
 // other NES frame (NES runs at ~60 fps), which is the right
 // tradeoff between smoothness and file size for a README demo.
+//
+// IMPORTANT: `docs/platformer.gif` is committed and embedded in the
+// README. Any change to the compiler, the runtime, the harness, or
+// `examples/platformer.ne` that alters the gameplay you see in the
+// first ~6 seconds of the demo must be followed by
+//
+//     node tests/emulator/record_gif.mjs platformer 360 2 docs/platformer.gif
+//
+// committed alongside the source change. The CI `emulator` job
+// regenerates the gif and fails if the committed copy is stale —
+// gifenc + jsnes are deterministic, so the freshly-rendered bytes
+// byte-match a valid commit. See `.github/workflows/ci.yml`.
 
 import { promises as fs } from "node:fs";
 import path from "node:path";

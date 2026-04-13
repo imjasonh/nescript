@@ -22,6 +22,22 @@ re-derive the project conventions from scratch.
   tmp path and fails if the committed version differs, pointing at
   the exact `cargo run -- build examples/<name>.ne` to run. The
   pre-commit hook under `scripts/pre-commit` catches this locally.
+- **`docs/platformer.gif` is committed** and embedded in the
+  top-level README as the project demo. `gifenc` + `jsnes` are
+  deterministic, so the gif's bytes are a function of the compiler,
+  the runtime, the harness, and `examples/platformer.ne`. Any change
+  to those that affects the first ~6 seconds of observable platformer
+  gameplay must be followed by regenerating the gif:
+
+  ```bash
+  node tests/emulator/record_gif.mjs platformer 360 2 docs/platformer.gif
+  ```
+
+  and committing it in the same change. CI's `emulator` job renders
+  a fresh gif and fails if the committed one doesn't byte-match. The
+  pre-commit hook rebuilds the gif when `platformer.ne`, `platformer.nes`,
+  `record_gif.mjs`, or `harness.html` is staged (and `tests/emulator/node_modules`
+  is installed).
 - `docs/future-work.md` lists the remaining gaps. If you implement
   something from that file, update the doc in the same PR.
 
