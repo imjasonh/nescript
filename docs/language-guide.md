@@ -641,21 +641,26 @@ Set the PPU scroll position:
 scroll(scroll_x, scroll_y)
 ```
 
-### Load Background
-
-Load a background nametable:
-
-```
-load_background TitleBG
-```
-
 ### Set Palette
 
-Apply a palette:
+```
+set_palette NightPalette
+```
+
+Queues the named palette for a vblank-safe copy into PPU palette
+RAM (`$3F00-$3F1F`). The write is applied by the NMI handler on the
+next vblank. See `palette` declarations below.
+
+### Load Background
 
 ```
-set_palette GamePalette
+load_background Level1
 ```
+
+Queues the named background (a full-screen 32×30 nametable + 64-byte
+attribute table) for a vblank-safe copy into nametable 0
+(`$2000-$23FF`). Applied by the NMI handler at the next vblank. See
+`background` declarations below.
 
 ### Function Calls as Statements
 
@@ -682,26 +687,69 @@ sprite Coin {
 
 ### Palette Declarations
 
-Define color palettes using NES PPU color indices (`$00`-`$3F`):
-
 ```
-palette GamePalette {
-    colors: [0x0F, 0x00, 0x10, 0x30,
-             0x0F, 0x07, 0x17, 0x27,
+palette MainPalette {
+    colors: [0x0F, 0x01, 0x11, 0x21,
+             0x0F, 0x06, 0x16, 0x26,
              0x0F, 0x09, 0x19, 0x29,
-             0x0F, 0x01, 0x11, 0x21]
+             0x0F, 0x0B, 0x1B, 0x2B,
+             0x0F, 0x01, 0x11, 0x21,
+             0x0F, 0x16, 0x27, 0x30,
+             0x0F, 0x14, 0x24, 0x34,
+             0x0F, 0x0B, 0x1B, 0x2B]
 }
 ```
 
-Each group of 4 values is a sub-palette. The first color is typically `0x0F` (black) as the shared background color.
+Each byte is an NES master-palette index (`$00-$3F`). The 32 bytes
+map directly to PPU palette RAM `$3F00-$3F1F` in the canonical NES
+layout:
+
+| Offset          | Contents                            |
+|-----------------|-------------------------------------|
+| `$00`-`$03`    | Background sub-palette 0 (4 colours) |
+| `$04`-`$07`    | Background sub-palette 1             |
+| `$08`-`$0B`    | Background sub-palette 2             |
+| `$0C`-`$0F`    | Background sub-palette 3             |
+| `$10`-`$13`    | Sprite sub-palette 0                 |
+| `$14`-`$17`    | Sprite sub-palette 1                 |
+| `$18`-`$1B`    | Sprite sub-palette 2                 |
+| `$1C`-`$1F`    | Sprite sub-palette 3                 |
+
+The first byte of each sub-palette is typically `$0F` (black); it
+serves as the shared background colour. Lists shorter than 32 bytes
+are zero-padded; lists longer than 32 are a compile error.
+
+The *first* `palette` declared in a program is loaded into VRAM at
+reset time, before rendering is enabled, so the title screen boots
+with the right colours on frame 0. Additional declarations sit in
+PRG ROM as named data blobs and become active via `set_palette Name`,
+which queues the write for the next vblank.
 
 ### Background Declarations
 
 ```
-background TitleBG {
-    chr: @chr("assets/title_screen.png")
+background TitleScreen {
+    tiles: [0x00, 0x01, 0x01, 0x00,  /* ... up to 960 bytes ... */]
+    attributes: [0xFF, 0x55,         /* ... up to 64 bytes ... */]
 }
 ```
+
+A background is a 32×30 nametable. `tiles` is the nametable itself
+— 960 bytes of CHR tile indices, one per 8×8 cell, in row-major
+order (left-to-right, top-to-bottom). `attributes` is the 8×8
+attribute table (64 bytes) that controls which sub-palette each
+16×16 metatile uses.
+
+Both lists are zero-padded up to their fixed sizes; `attributes`
+may be omitted entirely, in which case every cell uses background
+sub-palette 0.
+
+The *first* `background` declared is loaded into nametable 0 at
+reset time and background rendering is enabled automatically.
+Additional backgrounds can be swapped in via `load_background Name`,
+which queues the update for the next vblank. Full-nametable updates
+do not fit inside a single vblank, so large background swaps may
+require the program to disable rendering temporarily.
 
 ### Asset Sources
 
@@ -964,7 +1012,6 @@ reference NEScript variables.
 | Code   | Description                |
 |--------|----------------------------|
 | E0201  | Type mismatch              |
-| E0202  | Invalid cast               |
 | E0203  | Invalid operation for type |
 
 ### Memory Errors (E03xx)
@@ -979,7 +1026,6 @@ reference NEScript variables.
 |--------|----------------------------|
 | E0401  | Call depth exceeded        |
 | E0402  | Recursion detected         |
-| E0403  | Unreachable state          |
 | E0404  | Transition to undefined state |
 
 ### Declaration Errors (E05xx)
@@ -999,7 +1045,7 @@ reference NEScript variables.
 | W0101  | Expensive multiply/divide operation      |
 | W0102  | Loop without break or wait_frame         |
 | W0103  | Unused variable                          |
-| W0104  | Unreachable code                         |
+| W0104  | Unreachable code (after return/break/transition, or state unreachable from start) |
 
 ### Example Error Output
 

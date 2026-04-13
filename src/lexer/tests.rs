@@ -145,6 +145,8 @@ fn lex_all_keywords() {
         ("sprite", TokenKind::KwSprite),
         ("background", TokenKind::KwBackground),
         ("palette", TokenKind::KwPalette),
+        ("load_background", TokenKind::KwLoadBackground),
+        ("set_palette", TokenKind::KwSetPalette),
         ("draw", TokenKind::KwDraw),
         ("play", TokenKind::KwPlay),
         ("asm", TokenKind::KwAsm),

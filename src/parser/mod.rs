@@ -672,46 +672,35 @@ impl Parser {
         })
     }
 
+    // ── Palette / Background declarations ──
+
+    /// `palette Name { colors: [c0, c1, ..., c31] }` — declares a
+    /// 32-byte PPU palette. Colors shorter than 32 are zero-padded
+    /// by the analyzer; colors longer than 32 are rejected.
     fn parse_palette_decl(&mut self) -> Result<PaletteDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwPalette)?;
         let (name, _) = self.expect_ident()?;
         self.expect(&TokenKind::LBrace)?;
 
-        let mut colors = None;
-
+        let mut colors: Option<Vec<u8>> = None;
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
-            let (key, _) = self.expect_ident()?;
+            let (key, key_span) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             match key.as_str() {
                 "colors" => {
-                    self.expect(&TokenKind::LBracket)?;
-                    let mut vals = Vec::new();
-                    while *self.peek() != TokenKind::RBracket && *self.peek() != TokenKind::Eof {
-                        if let TokenKind::IntLiteral(v) = self.peek().clone() {
-                            self.advance();
-                            vals.push(v as u8);
-                        } else {
-                            return Err(Diagnostic::error(
-                                ErrorCode::E0201,
-                                format!("expected color index, found '{}'", self.peek()),
-                                self.current_span(),
-                            ));
-                        }
-                        if *self.peek() == TokenKind::Comma {
-                            self.advance();
-                        }
-                    }
-                    self.expect(&TokenKind::RBracket)?;
-                    colors = Some(vals);
+                    colors = Some(self.parse_byte_array("colors")?);
                 }
                 _ => {
                     return Err(Diagnostic::error(
                         ErrorCode::E0201,
                         format!("unknown palette property '{key}'"),
-                        self.current_span(),
+                        key_span,
                     ));
                 }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
             }
         }
         self.expect(&TokenKind::RBrace)?;
@@ -731,43 +720,55 @@ impl Parser {
         })
     }
 
+    /// `background Name { tiles: [...], attributes: [...] }` — the
+    /// tiles array is the 32×30 nametable (up to 960 bytes); the
+    /// attributes array is the 8×8 attribute table (up to 64 bytes).
+    /// Both shorter and omitted arrays are zero-padded by the
+    /// analyzer. Longer arrays are rejected.
     fn parse_background_decl(&mut self) -> Result<BackgroundDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwBackground)?;
         let (name, _) = self.expect_ident()?;
         self.expect(&TokenKind::LBrace)?;
 
-        let mut chr_source = None;
-
+        let mut tiles: Option<Vec<u8>> = None;
+        let mut attributes: Option<Vec<u8>> = None;
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
-            let (key, _) = self.expect_ident()?;
+            let (key, key_span) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             match key.as_str() {
-                "chr" => {
-                    chr_source = Some(self.parse_asset_source()?);
+                "tiles" => {
+                    tiles = Some(self.parse_byte_array("tiles")?);
+                }
+                "attributes" => {
+                    attributes = Some(self.parse_byte_array("attributes")?);
                 }
                 _ => {
                     return Err(Diagnostic::error(
                         ErrorCode::E0201,
                         format!("unknown background property '{key}'"),
-                        self.current_span(),
+                        key_span,
                     ));
                 }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
             }
         }
         self.expect(&TokenKind::RBrace)?;
 
-        let chr_source = chr_source.ok_or_else(|| {
+        let tiles = tiles.ok_or_else(|| {
             Diagnostic::error(
                 ErrorCode::E0201,
-                "background requires 'chr' property",
+                "background requires 'tiles' property",
                 start,
             )
         })?;
 
         Ok(BackgroundDecl {
             name,
-            chr_source,
+            tiles,
+            attributes: attributes.unwrap_or_default(),
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }

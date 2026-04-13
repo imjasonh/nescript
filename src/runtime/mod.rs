@@ -60,6 +60,26 @@ pub const ZP_SFX_COUNTER: u8 = 0x0A;
 /// advances to the next (pitch, duration) pair.
 pub const ZP_MUSIC_COUNTER: u8 = 0x0B;
 
+// ── PPU update handshake ──
+//
+// When a program declares `palette` or `background` blocks the
+// analyzer reserves `$11-$17` as runtime state for the vblank-safe
+// update path. User code sets these from inside a frame handler
+// (via `set_palette` / `load_background`), and the NMI handler
+// applies any pending update while the PPU is blanked, then
+// clears the flags.
+
+/// Bitfield of pending PPU updates.
+///   bit 0 = 1 → palette at `ZP_PENDING_PALETTE_*` is pending
+///   bit 1 = 1 → background at `ZP_PENDING_BG_TILES_*` / `_ATTRS_*` is pending
+pub const ZP_PPU_UPDATE_FLAGS: u8 = 0x11;
+pub const ZP_PENDING_PALETTE_LO: u8 = 0x12;
+pub const ZP_PENDING_PALETTE_HI: u8 = 0x13;
+pub const ZP_PENDING_BG_TILES_LO: u8 = 0x14;
+pub const ZP_PENDING_BG_TILES_HI: u8 = 0x15;
+pub const ZP_PENDING_BG_ATTRS_LO: u8 = 0x16;
+pub const ZP_PENDING_BG_ATTRS_HI: u8 = 0x17;
+
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
 pub fn gen_init() -> Vec<Instruction> {
@@ -151,7 +171,13 @@ pub fn gen_init() -> Vec<Instruction> {
 
 /// Generate the NMI handler.
 /// Called every vblank by the NES hardware.
-pub fn gen_nmi() -> Vec<Instruction> {
+///
+/// `has_ppu_updates` controls whether the handler runs the
+/// palette / nametable update helper. When false, the handler skips
+/// that block entirely so programs that never call `set_palette` /
+/// `load_background` pay zero cycles or bytes for the feature.
+#[must_use]
+pub fn gen_nmi(has_ppu_updates: bool) -> Vec<Instruction> {
     let mut out = Vec::new();
 
     // Save registers
@@ -166,6 +192,14 @@ pub fn gen_nmi() -> Vec<Instruction> {
     out.push(Instruction::new(STA, AM::Absolute(OAM_ADDR)));
     out.push(Instruction::new(LDA, AM::Immediate(0x02)));
     out.push(Instruction::new(STA, AM::Absolute(OAM_DMA)));
+
+    // PPU updates: check the flags byte, apply any pending palette
+    // or background write. Runs inside vblank where $2006/$2007
+    // writes are safe. Gated on `has_ppu_updates` so programs that
+    // never touch palette or background decls skip this entirely.
+    if has_ppu_updates {
+        out.extend(gen_ppu_update_apply());
+    }
 
     // Read controller 1
     out.push(Instruction::new(LDA, AM::Immediate(0x01)));
@@ -210,6 +244,265 @@ pub fn gen_nmi() -> Vec<Instruction> {
 /// Generate the IRQ handler (just RTI for now).
 pub fn gen_irq() -> Vec<Instruction> {
     vec![Instruction::implied(RTI)]
+}
+
+/// Generate the in-NMI PPU update helper. Checks
+/// [`ZP_PPU_UPDATE_FLAGS`] and, if any bit is set, copies the
+/// corresponding blob from PRG ROM to PPU RAM via `$2006`/`$2007`.
+/// Safe because the NMI fires at the start of vblank, giving
+/// ~2273 CPU cycles of safe PPU write time — enough for a full
+/// palette (32 bytes, ~200 cycles) plus a full nametable
+/// (1024 bytes, ~6500 cycles; this doesn't fit in a single frame
+/// so big updates should be staged by the caller).
+///
+/// For simplicity and to keep the NMI bounded, this helper writes
+/// the palette first and the nametable second, and only one of
+/// each can be pending at a time. If a nametable write is larger
+/// than vblank allows the program is responsible for either
+/// keeping rendering disabled or splitting the update.
+///
+/// The helper clears the pending flag only for updates it actually
+/// applied, so if a program ever queues a palette and a nametable
+/// in the same frame both land on the same NMI.
+fn gen_ppu_update_apply() -> Vec<Instruction> {
+    let mut out = Vec::new();
+
+    // Read flags. If zero, jump straight to the done label.
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_PPU_UPDATE_FLAGS)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__ppu_update_done".into()),
+    ));
+
+    // ── palette update (bit 0) ────────────────────────────────
+    // Check bit 0; if clear, skip to background.
+    out.push(Instruction::new(AND, AM::Immediate(0x01)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__ppu_update_no_palette".into()),
+    ));
+    // Set PPU addr to $3F00.
+    out.push(Instruction::new(LDA, AM::Absolute(PPU_STATUS)));
+    out.push(Instruction::new(LDA, AM::Immediate(0x3F)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    // Loop: write 32 bytes via `LDA (zp),Y` indirect-indexed from
+    // the pending palette pointer at $12/$13.
+    out.push(Instruction::new(LDY, AM::Immediate(0x00)));
+    out.push(Instruction::new(NOP, AM::Label("__ppu_pal_loop".into())));
+    out.push(Instruction::new(LDA, AM::IndirectY(ZP_PENDING_PALETTE_LO)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2007)));
+    out.push(Instruction::implied(INY));
+    out.push(Instruction::new(CPY, AM::Immediate(32)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__ppu_pal_loop".into()),
+    ));
+
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__ppu_update_no_palette".into()),
+    ));
+
+    // ── background update (bit 1) ────────────────────────────
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_PPU_UPDATE_FLAGS)));
+    out.push(Instruction::new(AND, AM::Immediate(0x02)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__ppu_update_no_bg".into()),
+    ));
+    // Nametable 0 starts at $2000.
+    out.push(Instruction::new(LDA, AM::Absolute(PPU_STATUS)));
+    out.push(Instruction::new(LDA, AM::Immediate(0x20)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    // Write 960 bytes as 4 loops of 240 (so Y fits in u8) — simpler
+    // to write as an outer X counter across 4 × 240-byte pages.
+    // X = 4 pages to go
+    out.push(Instruction::new(LDX, AM::Immediate(4)));
+    out.push(Instruction::new(NOP, AM::Label("__ppu_bg_outer".into())));
+    out.push(Instruction::new(LDY, AM::Immediate(0x00)));
+    out.push(Instruction::new(NOP, AM::Label("__ppu_bg_inner".into())));
+    out.push(Instruction::new(LDA, AM::IndirectY(ZP_PENDING_BG_TILES_LO)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2007)));
+    out.push(Instruction::implied(INY));
+    out.push(Instruction::new(CPY, AM::Immediate(240)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__ppu_bg_inner".into()),
+    ));
+    // After each 240-byte block, bump the pointer by 240 so the
+    // next block reads from the following chunk of the blob.
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_PENDING_BG_TILES_LO)));
+    out.push(Instruction::new(CLC, AM::Implied));
+    out.push(Instruction::new(ADC, AM::Immediate(240)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_PENDING_BG_TILES_LO)));
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_PENDING_BG_TILES_HI)));
+    out.push(Instruction::new(ADC, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_PENDING_BG_TILES_HI)));
+    out.push(Instruction::implied(DEX));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__ppu_bg_outer".into()),
+    ));
+    // Now write the 64-byte attribute table (at $23C0 — right after
+    // the nametable we just wrote). The PPU auto-increment sits at
+    // $23C0 already since we wrote exactly 960 bytes after $2000.
+    out.push(Instruction::new(LDY, AM::Immediate(0x00)));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__ppu_bg_attr_loop".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::IndirectY(ZP_PENDING_BG_ATTRS_LO)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2007)));
+    out.push(Instruction::implied(INY));
+    out.push(Instruction::new(CPY, AM::Immediate(64)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__ppu_bg_attr_loop".into()),
+    ));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__ppu_update_no_bg".into()),
+    ));
+
+    // Clear all pending flags. Programs re-queue every frame if
+    // they want repeating updates.
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_PPU_UPDATE_FLAGS)));
+
+    out.push(Instruction::new(NOP, AM::Label("__ppu_update_done".into())));
+
+    out
+}
+
+/// Emit a reset-time write of a 32-byte palette blob (referenced
+/// by label) to PPU `$3F00-$3F1F`. Rendering must be disabled
+/// when this runs (it is, between `gen_init` and the linker's PPU
+/// rendering-enable step). Uses the scratch ZP slots `$02/$03` to
+/// hold the indirect pointer — safe because nothing else runs
+/// between `gen_init` and user code.
+#[must_use]
+pub fn gen_initial_palette_load(label: &str) -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(LDA, AM::Absolute(PPU_STATUS))); // reset latch
+    out.push(Instruction::new(LDA, AM::Immediate(0x3F)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    // Stash the palette label into scratch ZP for indirect LDA.
+    out.push(Instruction::new(LDA, AM::SymbolLo(label.to_string())));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+    out.push(Instruction::new(LDA, AM::SymbolHi(label.to_string())));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+    out.push(Instruction::new(LDY, AM::Immediate(0x00)));
+    let loop_label = format!("__init_pal_loop_{label}");
+    out.push(Instruction::new(NOP, AM::Label(loop_label.clone())));
+    out.push(Instruction::new(LDA, AM::IndirectY(0x02)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2007)));
+    out.push(Instruction::implied(INY));
+    out.push(Instruction::new(CPY, AM::Immediate(32)));
+    out.push(Instruction::new(BNE, AM::LabelRelative(loop_label)));
+    out
+}
+
+/// Emit a reset-time write of a 960-byte nametable + 64-byte
+/// attribute table blob to nametable 0 (`$2000-$23FF`). Rendering
+/// must be disabled when this runs. The caller passes the label of
+/// the tiles blob and the label of the attribute blob separately —
+/// the linker emits them as adjacent data blocks so they can be
+/// resolved independently.
+#[must_use]
+pub fn gen_initial_background_load(tiles_label: &str, attrs_label: &str) -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(LDA, AM::Absolute(PPU_STATUS)));
+    out.push(Instruction::new(LDA, AM::Immediate(0x20)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+
+    // Write 960 bytes of tile data as 4 × 240 using two nested
+    // counters. We stash the outer page index in a scratch ZP slot
+    // because X is too small to index a 960-byte range directly.
+    out.push(Instruction::new(LDX, AM::Immediate(0x00)));
+    let page_loop = format!("__init_bg_page_{tiles_label}");
+    let inner_loop = format!("__init_bg_inner_{tiles_label}");
+    out.push(Instruction::new(NOP, AM::Label(page_loop.clone())));
+    // Per-page offset: X*240. Computed via Y and clamped at 240.
+    out.push(Instruction::new(LDY, AM::Immediate(0x00)));
+    out.push(Instruction::new(NOP, AM::Label(inner_loop.clone())));
+    // Fetch byte at blob[X*240 + Y]. We materialize the effective
+    // absolute address by unrolling 4 separate LDA Absolute,Y
+    // instructions, one per page, dispatched on X.
+    // For simplicity and correctness we take the slower path:
+    // compute (blob + X*240) as a ZP pointer and read via
+    // `LDA (zp),Y`.
+    // ZP scratch at $02/$03 (same slots used by the multiply/divide
+    // contract; gen_init runs before any user code so they're free).
+    out.push(Instruction::new(LDA, AM::SymbolLo(tiles_label.to_string())));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+    out.push(Instruction::new(LDA, AM::SymbolHi(tiles_label.to_string())));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+    // Add X*240 to the low byte (high byte carries via ADC).
+    // Actually — to keep this simple, we instead track bytes
+    // remaining as a 16-bit counter and use a generic LDA (ZP),Y
+    // loop. Rewrite the routine as a flat byte-counted loop.
+    // (Undo the per-page setup above by rebuilding the output
+    // vector from scratch.)
+    out.clear();
+
+    out.push(Instruction::new(LDA, AM::Absolute(PPU_STATUS)));
+    out.push(Instruction::new(LDA, AM::Immediate(0x20)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+
+    // Load tile blob pointer into $02/$03 scratch slots.
+    out.push(Instruction::new(LDA, AM::SymbolLo(tiles_label.to_string())));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+    out.push(Instruction::new(LDA, AM::SymbolHi(tiles_label.to_string())));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+
+    // 4 pages × 240 bytes each = 960 bytes total.
+    out.push(Instruction::new(LDX, AM::Immediate(4)));
+    let outer = format!("__init_bg_outer_{tiles_label}");
+    let inner = format!("__init_bg_inner_{tiles_label}");
+    out.push(Instruction::new(NOP, AM::Label(outer.clone())));
+    out.push(Instruction::new(LDY, AM::Immediate(0x00)));
+    out.push(Instruction::new(NOP, AM::Label(inner.clone())));
+    out.push(Instruction::new(LDA, AM::IndirectY(0x02)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2007)));
+    out.push(Instruction::implied(INY));
+    out.push(Instruction::new(CPY, AM::Immediate(240)));
+    out.push(Instruction::new(BNE, AM::LabelRelative(inner)));
+    // Advance pointer by 240.
+    out.push(Instruction::new(LDA, AM::ZeroPage(0x02)));
+    out.push(Instruction::new(CLC, AM::Implied));
+    out.push(Instruction::new(ADC, AM::Immediate(240)));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+    out.push(Instruction::new(LDA, AM::ZeroPage(0x03)));
+    out.push(Instruction::new(ADC, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+    out.push(Instruction::implied(DEX));
+    out.push(Instruction::new(BNE, AM::LabelRelative(outer)));
+
+    // Now the 64 attribute bytes land at $23C0 — the PPU auto-
+    // increment is already there after the 960 tile writes.
+    out.push(Instruction::new(LDA, AM::SymbolLo(attrs_label.to_string())));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+    out.push(Instruction::new(LDA, AM::SymbolHi(attrs_label.to_string())));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+    out.push(Instruction::new(LDY, AM::Immediate(0x00)));
+    let attr_loop = format!("__init_bg_attr_{attrs_label}");
+    out.push(Instruction::new(NOP, AM::Label(attr_loop.clone())));
+    out.push(Instruction::new(LDA, AM::IndirectY(0x02)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2007)));
+    out.push(Instruction::implied(INY));
+    out.push(Instruction::new(CPY, AM::Immediate(64)));
+    out.push(Instruction::new(BNE, AM::LabelRelative(attr_loop)));
+    out
 }
 
 /// Zero-page locations used by multiply/divide routines.

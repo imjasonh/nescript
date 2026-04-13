@@ -11,4 +11,6 @@ pub use audio::{
 };
 pub use chr::png_to_chr;
 pub use palette::{nearest_nes_color, NES_COLORS};
-pub use resolve::resolve_sprites;
+pub use resolve::{
+    resolve_backgrounds, resolve_palettes, resolve_sprites, BackgroundData, PaletteData,
+};

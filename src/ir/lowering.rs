@@ -525,8 +525,11 @@ impl LoweringContext {
                 let y = self.lower_expr(y_expr);
                 self.emit(IrOp::Scroll(x, y));
             }
-            Statement::LoadBackground(_, _) | Statement::SetPalette(_, _) => {
-                // TODO: implement in asset pipeline
+            Statement::SetPalette(name, _) => {
+                self.emit(IrOp::SetPalette(name.clone()));
+            }
+            Statement::LoadBackground(name, _) => {
+                self.emit(IrOp::LoadBackground(name.clone()));
             }
             Statement::DebugLog(args, _) => {
                 let temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
@@ -634,16 +637,7 @@ impl LoweringContext {
                                 self.emit(IrOp::StoreVarHi(var_id, d_hi));
                             }
                         } else {
-                            let ir_op = match op {
-                                AssignOp::PlusAssign => IrOp::Add(result, current, rhs),
-                                AssignOp::MinusAssign => IrOp::Sub(result, current, rhs),
-                                AssignOp::AmpAssign => IrOp::And(result, current, rhs),
-                                AssignOp::PipeAssign => IrOp::Or(result, current, rhs),
-                                AssignOp::CaretAssign => IrOp::Xor(result, current, rhs),
-                                AssignOp::ShiftLeftAssign => IrOp::ShiftLeft(result, current, 1),
-                                AssignOp::ShiftRightAssign => IrOp::ShiftRight(result, current, 1),
-                                AssignOp::Assign => unreachable!(),
-                            };
+                            let ir_op = compound_assign_op(op, result, current, rhs, expr, self);
                             self.emit(ir_op);
                             self.emit(IrOp::StoreVar(var_id, result));
                             if dest_is_u16 {
@@ -667,16 +661,7 @@ impl LoweringContext {
                     let current = self.fresh_temp();
                     self.emit(IrOp::ArrayLoad(current, var_id, idx));
                     let result = self.fresh_temp();
-                    let ir_op = match op {
-                        AssignOp::PlusAssign => IrOp::Add(result, current, val),
-                        AssignOp::MinusAssign => IrOp::Sub(result, current, val),
-                        AssignOp::AmpAssign => IrOp::And(result, current, val),
-                        AssignOp::PipeAssign => IrOp::Or(result, current, val),
-                        AssignOp::CaretAssign => IrOp::Xor(result, current, val),
-                        AssignOp::ShiftLeftAssign => IrOp::ShiftLeft(result, current, 1),
-                        AssignOp::ShiftRightAssign => IrOp::ShiftRight(result, current, 1),
-                        AssignOp::Assign => unreachable!(),
-                    };
+                    let ir_op = compound_assign_op(op, result, current, val, expr, self);
                     self.emit(ir_op);
                     self.emit(IrOp::ArrayStore(var_id, idx, result));
                 }
@@ -698,16 +683,7 @@ impl LoweringContext {
                         self.emit(IrOp::LoadVar(current, var_id));
                         let rhs = self.lower_expr(expr);
                         let result = self.fresh_temp();
-                        let ir_op = match op {
-                            AssignOp::PlusAssign => IrOp::Add(result, current, rhs),
-                            AssignOp::MinusAssign => IrOp::Sub(result, current, rhs),
-                            AssignOp::AmpAssign => IrOp::And(result, current, rhs),
-                            AssignOp::PipeAssign => IrOp::Or(result, current, rhs),
-                            AssignOp::CaretAssign => IrOp::Xor(result, current, rhs),
-                            AssignOp::ShiftLeftAssign => IrOp::ShiftLeft(result, current, 1),
-                            AssignOp::ShiftRightAssign => IrOp::ShiftRight(result, current, 1),
-                            AssignOp::Assign => unreachable!(),
-                        };
+                        let ir_op = compound_assign_op(op, result, current, rhs, expr, self);
                         self.emit(ir_op);
                         self.emit(IrOp::StoreVar(var_id, result));
                     }
@@ -1036,6 +1012,27 @@ impl LoweringContext {
             _ => {}
         }
 
+        // Shift operators with a compile-time-constant RHS take a
+        // specialized path that bakes the count into the IR op. This
+        // also covers the common `x << 1` / `x >> 2` case where the
+        // RHS is a literal in the source.
+        if matches!(op, BinOp::ShiftLeft | BinOp::ShiftRight) {
+            if let Some(count) = self.eval_const(right) {
+                let l = self.lower_expr(left);
+                let t = self.fresh_temp();
+                // Shifting by ≥ 8 zeroes an 8-bit value; clamp so the
+                // codegen doesn't emit an absurd number of ASL/LSR.
+                let count = count.min(8) as u8;
+                let ir_op = if op == BinOp::ShiftLeft {
+                    IrOp::ShiftLeft(t, l, count)
+                } else {
+                    IrOp::ShiftRight(t, l, count)
+                };
+                self.emit(ir_op);
+                return t;
+            }
+        }
+
         let l = self.lower_expr(left);
         let r = self.lower_expr(right);
         let wide = self.is_wide(l) || self.is_wide(r);
@@ -1159,12 +1156,10 @@ impl LoweringContext {
             BinOp::Gt => self.emit(IrOp::CmpGt(t, l, r)),
             BinOp::LtEq => self.emit(IrOp::CmpLtEq(t, l, r)),
             BinOp::GtEq => self.emit(IrOp::CmpGtEq(t, l, r)),
-            BinOp::ShiftLeft => self.emit(IrOp::ShiftLeft(t, l, 1)), // TODO: dynamic shift
-            BinOp::ShiftRight => self.emit(IrOp::ShiftRight(t, l, 1)),
-            BinOp::Div | BinOp::Mod => {
-                // Software div/mod — emit as a call to runtime for now
-                self.emit(IrOp::LoadImm(t, 0));
-            }
+            BinOp::ShiftLeft => self.emit(IrOp::ShiftLeftVar(t, l, r)),
+            BinOp::ShiftRight => self.emit(IrOp::ShiftRightVar(t, l, r)),
+            BinOp::Div => self.emit(IrOp::Div(t, l, r)),
+            BinOp::Mod => self.emit(IrOp::Mod(t, l, r)),
             BinOp::And | BinOp::Or => unreachable!("handled above"),
         }
 
@@ -1261,5 +1256,42 @@ fn button_mask(button: &str) -> u8 {
         "left" => 0x02,
         "right" => 0x01,
         _ => 0x00,
+    }
+}
+
+/// Build the IR op for a compound-assignment `lhs OP= rhs`. The
+/// `rhs_expr` is consulted for shift counts so `x <<= 3` becomes
+/// `ShiftLeft(result, current, 3)` rather than a runtime shift. All
+/// other operators just map to their 3-address form over the already-
+/// lowered temps.
+fn compound_assign_op(
+    op: AssignOp,
+    result: IrTemp,
+    current: IrTemp,
+    rhs: IrTemp,
+    rhs_expr: &Expr,
+    ctx: &LoweringContext,
+) -> IrOp {
+    match op {
+        AssignOp::PlusAssign => IrOp::Add(result, current, rhs),
+        AssignOp::MinusAssign => IrOp::Sub(result, current, rhs),
+        AssignOp::AmpAssign => IrOp::And(result, current, rhs),
+        AssignOp::PipeAssign => IrOp::Or(result, current, rhs),
+        AssignOp::CaretAssign => IrOp::Xor(result, current, rhs),
+        AssignOp::ShiftLeftAssign => {
+            if let Some(n) = ctx.eval_const(rhs_expr) {
+                IrOp::ShiftLeft(result, current, n.min(8) as u8)
+            } else {
+                IrOp::ShiftLeftVar(result, current, rhs)
+            }
+        }
+        AssignOp::ShiftRightAssign => {
+            if let Some(n) = ctx.eval_const(rhs_expr) {
+                IrOp::ShiftRight(result, current, n.min(8) as u8)
+            } else {
+                IrOp::ShiftRightVar(result, current, rhs)
+            }
+        }
+        AssignOp::Assign => unreachable!(),
     }
 }

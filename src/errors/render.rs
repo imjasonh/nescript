@@ -9,7 +9,6 @@ pub fn render_diagnostics(source: &str, filename: &str, diagnostics: &[Diagnosti
         let kind = match diag.level {
             Level::Error => ReportKind::Error,
             Level::Warning => ReportKind::Warning,
-            Level::Info => ReportKind::Advice,
         };
 
         let mut report = Report::build(kind, filename, diag.span.start as usize)

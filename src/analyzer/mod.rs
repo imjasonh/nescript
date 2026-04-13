@@ -57,14 +57,31 @@ pub fn analyze(program: &Program) -> AnalysisResult {
     for decl in &program.music {
         music_names.insert(decl.name.clone());
     }
+    let mut palette_names = HashSet::new();
+    for decl in &program.palettes {
+        palette_names.insert(decl.name.clone());
+    }
+    let mut background_names = HashSet::new();
+    for decl in &program.backgrounds {
+        background_names.insert(decl.name.clone());
+    }
+    // Programs that use palette or background declarations need 7
+    // bytes of zero page for the vblank-safe update handshake
+    // (`$11` flags + 2 × 3 pointer slots). Bump the user zero-page
+    // start past that region so var allocation doesn't collide with
+    // the runtime slots.
+    let needs_ppu_update_slots = !program.palettes.is_empty() || !program.backgrounds.is_empty();
+    let next_zp_addr = if needs_ppu_update_slots { 0x18 } else { 0x10 };
     let mut analyzer = Analyzer {
         symbols: HashMap::new(),
         var_allocations: Vec::new(),
         diagnostics: Vec::new(),
         sfx_names,
         music_names,
+        palette_names,
+        background_names,
         next_ram_addr: 0x0300, // $0300 is first usable RAM after OAM buffer
-        next_zp_addr: 0x10,    // $10 is first usable zero-page after reserved area
+        next_zp_addr,
         call_graph: HashMap::new(),
         max_depths: HashMap::new(),
         stack_depth_limit: DEFAULT_STACK_DEPTH,
@@ -97,6 +114,12 @@ struct Analyzer {
     sfx_names: HashSet<String>,
     /// Set of music names declared in the program.
     music_names: HashSet<String>,
+    /// Set of palette names declared in the program. Used to
+    /// validate `set_palette Name` targets.
+    palette_names: HashSet<String>,
+    /// Set of background names declared in the program. Used to
+    /// validate `load_background Name` targets.
+    background_names: HashSet<String>,
     next_ram_addr: u16,
     next_zp_addr: u8,
     call_graph: HashMap<String, Vec<String>>,
@@ -151,6 +174,78 @@ impl Analyzer {
         // Register and allocate globals
         for var in &program.globals {
             self.register_var(var);
+        }
+
+        // Validate palette and background declarations. Palettes
+        // must be ≤ 32 bytes (PPU palette RAM is $3F00-$3F1F) and
+        // each byte must fit in 6 bits (NES master palette is
+        // `$00-$3F`). Backgrounds must fit in a single 32×30
+        // nametable: ≤ 960 tile bytes, ≤ 64 attribute bytes.
+        // Duplicate names are caught via the shared symbol table.
+        let mut seen_palettes = HashSet::new();
+        for palette in &program.palettes {
+            if !seen_palettes.insert(palette.name.clone()) {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0501,
+                    format!("duplicate palette '{}'", palette.name),
+                    palette.span,
+                ));
+            }
+            if palette.colors.len() > 32 {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "palette '{}' has {} colors; maximum is 32",
+                        palette.name,
+                        palette.colors.len()
+                    ),
+                    palette.span,
+                ));
+            }
+            for (i, c) in palette.colors.iter().enumerate() {
+                if *c > 0x3F {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!(
+                            "palette '{}' color {i} is ${c:02X}; NES master palette indices are $00-$3F",
+                            palette.name,
+                        ),
+                        palette.span,
+                    ));
+                }
+            }
+        }
+        let mut seen_backgrounds = HashSet::new();
+        for bg in &program.backgrounds {
+            if !seen_backgrounds.insert(bg.name.clone()) {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0501,
+                    format!("duplicate background '{}'", bg.name),
+                    bg.span,
+                ));
+            }
+            if bg.tiles.len() > 960 {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "background '{}' has {} tile bytes; maximum is 960 (32×30)",
+                        bg.name,
+                        bg.tiles.len()
+                    ),
+                    bg.span,
+                ));
+            }
+            if bg.attributes.len() > 64 {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "background '{}' has {} attribute bytes; maximum is 64 (8×8)",
+                        bg.name,
+                        bg.attributes.len()
+                    ),
+                    bg.span,
+                ));
+            }
         }
 
         // Register functions as symbols
@@ -1060,9 +1155,25 @@ impl Analyzer {
                     ));
                 }
             }
-            Statement::WaitFrame(_)
-            | Statement::LoadBackground(_, _)
-            | Statement::SetPalette(_, _) => {}
+            Statement::WaitFrame(_) => {}
+            Statement::SetPalette(name, span) => {
+                if !self.palette_names.contains(name) {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0502,
+                        format!("unknown palette '{name}'"),
+                        *span,
+                    ));
+                }
+            }
+            Statement::LoadBackground(name, span) => {
+                if !self.background_names.contains(name) {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0502,
+                        format!("unknown background '{name}'"),
+                        *span,
+                    ));
+                }
+            }
             Statement::DebugLog(args, _) => {
                 for arg in args {
                     self.walk_expr_reads(arg);
@@ -1365,13 +1476,13 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
         | Statement::WaitFrame(_)
         | Statement::Break(_)
         | Statement::Continue(_)
-        | Statement::LoadBackground(_, _)
-        | Statement::SetPalette(_, _)
         | Statement::InlineAsm(_, _)
         | Statement::RawAsm(_, _)
         | Statement::Play(_, _)
         | Statement::StartMusic(_, _)
-        | Statement::StopMusic(_) => {}
+        | Statement::StopMusic(_)
+        | Statement::SetPalette(_, _)
+        | Statement::LoadBackground(_, _) => {}
     }
 }
 

@@ -55,6 +55,16 @@ pub struct SpriteDecl {
     pub span: Span,
 }
 
+/// `palette Name { colors: [c0, c1, ..., c31] }` — declares a
+/// 32-byte PPU palette (16 bytes background + 16 bytes sprite, in
+/// the standard `$3F00-$3F1F` layout). Colors are NES master-palette
+/// indices, `$00-$3F`. Shorter lists are zero-padded; longer lists
+/// are rejected by the analyzer.
+///
+/// The first `palette` declared in a program is loaded into VRAM at
+/// reset time. Other declarations sit in PRG ROM as named data
+/// blobs and become active via `set_palette Name`, which queues the
+/// write for the next vblank.
 #[derive(Debug, Clone)]
 pub struct PaletteDecl {
     pub name: String,
@@ -62,10 +72,21 @@ pub struct PaletteDecl {
     pub span: Span,
 }
 
+/// `background Name { tiles: [960 bytes], attributes: [64 bytes] }`
+/// — declares a full-screen nametable. `tiles` is a 32×30 grid of
+/// CHR tile indices (`$0000-$03BF` of a nametable); `attributes` is
+/// the 8×8 attribute table (`$03C0-$03FF`). Shorter lists are
+/// zero-padded to fill the nametable; longer lists are rejected.
+///
+/// The first `background` declared in a program is loaded into
+/// nametable 0 at reset time. Other declarations become active via
+/// `load_background Name`, which queues the write for the next
+/// vblank.
 #[derive(Debug, Clone)]
 pub struct BackgroundDecl {
     pub name: String,
-    pub chr_source: AssetSource,
+    pub tiles: Vec<u8>,
+    pub attributes: Vec<u8>,
     pub span: Span,
 }
 
@@ -343,7 +364,13 @@ pub enum Statement {
     Transition(String, Span),
     WaitFrame(Span),
     Call(String, Vec<Expr>, Span),
+    /// `load_background Name` — queue the named background for a
+    /// vblank-safe copy into nametable 0. Lowered to
+    /// [`IrOp::LoadBackground`].
     LoadBackground(String, Span),
+    /// `set_palette Name` — queue the named palette for a
+    /// vblank-safe copy into `$3F00-$3F1F`. Lowered to
+    /// [`IrOp::SetPalette`].
     SetPalette(String, Span),
     Scroll(Expr, Expr, Span),
     /// debug.log(expr, ...) — writes values to the emulator debug port.
@@ -357,14 +384,14 @@ pub enum Statement {
     /// skip variable substitution for completely unmanaged bytes.
     InlineAsm(String, Span),
     RawAsm(String, Span),
-    /// Audio: `play SfxName` — trigger a one-shot sound effect.
-    /// Currently a no-op at codegen time; no audio driver exists.
+    /// Audio: `play SfxName` — trigger a one-shot sound effect on pulse 1.
+    /// Compiles to a trigger sequence plus an envelope pointer store;
+    /// the runtime NMI tick walks the envelope at one byte per frame.
     Play(String, Span),
-    /// Audio: `start_music TrackName` — begin playing background music.
-    /// Currently a no-op at codegen time.
+    /// Audio: `start_music TrackName` — begin playing a looping music
+    /// track on pulse 2, driven by the same NMI tick.
     StartMusic(String, Span),
-    /// Audio: `stop_music` — stop any currently-playing music.
-    /// Currently a no-op at codegen time.
+    /// Audio: `stop_music` — silence pulse 2 and the music state machine.
     StopMusic(Span),
 }
 

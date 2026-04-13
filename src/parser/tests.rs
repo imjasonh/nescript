@@ -508,38 +508,80 @@ fn parse_sprite_decl() {
     }
 }
 
+// ── Palette / background declarations ──
+
 #[test]
 fn parse_palette_decl() {
     let src = r#"
         game "Test" { mapper: NROM }
-        palette MainPal {
-            colors: [0x0F, 0x00, 0x10, 0x20]
+        palette Main {
+            colors: [0x0F, 0x00, 0x10, 0x20,
+                     0x0F, 0x06, 0x16, 0x26,
+                     0x0F, 0x09, 0x19, 0x29,
+                     0x0F, 0x01, 0x11, 0x21]
         }
         on frame { wait_frame }
         start Main
     "#;
     let prog = parse_ok(src);
     assert_eq!(prog.palettes.len(), 1);
-    assert_eq!(prog.palettes[0].name, "MainPal");
-    assert_eq!(prog.palettes[0].colors, vec![0x0F, 0x00, 0x10, 0x20]);
+    assert_eq!(prog.palettes[0].name, "Main");
+    assert_eq!(prog.palettes[0].colors.len(), 16);
+    assert_eq!(prog.palettes[0].colors[0], 0x0F);
+    assert_eq!(prog.palettes[0].colors[15], 0x21);
 }
 
 #[test]
-fn parse_background_decl() {
+fn parse_background_decl_with_attributes() {
     let src = r#"
         game "Test" { mapper: NROM }
-        background TitleBg {
-            chr: @chr("title.png")
+        background Title {
+            tiles: [1, 2, 3, 4, 5]
+            attributes: [0xFF, 0x55]
         }
         on frame { wait_frame }
         start Main
     "#;
     let prog = parse_ok(src);
     assert_eq!(prog.backgrounds.len(), 1);
-    assert_eq!(prog.backgrounds[0].name, "TitleBg");
-    match &prog.backgrounds[0].chr_source {
-        AssetSource::Chr(path) => assert_eq!(path, "title.png"),
-        other => panic!("expected Chr, got {other:?}"),
+    assert_eq!(prog.backgrounds[0].name, "Title");
+    assert_eq!(prog.backgrounds[0].tiles, vec![1, 2, 3, 4, 5]);
+    assert_eq!(prog.backgrounds[0].attributes, vec![0xFF, 0x55]);
+}
+
+#[test]
+fn parse_background_decl_without_attributes() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        background Stage {
+            tiles: [9, 9, 9]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.backgrounds[0].tiles, vec![9, 9, 9]);
+    assert!(prog.backgrounds[0].attributes.is_empty());
+}
+
+#[test]
+fn parse_set_palette_statement() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        palette P { colors: [0x0F] }
+        state Title {
+            on frame {
+                set_palette P
+            }
+        }
+        start Title
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    assert_eq!(frame.statements.len(), 1);
+    match &frame.statements[0] {
+        Statement::SetPalette(name, _) => assert_eq!(name, "P"),
+        other => panic!("expected SetPalette, got {other:?}"),
     }
 }
 
@@ -547,9 +589,10 @@ fn parse_background_decl() {
 fn parse_load_background_statement() {
     let src = r#"
         game "Test" { mapper: NROM }
+        background BG { tiles: [0] }
         state Title {
             on frame {
-                load_background TitleBg
+                load_background BG
             }
         }
         start Title
@@ -558,28 +601,8 @@ fn parse_load_background_statement() {
     let frame = prog.states[0].on_frame.as_ref().unwrap();
     assert_eq!(frame.statements.len(), 1);
     match &frame.statements[0] {
-        Statement::LoadBackground(name, _) => assert_eq!(name, "TitleBg"),
+        Statement::LoadBackground(name, _) => assert_eq!(name, "BG"),
         other => panic!("expected LoadBackground, got {other:?}"),
-    }
-}
-
-#[test]
-fn parse_set_palette_statement() {
-    let src = r#"
-        game "Test" { mapper: NROM }
-        state Title {
-            on frame {
-                set_palette MainPal
-            }
-        }
-        start Title
-    "#;
-    let prog = parse_ok(src);
-    let frame = prog.states[0].on_frame.as_ref().unwrap();
-    assert_eq!(frame.statements.len(), 1);
-    match &frame.statements[0] {
-        Statement::SetPalette(name, _) => assert_eq!(name, "MainPal"),
-        other => panic!("expected SetPalette, got {other:?}"),
     }
 }
 

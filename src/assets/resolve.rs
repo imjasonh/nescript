@@ -3,6 +3,50 @@ use std::path::Path;
 use crate::linker::SpriteData;
 use crate::parser::ast::{AssetSource, Program};
 
+/// Resolved palette data, ready for the linker to splice into PRG
+/// ROM as a 32-byte data blob at the label returned by [`Self::label`].
+/// Declarations shorter than 32 bytes are zero-padded so the runtime
+/// can always push exactly 32 bytes to `$3F00-$3F1F`.
+#[derive(Debug, Clone)]
+pub struct PaletteData {
+    pub name: String,
+    /// Exactly 32 bytes. Index `i` is the value written to PPU
+    /// address `$3F00 + i`.
+    pub colors: [u8; 32],
+}
+
+impl PaletteData {
+    /// The ROM-level label under which the linker emits the 32-byte
+    /// blob. The IR codegen references this label when lowering
+    /// `set_palette Name`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        format!("__palette_{}", self.name)
+    }
+}
+
+/// Resolved background data. `tiles` is the 960-byte nametable
+/// (32 columns × 30 rows) and `attrs` is the 64-byte attribute
+/// table. Both are zero-padded up from the declared sizes so the
+/// runtime NMI helper can always push fixed-length data.
+#[derive(Debug, Clone)]
+pub struct BackgroundData {
+    pub name: String,
+    pub tiles: [u8; 960],
+    pub attrs: [u8; 64],
+}
+
+impl BackgroundData {
+    #[must_use]
+    pub fn tiles_label(&self) -> String {
+        format!("__bg_tiles_{}", self.name)
+    }
+    #[must_use]
+    pub fn attrs_label(&self) -> String {
+        format!("__bg_attrs_{}", self.name)
+    }
+}
+
 /// Resolve sprite declarations in a program into concrete CHR byte blobs and
 /// assign each one a tile index in CHR ROM.
 ///
@@ -65,6 +109,53 @@ pub fn resolve_sprites(program: &Program, source_dir: &Path) -> Result<Vec<Sprit
     }
 
     Ok(sprites)
+}
+
+/// Resolve all `palette Name { ... }` declarations in `program` into
+/// 32-byte fixed-size blobs suitable for splicing into PRG ROM.
+/// Declarations with fewer than 32 colors are zero-padded.
+#[must_use]
+pub fn resolve_palettes(program: &Program) -> Vec<PaletteData> {
+    program
+        .palettes
+        .iter()
+        .map(|p| {
+            let mut colors = [0u8; 32];
+            for (i, c) in p.colors.iter().enumerate().take(32) {
+                colors[i] = *c;
+            }
+            PaletteData {
+                name: p.name.clone(),
+                colors,
+            }
+        })
+        .collect()
+}
+
+/// Resolve all `background Name { ... }` declarations in `program`
+/// into fixed-size 960-byte tile maps and 64-byte attribute tables.
+/// Declarations shorter than the maximum are zero-padded.
+#[must_use]
+pub fn resolve_backgrounds(program: &Program) -> Vec<BackgroundData> {
+    program
+        .backgrounds
+        .iter()
+        .map(|b| {
+            let mut tiles = [0u8; 960];
+            for (i, t) in b.tiles.iter().enumerate().take(960) {
+                tiles[i] = *t;
+            }
+            let mut attrs = [0u8; 64];
+            for (i, a) in b.attributes.iter().enumerate().take(64) {
+                attrs[i] = *a;
+            }
+            BackgroundData {
+                name: b.name.clone(),
+                tiles,
+                attrs,
+            }
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -146,5 +237,91 @@ mod tests {
         let sprites = resolve_sprites(&program, Path::new(".")).unwrap();
         // Missing binary file → silently skipped
         assert!(sprites.is_empty());
+    }
+
+    use crate::parser::ast::{BackgroundDecl, PaletteDecl};
+
+    fn blank_program() -> Program {
+        Program {
+            game: GameDecl {
+                name: "Test".to_string(),
+                mapper: Mapper::NROM,
+                mirroring: Mirroring::Horizontal,
+                span: Span::dummy(),
+            },
+            globals: Vec::new(),
+            constants: Vec::new(),
+            enums: Vec::new(),
+            structs: Vec::new(),
+            functions: Vec::new(),
+            states: Vec::new(),
+            sprites: Vec::new(),
+            palettes: Vec::new(),
+            backgrounds: Vec::new(),
+            sfx: Vec::new(),
+            music: Vec::new(),
+            banks: Vec::new(),
+            start_state: "Main".to_string(),
+            span: Span::dummy(),
+        }
+    }
+
+    #[test]
+    fn resolve_palette_zero_pads_to_32_bytes() {
+        let mut program = blank_program();
+        program.palettes.push(PaletteDecl {
+            name: "Cool".to_string(),
+            colors: vec![0x0F, 0x01, 0x11, 0x21],
+            span: Span::dummy(),
+        });
+        let resolved = resolve_palettes(&program);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "Cool");
+        assert_eq!(resolved[0].colors.len(), 32);
+        assert_eq!(&resolved[0].colors[..4], &[0x0F, 0x01, 0x11, 0x21]);
+        // Remainder is zero-padded.
+        assert!(resolved[0].colors[4..].iter().all(|&b| b == 0));
+        assert_eq!(resolved[0].label(), "__palette_Cool");
+    }
+
+    #[test]
+    fn resolve_palette_truncates_beyond_32_bytes() {
+        // The analyzer rejects >32-byte palettes with E0201; at the
+        // resolve level we defensively truncate so downstream code
+        // always sees exactly 32 bytes. This lets bad input still
+        // produce a valid ROM structure for diagnostic purposes.
+        let mut program = blank_program();
+        program.palettes.push(PaletteDecl {
+            name: "Big".to_string(),
+            colors: (0u8..40).collect(),
+            span: Span::dummy(),
+        });
+        let resolved = resolve_palettes(&program);
+        assert_eq!(resolved[0].colors.len(), 32);
+        assert_eq!(resolved[0].colors[0], 0);
+        assert_eq!(resolved[0].colors[31], 31);
+    }
+
+    #[test]
+    fn resolve_background_pads_tiles_and_attrs() {
+        let mut program = blank_program();
+        program.backgrounds.push(BackgroundDecl {
+            name: "Stage".to_string(),
+            tiles: vec![1, 2, 3],
+            attributes: vec![0xFF],
+            span: Span::dummy(),
+        });
+        let resolved = resolve_backgrounds(&program);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].name, "Stage");
+        assert_eq!(resolved[0].tiles.len(), 960);
+        assert_eq!(resolved[0].tiles[0], 1);
+        assert_eq!(resolved[0].tiles[2], 3);
+        assert!(resolved[0].tiles[3..].iter().all(|&b| b == 0));
+        assert_eq!(resolved[0].attrs.len(), 64);
+        assert_eq!(resolved[0].attrs[0], 0xFF);
+        assert!(resolved[0].attrs[1..].iter().all(|&b| b == 0));
+        assert_eq!(resolved[0].tiles_label(), "__bg_tiles_Stage");
+        assert_eq!(resolved[0].attrs_label(), "__bg_attrs_Stage");
     }
 }

@@ -108,8 +108,25 @@ pub enum IrOp {
     And(IrTemp, IrTemp, IrTemp),
     Or(IrTemp, IrTemp, IrTemp),
     Xor(IrTemp, IrTemp, IrTemp),
+    /// Shift `src` left by a compile-time-known count. Lowering
+    /// extracts the count from constant RHS expressions; non-constant
+    /// shifts lower to [`IrOp::ShiftLeftVar`].
     ShiftLeft(IrTemp, IrTemp, u8),
+    /// Shift `src` right by a compile-time-known count.
     ShiftRight(IrTemp, IrTemp, u8),
+    /// Shift `src` left by a runtime-variable count held in `amt`.
+    /// Codegen emits a short loop. Never produced by the lowering
+    /// when the RHS constant-folds; the optimizer may also turn this
+    /// back into [`IrOp::ShiftLeft`] once `amt` is known.
+    ShiftLeftVar(IrTemp, IrTemp, IrTemp),
+    /// Shift `src` right by a runtime-variable count held in `amt`.
+    ShiftRightVar(IrTemp, IrTemp, IrTemp),
+    /// Software 8/8 divide: `dest = a / b`. Lowered to a `__divide`
+    /// call in codegen; the strength reducer folds constant divisors
+    /// into shifts / AND masks where possible before this runs.
+    Div(IrTemp, IrTemp, IrTemp),
+    /// Software 8/8 modulo: `dest = a % b`.
+    Mod(IrTemp, IrTemp, IrTemp),
     Negate(IrTemp, IrTemp),
     Complement(IrTemp, IrTemp),
 
@@ -239,6 +256,17 @@ pub enum IrOp {
         b_lo: IrTemp,
         b_hi: IrTemp,
     },
+
+    /// `set_palette Name` — queues a palette update for the next
+    /// vblank. Codegen writes the palette's ROM label pointer into
+    /// the runtime-reserved ZP slot and sets a pending bit; the NMI
+    /// handler applies the write at the next vblank.
+    SetPalette(String),
+    /// `load_background Name` — queues a nametable update for the
+    /// next vblank. Codegen writes both the tiles and attributes
+    /// label pointers into their ZP slots and sets a pending bit;
+    /// the NMI handler applies the writes at the next vblank.
+    LoadBackground(String),
 
     // Audio ops — map to the minimal APU driver emitted by the linker.
     /// `play SfxName` — trigger a one-shot sound effect on pulse 1.
