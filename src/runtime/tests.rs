@@ -70,7 +70,7 @@ fn init_assembles_without_error() {
 
 #[test]
 fn nmi_saves_and_restores_registers() {
-    let nmi = gen_nmi(false);
+    let nmi = gen_nmi(false, false);
     // First three instructions should push A, X, Y
     assert_eq!(nmi[0].opcode, PHA);
     assert_eq!(nmi[1].opcode, TXA);
@@ -86,7 +86,7 @@ fn nmi_saves_and_restores_registers() {
 
 #[test]
 fn nmi_triggers_oam_dma() {
-    let nmi = gen_nmi(false);
+    let nmi = gen_nmi(false, false);
     let has_dma = nmi
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4014));
@@ -95,7 +95,7 @@ fn nmi_triggers_oam_dma() {
 
 #[test]
 fn nmi_reads_controller() {
-    let nmi = gen_nmi(false);
+    let nmi = gen_nmi(false, false);
     // Should write strobe to $4016
     let has_strobe = nmi
         .iter()
@@ -105,7 +105,7 @@ fn nmi_reads_controller() {
 
 #[test]
 fn nmi_sets_frame_flag() {
-    let nmi = gen_nmi(false);
+    let nmi = gen_nmi(false, false);
     let has_flag = nmi
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(ZP_FRAME_FLAG));
@@ -114,7 +114,7 @@ fn nmi_sets_frame_flag() {
 
 #[test]
 fn nmi_assembles_without_error() {
-    let nmi = gen_nmi(false);
+    let nmi = gen_nmi(false, false);
     let result = asm::assemble(&nmi, 0xF000);
     assert!(!result.bytes.is_empty());
     assert!(

@@ -27,6 +27,7 @@ Open any `.nes` file in an NES emulator ([Mesen](https://www.mesen.ca/), [FCEUX]
 | `sprites_and_palettes.ne` | sprites, scroll, cast | Inline CHR data, PPU scroll writes, type casting |
 | `mmc1_banked.ne` | MMC1, banks, multiply | Banked mapper with software multiply |
 | `palette_and_background.ne` | palette, background, set_palette, load_background | Reset-time initial load plus vblank-safe runtime swaps |
+| `platformer.ne` | **every subsystem** | End-to-end side-scrolling demo: custom CHR tileset, full 32×30 nametable with per-region attribute palettes, 2×2 metasprite hero with gravity/jump physics, wrap-around horizontal scrolling, enemies, coin pickups, user-declared SFX + music, and a Title → Playing state machine with an autopilot so the headless harness still hits interesting gameplay at frame 180. Regenerate the tile art with `cargo run --bin gen_platformer_tiles`. |
 
 ## Emulator Controls
 

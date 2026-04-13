@@ -4,6 +4,17 @@ version = "0.1.0"
 edition = "2021"
 description = "A statically-typed compiler for NES game development"
 license = "MIT"
+default-run = "nescript"
+
+[[bin]]
+name = "nescript"
+path = "src/main.rs"
+
+# One-shot tile / nametable generator for examples/platformer.ne. Kept in-tree
+# (rather than as a Python script) so the repo stays single-language.
+[[bin]]
+name = "gen_platformer_tiles"
+path = "scripts/gen_platformer_tiles.rs"
 
 [dependencies]
 clap = { version = "4", features = ["derive"] }

@@ -161,6 +161,15 @@ semantics come back, add the codes at that point.
   `while true` or `loop { if cond { continue } }`.
 - No warning for `fast` variables that never justify the zero-page slot
   (could cross-reference access counts).
+- No warning when a `palette` declaration has inconsistent "index 0" bytes
+  across its eight sub-palettes. The NES hardware mirrors `$3F10/$3F14/
+  $3F18/$3F1C` onto `$3F00/$3F04/$3F08/$3F0C`, so writing the full 32-byte
+  blob sequentially causes the last four "sprite sub-palette 0" bytes to
+  overwrite the background universal colour; the fix is a user-side
+  convention (every sub-palette's first byte equals the chosen universal
+  colour) but the analyzer doesn't warn when a declaration violates it.
+  The mistake produced a solid-black screen in `examples/platformer.ne`
+  until it was chased down by hand.
 
 ---
 

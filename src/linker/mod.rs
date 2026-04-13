@@ -261,6 +261,14 @@ impl Linker {
         // `palette` blocks, use the first one; otherwise fall back
         // to the built-in default palette so sprites show up in a
         // reasonable colour scheme without any user setup.
+        //
+        // IMPORTANT: `gen_init` leaves rendering fully disabled so
+        // these $2006/$2007 writes are safe. We re-enable rendering
+        // via `gen_enable_rendering` once all initial VRAM loads
+        // complete — writing to $2007 with either the sprite or the
+        // background layer active corrupts the PPU's internal
+        // address register, which used to clobber everything past
+        // about the first 72 bytes of a 1024-byte nametable load.
         if let Some(first_palette) = palettes.first() {
             all_instructions.extend(runtime::gen_initial_palette_load(&first_palette.label()));
         } else {
@@ -270,17 +278,20 @@ impl Linker {
         // Load the initial background if the program declared any.
         // Most programs don't, so the common case emits nothing
         // here and leaves nametable 0 zero-filled.
+        let has_user_background = !backgrounds.is_empty();
         if let Some(first_bg) = backgrounds.first() {
             all_instructions.extend(runtime::gen_initial_background_load(
                 &first_bg.tiles_label(),
                 &first_bg.attrs_label(),
             ));
-            // Enable background rendering. Default init only turns
-            // on sprites (`$10`), so OR in the background bit
-            // (`$08`) when a user background is present.
-            all_instructions.push(Instruction::new(LDA, AM::Immediate(0x1E)));
-            all_instructions.push(Instruction::new(STA, AM::Absolute(0x2001)));
         }
+
+        // Now that all palette and nametable writes are done, turn
+        // rendering on. Programs with a declared background get
+        // bg+sprites ($1E); programs without get sprites only ($10)
+        // to preserve the pre-fix behaviour of example ROMs that
+        // rely on a hidden nametable.
+        all_instructions.extend(runtime::gen_enable_rendering(has_user_background));
 
         // User code (var init + main loop)
         all_instructions.extend(user_code.iter().cloned());
@@ -400,15 +411,10 @@ impl Linker {
         if has_label(user_code, "__ir_mmc3_reload") {
             all_instructions.push(Instruction::new(JSR, AM::Label("__ir_mmc3_reload".into())));
         }
-        // Audio tick: if audio is in use, JSR into the per-frame
-        // driver tick before the normal NMI body. The tick walks
-        // both the sfx envelope and the music note stream, writing
-        // APU registers as needed. Programs that never use audio
-        // skip this splice entirely — no ROM cost.
-        if has_audio {
-            all_instructions.push(Instruction::new(JSR, AM::Label("__audio_tick".into())));
-        }
-        all_instructions.extend(runtime::gen_nmi(has_ppu_updates));
+        // The audio tick JSR is emitted by `gen_nmi` itself, after
+        // the register and scratch-slot saves, so it can freely
+        // clobber A/X/Y and $02/$03 without corrupting user state.
+        all_instructions.extend(runtime::gen_nmi(has_ppu_updates, has_audio));
 
         // IRQ handler
         all_instructions.push(Instruction::new(NOP, AM::Label("__irq".into())));
