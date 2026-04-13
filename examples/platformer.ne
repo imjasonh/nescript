@@ -32,54 +32,34 @@ game "Platformer" {
 }
 
 // ── Palette ──────────────────────────────────────────────────
-// The background palette drives the sky / hill / ground look.
-// Each sub-palette reserves index 0 for the shared background
-// colour (sky blue $22), plus three working colours.
-//   bg 0 (sky region):     sky blue, white, light gray, black
-//   bg 1 (air/blocks row): sky blue, red, peach, dark red
-//   bg 2 (ground row):     sky blue, lime green, dark green, dark brown
-//   bg 3 (unused reserve): sky blue, yellow, orange, gold
-// The sprite sub-palette 0 (used by every `draw` statement — the
-// OAM attribute byte is always 0 in the current NEScript
-// runtime) carries the hero's red/peach/white body colours.
-// NOTE: the first byte of every sub-palette must match. The PPU
-// mirrors $3F10/$3F14/$3F18/$3F1C onto $3F00/$3F04/$3F08/$3F0C, so
-// writing 8 distinct "index 0" bytes ends up clobbering the
-// background universal colour with the last write. The canonical
-// fix — and what every NES game does — is to use the universal
-// background colour ($22 sky blue here) in all 8 slots. For sprite
-// palettes, index 0 is always transparent regardless of the stored
-// value, so this costs nothing visually.
+// Authored in grouped form: one shared `universal:` colour fills
+// every sub-palette's index-0 slot automatically. That single
+// declaration is enough to dodge the notorious `$3F10/$3F14/$3F18/
+// $3F1C` PPU mirror trap — when a program writes 8 distinct
+// "index 0" bytes sequentially, the last write clobbers the
+// shared background colour and the screen turns the wrong colour
+// (or all-black). Using one shared universal everywhere is what
+// every shipped NES game does; the parser handles it for us.
+//
+// `0x22` is the lavender-blue NES master palette slot Super Mario
+// Bros uses for its iconic sky. The colour names map to the
+// curated set documented in `docs/language-guide.md`.
 palette Main {
-    colors: [
-        // bg palette 0 — sky / clouds
-        //   0 = sky blue (universal bg)
-        //   1 = white
-        //   2 = light gray
-        //   3 = black
-        0x22, 0x30, 0x10, 0x0F,
-        // bg palette 1 — bricks, Q-blocks
-        //   1 = red, 2 = peach, 3 = dark red
-        0x22, 0x16, 0x27, 0x06,
-        // bg palette 2 — grass, hills, bushes, dirt
-        //   1 = light green
-        //   2 = light brown
-        //   3 = dark brown
-        0x22, 0x1A, 0x17, 0x07,
-        // bg palette 3 — unused but the mirroring still writes here
-        0x22, 0x28, 0x27, 0x17,
-        // sprite palette 0 — hero / enemy / coin
-        //   (OAM attribute is always 0 in the current runtime so
-        //    every sprite uses this one sub-palette)
-        //   1 = red cap, 2 = peach skin, 3 = white
-        0x22, 0x16, 0x27, 0x30,
-        // sprite palette 1 — reserved
-        0x22, 0x07, 0x17, 0x27,
-        // sprite palette 2 — reserved
-        0x22, 0x2A, 0x1A, 0x30,
-        // sprite palette 3 — reserved
-        0x22, 0x28, 0x18, 0x38
-    ]
+    universal: 0x22                         // sky blue (NES $22)
+
+    // Background sub-palettes
+    bg0: [white,        gray,       black]   // sky / clouds
+    bg1: [red,          orange,     dk_red]  // bricks, Q-blocks
+    bg2: [bright_green, dk_orange,  brown]   // grass, hills, bushes, dirt
+    bg3: [yellow,       orange,     dk_orange] // reserved
+
+    // Sprite sub-palette 0 — every `draw` uses this one slot
+    // because the OAM attribute byte is always 0 in v0.1.
+    //   1 = red cap, 2 = orange skin, 3 = white highlight.
+    sp0: [red,          orange,     white]
+    sp1: [brown,        dk_orange,  orange]    // reserved
+    sp2: [neon_green,   bright_green, white]   // reserved
+    sp3: [yellow,       olive,      cream]     // reserved
 }
 
 // ── Tileset ──────────────────────────────────────────────────
@@ -89,38 +69,149 @@ palette Main {
 // same declaration drives the player, enemies, coins, and every
 // background tile after tile 0. Tile 0 is reserved by the linker
 // for the built-in smiley — the background leaves it unreferenced.
+//
+// All 15 tiles are authored as 8×8 ASCII pixel art and stacked
+// vertically (1 tile wide × 15 tiles tall) so the parser splits
+// them into consecutive CHR tile indices in reading order. The
+// art uses the `.abc` vocabulary (`. = 0`, `a = 1`, `b = 2`,
+// `c = 3`); regenerate with `cargo run --bin gen_platformer_tiles`.
 sprite Tileset {
-    chr: [
+    pixels: [
         // tile 1: Player head L
-        0x3F, 0x7F, 0x70, 0x61, 0xCF, 0xCD, 0xC0, 0xC0, 0x00, 0x00, 0x0F, 0x1F, 0x3F, 0x3F, 0x3F, 0x3F,
+        "..aaaaaa",
+        ".aaaaaaa",
+        ".aaabbbb",
+        ".aabbbbc",
+        "aabbcccc",
+        "aabbccbc",
+        "aabbbbbb",
+        "aabbbbbb",
         // tile 2: Player head R
-        0xFC, 0xFE, 0x0E, 0x83, 0xF8, 0x4C, 0x00, 0x00, 0x00, 0x00, 0xF0, 0xFC, 0xFF, 0xFF, 0xFF, 0xFF,
+        "aaaaaa..",
+        "aaaaaaa.",
+        "bbbbaaa.",
+        "cbbbbbaa",
+        "cccccbbb",
+        "bcbbccbb",
+        "bbbbbbbb",
+        "bbbbbbbb",
         // tile 3: Player body L
-        0x7F, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0xE0, 0x00, 0x10, 0x18, 0x00, 0x7F, 0x7F, 0x67, 0x07,
+        ".aaaaaaa",
+        "aaacaaaa",
+        "aaaccaaa",
+        "aaaaaaaa",
+        ".bbbbbbb",
+        ".bbbbbbb",
+        ".bb..bbb",
+        "aaa..bbb",
         // tile 4: Player body R
-        0xFE, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x07, 0x00, 0x08, 0x18, 0x00, 0xFE, 0xFE, 0xE6, 0xE0,
+        "aaaaaaa.",
+        "aaaacaaa",
+        "aaaccaaa",
+        "aaaaaaaa",
+        "bbbbbbb.",
+        "bbbbbbb.",
+        "bbb..bb.",
+        "bbb..aaa",
         // tile 5: Enemy
-        0x3C, 0x7E, 0x76, 0xFF, 0x99, 0x7E, 0xBD, 0x99, 0x00, 0x00, 0x18, 0x38, 0x7E, 0x00, 0x00, 0x00,
+        "..aaaa..",
+        ".aaaaaa.",
+        ".aacbaa.",
+        "aacccaaa",
+        "abbccbba",
+        ".aaaaaa.",
+        "a.aaaa.a",
+        "a..aa..a",
         // tile 6: Coin
-        0x00, 0x00, 0x18, 0x24, 0x24, 0x18, 0x00, 0x00, 0x18, 0x3C, 0x7E, 0x7E, 0x7E, 0x7E, 0x3C, 0x18,
+        "...bb...",
+        "..bbbb..",
+        ".bbccbb.",
+        ".bcbbcb.",
+        ".bcbbcb.",
+        ".bbccbb.",
+        "..bbbb..",
+        "...bb...",
         // tile 7: Grass top
-        0xFF, 0xBB, 0xFF, 0xFF, 0xFF, 0xFF, 0xBD, 0xFF, 0x00, 0x00, 0x00, 0x6A, 0xF7, 0xFF, 0xFF, 0xFF,
+        "aaaaaaaa",
+        "a.aaa.aa",
+        "aaaaaaaa",
+        "accacaca",
+        "ccccaccc",
+        "cccccccc",
+        "cbccccbc",
+        "cccccccc",
         // tile 8: Dirt
-        0xFF, 0xBD, 0xFF, 0xF7, 0xFF, 0xBD, 0xF7, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+        "cccccccc",
+        "cbccccbc",
+        "cccccccc",
+        "ccccbccc",
+        "cccccccc",
+        "cbccccbc",
+        "ccccbccc",
+        "cccccccc",
         // tile 9: Brick
-        0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x82, 0x82, 0x82, 0xFF, 0x10, 0x10, 0x10,
+        "cccccccc",
+        "caaaaaca",
+        "caaaaaca",
+        "caaaaaca",
+        "cccccccc",
+        "aaacaaaa",
+        "aaacaaaa",
+        "aaacaaaa",
         // tile 10: Cloud L
-        0x00, 0x1C, 0x3E, 0x7F, 0x7F, 0x1F, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x60, 0x3E, 0x07,
+        "........",
+        "...aaa..",
+        "..aaaaa.",
+        ".aaaaaaa",
+        ".aaaaaaa",
+        ".bbaaaaa",
+        "..bbbbba",
+        ".....bbb",
         // tile 11: Cloud R
-        0x00, 0x70, 0xF8, 0xFE, 0xFE, 0xF8, 0x80, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x7C, 0xE0,
+        "........",
+        ".aaa....",
+        "aaaaa...",
+        "aaaaaaa.",
+        "aaaaaaa.",
+        "aaaaabb.",
+        "abbbbb..",
+        "bbb.....",
         // tile 12: Hill
-        0x00, 0x0C, 0x1E, 0x3F, 0x2F, 0x4B, 0x75, 0xC9, 0x00, 0x00, 0x00, 0x00, 0x10, 0x34, 0x0A, 0x36,
+        "........",
+        "....aa..",
+        "...aaaa.",
+        "..aaaaaa",
+        "..abaaaa",
+        ".abbabaa",
+        ".aaababa",
+        "aabbabba",
         // tile 13: Bush
-        0x00, 0x18, 0x3C, 0x7E, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x02, 0x02, 0x06, 0x06, 0x55,
+        "........",
+        "...aa...",
+        "..aaaa..",
+        ".aaaaac.",
+        "aaaaaaca",
+        "aaaaacca",
+        "aaaaacca",
+        "acacacac",
         // tile 14: Q Block
-        0xFF, 0xFF, 0xC3, 0xDB, 0xD3, 0xC3, 0xFF, 0xFF, 0xFF, 0x81, 0xBD, 0xBD, 0xBD, 0xBD, 0x81, 0xFF,
+        "cccccccc",
+        "caaaaaac",
+        "cabbbbac",
+        "cabccbac",
+        "cabcbbac",
+        "cabbbbac",
+        "caaaaaac",
+        "cccccccc",
         // tile 15: Sky (blank)
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "........"
     ]
 }
 
@@ -133,142 +224,121 @@ const TILE_ENEMY: u8 = 5
 const TILE_COIN: u8 = 6
 
 // ── Background ──────────────────────────────────────────────
-// Full-screen 32×30 nametable showing a static level view that
-// horizontal scrolling pans across. The attribute table splits
-// the screen into three palette regions (sky/blocks/ground) so
-// the grass and hills pick up the right colours even without
-// per-tile attribute churn.
+// The 32×30 nametable is authored as ASCII art with a `legend`
+// block naming each tile by a single character. Horizontal
+// scrolling pans this single nametable via `scroll()` so it only
+// needs to look interesting at any X offset.
+//
+// `palette_map:` is the friendlier alternative to a 64-byte
+// hand-packed attribute table: 16×15 metatile entries, one
+// digit per 16×16 metatile, and the parser packs the 2-bit
+// `(br<<6)|(bl<<4)|(tr<<2)|tl` quadrants automatically. The
+// three palette regions are sky (`0`), brick row (`1`), and
+// ground (`2`).
 background Level {
-    tiles: [
-        // rows 0-4: clean sky
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        // row 5: clouds at x=4..5 and x=20..21
-        15, 15, 15, 15, 10, 11, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 10, 11, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        // row 6: cloud at x=12..13
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 10, 11, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        // rows 7-14: more clean sky
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        // row 15: brick/Q-block platform left, brick platform right
-        15, 15, 15, 15, 15, 15, 9, 9, 14, 9, 15, 15, 15, 15, 15, 15,
-        15, 15, 9, 9, 9, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        // rows 16-19: sky
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        // row 20: hills (3 on left, 4 on right)
-        15, 15, 12, 12, 12, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 12, 12, 12, 12, 15, 15, 15, 15, 15, 15,
-        // row 21: bushes above the grass line
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 13, 13, 13, 15, 15, 15,
-        15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 15, 13, 13, 15, 15, 15,
-        // row 22: grass top (full width)
-        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-        7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7, 7,
-        // rows 23-29: dirt with a few buried bricks for texture
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 8,
-        8, 8, 8, 8, 8, 9, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 9, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 9, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 9, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8,
-        8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8, 8
+    legend {
+        ".": 15   // sky (blank)
+        "<": 10   // cloud left half
+        ">": 11   // cloud right half
+        "#": 9    // brick
+        "Q": 14   // question block
+        "^": 12   // hill silhouette
+        "*": 13   // bush
+        "=": 7    // grass top
+        "%": 8    // dirt
+    }
+
+    map: [
+        "................................",
+        "................................",
+        "................................",
+        "................................",
+        "................................",
+        "....<>..............<>..........",
+        "............<>..................",
+        "................................",
+        "................................",
+        "................................",
+        "................................",
+        "................................",
+        "................................",
+        "................................",
+        "................................",
+        "......##Q#........###...........",
+        "................................",
+        "................................",
+        "................................",
+        "................................",
+        "..^^^.................^^^^......",
+        "..........***..............**...",
+        "================================",
+        "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%#%",
+        "%%%%%#%%%%%%%%%%%%#%%%%%%%%%%%%%",
+        "%%%%%%%%%%%#%%%%%%%%%%%%#%%%%%%%",
+        "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%",
+        "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%",
+        "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%",
+        "%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%"
     ]
-    attributes: [
-        // 8×8 attribute grid, one byte per 32×32-px metatile group.
-        // Each byte packs 4 identical 2-bit quadrants selecting a
-        // sub-palette (0..3):
-        //     0x00 = sub-palette 0 (sky / clouds)
-        //     0x55 = sub-palette 1 (bricks / Q-blocks)
-        //     0xAA = sub-palette 2 (grass / hills / dirt)
-        //
-        // Row mapping: ay 0-2 (nt rows 0-11) = sky, ay 3 (nt rows
-        // 12-15) = brick row, ay 4 (nt rows 16-19) = more sky, ay
-        // 5-7 (nt rows 20-29) = ground.
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55, 0x55,
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-        0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
-        0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA,
-        0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA
+
+    palette_map: [
+        "0000000000000000",   // metatile rows 0-5  → sky sub-palette
+        "0000000000000000",
+        "0000000000000000",
+        "0000000000000000",
+        "0000000000000000",
+        "0000000000000000",
+        "1111111111111111",   // metatile rows 6-7  → brick sub-palette
+        "1111111111111111",
+        "0000000000000000",   // metatile rows 8-9  → sky again
+        "0000000000000000",
+        "2222222222222222",   // metatile rows 10-15 → ground sub-palette
+        "2222222222222222",   //   (rows 15 sits off-screen but the PPU
+        "2222222222222222",   //    still reads its attribute byte, so
+        "2222222222222222",   //    we emit it explicitly to match the
+        "2222222222222222",   //    hand-packed attribute table the
+        "2222222222222222"    //    old form was using.)
     ]
 }
 
 // ── Audio ────────────────────────────────────────────────────
+//
+// SFX: scalar `pitch:` matches the v1 driver's latch-once
+// behaviour — pulse 1's period is sampled exactly once when the
+// effect triggers and never updated, so a single byte is the
+// natural form for the current pipeline. `envelope:` is the
+// friendlier alias for `volume:`.
 
-// Custom boingy jump sound — descending pitch arc on pulse 1.
+// Custom boingy jump sound — fixed-pitch arc on pulse 1.
 sfx Boing {
     duty: 2
-    pitch: [0x30, 0x38, 0x40, 0x48, 0x50, 0x58, 0x60]
-    volume: [12, 11, 10, 9, 7, 5, 2]
+    pitch: 0x30
+    envelope: [12, 11, 10, 9, 7, 5, 2]
 }
 
 // Custom coin ding — short rising blip.
 sfx Ding {
     duty: 2
-    pitch: [0x20, 0x20, 0x20, 0x20]
-    volume: [14, 12, 8, 3]
+    pitch: 0x20
+    envelope: [14, 12, 8, 3]
 }
 
 // Custom looping underworld theme — playful four-bar loop on
-// pulse 2 that plays while the player is alive.
+// pulse 2 that plays while the player is alive. Note names
+// (C4 / E4 / etc.) plus a default `tempo:` so each note only
+// has to spell its frame count when it deviates from the beat.
 music Theme {
     duty: 2
     volume: 9
     repeat: true
+    tempo: 10
     notes: [
-        37, 10,   // C4
-        41, 10,   // E4
-        44, 10,   // G4
-        49, 10,   // C5
-        44, 10,   // G4
-        41, 10,   // E4
-        39, 15,   // D4
-         0,  5,   // rest
-        36, 10,   // B3
-        41, 10,   // E4
-        44, 10,   // G4
-        49, 20,   // C5
-         0, 10    // rest
+        C4, E4, G4, C5, G4, E4,
+        D4 15,
+        rest 5,
+        B3, E4, G4,
+        C5 20,
+        rest 10
     ]
 }
 

@@ -635,20 +635,83 @@ impl Parser {
 
     // ── Sprite / Palette / Background declarations ──
 
+    /// Sprite declarations accept one of two shapes:
+    ///
+    /// **Raw CHR bytes** — the original form, matching how CHR is
+    /// stored on the cart:
+    /// ```text
+    /// sprite Heart {
+    ///     chr: [0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18, 0x00,
+    ///           0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18, 0x00]
+    /// }
+    /// // or from an external file:
+    /// sprite Player { chr: @chr("assets/player.png") }
+    /// ```
+    ///
+    /// **Pixel-art strings** — each string is one row of pixels, each
+    /// character is one pixel's 2-bit palette index. Way easier to
+    /// hand-author than hex:
+    /// ```text
+    /// sprite Arrow {
+    ///     pixels: [
+    ///         "...##...",
+    ///         "...###..",
+    ///         "########",
+    ///         "########",
+    ///         "########",
+    ///         "########",
+    ///         "...###..",
+    ///         "...##..."
+    ///     ]
+    /// }
+    /// ```
+    ///
+    /// Characters map to palette indices as follows:
+    ///
+    /// | Char(s)  | Index | Meaning                       |
+    /// |----------|-------|-------------------------------|
+    /// | `.` ` `  | 0     | transparent / background      |
+    /// | `#` `1`  | 1     | sub-palette colour 1          |
+    /// | `%` `2`  | 2     | sub-palette colour 2          |
+    /// | `@` `3`  | 3     | sub-palette colour 3          |
+    ///
+    /// Rows must all be the same length, and both dimensions must be
+    /// multiples of 8 (the NES tile size). Multi-tile sprites (16×8,
+    /// 8×16, 16×16, …) are split into 8×8 tiles in row-major reading
+    /// order so consecutive tile indices line up with what `draw`
+    /// expects.
     fn parse_sprite_decl(&mut self) -> Result<SpriteDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwSprite)?;
         let (name, _) = self.expect_ident()?;
         self.expect(&TokenKind::LBrace)?;
 
-        let mut chr_source = None;
+        let mut chr_source: Option<AssetSource> = None;
 
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
-            let (key, _) = self.expect_ident()?;
+            let (key, key_span) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             match key.as_str() {
                 "chr" => {
+                    if chr_source.is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            "sprite 'chr' and 'pixels' are mutually exclusive",
+                            key_span,
+                        ));
+                    }
                     chr_source = Some(self.parse_asset_source()?);
+                }
+                "pixels" => {
+                    if chr_source.is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            "sprite 'pixels' and 'chr' are mutually exclusive",
+                            key_span,
+                        ));
+                    }
+                    let bytes = self.parse_pixel_art(&name, key_span)?;
+                    chr_source = Some(AssetSource::Inline(bytes));
                 }
                 _ => {
                     return Err(Diagnostic::error(
@@ -662,7 +725,11 @@ impl Parser {
         self.expect(&TokenKind::RBrace)?;
 
         let chr_source = chr_source.ok_or_else(|| {
-            Diagnostic::error(ErrorCode::E0201, "sprite requires 'chr' property", start)
+            Diagnostic::error(
+                ErrorCode::E0201,
+                "sprite requires 'chr' or 'pixels' property",
+                start,
+            )
         })?;
 
         Ok(SpriteDecl {
@@ -672,24 +739,274 @@ impl Parser {
         })
     }
 
+    /// Parse a pixel-art block of the form
+    /// `[ "row0", "row1", ... ]` and lower it to CHR bytes.
+    ///
+    /// Each character is one pixel; see [`Self::parse_sprite_decl`]
+    /// for the full character → palette-index mapping. All rows must
+    /// be the same length and both dimensions must be multiples of 8.
+    /// Multi-tile sprites are split into 8×8 tiles in row-major order
+    /// so `tile_index, tile_index+1, ...` traverses the tiles in the
+    /// same order your eye reads them.
+    fn parse_pixel_art(
+        &mut self,
+        sprite_name: &str,
+        key_span: Span,
+    ) -> Result<Vec<u8>, Diagnostic> {
+        self.expect(&TokenKind::LBracket)?;
+        let mut rows: Vec<String> = Vec::new();
+        while *self.peek() != TokenKind::RBracket && *self.peek() != TokenKind::Eof {
+            match self.peek().clone() {
+                TokenKind::StringLiteral(s) => {
+                    self.advance();
+                    rows.push(s);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!(
+                            "expected pixel row string in sprite '{sprite_name}', found '{}'",
+                            self.peek()
+                        ),
+                        self.current_span(),
+                    ));
+                }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBracket)?;
+
+        if rows.is_empty() {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!("sprite '{sprite_name}' 'pixels' list is empty"),
+                key_span,
+            ));
+        }
+        let width = rows[0].chars().count();
+        for (i, row) in rows.iter().enumerate() {
+            let len = row.chars().count();
+            if len != width {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "sprite '{sprite_name}' pixel row {i} has {len} cells but \
+                         row 0 has {width}; every row must be the same width"
+                    ),
+                    key_span,
+                ));
+            }
+        }
+        let height = rows.len();
+        if width == 0 || !width.is_multiple_of(8) {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!(
+                    "sprite '{sprite_name}' width is {width}; must be a non-zero multiple of 8"
+                ),
+                key_span,
+            ));
+        }
+        if !height.is_multiple_of(8) {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!("sprite '{sprite_name}' height is {height}; must be a multiple of 8"),
+                key_span,
+            ));
+        }
+
+        // Convert rows to a 2-bit palette-index grid.
+        let mut grid: Vec<Vec<u8>> = Vec::with_capacity(height);
+        for (ry, row) in rows.iter().enumerate() {
+            let mut line = Vec::with_capacity(width);
+            for (rx, ch) in row.chars().enumerate() {
+                // Three vocabularies map to the same 0-3 index so
+                // artists can use whichever feels natural:
+                //   `. # % @` — shade-intensity glyphs (dense = hi)
+                //   `0 1 2 3` — literal palette-index digits
+                //   `. a b c` — letter form used by most NES tools
+                let val = match ch {
+                    '.' | ' ' | '0' => 0u8,
+                    '#' | '1' | 'a' | 'A' => 1,
+                    '%' | '2' | 'b' | 'B' => 2,
+                    '@' | '3' | 'c' | 'C' => 3,
+                    other => {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "sprite '{sprite_name}' pixel at ({rx}, {ry}) has \
+                                 invalid character '{other}'; use '.'/' '/'0' for \
+                                 index 0, '#'/'1'/'a' for 1, '%'/'2'/'b' for 2, \
+                                 '@'/'3'/'c' for 3"
+                            ),
+                            key_span,
+                        ));
+                    }
+                };
+                line.push(val);
+            }
+            grid.push(line);
+        }
+
+        // Encode into CHR tiles. Each 8×8 block becomes 16 bytes: the
+        // first 8 are bit 0 of each pixel (bitplane 0), the next 8 are
+        // bit 1 (bitplane 1). Tiles are emitted in row-major reading
+        // order so consecutive tile indices match what you'd expect.
+        let tiles_x = width / 8;
+        let tiles_y = height / 8;
+        let mut out = Vec::with_capacity(tiles_x * tiles_y * 16);
+        for ty in 0..tiles_y {
+            for tx in 0..tiles_x {
+                let mut plane0 = [0u8; 8];
+                let mut plane1 = [0u8; 8];
+                for row_in_tile in 0..8 {
+                    let y = ty * 8 + row_in_tile;
+                    let mut p0 = 0u8;
+                    let mut p1 = 0u8;
+                    for col_in_tile in 0..8 {
+                        let x = tx * 8 + col_in_tile;
+                        let v = grid[y][x];
+                        let shift = 7 - col_in_tile;
+                        if v & 0b01 != 0 {
+                            p0 |= 1 << shift;
+                        }
+                        if v & 0b10 != 0 {
+                            p1 |= 1 << shift;
+                        }
+                    }
+                    plane0[row_in_tile] = p0;
+                    plane1[row_in_tile] = p1;
+                }
+                out.extend_from_slice(&plane0);
+                out.extend_from_slice(&plane1);
+            }
+        }
+        Ok(out)
+    }
+
     // ── Palette / Background declarations ──
 
     /// `palette Name { colors: [c0, c1, ..., c31] }` — declares a
     /// 32-byte PPU palette. Colors shorter than 32 are zero-padded
     /// by the analyzer; colors longer than 32 are rejected.
+    /// Palette declarations accept one of two shapes. They cannot be mixed:
+    ///
+    /// **Flat form** — a single 32-byte list matching the PPU layout:
+    /// ```text
+    /// palette Main {
+    ///     colors: [0x0F, 0x01, 0x11, 0x21,  /* bg0..bg3, sp0..sp3 */ ...]
+    /// }
+    /// ```
+    ///
+    /// **Grouped form** — a per-slot declaration with an optional shared
+    /// universal colour:
+    /// ```text
+    /// palette Main {
+    ///     universal: black         // optional, defaults to black ($0F)
+    ///     bg0: [dk_blue, blue, sky_blue]    // 3 colours — universal prepended
+    ///     bg1: [dk_purple, purple, lavender]
+    ///     bg2: [dk_red,    red,    peach]
+    ///     bg3: [dk_green,  green,  mint]
+    ///     sp0: [dk_blue,   blue,   sky_blue]
+    ///     sp1: [dk_red,    red,    peach]
+    ///     sp2: [dk_green,  green,  mint]
+    ///     sp3: [dk_gray,   lt_gray, white]
+    /// }
+    /// ```
+    ///
+    /// Grouped form auto-fixes the `$3F10 / $3F14 / $3F18 / $3F1C` PPU
+    /// mirror issue — every sub-palette's index-0 byte is forced to the
+    /// same universal value, so sequential writes to
+    /// `$3F00-$3F1F` never accidentally clobber the shared background
+    /// colour.
+    ///
+    /// Any colour value (in either form) may be a raw byte literal
+    /// (`0x0F`) or a named NES colour (`black`, `dk_blue`, `sky_blue`, …).
+    /// See [`crate::assets::color_name_to_index`] for the full name list.
     fn parse_palette_decl(&mut self) -> Result<PaletteDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwPalette)?;
         let (name, _) = self.expect_ident()?;
         self.expect(&TokenKind::LBrace)?;
 
-        let mut colors: Option<Vec<u8>> = None;
+        // Flat-form output.
+        let mut flat_colors: Option<Vec<u8>> = None;
+        // Grouped-form scratch: 8 sub-palette slots, each up to 4
+        // colours. `None` means "user didn't declare this slot".
+        let mut slots: [Option<Vec<u8>>; 8] = Default::default();
+        let mut universal: Option<u8> = None;
+        let mut grouped_first_key: Option<Span> = None;
+
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             let (key, key_span) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             match key.as_str() {
                 "colors" => {
-                    colors = Some(self.parse_byte_array("colors")?);
+                    if grouped_first_key.is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            "palette cannot mix 'colors' with grouped sub-palette \
+                             fields (bg0..sp3 / universal); pick one form",
+                            key_span,
+                        ));
+                    }
+                    flat_colors = Some(self.parse_color_array("colors")?);
+                }
+                "universal" => {
+                    if flat_colors.is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            "palette cannot mix 'colors' with 'universal'; pick one form",
+                            key_span,
+                        ));
+                    }
+                    grouped_first_key.get_or_insert(key_span);
+                    universal = Some(self.parse_color_value("universal")?);
+                }
+                slot_name @ ("bg0" | "bg1" | "bg2" | "bg3" | "sp0" | "sp1" | "sp2" | "sp3") => {
+                    if flat_colors.is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "palette cannot mix 'colors' with '{slot_name}'; pick one form"
+                            ),
+                            key_span,
+                        ));
+                    }
+                    grouped_first_key.get_or_insert(key_span);
+                    let slot_idx = match slot_name {
+                        "bg0" => 0,
+                        "bg1" => 1,
+                        "bg2" => 2,
+                        "bg3" => 3,
+                        "sp0" => 4,
+                        "sp1" => 5,
+                        "sp2" => 6,
+                        "sp3" => 7,
+                        _ => unreachable!(),
+                    };
+                    if slots[slot_idx].is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0501,
+                            format!("duplicate sub-palette '{slot_name}'"),
+                            key_span,
+                        ));
+                    }
+                    let entries = self.parse_color_array(slot_name)?;
+                    if entries.len() > 4 {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "sub-palette '{slot_name}' has {} colours; maximum is 4 \
+                                 (3 + optional leading universal override)",
+                                entries.len()
+                            ),
+                            key_span,
+                        ));
+                    }
+                    slots[slot_idx] = Some(entries);
                 }
                 _ => {
                     return Err(Diagnostic::error(
@@ -705,13 +1022,41 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace)?;
 
-        let colors = colors.ok_or_else(|| {
-            Diagnostic::error(
+        let colors = if let Some(flat) = flat_colors {
+            flat
+        } else if grouped_first_key.is_some() {
+            // Assemble the 32-byte blob from the grouped slots.
+            // `$0F` is the canonical "one true black" universal that
+            // every NES cart uses when nothing else is specified.
+            let uni = universal.unwrap_or(0x0F);
+            let mut out = vec![0u8; 32];
+            for (slot_idx, slot) in slots.iter().enumerate() {
+                let base = slot_idx * 4;
+                out[base] = uni;
+                if let Some(entries) = slot {
+                    if entries.len() == 4 {
+                        // Explicit override of the universal byte
+                        // for this slot only.
+                        out[base] = entries[0];
+                        out[base + 1] = entries[1];
+                        out[base + 2] = entries[2];
+                        out[base + 3] = entries[3];
+                    } else {
+                        for (i, c) in entries.iter().enumerate() {
+                            out[base + 1 + i] = *c;
+                        }
+                    }
+                }
+            }
+            out
+        } else {
+            return Err(Diagnostic::error(
                 ErrorCode::E0201,
-                "palette requires 'colors' property",
+                "palette requires either 'colors' or at least one sub-palette field \
+                 (bg0..bg3 / sp0..sp3)",
                 start,
-            )
-        })?;
+            ));
+        };
 
         Ok(PaletteDecl {
             name,
@@ -720,28 +1065,235 @@ impl Parser {
         })
     }
 
-    /// `background Name { tiles: [...], attributes: [...] }` — the
-    /// tiles array is the 32×30 nametable (up to 960 bytes); the
-    /// attributes array is the 8×8 attribute table (up to 64 bytes).
-    /// Both shorter and omitted arrays are zero-padded by the
-    /// analyzer. Longer arrays are rejected.
+    /// Parse a single NES colour value: either a `u8` integer literal or
+    /// an identifier resolved via
+    /// [`crate::assets::color_name_to_index`]. Used by palette
+    /// declarations so either raw hex bytes (`0x0F`) or friendly names
+    /// (`black`, `sky_blue`) can appear anywhere a colour is expected.
+    fn parse_color_value(&mut self, prop: &str) -> Result<u8, Diagnostic> {
+        match self.peek().clone() {
+            TokenKind::IntLiteral(v) => {
+                self.advance();
+                if v > 0xFF {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("'{prop}' colour value {v} doesn't fit in a u8"),
+                        self.current_span(),
+                    ));
+                }
+                Ok(v as u8)
+            }
+            TokenKind::Ident(name) => {
+                let span = self.current_span();
+                self.advance();
+                crate::assets::color_name_to_index(&name).ok_or_else(|| {
+                    Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!(
+                            "unknown NES colour name '{name}' in '{prop}'; \
+                             use a byte literal (0x00-0x3F) or a name like \
+                             'black' / 'blue' / 'sky_blue'"
+                        ),
+                        span,
+                    )
+                })
+            }
+            _ => Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!(
+                    "expected colour value for '{prop}' (byte literal or name), found '{}'",
+                    self.peek()
+                ),
+                self.current_span(),
+            )),
+        }
+    }
+
+    /// Parse `[color, color, ...]` where each element is either a byte
+    /// literal or a named NES colour. This is the "friendly" version of
+    /// [`Self::parse_byte_array`] used everywhere a palette byte is
+    /// expected.
+    fn parse_color_array(&mut self, prop: &str) -> Result<Vec<u8>, Diagnostic> {
+        self.expect(&TokenKind::LBracket)?;
+        let mut out = Vec::new();
+        while *self.peek() != TokenKind::RBracket && *self.peek() != TokenKind::Eof {
+            out.push(self.parse_color_value(prop)?);
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBracket)?;
+        Ok(out)
+    }
+
+    /// Background declarations pick one of two authoring styles for
+    /// the 32×30 nametable:
+    ///
+    /// **Raw bytes** — a flat list matching the PPU nametable layout,
+    /// 960 tile indices in row-major order, optionally followed by a
+    /// 64-byte attribute table:
+    /// ```text
+    /// background StageOne {
+    ///     tiles: [0, 1, 2, 3, ...]
+    ///     attributes: [0xFF, 0x55, ...]
+    /// }
+    /// ```
+    ///
+    /// **Tilemap + legend** — a legend mapping single characters to
+    /// CHR tile indices, followed by a `map:` list-of-strings where
+    /// each character is one cell of the nametable. Rows shorter than
+    /// 32 cells are right-padded with tile 0; extra rows past row 30
+    /// are an error. Optional `palette_map:` is a 16×15 grid of
+    /// sub-palette indices `0`-`3`, one digit per 16×16 metatile,
+    /// auto-packed into the 64-byte attribute table (no more hand-
+    /// packing 2-bit pairs):
+    /// ```text
+    /// background StageOne {
+    ///     legend {
+    ///         '.': 0      // empty
+    ///         '#': 1      // brick
+    ///         'X': 2      // coin
+    ///     }
+    ///     map: [
+    ///         "................................",
+    ///         "................................",
+    ///         "......##........##..............",
+    ///         "....##..##....##..##............",
+    ///         // ... up to 30 rows, 32 cells each
+    ///     ]
+    ///     palette_map: [
+    ///         "0000000011110000",  // 16 metatile cols
+    ///         "0000000011110000",
+    ///         // ... up to 15 metatile rows
+    ///     ]
+    /// }
+    /// ```
     fn parse_background_decl(&mut self) -> Result<BackgroundDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwBackground)?;
         let (name, _) = self.expect_ident()?;
         self.expect(&TokenKind::LBrace)?;
 
-        let mut tiles: Option<Vec<u8>> = None;
-        let mut attributes: Option<Vec<u8>> = None;
+        // Raw-form scratch.
+        let mut tiles_raw: Option<Vec<u8>> = None;
+        let mut attributes_raw: Option<Vec<u8>> = None;
+        // Tilemap-form scratch.
+        let mut legend: Option<std::collections::HashMap<char, u8>> = None;
+        let mut legend_span: Option<Span> = None;
+        let mut map_rows: Option<(Vec<String>, Span)> = None;
+        let mut palette_rows: Option<(Vec<String>, Span)> = None;
+
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            // `legend { ... }` uses a brace block rather than a
+            // `key: value` pair, so detect it specially.
+            if matches!(self.peek(), TokenKind::Ident(n) if n == "legend")
+                && self.peek_at_offset(1) == Some(&TokenKind::LBrace)
+            {
+                let span = self.current_span();
+                self.advance(); // `legend`
+                self.advance(); // `{`
+                let mut map: std::collections::HashMap<char, u8> = std::collections::HashMap::new();
+                while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+                    let key_span = self.current_span();
+                    let ch = match self.peek().clone() {
+                        TokenKind::StringLiteral(s) => {
+                            self.advance();
+                            let mut chars = s.chars();
+                            let c = chars.next().ok_or_else(|| {
+                                Diagnostic::error(
+                                    ErrorCode::E0201,
+                                    "legend key must be a single character",
+                                    key_span,
+                                )
+                            })?;
+                            if chars.next().is_some() {
+                                return Err(Diagnostic::error(
+                                    ErrorCode::E0201,
+                                    format!("legend key '{s}' has more than one character"),
+                                    key_span,
+                                ));
+                            }
+                            c
+                        }
+                        _ => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!(
+                                    "expected string literal for legend key, found '{}'",
+                                    self.peek()
+                                ),
+                                key_span,
+                            ));
+                        }
+                    };
+                    self.expect(&TokenKind::Colon)?;
+                    let tile = self.parse_u8_literal("legend value")?;
+                    if map.insert(ch, tile).is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0501,
+                            format!("duplicate legend entry '{ch}'"),
+                            key_span,
+                        ));
+                    }
+                    if *self.peek() == TokenKind::Comma {
+                        self.advance();
+                    }
+                }
+                self.expect(&TokenKind::RBrace)?;
+                if legend.is_some() {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0501,
+                        "duplicate 'legend' block",
+                        span,
+                    ));
+                }
+                legend = Some(map);
+                legend_span = Some(span);
+                continue;
+            }
+
             let (key, key_span) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             match key.as_str() {
                 "tiles" => {
-                    tiles = Some(self.parse_byte_array("tiles")?);
+                    if tiles_raw.is_some() || map_rows.is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0501,
+                            "duplicate tile data in background declaration",
+                            key_span,
+                        ));
+                    }
+                    tiles_raw = Some(self.parse_byte_array("tiles")?);
                 }
                 "attributes" => {
-                    attributes = Some(self.parse_byte_array("attributes")?);
+                    if attributes_raw.is_some() || palette_rows.is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0501,
+                            "duplicate attribute data in background declaration",
+                            key_span,
+                        ));
+                    }
+                    attributes_raw = Some(self.parse_byte_array("attributes")?);
+                }
+                "map" => {
+                    if map_rows.is_some() || tiles_raw.is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0501,
+                            "duplicate tile data in background declaration",
+                            key_span,
+                        ));
+                    }
+                    map_rows = Some((self.parse_string_array("map")?, key_span));
+                }
+                "palette_map" => {
+                    if palette_rows.is_some() || attributes_raw.is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0501,
+                            "duplicate attribute data in background declaration",
+                            key_span,
+                        ));
+                    }
+                    palette_rows = Some((self.parse_string_array("palette_map")?, key_span));
                 }
                 _ => {
                     return Err(Diagnostic::error(
@@ -757,36 +1309,107 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace)?;
 
-        let tiles = tiles.ok_or_else(|| {
-            Diagnostic::error(
+        // Resolve the tile source.
+        let tiles = if let Some(flat) = tiles_raw {
+            flat
+        } else if let Some((rows, span)) = map_rows {
+            let legend = legend.as_ref().ok_or_else(|| {
+                Diagnostic::error(
+                    ErrorCode::E0201,
+                    "background 'map' requires a 'legend { ... }' block",
+                    legend_span.unwrap_or(span),
+                )
+            })?;
+            tilemap_to_bytes(&name, &rows, legend, span)?
+        } else {
+            return Err(Diagnostic::error(
                 ErrorCode::E0201,
-                "background requires 'tiles' property",
+                "background requires a 'tiles' array or a 'map' + 'legend'",
                 start,
-            )
-        })?;
+            ));
+        };
+
+        // Resolve the attribute source.
+        let attributes = if let Some(flat) = attributes_raw {
+            flat
+        } else if let Some((rows, span)) = palette_rows {
+            palette_map_to_attrs(&name, &rows, span)?
+        } else {
+            Vec::new()
+        };
 
         Ok(BackgroundDecl {
             name,
             tiles,
-            attributes: attributes.unwrap_or_default(),
+            attributes,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
 
+    /// Parse a `[string, string, ...]` list. Used by background
+    /// `map:` and `palette_map:` where each string is one row of the
+    /// grid and characters inside the string are cells.
+    fn parse_string_array(&mut self, prop: &str) -> Result<Vec<String>, Diagnostic> {
+        self.expect(&TokenKind::LBracket)?;
+        let mut out = Vec::new();
+        while *self.peek() != TokenKind::RBracket && *self.peek() != TokenKind::Eof {
+            match self.peek().clone() {
+                TokenKind::StringLiteral(s) => {
+                    self.advance();
+                    out.push(s);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("expected string row in '{prop}', found '{}'", self.peek()),
+                        self.current_span(),
+                    ));
+                }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBracket)?;
+        Ok(out)
+    }
+
     // ── SFX / Music declarations ──
 
-    /// `sfx Name { duty: N, pitch: [..], volume: [..] }`. Pitch and
-    /// volume arrays must be the same length — each index is one
-    /// frame of the envelope. Duty is optional, default 2 (50%).
+    /// `sfx Name { duty: N, pitch: ..., volume: [..] }`.
+    ///
+    /// The v1 audio driver latches the pulse-1 period **once** on
+    /// trigger, so there's no point giving a per-frame pitch array —
+    /// only `pitch[0]` is ever read. That's now reflected in the
+    /// syntax:
+    ///
+    /// - `pitch: 0x50` — a single byte, latched at trigger time (the
+    ///   natural form for the current driver).
+    /// - `pitch: [0x50, 0x50, ...]` — still accepted for
+    ///   backwards-compatibility with existing sources; the analyzer
+    ///   requires the array length to match `volume`.
+    ///
+    /// `envelope:` is a friendlier alias for `volume:` — both mean the
+    /// same thing (the per-frame volume ramp that shapes the sound).
     fn parse_sfx_decl(&mut self) -> Result<SfxDecl, Diagnostic> {
+        // Scalar pitches expand to a per-frame array once we know
+        // the envelope length, so we track both possibilities in
+        // this local enum while parsing. Declared here so clippy's
+        // `items_after_statements` stays happy.
+        enum PitchSrc {
+            Scalar(u8),
+            Array(Vec<u8>),
+        }
+
         let start = self.current_span();
         self.expect(&TokenKind::KwSfx)?;
         let (name, _) = self.expect_ident()?;
         self.expect(&TokenKind::LBrace)?;
 
         let mut duty: u8 = 2;
-        let mut pitch: Option<Vec<u8>> = None;
+        let mut pitch_src: Option<PitchSrc> = None;
         let mut volume: Option<Vec<u8>> = None;
+        let mut volume_key: &'static str = "volume";
 
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             let (key, key_span) = self.expect_ident()?;
@@ -803,15 +1426,36 @@ impl Parser {
                     }
                 }
                 "pitch" => {
-                    pitch = Some(self.parse_byte_array("pitch")?);
+                    // Either a scalar (new form) or a [bytes] array
+                    // (legacy form). Branch on the leading token.
+                    if *self.peek() == TokenKind::LBracket {
+                        pitch_src = Some(PitchSrc::Array(self.parse_byte_array("pitch")?));
+                    } else {
+                        pitch_src = Some(PitchSrc::Scalar(self.parse_u8_literal("pitch")?));
+                    }
                 }
-                "volume" => {
-                    let vals = self.parse_byte_array("volume")?;
+                "volume" | "envelope" => {
+                    if volume.is_some() {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            "sfx 'volume' / 'envelope' are aliases — pick one",
+                            key_span,
+                        ));
+                    }
+                    // Remember which spelling the user chose so
+                    // diagnostics below match their source.
+                    let prop = if key.as_str() == "envelope" {
+                        "envelope"
+                    } else {
+                        "volume"
+                    };
+                    volume_key = prop;
+                    let vals = self.parse_byte_array(prop)?;
                     for v in &vals {
                         if *v > 15 {
                             return Err(Diagnostic::error(
                                 ErrorCode::E0201,
-                                format!("sfx 'volume' entries must be 0-15, got {v}"),
+                                format!("sfx '{prop}' entries must be 0-15, got {v}"),
                                 key_span,
                             ));
                         }
@@ -832,32 +1476,52 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace)?;
 
-        let pitch = pitch.ok_or_else(|| {
+        let pitch_src = pitch_src.ok_or_else(|| {
             Diagnostic::error(ErrorCode::E0201, "sfx requires 'pitch' property", start)
         })?;
         let volume = volume.ok_or_else(|| {
-            Diagnostic::error(ErrorCode::E0201, "sfx requires 'volume' property", start)
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("sfx requires '{volume_key}' property (or its alias)"),
+                start,
+            )
         })?;
 
-        if pitch.is_empty() {
+        if volume.is_empty() {
             return Err(Diagnostic::error(
                 ErrorCode::E0201,
-                "sfx 'pitch' array must have at least one frame",
+                format!("sfx '{volume_key}' array must have at least one frame"),
                 start,
             ));
         }
-        if pitch.len() != volume.len() {
-            return Err(Diagnostic::error(
-                ErrorCode::E0201,
-                format!(
-                    "sfx 'pitch' and 'volume' arrays must have the same length \
-                     (pitch has {}, volume has {})",
-                    pitch.len(),
-                    volume.len()
-                ),
-                start,
-            ));
-        }
+
+        // Normalize to the legacy per-frame pitch array the rest of
+        // the compiler already consumes. Scalar pitches just repeat.
+        let pitch = match pitch_src {
+            PitchSrc::Scalar(v) => vec![v; volume.len()],
+            PitchSrc::Array(v) => {
+                if v.is_empty() {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        "sfx 'pitch' array must have at least one frame",
+                        start,
+                    ));
+                }
+                if v.len() != volume.len() {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!(
+                            "sfx 'pitch' and '{volume_key}' arrays must have the \
+                             same length (pitch has {}, {volume_key} has {})",
+                            v.len(),
+                            volume.len()
+                        ),
+                        start,
+                    ));
+                }
+                v
+            }
+        };
 
         Ok(SfxDecl {
             name,
@@ -868,10 +1532,44 @@ impl Parser {
         })
     }
 
-    /// `music Name { duty: N, volume: N, repeat: true|false, notes: [..] }`.
-    /// Notes are encoded as a flat list: `[pitch1, dur1, pitch2, dur2, ...]`.
-    /// Pitch 0 is a rest; nonzero pitches are indices into the builtin
-    /// period table (1 = C1, 60 = B5). Duration is in frames (1-255).
+    /// `music Name { duty, volume, repeat, tempo, notes }`.
+    ///
+    /// Notes can be authored in two styles. The parser picks the style
+    /// based on whether a `tempo:` field is present:
+    ///
+    /// **Raw form** (`tempo:` absent) — a flat list of `pitch, duration`
+    /// integer pairs. Every entry is a `u8` literal and pairs are
+    /// separated by commas:
+    /// ```text
+    /// music Theme {
+    ///     notes: [
+    ///         37, 20,    // C4 for 20 frames
+    ///         41, 20,    // E4
+    ///         44, 20,    // G4
+    ///         0, 10,     // rest for 10 frames
+    ///     ]
+    /// }
+    /// ```
+    ///
+    /// **Note-name form** (`tempo:` present) — each entry is a note
+    /// name (`C4`, `Cs4`, `Db4`, …, `B5`) or `rest`, with an optional
+    /// per-note duration override. Entries are separated by commas,
+    /// and `tempo:` sets the default duration when none is given:
+    /// ```text
+    /// music Theme {
+    ///     tempo: 20             // default frames per note
+    ///     notes: [
+    ///         C4, E4, G4, C5,   // all use tempo (20 frames each)
+    ///         G4 40,            // this one is held twice as long
+    ///         rest 10,          // short rest
+    ///         E4, C4
+    ///     ]
+    /// }
+    /// ```
+    ///
+    /// Integer literals still work inside the note-name form too —
+    /// useful for raw period-table indices when you don't feel like
+    /// spelling out a name.
     fn parse_music_decl(&mut self) -> Result<MusicDecl, Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwMusic)?;
@@ -881,7 +1579,12 @@ impl Parser {
         let mut duty: u8 = 2;
         let mut volume: u8 = 10;
         let mut loops: bool = true;
-        let mut notes: Option<Vec<MusicNote>> = None;
+        let mut tempo: Option<u8> = None;
+        // Defer note parsing until we've seen all the simple scalar
+        // fields, so `tempo:` can be declared after `notes:` if the
+        // user prefers that order — we stash the token position to
+        // rewind to.
+        let mut notes_pos: Option<(usize, Span)> = None;
 
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             let (key, key_span) = self.expect_ident()?;
@@ -907,6 +1610,17 @@ impl Parser {
                         ));
                     }
                 }
+                "tempo" => {
+                    let t = self.parse_u8_literal("tempo")?;
+                    if t == 0 {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            "music 'tempo' must be >= 1 (frames per note)",
+                            key_span,
+                        ));
+                    }
+                    tempo = Some(t);
+                }
                 "repeat" => match self.peek().clone() {
                     TokenKind::BoolLiteral(b) => {
                         self.advance();
@@ -921,36 +1635,18 @@ impl Parser {
                     }
                 },
                 "notes" => {
-                    let flat = self.parse_byte_array("notes")?;
-                    if flat.len() % 2 != 0 {
+                    if notes_pos.is_some() {
                         return Err(Diagnostic::error(
-                            ErrorCode::E0201,
-                            "music 'notes' must have an even number of entries \
-                             (pitch, duration, pitch, duration, ...)",
+                            ErrorCode::E0501,
+                            "duplicate 'notes' in music declaration",
                             key_span,
                         ));
                     }
-                    let mut n = Vec::with_capacity(flat.len() / 2);
-                    for pair in flat.chunks(2) {
-                        let pitch = pair[0];
-                        let duration = pair[1];
-                        if duration == 0 {
-                            return Err(Diagnostic::error(
-                                ErrorCode::E0201,
-                                "music note duration must be >= 1",
-                                key_span,
-                            ));
-                        }
-                        if pitch > 60 {
-                            return Err(Diagnostic::error(
-                                ErrorCode::E0201,
-                                format!("music note pitch must be 0 (rest) or 1-60, got {pitch}"),
-                                key_span,
-                            ));
-                        }
-                        n.push(MusicNote { pitch, duration });
-                    }
-                    notes = Some(n);
+                    notes_pos = Some((self.pos, key_span));
+                    // Skip past the notes list without parsing it yet
+                    // — we need to know whether `tempo:` is set before
+                    // picking between raw-pair form and note-name form.
+                    self.skip_balanced_brackets()?;
                 }
                 _ => {
                     return Err(Diagnostic::error(
@@ -966,14 +1662,27 @@ impl Parser {
         }
         self.expect(&TokenKind::RBrace)?;
 
-        let notes = notes.ok_or_else(|| {
+        let (notes_token_pos, notes_span) = notes_pos.ok_or_else(|| {
             Diagnostic::error(ErrorCode::E0201, "music requires 'notes' property", start)
         })?;
+
+        // Rewind to the `[` of the notes list and parse it with the
+        // right format chosen by whether `tempo:` was set above.
+        let saved_pos = self.pos;
+        self.pos = notes_token_pos;
+        let notes = if let Some(default_dur) = tempo {
+            self.parse_named_notes(default_dur, notes_span)?
+        } else {
+            self.parse_flat_note_pairs(notes_span)?
+        };
+        // Restore the cursor past the closing brace so the outer
+        // program loop keeps marching through the source.
+        self.pos = saved_pos;
 
         if notes.is_empty() {
             return Err(Diagnostic::error(
                 ErrorCode::E0201,
-                "music 'notes' must contain at least one (pitch, duration) pair",
+                "music 'notes' must contain at least one note",
                 start,
             ));
         }
@@ -986,6 +1695,160 @@ impl Parser {
             notes,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
+    }
+
+    /// Fast-forward `self.pos` past a matched `[` … `]` pair, used by
+    /// music parsing so the notes list can be re-scanned later once
+    /// `tempo:` presence is known.
+    fn skip_balanced_brackets(&mut self) -> Result<(), Diagnostic> {
+        self.expect(&TokenKind::LBracket)?;
+        let mut depth = 1i32;
+        while depth > 0 {
+            match self.peek().clone() {
+                TokenKind::LBracket => {
+                    depth += 1;
+                    self.advance();
+                }
+                TokenKind::RBracket => {
+                    depth -= 1;
+                    self.advance();
+                }
+                TokenKind::Eof => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        "unterminated '[' in music notes",
+                        self.current_span(),
+                    ));
+                }
+                _ => {
+                    self.advance();
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Parse a legacy-form `notes: [pitch, duration, pitch, duration, ...]`
+    /// flat pair list. Used when the music block has no `tempo:` field.
+    fn parse_flat_note_pairs(&mut self, key_span: Span) -> Result<Vec<MusicNote>, Diagnostic> {
+        let flat = self.parse_byte_array("notes")?;
+        if flat.len() % 2 != 0 {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                "music 'notes' must have an even number of entries \
+                 (pitch, duration, pitch, duration, ...) when 'tempo' is not set",
+                key_span,
+            ));
+        }
+        let mut out = Vec::with_capacity(flat.len() / 2);
+        for pair in flat.chunks(2) {
+            let pitch = pair[0];
+            let duration = pair[1];
+            if duration == 0 {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    "music note duration must be >= 1",
+                    key_span,
+                ));
+            }
+            if pitch > 60 {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!("music note pitch must be 0 (rest) or 1-60, got {pitch}"),
+                    key_span,
+                ));
+            }
+            out.push(MusicNote { pitch, duration });
+        }
+        Ok(out)
+    }
+
+    /// Parse a note-name form note list with entries like
+    /// `C4`, `Cs4 40`, `rest`, `rest 10`. Each entry is a pitch
+    /// (note-name identifier, `rest`, or integer literal) with an
+    /// optional inline duration; missing durations default to `tempo`.
+    /// Entries are comma-separated; trailing commas are allowed.
+    fn parse_named_notes(
+        &mut self,
+        default_dur: u8,
+        key_span: Span,
+    ) -> Result<Vec<MusicNote>, Diagnostic> {
+        self.expect(&TokenKind::LBracket)?;
+        let mut out = Vec::new();
+        while *self.peek() != TokenKind::RBracket && *self.peek() != TokenKind::Eof {
+            // ── Parse the pitch ──
+            let pitch = match self.peek().clone() {
+                TokenKind::IntLiteral(v) => {
+                    self.advance();
+                    if v > 60 {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!("music note pitch must be 0 (rest) or 1-60, got {v}"),
+                            key_span,
+                        ));
+                    }
+                    v as u8
+                }
+                TokenKind::Ident(name) => {
+                    let span = self.current_span();
+                    self.advance();
+                    crate::assets::note_name_to_index(&name).ok_or_else(|| {
+                        Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "unknown note name '{name}'; use a name like C4/Cs4/Db4, \
+                                 'rest', or a numeric pitch index 0-60"
+                            ),
+                            span,
+                        )
+                    })?
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!(
+                            "expected note name or pitch index in music notes, found '{}'",
+                            self.peek()
+                        ),
+                        self.current_span(),
+                    ));
+                }
+            };
+
+            // ── Optional duration override ──
+            //
+            // A bare integer literal before the next comma is the
+            // duration for this note. Otherwise use the block's tempo.
+            let duration = if let TokenKind::IntLiteral(v) = self.peek().clone() {
+                self.advance();
+                if v == 0 {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        "music note duration must be >= 1",
+                        key_span,
+                    ));
+                }
+                if v > 255 {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("music note duration {v} doesn't fit in a u8 (max 255)"),
+                        key_span,
+                    ));
+                }
+                v as u8
+            } else {
+                default_dur
+            };
+
+            out.push(MusicNote { pitch, duration });
+
+            // Entries are comma-separated; trailing commas are fine.
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBracket)?;
+        Ok(out)
     }
 
     /// Parse a `[byte, byte, ...]` array. Used by sfx/music property
@@ -2024,6 +2887,155 @@ impl Parser {
             )),
         }
     }
+}
+
+/// Convert a tilemap authored as rows of characters into the flat
+/// byte array the nametable expects. Each row is up to 32 characters
+/// wide; shorter rows pad with the default tile 0, longer rows are an
+/// error. The full tile map is 30 rows × 32 cols = 960 bytes; fewer
+/// rows are zero-padded (the analyzer does the final padding, so we
+/// just emit whatever the user declared without the trailing zeros
+/// here).
+fn tilemap_to_bytes(
+    bg_name: &str,
+    rows: &[String],
+    legend: &std::collections::HashMap<char, u8>,
+    span: Span,
+) -> Result<Vec<u8>, Diagnostic> {
+    if rows.len() > 30 {
+        return Err(Diagnostic::error(
+            ErrorCode::E0201,
+            format!(
+                "background '{bg_name}' tilemap has {} rows; maximum is 30",
+                rows.len()
+            ),
+            span,
+        ));
+    }
+    let mut out = Vec::with_capacity(rows.len() * 32);
+    for (ry, row) in rows.iter().enumerate() {
+        let chars: Vec<char> = row.chars().collect();
+        if chars.len() > 32 {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!(
+                    "background '{bg_name}' tilemap row {ry} has {} cells; \
+                     maximum is 32",
+                    chars.len()
+                ),
+                span,
+            ));
+        }
+        for (rx, ch) in chars.iter().enumerate() {
+            let tile = legend.get(ch).copied().ok_or_else(|| {
+                Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "background '{bg_name}' tilemap cell ({rx}, {ry}) uses \
+                         character '{ch}' which is not in the legend"
+                    ),
+                    span,
+                )
+            })?;
+            out.push(tile);
+        }
+        // Pad the remainder of this row with tile 0 so subsequent
+        // rows land at the right column in the flat array.
+        out.resize(out.len() + (32 - chars.len()), 0);
+    }
+    Ok(out)
+}
+
+/// Convert a `palette_map:` grid (rows of digit characters `0`-`3`,
+/// one per 16×16 metatile) into the 64-byte attribute table the PPU
+/// expects.
+///
+/// The attribute layout is notoriously awkward: each attribute byte
+/// covers a 32×32-pixel region (four 16×16 metatiles) packed as
+/// `BR BL TR TL` — top-left in the low bits, bottom-right in the high
+/// bits. The attribute table is a fixed 8×8 = 64 bytes covering 16
+/// metatile rows, even though only the top 15 (the visible 240
+/// scanlines) render on screen. Programs may declare up to 16 rows
+/// so the off-screen half picks up sensible attribute bytes; if
+/// exactly 15 are given, the parser auto-replicates row 14 down
+/// into row 15 so the last attribute byte stays consistent with
+/// what's visible.
+fn palette_map_to_attrs(bg_name: &str, rows: &[String], span: Span) -> Result<Vec<u8>, Diagnostic> {
+    if rows.len() > 16 {
+        return Err(Diagnostic::error(
+            ErrorCode::E0201,
+            format!(
+                "background '{bg_name}' palette_map has {} rows; maximum is 16 \
+                 (15 visible metatile rows + 1 off-screen row for the bottom \
+                 half of the last attribute byte)",
+                rows.len()
+            ),
+            span,
+        ));
+    }
+    // Build a dense 16×16 grid of sub-palette indices (rows beyond
+    // declared are 0). Using 16 metatile rows keeps the packing loop
+    // branch-free.
+    let mut grid = [[0u8; 16]; 16];
+    for (ry, row) in rows.iter().enumerate() {
+        let chars: Vec<char> = row.chars().collect();
+        if chars.len() > 16 {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!(
+                    "background '{bg_name}' palette_map row {ry} has {} cells; \
+                     maximum is 16 (one per 16×16 metatile)",
+                    chars.len()
+                ),
+                span,
+            ));
+        }
+        for (rx, ch) in chars.iter().enumerate() {
+            let idx = match ch {
+                '0' => 0u8,
+                '1' => 1,
+                '2' => 2,
+                '3' => 3,
+                ' ' | '.' => 0,
+                other => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!(
+                            "background '{bg_name}' palette_map cell ({rx}, {ry}) \
+                             has '{other}'; must be a sub-palette digit '0'-'3'"
+                        ),
+                        span,
+                    ));
+                }
+            };
+            grid[ry][rx] = idx;
+        }
+    }
+    // If the user gave exactly 15 rows, replicate row 14 into row 15
+    // so the last attribute byte's bottom-half picks up the same
+    // sub-palette as the visible bottom of the screen. Users who
+    // want explicit control over the off-screen row can supply all
+    // 16 rows.
+    if rows.len() == 15 {
+        grid[15] = grid[14];
+    }
+    // Pack into the 8×8 attribute table. Each attribute byte covers
+    // a 2×2 block of metatiles:
+    //     bits 0-1 = top-left      (grid[ay*2  ][ax*2  ])
+    //     bits 2-3 = top-right     (grid[ay*2  ][ax*2+1])
+    //     bits 4-5 = bottom-left   (grid[ay*2+1][ax*2  ])
+    //     bits 6-7 = bottom-right  (grid[ay*2+1][ax*2+1])
+    let mut out = vec![0u8; 64];
+    for ay in 0..8 {
+        for ax in 0..8 {
+            let tl = grid[ay * 2][ax * 2] & 0b11;
+            let tr = grid[ay * 2][ax * 2 + 1] & 0b11;
+            let bl = grid[ay * 2 + 1][ax * 2] & 0b11;
+            let br = grid[ay * 2 + 1][ax * 2 + 1] & 0b11;
+            out[ay * 8 + ax] = tl | (tr << 2) | (bl << 4) | (br << 6);
+        }
+    }
+    Ok(out)
 }
 
 pub fn parse(source: &str) -> (Option<Program>, Vec<Diagnostic>) {

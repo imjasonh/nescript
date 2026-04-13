@@ -97,6 +97,82 @@ fn sanitize_label(name: &str) -> String {
         .collect()
 }
 
+/// Resolve a note name like `C4` / `Cs4` / `Db4` / `rest` into the
+/// period-table index understood by the runtime music driver.
+///
+/// Returns:
+/// - `Some(0)` for `rest` (silence)
+/// - `Some(1..=60)` for a C1..B5 note
+/// - `None` for anything else
+///
+/// The period table used by `runtime::gen_period_table` is laid out
+/// one octave per 12 entries starting at C1 = index 1, so:
+///
+/// | Octave | First index | Last index |
+/// |--------|-------------|------------|
+/// | 1      | 1 (C1)      | 12 (B1)    |
+/// | 2      | 13 (C2)     | 24 (B2)    |
+/// | 3      | 25 (C3)     | 36 (B3)    |
+/// | 4      | 37 (C4)     | 48 (B4)    |
+/// | 5      | 49 (C5)     | 60 (B5)    |
+///
+/// Middle C is `C4` = 37.
+///
+/// Accidentals are written as `Cs4` (C sharp) or `Db4` (D flat); the
+/// `#` and flat characters aren't valid `NEScript` identifiers, so
+/// the two-letter prefix is the portable alternative. Names are
+/// case-insensitive and equivalent enharmonic pairs
+/// (e.g. `Cs4` / `Db4`) both resolve to the same index.
+#[must_use]
+pub fn note_name_to_index(name: &str) -> Option<u8> {
+    let lower = name.to_ascii_lowercase();
+    if lower == "rest" || lower == "_" {
+        return Some(0);
+    }
+    // The shortest valid note name is 2 chars ("c1"), the longest is
+    // 3 chars ("cs5"). Anything else can't be a note.
+    let bytes = lower.as_bytes();
+    if bytes.len() < 2 || bytes.len() > 3 {
+        return None;
+    }
+    // Last char must be the octave digit.
+    let octave = match bytes[bytes.len() - 1] {
+        b'1' => 0u8,
+        b'2' => 1,
+        b'3' => 2,
+        b'4' => 3,
+        b'5' => 4,
+        _ => return None,
+    };
+    // Step index within the octave: C=0, C#=1, D=2, D#=3, E=4,
+    // F=5, F#=6, G=7, G#=8, A=9, A#=10, B=11.
+    let step: u8 = match (bytes[0], bytes.get(1).copied()) {
+        (b'c', Some(b's')) | (b'd', Some(b'b')) => 1,
+        (b'c', _) => 0,
+        (b'd', Some(b's')) | (b'e', Some(b'b')) => 3,
+        (b'd', _) => 2,
+        (b'e', _) => 4,
+        (b'f', Some(b's')) | (b'g', Some(b'b')) => 6,
+        (b'f', _) => 5,
+        (b'g', Some(b's')) | (b'a', Some(b'b')) => 8,
+        (b'g', _) => 7,
+        (b'a', Some(b's')) | (b'b', Some(b'b')) => 10,
+        (b'a', _) => 9,
+        (b'b', _) => 11,
+        _ => return None,
+    };
+    // If byte[1] is present it must have been consumed as an
+    // accidental OR be the octave digit. Validate the accidental path
+    // actually consumed byte[1].
+    if bytes.len() == 3 {
+        let acc = bytes[1];
+        if acc != b's' && acc != b'b' {
+            return None;
+        }
+    }
+    Some(octave * 12 + step + 1)
+}
+
 /// Per-frame max (user-declared sfx length cap).
 ///
 /// The driver walks envelope bytes one per NMI — a 60-frame sfx
@@ -763,6 +839,63 @@ mod tests {
         }
         assert!(!is_builtin_sfx("totally_made_up"));
         assert!(!is_builtin_music("also_made_up"));
+    }
+
+    #[test]
+    fn note_name_middle_c_is_index_37() {
+        // The period-table's middle-C slot — every other note is
+        // anchored relative to this, so regressions here silently
+        // transpose every song in the program.
+        assert_eq!(note_name_to_index("C4"), Some(37));
+        assert_eq!(note_name_to_index("c4"), Some(37));
+    }
+
+    #[test]
+    fn note_name_rest_maps_to_zero() {
+        assert_eq!(note_name_to_index("rest"), Some(0));
+        assert_eq!(note_name_to_index("REST"), Some(0));
+        assert_eq!(note_name_to_index("_"), Some(0));
+    }
+
+    #[test]
+    fn note_name_octave_range() {
+        assert_eq!(note_name_to_index("C1"), Some(1));
+        assert_eq!(note_name_to_index("B1"), Some(12));
+        assert_eq!(note_name_to_index("C2"), Some(13));
+        assert_eq!(note_name_to_index("C5"), Some(49));
+        assert_eq!(note_name_to_index("B5"), Some(60));
+    }
+
+    #[test]
+    fn note_name_enharmonic_equivalence() {
+        // C# == Db, D# == Eb, etc. The music driver only has one slot
+        // per pitch, so enharmonic spellings must collapse.
+        assert_eq!(note_name_to_index("Cs4"), note_name_to_index("Db4"));
+        assert_eq!(note_name_to_index("Ds4"), note_name_to_index("Eb4"));
+        assert_eq!(note_name_to_index("Fs4"), note_name_to_index("Gb4"));
+        assert_eq!(note_name_to_index("Gs4"), note_name_to_index("Ab4"));
+        assert_eq!(note_name_to_index("As4"), note_name_to_index("Bb4"));
+    }
+
+    #[test]
+    fn note_name_sharp_flat_indices() {
+        // C# sits between C and D in the period table.
+        let c4 = note_name_to_index("C4").unwrap();
+        let cs4 = note_name_to_index("Cs4").unwrap();
+        let d4 = note_name_to_index("D4").unwrap();
+        assert_eq!(cs4, c4 + 1);
+        assert_eq!(d4, c4 + 2);
+    }
+
+    #[test]
+    fn note_name_invalid_names_return_none() {
+        assert_eq!(note_name_to_index(""), None);
+        assert_eq!(note_name_to_index("H4"), None); // H isn't a note
+        assert_eq!(note_name_to_index("C0"), None); // below period table
+        assert_eq!(note_name_to_index("C6"), None); // above period table
+        assert_eq!(note_name_to_index("C#4"), None); // `#` not allowed in idents
+        assert_eq!(note_name_to_index("Csx4"), None); // bogus accidental
+        assert_eq!(note_name_to_index("CoolName"), None);
     }
 
     #[test]

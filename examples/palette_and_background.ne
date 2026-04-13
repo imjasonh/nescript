@@ -24,39 +24,39 @@ game "Palette + BG Demo" {
 
 // ── Palettes ────────────────────────────────────────────────
 //
-// Each palette is 32 bytes laid out in the standard NES order:
-//   $00-$0F  background palettes 0-3 (4 colours each)
-//   $10-$1F  sprite palettes 0-3 (4 colours each, $10/$14/$18/$1C
-//             mirror the bg slots)
+// Both palettes are authored in grouped form: one shared
+// `universal:` colour feeds every sub-palette's index-0 slot,
+// which auto-fixes the `$3F10/$3F14/$3F18/$3F1C` PPU mirror
+// trap (the parser handles the packing). Each `bgN` / `spN`
+// field only needs three colours — the universal is prepended.
 //
-// `CoolBlues` uses deep blue background tiles with pale highlights;
-// `WarmReds` swaps them for red/orange tones. Every 4 bytes is a
-// sub-palette.
+// Named NES colours resolve to master-palette indices via the
+// curated name table; see `docs/language-guide.md` for the full
+// list. Hex byte literals (`0x01`, `0x14`, …) still work if you
+// need a colour that doesn't have a name.
 
 palette CoolBlues {
-    colors: [
-        0x0F, 0x01, 0x11, 0x21,  // bg palette 0: black, deep blue, sky, pale
-        0x0F, 0x02, 0x12, 0x22,  // bg palette 1
-        0x0F, 0x0C, 0x1C, 0x2C,  // bg palette 2
-        0x0F, 0x0B, 0x1B, 0x2B,  // bg palette 3
-        0x0F, 0x01, 0x11, 0x21,  // sprite palette 0
-        0x0F, 0x16, 0x27, 0x30,  // sprite palette 1
-        0x0F, 0x14, 0x24, 0x34,  // sprite palette 2
-        0x0F, 0x0B, 0x1B, 0x2B   // sprite palette 3
-    ]
+    universal: black
+    bg0: [dk_blue, blue, sky_blue]         // deep blue highlights
+    bg1: [indigo, royal_blue, periwinkle]  // cool purples
+    bg2: [dk_cyan, cyan, lt_cyan]          // aquas
+    bg3: [dk_teal, teal, lt_teal]          // teal accents
+    sp0: [dk_blue, blue, sky_blue]         // matches bg0
+    sp1: [red, orange, white]              // warm accent sprites
+    sp2: [magenta, lt_magenta, pale_pink]  // magenta sprites
+    sp3: [dk_teal, teal, lt_teal]          // matches bg3
 }
 
 palette WarmReds {
-    colors: [
-        0x0F, 0x06, 0x16, 0x26,  // bg palette 0: black, dark red, red, peach
-        0x0F, 0x07, 0x17, 0x27,  // bg palette 1
-        0x0F, 0x08, 0x18, 0x28,  // bg palette 2
-        0x0F, 0x09, 0x19, 0x29,  // bg palette 3
-        0x0F, 0x06, 0x16, 0x26,  // sprite palette 0
-        0x0F, 0x16, 0x27, 0x30,  // sprite palette 1
-        0x0F, 0x14, 0x24, 0x34,  // sprite palette 2
-        0x0F, 0x0B, 0x1B, 0x2B   // sprite palette 3
-    ]
+    universal: black
+    bg0: [dk_red, red, lt_red]             // fiery warm bg
+    bg1: [brown, dk_orange, orange]        // autumnal
+    bg2: [dk_olive, olive, yellow]         // muted yellows
+    bg3: [dk_green, green, lt_green]       // greens for contrast
+    sp0: [dk_red, red, lt_red]             // matches bg0
+    sp1: [red, orange, white]              // highlight sprites
+    sp2: [magenta, lt_magenta, pale_pink]  // pinks
+    sp3: [dk_teal, teal, lt_teal]          // cool accent
 }
 
 // ── Backgrounds ─────────────────────────────────────────────
@@ -74,40 +74,46 @@ palette WarmReds {
 // top-left to bottom-right so the swap is visually obvious.
 
 background TitleScreen {
-    tiles: [
-        // Row 14 (offset 14*32 = 448): a ribbon of tile 0
-        // across columns 4..28.
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        // Row 14
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    // Both backgrounds resolve to an all-zero nametable for this
+    // demo — the visual difference between them comes from the
+    // palette swap triggered alongside `load_background`. We still
+    // author them with a `legend` + `map:` block here so the demo
+    // exercises the pleasant syntax the same way a real game
+    // would. The '.' legend entry alone is enough to fill an
+    // all-tile-0 background; every row is padded to 32 columns
+    // automatically by the parser.
+    legend { ".": 0 }
+    map: [
+        "................................",   // row 0
+        "................................",   // row 1
+        "................................",   // row 2
+        "................................",   // row 3
+        "................................",   // row 4
+        "................................",   // row 5
+        "................................",   // row 6
+        "................................",   // row 7
+        "................................",   // row 8
+        "................................",   // row 9
+        "................................",   // row 10
+        "................................",   // row 11
+        "................................",   // row 12
+        "................................",   // row 13
+        "................................",   // row 14 (ribbon)
+        "................................"    // row 15
     ]
 }
 
 background StageOne {
-    tiles: [
-        // A few scattered tile-0s across the first 4 rows so the
-        // background visibly differs from TitleScreen after the
-        // swap. Remaining rows are zero-padded and render as
-        // tile 0 anyway — the visual difference comes from the
-        // palette swap triggered alongside.
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
+    // StageOne's visual difference comes from the palette swap —
+    // the tile grid is still the built-in smiley everywhere. We
+    // only declare 4 rows to prove the parser's zero-padding
+    // still works with the new tilemap form.
+    legend { ".": 0 }
+    map: [
+        "................................",
+        "................................",
+        "................................",
+        "................................"
     ]
 }
 

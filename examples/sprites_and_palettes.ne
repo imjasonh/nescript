@@ -9,17 +9,38 @@ game "Asset Demo" {
     mapper: NROM
 }
 
-// Define a sprite with inline CHR tile data (16 bytes = one 8x8 tile)
-// This is a simple arrow pointing right
+// Define a sprite with ASCII pixel art. Each character maps to a
+// 2-bit palette index: `.` = 0 (transparent), `#` = 1, `%` = 2,
+// `@` = 3. The parser handles the 2-bitplane CHR encoding, so we
+// never touch hex bytes by hand.
+//
+// Arrow — a right-facing arrow in palette-index 1.
 sprite Arrow {
-    chr: [0x18, 0x1C, 0xFE, 0xFF, 0xFF, 0xFE, 0x1C, 0x18,
-          0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+    pixels: [
+        "...##...",
+        "...###..",
+        "#######.",
+        "########",
+        "########",
+        "#######.",
+        "...###..",
+        "...##..."
+    ]
 }
 
-// Define a sprite with a heart shape
+// Heart — a full-colour heart in palette-index 3 (the brightest
+// shade, `@`).
 sprite Heart {
-    chr: [0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18, 0x00,
-          0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18, 0x00]
+    pixels: [
+        ".@@..@@.",
+        "@@@@@@@@",
+        "@@@@@@@@",
+        "@@@@@@@@",
+        ".@@@@@@.",
+        "..@@@@..",
+        "...@@...",
+        "........"
+    ]
 }
 
 var px: u8 = 128
