@@ -6,14 +6,7 @@ NEScript compiles `.ne` source files directly into playable iNES ROM files, with
 
 ![Platformer demo](docs/platformer.gif)
 
-An end-to-end side-scrolling platformer — custom CHR art, full
-background nametable with per-region palettes, physics-driven hero,
-scrolling camera, enemies, coins, user-declared SFX/music, and a
-Title → Playing state machine — all in a single 24 KB iNES ROM
-compiled from one NEScript source file.
-
-**Source:** [`examples/platformer.ne`](examples/platformer.ne) ·
-**Regenerate the tile art:** `cargo run --bin gen_platformer_tiles`
+_Source: [`examples/platformer.ne`](examples/platformer.ne)_
 
 ## Quick Start
 
