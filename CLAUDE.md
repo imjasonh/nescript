@@ -15,6 +15,13 @@ re-derive the project conventions from scratch.
   pipeline.
 - Examples live in `examples/*.ne`. Every example is expected to compile
   cleanly and has a pinned emulator golden — see below.
+- **`examples/*.nes` is committed.** The compiler is deterministic
+  (same source → byte-identical ROM), so the ROMs travel with the
+  repo. If you edit any `.ne` file you **must** rebuild its `.nes`
+  in the same commit — CI's `examples` job rebuilds each ROM into a
+  tmp path and fails if the committed version differs, pointing at
+  the exact `cargo run -- build examples/<name>.ne` to run. The
+  pre-commit hook under `scripts/pre-commit` catches this locally.
 - `docs/future-work.md` lists the remaining gaps. If you implement
   something from that file, update the doc in the same PR.
 
@@ -63,8 +70,9 @@ tests/emulator/
 The harness is **separate** from `cargo test`. You have to run it by hand:
 
 ```bash
-# 1. Build every example first. The harness reads pre-built .nes files
-#    from examples/ — it will not invoke cargo.
+# 1. Rebuild every example with the current compiler. The harness
+#    reads whatever sits under examples/*.nes — if you want to test
+#    your working copy you have to rebuild them first.
 cargo build --release
 for f in examples/*.ne; do ./target/release/nescript build "$f"; done
 
@@ -72,12 +80,21 @@ for f in examples/*.ne; do ./target/release/nescript build "$f"; done
 cd tests/emulator
 npm install          # or `npm ci` in CI
 
-# 3. Verify every example still matches its golden.
+# 3. Verify every ROM still matches its golden.
 node run_examples.mjs
-# → "21/21 ROMs match their goldens" on success
+# → "22/22 ROMs match their goldens" on success
 # → FAIL / MISS lines + `actual/<name>.png`, `actual/<name>.diff.png`,
 #   `actual/<name>.wav` written for any ROM that mismatched
 ```
+
+The harness always runs against whatever sits in `examples/*.nes`,
+so iterating on the compiler means rebuilding the example first.
+CI's `emulator` job does this too — it builds the compiler, compiles
+every `.ne` into the workspace (overwriting the committed ROMs,
+which are ephemeral in the CI checkout), and then runs the harness.
+The committed ROMs are a PR-review convenience and a "did this
+change affect codegen" tripwire via the `examples` job's
+reproducibility diff; they are **not** what the emulator job tests.
 
 ### Updating goldens
 

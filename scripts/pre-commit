@@ -15,4 +15,28 @@ cargo clippy --all-targets -- -D warnings
 echo "  Running tests..."
 cargo test --all-targets
 
+# Committed ROMs must match their .ne sources — the compiler is
+# deterministic, so any example whose on-disk .nes differs from a
+# fresh build means someone edited the .ne file but forgot to
+# rebuild. Rebuild each to a tmp path and fail if any differ, then
+# point the user at the exact `cargo run` command to fix it.
+echo "  Checking committed ROMs match .ne sources..."
+cargo build --release --quiet
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+stale=0
+for f in examples/*.ne; do
+    name=$(basename "$f" .ne)
+    ./target/release/nescript build "$f" --output "$tmp/$name.nes" >/dev/null
+    if ! cmp -s "examples/$name.nes" "$tmp/$name.nes"; then
+        echo "    STALE: examples/$name.nes"
+        echo "           rerun: cargo run --release -- build $f"
+        stale=1
+    fi
+done
+if [ $stale -ne 0 ]; then
+    echo "one or more committed ROMs are out of date"
+    exit 1
+fi
+
 echo "All pre-commit checks passed."
