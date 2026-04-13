@@ -35,43 +35,45 @@ game "Audio Demo" {
 // ── User-declared sound effects ──
 //
 // An `sfx` block is a frame-accurate envelope for pulse 1. `pitch`
-// latches the pulse period once on trigger; `volume` runs one entry
-// per frame, so the envelope length controls the effect duration.
-// `duty` (0-3) picks the pulse waveform shape (2 = 50% square).
+// is latched into `$4002` once on trigger — the v1 audio driver
+// never updates the pulse period mid-effect — so a single scalar
+// byte is the natural form for the current pipeline. `envelope:`
+// is a friendlier alias for `volume:`: both describe the per-frame
+// volume ramp that shapes the effect. `duty` (0-3) picks the pulse
+// waveform (2 = 50% square).
 
 // A gentle rising chirp, longer than the builtin coin.
 sfx LongCoin {
     duty: 2
-    pitch: [0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50, 0x50]
-    volume: [15, 14, 13, 12, 11, 9, 7, 5, 3, 1]
+    pitch: 0x50
+    envelope: [15, 14, 13, 12, 11, 9, 7, 5, 3, 1]
 }
 
 // A sharp two-part zap — quick high spike into silence.
 sfx Zap {
     duty: 3
-    pitch: [0x20, 0x20, 0x20, 0x20, 0x20]
-    volume: [15, 12, 8, 4, 1]
+    pitch: 0x20
+    envelope: [15, 12, 8, 4, 1]
 }
 
 // ── User-declared music tracks ──
 //
-// A `music` block is a flat list of `(pitch, duration)` note pairs.
-// Pitch 0 = rest; 1-60 = period table index (C1..B5, middle C = 37).
-// Duration is in frames (so at 60 fps, 30 = half second per note).
-// Music loops by default; set `repeat: false` for one-shot cues.
+// Notes are written in note-name form (`C4`, `E4`, `G4`, …) with a
+// default frames-per-note set by `tempo:`. Any note can override
+// the default by trailing the name with an explicit duration
+// (e.g. `G4 40` holds twice as long). `rest` (or the alias `_`) is
+// a silent beat. Use the legacy `37, 20, 41, 20, ...` pair form by
+// leaving `tempo:` out if you'd rather pick pitches by index.
 
-// A cheerful four-note looping theme.
+// A cheerful four-note looping theme — every note is one-third of
+// a second long, and the whole loop is 120 frames = 2 seconds.
 music Theme {
     duty: 2
     volume: 10
     repeat: true
+    tempo: 20
     notes: [
-        37, 20,  // C4
-        41, 20,  // E4
-        44, 20,  // G4
-        49, 20,  // C5
-        44, 20,  // G4
-        41, 20,  // E4
+        C4, E4, G4, C5, G4, E4
     ]
 }
 

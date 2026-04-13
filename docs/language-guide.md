@@ -858,8 +858,13 @@ Rules:
 - Every character in a `map:` string must be defined in the legend
   (otherwise `E0201`).
 - `palette_map:` rows are ≤ 16 digit characters (`0`-`3`, plus
-  `.` / space as a sub-palette 0 alias), no more than 15 rows. The
-  parser packs adjacent 2×2 metatile groups into the awkward
+  `.` / space as a sub-palette 0 alias). Up to 16 rows are
+  accepted: the first 15 cover the visible 240-scanline screen and
+  the optional 16th covers the off-screen half of the last
+  attribute row (the PPU still reads it). If exactly 15 rows are
+  supplied, the parser auto-replicates row 14 into row 15 so the
+  visible bottom edge of the screen gets consistent attribute
+  bytes. The packer handles the awkward
   `(br<<6)|(bl<<4)|(tr<<2)|tl` attribute-byte layout for you.
 - Raw and tilemap forms are mutually exclusive per field
   (`tiles:` vs `map:`, `attributes:` vs `palette_map:`).

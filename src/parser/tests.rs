@@ -1781,6 +1781,54 @@ fn parse_sprite_pixel_art_rejects_non_multiple_of_8() {
 }
 
 #[test]
+fn parse_sprite_pixel_art_accepts_abc_alias() {
+    // `.abc` is the vocabulary every NES tool uses for 2-bit pixel
+    // art; the parser should accept it interchangeably with `.#%@`
+    // and `.0123`. Two sprites written in the two forms must
+    // encode to bit-identical CHR bytes.
+    let letters = r#"
+        game "T" { mapper: NROM }
+        sprite A {
+            pixels: [
+                "........",
+                "...aa...",
+                "..abba..",
+                ".abbccb.",
+                ".abbccb.",
+                "..abba..",
+                "...aa...",
+                "........"
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let glyphs = r#"
+        game "T" { mapper: NROM }
+        sprite A {
+            pixels: [
+                "........",
+                "...##...",
+                "..#%%#..",
+                ".#%%@@%.",
+                ".#%%@@%.",
+                "..#%%#..",
+                "...##...",
+                "........"
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let p1 = parse_ok(letters);
+    let p2 = parse_ok(glyphs);
+    match (&p1.sprites[0].chr_source, &p2.sprites[0].chr_source) {
+        (AssetSource::Inline(a), AssetSource::Inline(b)) => assert_eq!(a, b),
+        _ => panic!("expected inline CHR on both sprites"),
+    }
+}
+
+#[test]
 fn parse_sprite_pixel_art_rejects_ragged_rows() {
     let src = r#"
         game "T" { mapper: NROM }
@@ -2081,6 +2129,110 @@ fn parse_background_palette_map_packs_attributes() {
     //   BL = grid[1][2] = 1  BR = grid[1][3] = 1
     // = (1) | (1 << 2) | (1 << 4) | (1 << 6) = 0x55
     assert_eq!(attrs[1], 0x55);
+}
+
+#[test]
+fn parse_background_palette_map_15_rows_replicates_off_screen_row() {
+    // When a program only declares 15 rows (the visible metatile
+    // grid), the parser should replicate the bottom row into the
+    // off-screen 16th row so the last attribute byte's bottom half
+    // picks up the same sub-palette as the visible bottom.
+    let src = r#"
+        game "T" { mapper: NROM }
+        background Stage {
+            legend { ".": 0 }
+            map: ["................................"]
+            palette_map: [
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222",
+                "2222222222222222"
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let attrs = &prog.backgrounds[0].attributes;
+    // Every byte covers 4 metatiles at sub-palette 2, so each
+    // byte should be 0b10_10_10_10 = 0xAA. Crucially, the last
+    // attribute row (bytes 56-63) must also be 0xAA — if the
+    // auto-replicate didn't happen, bytes 56-63 would be 0x0A
+    // (top-half 2, bottom-half 0) since the 16th metatile row
+    // would default to sub-palette 0.
+    for b in attrs {
+        assert_eq!(*b, 0xAA, "every attribute byte should be 2s");
+    }
+}
+
+#[test]
+fn parse_background_palette_map_16_rows_accepted() {
+    // The parser accepts an explicit 16th row for programs that
+    // want full control over the off-screen attribute byte.
+    let src = r#"
+        game "T" { mapper: NROM }
+        background Stage {
+            legend { ".": 0 }
+            map: ["................................"]
+            palette_map: [
+                "1111111111111111", "1111111111111111",
+                "1111111111111111", "1111111111111111",
+                "1111111111111111", "1111111111111111",
+                "1111111111111111", "1111111111111111",
+                "1111111111111111", "1111111111111111",
+                "1111111111111111", "1111111111111111",
+                "1111111111111111", "1111111111111111",
+                "1111111111111111",
+                "2222222222222222"
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let attrs = &prog.backgrounds[0].attributes;
+    // The last attribute byte's top half covers metatile row 14
+    // (sub-palette 1) and bottom half covers metatile row 15
+    // (sub-palette 2). Byte = (1) | (1 << 2) | (2 << 4) | (2 << 6)
+    // = 0x01 | 0x04 | 0x20 | 0x80 = 0xA5.
+    assert_eq!(attrs[63], 0xA5);
+}
+
+#[test]
+fn parse_background_palette_map_rejects_17_rows() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        background Bad {
+            legend { ".": 0 }
+            map: ["."]
+            palette_map: [
+                "0000000000000000", "0000000000000000",
+                "0000000000000000", "0000000000000000",
+                "0000000000000000", "0000000000000000",
+                "0000000000000000", "0000000000000000",
+                "0000000000000000", "0000000000000000",
+                "0000000000000000", "0000000000000000",
+                "0000000000000000", "0000000000000000",
+                "0000000000000000", "0000000000000000",
+                "0000000000000000"
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let diags = parse_err(src);
+    assert!(diags.contains(&crate::errors::ErrorCode::E0201));
 }
 
 #[test]

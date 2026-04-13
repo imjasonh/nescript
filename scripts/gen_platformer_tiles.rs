@@ -3,11 +3,11 @@
 //!
 //! Run with `cargo run --bin gen_platformer_tiles`. The output is
 //! intended to be pasted into `platformer.ne` under the
-//! `sprite Tileset { chr: [...] }` and
-//! `background Level { tiles: [...] }` blocks. Keeping the source of
-//! truth here (instead of hand-maintained hex in the `.ne` file)
-//! makes the tile art editable as ASCII and ensures the CHR bytes
-//! and the nametable stay in sync with named tile indices.
+//! `sprite Tileset { pixels: [...] }` and
+//! `background Level { legend { ... } map: [...] palette_map: [...] }`
+//! blocks. Keeping the source of truth here (instead of
+//! hand-maintained ASCII in the `.ne` file) ensures the tile art,
+//! the nametable, and the named tile indices all stay in sync.
 //!
 //! Tiles are defined as 8×8 ASCII art where each character selects
 //! one of 4 sub-palette slots:
@@ -15,8 +15,10 @@
 //!     'a' = colour 1
 //!     'b' = colour 2
 //!     'c' = colour 3
-
-use std::fmt::Write as _;
+//!
+//! Both the generator *and* the `NEScript` parser accept `.abc` as
+//! aliases for `.#%@`, so the output is ready to paste directly
+//! into a `pixels:` block without translation.
 
 /// A single 8×8 tile description: name + ASCII art.
 struct Tile {
@@ -242,34 +244,32 @@ const BUSH: u8 = 13;
 const QBLOCK: u8 = 14;
 const SKY: u8 = 15;
 
-/// Encode one 8×8 tile into its 16-byte NES CHR representation
-/// (two 8-byte bitplanes: low bit then high bit).
-fn tile_to_chr(art: &str) -> [u8; 16] {
+/// Validate that a tile's ASCII art is well-formed (8 rows × 8 cols,
+/// only the legal `.abc` characters). Pixel→CHR encoding now happens
+/// inside the `NEScript` parser when it sees the `pixels:` block, so
+/// this generator's job is just to make sure the strings we paste
+/// are syntactically valid.
+fn validate_tile_art(name: &str, art: &str) {
     let rows: Vec<&str> = art.lines().filter(|l| !l.is_empty()).collect();
-    assert_eq!(rows.len(), 8, "expected 8 rows, got {}", rows.len());
-    let mut chr = [0u8; 16];
+    assert_eq!(
+        rows.len(),
+        8,
+        "tile '{name}': expected 8 rows, got {}",
+        rows.len()
+    );
     for (y, row) in rows.iter().enumerate() {
-        assert_eq!(row.len(), 8, "expected 8 cols in row {y}: {row:?}");
-        let (mut plane0, mut plane1) = (0u8, 0u8);
-        for (x, ch) in row.chars().enumerate() {
-            let idx: u8 = match ch {
-                '.' => 0,
-                'a' => 1,
-                'b' => 2,
-                'c' => 3,
-                other => panic!("invalid tile char {other:?}"),
-            };
-            if idx & 1 != 0 {
-                plane0 |= 0x80 >> x;
-            }
-            if idx & 2 != 0 {
-                plane1 |= 0x80 >> x;
-            }
+        assert_eq!(
+            row.len(),
+            8,
+            "tile '{name}' row {y}: expected 8 cols, got {row:?}"
+        );
+        for ch in row.chars() {
+            assert!(
+                matches!(ch, '.' | 'a' | 'b' | 'c'),
+                "tile '{name}' row {y}: invalid character '{ch}'"
+            );
         }
-        chr[y] = plane0;
-        chr[y + 8] = plane1;
     }
-    chr
 }
 
 /// Build a 32×30 nametable for a static Mario-ish level vista.
@@ -367,62 +367,112 @@ fn build_attributes() -> [u8; 64] {
     attr
 }
 
-fn emit_byte_block(bs: &[u8], per_row: usize, indent: &str) -> String {
-    let mut out = String::new();
-    for chunk in bs.chunks(per_row) {
-        out.push_str(indent);
-        for (i, b) in chunk.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            let _ = write!(out, "{b}");
-        }
-        out.push_str(",\n");
-    }
-    out
-}
-
-fn emit_hex_block(bs: &[u8], per_row: usize, indent: &str) -> String {
-    let mut out = String::new();
-    for chunk in bs.chunks(per_row) {
-        out.push_str(indent);
-        for (i, b) in chunk.iter().enumerate() {
-            if i > 0 {
-                out.push_str(", ");
-            }
-            let _ = write!(out, "0x{b:02X}");
-        }
-        out.push_str(",\n");
-    }
-    out
-}
-
 fn main() {
-    // ── CHR ──
-    let mut chr_all: Vec<u8> = Vec::new();
-    println!("// ── CHR tiles (paste into sprite Tileset {{ chr: [...] }}) ──");
+    // ── CHR tiles as pixel-art strings ──────────────────────────
+    //
+    // `NEScript`'s `sprite Name { pixels: [...] }` accepts one string
+    // per pixel row; the parser splits the grid into 8×8 tiles in
+    // row-major reading order, so emitting each 8-row tile
+    // sequentially (stacked vertically, 1 tile wide × 15 tiles tall)
+    // produces CHR tile indices 1..15 in the same order as the
+    // TILES array.
+    println!("// ── CHR tiles (paste into sprite Tileset {{ pixels: [...] }}) ──");
+    println!("    pixels: [");
     for (i, tile) in TILES.iter().enumerate() {
+        validate_tile_art(tile.name, tile.art);
         let tile_idx = i + 1;
-        let chr = tile_to_chr(tile.art);
-        chr_all.extend_from_slice(&chr);
-        println!("    // tile {tile_idx}: {}", tile.name);
-        print!("{}", emit_hex_block(&chr, 16, "    "));
+        println!("        // tile {tile_idx}: {}", tile.name);
+        for row in tile.art.lines().filter(|l| !l.is_empty()) {
+            println!("        \"{row}\",");
+        }
     }
-    println!(
-        "// total tiles: {}, total CHR bytes: {}\n",
-        TILES.len(),
-        chr_all.len()
-    );
+    println!("    ]\n");
 
-    // ── Nametable ──
+    // ── Background tilemap via legend + map form ────────────────
+    //
+    // Each distinct nametable tile gets one easy-to-read legend
+    // character. `.` is the most common (sky), so use it for the
+    // default fill to keep the `map:` strings tidy. The compiler
+    // validates every character — any typo in the rows below is
+    // caught by the parser rather than by a render bug at runtime.
+    println!("// ── Nametable (paste into background Level {{ legend/map/palette_map }}) ──");
+    println!("    legend {{");
+    println!("        \".\": 15   // sky (blank)");
+    println!("        \"<\": 10   // cloud left half");
+    println!("        \">\": 11   // cloud right half");
+    println!("        \"#\": 9    // brick");
+    println!("        \"Q\": 14   // question block");
+    println!("        \"^\": 12   // hill silhouette");
+    println!("        \"*\": 13   // bush");
+    println!("        \"=\": 7    // grass top");
+    println!("        \"%\": 8    // dirt");
+    println!("    }}");
+    println!();
+    println!("    map: [");
     let nt = build_nametable();
     assert_eq!(nt.len(), 960);
-    println!("// ── Nametable (paste into background Level {{ tiles: [...] }}) ──");
-    print!("{}", emit_byte_block(&nt, 16, "        "));
+    let legend = legend_char_for;
+    for row in 0..30 {
+        let mut s = String::from("        \"");
+        for col in 0..32 {
+            s.push(legend(nt[row * 32 + col]));
+        }
+        s.push_str("\",");
+        println!("{s}");
+    }
+    println!("    ]\n");
 
-    // ── Attributes ──
+    // ── Palette map (auto-packs the 64-byte attribute table) ────
+    //
+    // `palette_map:` is a 16-wide grid of sub-palette digits (one
+    // per 16×16 metatile). The parser packs pairs of rows into the
+    // 8×8 attribute table automatically, so we emit the metatile
+    // grid directly and skip the awkward `(br<<6)|(bl<<4)|(tr<<2)|tl`
+    // bit-packing the old raw-bytes form demanded.
+    //
+    // The attribute table covers 16 metatile rows (8 attr rows ×
+    // 2 each); the last row sits below the visible 240-scanline
+    // screen but the PPU still reads it, so we emit all 16 rows to
+    // match whatever the original hand-packed attribute byte was.
+    println!("// ── Attributes (paste into background Level {{ palette_map: [...] }}) ──");
+    println!("    palette_map: [");
     let attr = build_attributes();
-    assert_eq!(attr.len(), 64);
-    println!("\n// ── Attributes (paste into background Level {{ attributes: [...] }}) ──");
-    print!("{}", emit_byte_block(&attr, 16, "        "));
+    for my in 0..16 {
+        let mut s = String::from("        \"");
+        for mx in 0..16 {
+            // Recover the sub-palette index for metatile (mx, my)
+            // from the packed attribute table. Each byte covers a
+            // 2×2 metatile block at attr[(my/2)*8 + mx/2], with
+            // quadrants laid out as BR BL TR TL in the high bits.
+            let byte = attr[(my / 2) * 8 + mx / 2];
+            let quadrant = match (mx % 2, my % 2) {
+                (0, 0) => byte & 0b11,
+                (1, 0) => (byte >> 2) & 0b11,
+                (0, 1) => (byte >> 4) & 0b11,
+                _ => (byte >> 6) & 0b11,
+            };
+            s.push(char::from(b'0' + quadrant));
+        }
+        s.push_str("\",");
+        println!("{s}");
+    }
+    println!("    ]");
+}
+
+/// Map a CHR tile index back to its legend character in the
+/// generated `map:` block. Must stay in sync with the `legend { ... }`
+/// block printed by `main()`.
+fn legend_char_for(tile: u8) -> char {
+    match tile {
+        15 => '.',
+        10 => '<',
+        11 => '>',
+        9 => '#',
+        14 => 'Q',
+        12 => '^',
+        13 => '*',
+        7 => '=',
+        8 => '%',
+        other => panic!("no legend char for tile {other}"),
+    }
 }

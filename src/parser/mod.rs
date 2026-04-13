@@ -822,18 +822,24 @@ impl Parser {
         for (ry, row) in rows.iter().enumerate() {
             let mut line = Vec::with_capacity(width);
             for (rx, ch) in row.chars().enumerate() {
+                // Three vocabularies map to the same 0-3 index so
+                // artists can use whichever feels natural:
+                //   `. # % @` — shade-intensity glyphs (dense = hi)
+                //   `0 1 2 3` — literal palette-index digits
+                //   `. a b c` — letter form used by most NES tools
                 let val = match ch {
                     '.' | ' ' | '0' => 0u8,
-                    '#' | '1' => 1,
-                    '%' | '2' => 2,
-                    '@' | '3' => 3,
+                    '#' | '1' | 'a' | 'A' => 1,
+                    '%' | '2' | 'b' | 'B' => 2,
+                    '@' | '3' | 'c' | 'C' => 3,
                     other => {
                         return Err(Diagnostic::error(
                             ErrorCode::E0201,
                             format!(
                                 "sprite '{sprite_name}' pixel at ({rx}, {ry}) has \
                                  invalid character '{other}'; use '.'/' '/'0' for \
-                                 index 0, '#'/'1' for 1, '%'/'2' for 2, '@'/'3' for 3"
+                                 index 0, '#'/'1'/'a' for 1, '%'/'2'/'b' for 2, \
+                                 '@'/'3'/'c' for 3"
                             ),
                             key_span,
                         ));
@@ -2947,18 +2953,21 @@ fn tilemap_to_bytes(
 /// The attribute layout is notoriously awkward: each attribute byte
 /// covers a 32×32-pixel region (four 16×16 metatiles) packed as
 /// `BR BL TR TL` — top-left in the low bits, bottom-right in the high
-/// bits. A 32×30-pixel nametable has a 16×15 metatile grid but the
-/// attribute table is a fixed 8×8 = 64 bytes, so the last half-row
-/// of metatiles (rows 14-15, which render below the visible area) is
-/// always zero-padded.
+/// bits. The attribute table is a fixed 8×8 = 64 bytes covering 16
+/// metatile rows, even though only the top 15 (the visible 240
+/// scanlines) render on screen. Programs may declare up to 16 rows
+/// so the off-screen half picks up sensible attribute bytes; if
+/// exactly 15 are given, the parser auto-replicates row 14 down
+/// into row 15 so the last attribute byte stays consistent with
+/// what's visible.
 fn palette_map_to_attrs(bg_name: &str, rows: &[String], span: Span) -> Result<Vec<u8>, Diagnostic> {
-    // 16 metatile cols × up to 15 metatile rows.
-    if rows.len() > 15 {
+    if rows.len() > 16 {
         return Err(Diagnostic::error(
             ErrorCode::E0201,
             format!(
-                "background '{bg_name}' palette_map has {} rows; maximum is 15 \
-                 (one entry per 16×16 metatile row)",
+                "background '{bg_name}' palette_map has {} rows; maximum is 16 \
+                 (15 visible metatile rows + 1 off-screen row for the bottom \
+                 half of the last attribute byte)",
                 rows.len()
             ),
             span,
@@ -3001,6 +3010,14 @@ fn palette_map_to_attrs(bg_name: &str, rows: &[String], span: Span) -> Result<Ve
             };
             grid[ry][rx] = idx;
         }
+    }
+    // If the user gave exactly 15 rows, replicate row 14 into row 15
+    // so the last attribute byte's bottom-half picks up the same
+    // sub-palette as the visible bottom of the screen. Users who
+    // want explicit control over the off-screen row can supply all
+    // 16 rows.
+    if rows.len() == 15 {
+        grid[15] = grid[14];
     }
     // Pack into the 8×8 attribute table. Each attribute byte covers
     // a 2×2 block of metatiles:
