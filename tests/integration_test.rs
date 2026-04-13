@@ -4,8 +4,9 @@ use nescript::analyzer;
 use nescript::assets;
 use nescript::codegen::IrCodeGen;
 use nescript::ir;
-use nescript::linker::Linker;
+use nescript::linker::{Linker, PrgBank};
 use nescript::optimizer;
+use nescript::parser::ast::BankType;
 use nescript::rom;
 
 /// Compile a `NEScript` source string into a .nes ROM. Runs the full
@@ -843,6 +844,13 @@ fn program_with_sprites_and_palette() {
 
 /// Compile a source string using the mapper-aware linker.
 fn compile_with_mapper(source: &str) -> Vec<u8> {
+    compile_banked(source)
+}
+
+/// Compile a source string, running the full IR pipeline and
+/// routing declared `bank X: prg` entries through `link_banked`
+/// as empty switchable PRG slots. This mirrors the real CLI path.
+fn compile_banked(source: &str) -> Vec<u8> {
     let (program, diags) = nescript::parser::parse(source);
     assert!(
         diags.is_empty(),
@@ -872,7 +880,13 @@ fn compile_with_mapper(source: &str) -> Vec<u8> {
     nescript::codegen::peephole::optimize(&mut instructions);
 
     let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
-    linker.link_with_all_assets(&instructions, &sprites, &sfx, &music)
+    let switchable_banks: Vec<PrgBank> = program
+        .banks
+        .iter()
+        .filter(|b| b.bank_type == BankType::Prg)
+        .map(|b| PrgBank::empty(&b.name))
+        .collect();
+    linker.link_banked(&instructions, &sprites, &sfx, &music, &switchable_banks)
 }
 
 #[test]
@@ -1190,4 +1204,403 @@ fn ir_codegen_locals_do_not_overlap_array_globals() {
         init_stores_seen, 4,
         "expected 4 init stores for xs[0..4], found {init_stores_seen}"
     );
+}
+
+// ─── End-to-end bank switching tests ───────────────────────────────
+//
+// These tests compile real NEScript source through the full parse
+// → analyze → IR → codegen → linker pipeline, producing .nes ROMs
+// that assert the bank-switching layout the README promises:
+//
+//   * Declared `bank X: prg` slots become real 16 KB PRG banks
+//   * Fixed bank lands at the end so it maps to $C000-$FFFF
+//   * Reset vector points inside the fixed bank
+//   * Mapper-specific init code appears in the fixed bank
+//   * Every iNES header field reflects the banked layout
+
+#[test]
+fn e2e_mmc1_with_two_declared_banks_produces_three_bank_rom() {
+    // MMC1 with two declared PRG banks should ship a ROM with
+    // three 16 KB PRG slots (Level1Data, Level2Data, fixed).
+    let source = r#"
+        game "MMC1 Banked" {
+            mapper: MMC1
+            mirroring: horizontal
+        }
+        bank Level1Data: prg
+        bank Level2Data: prg
+        var x: u8 = 0
+        on frame {
+            if button.right { x += 1 }
+        }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 1, "mapper number should be 1 (MMC1)");
+    assert_eq!(info.prg_banks, 3, "should have 2 switchable + 1 fixed bank");
+    assert_eq!(rom.len(), 16 + 3 * 16384 + 8192);
+}
+
+#[test]
+fn e2e_uxrom_with_four_banks_produces_five_bank_rom() {
+    let source = r#"
+        game "UxROM Banked" {
+            mapper: UxROM
+            mirroring: vertical
+        }
+        bank Level1: prg
+        bank Level2: prg
+        bank Level3: prg
+        bank Level4: prg
+        var x: u8 = 0
+        on frame {
+            if button.a { x += 1 }
+        }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 2, "mapper number should be 2 (UxROM)");
+    assert_eq!(info.prg_banks, 5, "4 switchable + 1 fixed = 5 PRG banks");
+    assert_eq!(info.mirroring, nescript::parser::ast::Mirroring::Vertical);
+}
+
+#[test]
+fn e2e_mmc3_with_three_banks_produces_four_bank_rom() {
+    let source = r#"
+        game "MMC3 Banked" {
+            mapper: MMC3
+            mirroring: horizontal
+        }
+        bank Stage1: prg
+        bank Stage2: prg
+        bank Stage3: prg
+        var x: u8 = 0
+        on frame {
+            if button.start { x = 1 }
+        }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 4, "mapper number should be 4 (MMC3)");
+    assert_eq!(info.prg_banks, 4, "3 switchable + 1 fixed = 4 PRG banks");
+}
+
+#[test]
+fn e2e_banked_fixed_bank_contains_reset_vector() {
+    // The reset vector (bytes $FFFC/$FFFD in the final bank) must
+    // point into the $C000-$FFFF window — this is how the CPU
+    // boots into the fixed bank regardless of mapper.
+    let source = r#"
+        game "BankTest" { mapper: MMC1 }
+        bank Data: prg
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    let prg_end = 16 + info.prg_banks * 16384;
+    // Last 6 bytes = NMI, RESET, IRQ vectors (little-endian).
+    let reset = u16::from_le_bytes([rom[prg_end - 4], rom[prg_end - 3]]);
+    assert!(
+        (0xC000..=0xFFFF).contains(&reset),
+        "reset vector {reset:#06X} must live in fixed-bank address window"
+    );
+}
+
+#[test]
+fn e2e_banked_fixed_bank_contains_mmc1_init_and_bank_select() {
+    // MMC1 requires a 6-way STA $8000 pattern at init (1 reset +
+    // 5 control bits) plus a 5-way STA $E000 pattern in the
+    // bank-select routine. Both must be in the fixed bank — they
+    // ship with the program regardless of whether user code
+    // calls `__bank_select` directly.
+    let source = r#"
+        game "MMC1Init" { mapper: MMC1 }
+        bank Payload: prg
+        var x: u8 = 0
+        on frame { x += 1 }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    // The fixed bank is the last 16 KB of PRG.
+    let fixed_offset = 16 + (info.prg_banks - 1) * 16384;
+    let fixed_bank = &rom[fixed_offset..fixed_offset + 16384];
+
+    // Count STA $8000 (opcode $8D, operand little-endian $00 $80):
+    // MMC1 init writes to $8000 six times.
+    let sta_lo = [0x8Du8, 0x00, 0x80];
+    let lo_count = fixed_bank.windows(3).filter(|w| *w == sta_lo).count();
+    assert!(
+        lo_count >= 6,
+        "MMC1 fixed bank should contain >=6 STA $8000 writes (got {lo_count})"
+    );
+
+    // Count STA $E000 (opcode $8D, operand $00 $E0): bank-select
+    // writes to it 5 times.
+    let sta_hi = [0x8Du8, 0x00, 0xE0];
+    let hi_count = fixed_bank.windows(3).filter(|w| *w == sta_hi).count();
+    assert!(
+        hi_count >= 5,
+        "MMC1 fixed bank should contain >=5 STA $E000 writes (got {hi_count})"
+    );
+}
+
+#[test]
+fn e2e_banked_fixed_bank_contains_uxrom_bank_table() {
+    // UxROM ships a 256-byte bank-select bus-conflict table
+    // (values 0..=255). The table must be in the fixed bank.
+    let source = r#"
+        game "UxROMInit" { mapper: UxROM }
+        bank Payload: prg
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).unwrap();
+    let fixed_offset = 16 + (info.prg_banks - 1) * 16384;
+    let fixed = &rom[fixed_offset..fixed_offset + 16384];
+
+    // Search for a run of 0,1,2,3,...,31 — a 32-byte stretch that's
+    // distinctive enough that a random PRG byte sequence almost
+    // never contains it. The full 256-byte table starts with this
+    // prefix.
+    let mut needle: [u8; 32] = [0; 32];
+    #[allow(clippy::cast_possible_truncation)]
+    for (i, b) in needle.iter_mut().enumerate() {
+        *b = i as u8;
+    }
+    let found = fixed.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        found,
+        "UxROM fixed bank should contain the bank-select bus-conflict table"
+    );
+}
+
+#[test]
+fn e2e_banked_fixed_bank_contains_mmc3_init_writes() {
+    // MMC3 init writes two (bank-select, bank-number) pairs to
+    // ($8000, $8001) plus one $A000 mirroring write and one
+    // $E000 IRQ-disable write. We check each pattern appears.
+    let source = r#"
+        game "MMC3Init" { mapper: MMC3 }
+        bank Stage1: prg
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).unwrap();
+    let fixed_offset = 16 + (info.prg_banks - 1) * 16384;
+    let fixed_bank = &rom[fixed_offset..fixed_offset + 16384];
+
+    let select = [0x8Du8, 0x00, 0x80];
+    let data = [0x8Du8, 0x01, 0x80];
+    let mirror = [0x8Du8, 0x00, 0xA0];
+
+    // MMC3 init writes $8000 twice, plus once per bank-select
+    // call. With no `__bank_select` invocations from user code
+    // we expect exactly 2 init writes to $8000, but the
+    // bank-select subroutine also writes $8000 once. So the
+    // minimum is 3 (2 init + 1 bank-select body).
+    let select_count = fixed_bank.windows(3).filter(|w| *w == select).count();
+    let data_count = fixed_bank.windows(3).filter(|w| *w == data).count();
+    let mirror_count = fixed_bank.windows(3).filter(|w| *w == mirror).count();
+    assert!(
+        select_count >= 3,
+        "MMC3 fixed bank should contain >=3 STA $8000 writes (got {select_count})"
+    );
+    assert!(
+        data_count >= 3,
+        "MMC3 fixed bank should contain >=3 STA $8001 writes (got {data_count})"
+    );
+    assert!(
+        mirror_count >= 1,
+        "MMC3 fixed bank should contain >=1 STA $A000 write for mirroring (got {mirror_count})"
+    );
+}
+
+#[test]
+fn e2e_banked_switchable_banks_contain_ff_padding() {
+    // Empty switchable banks should be entirely $FF-filled so no
+    // stray code accidentally lands in them. We check each
+    // switchable bank slot is 16384 bytes of $FF.
+    let source = r#"
+        game "PadCheck" { mapper: MMC1 }
+        bank A: prg
+        bank B: prg
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    for i in 0..2 {
+        let offset = 16 + i * 16384;
+        let bank = &rom[offset..offset + 16384];
+        assert!(
+            bank.iter().all(|&b| b == 0xFF),
+            "switchable bank {i} should be all $FF padding"
+        );
+    }
+}
+
+#[test]
+fn e2e_nrom_still_produces_single_bank_rom_without_declarations() {
+    // Regression: programs that don't declare banks and use NROM
+    // must still ship as a single-bank 16 KB PRG ROM (the legacy
+    // layout), unaffected by the banking pipeline.
+    let source = r#"
+        game "Plain" { mapper: NROM }
+        var x: u8 = 0
+        on frame { x += 1 }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).unwrap();
+    assert_eq!(info.mapper, 0);
+    assert_eq!(info.prg_banks, 1);
+    assert_eq!(rom.len(), 16 + 16384 + 8192);
+}
+
+#[test]
+fn e2e_chr_banks_do_not_consume_prg_slots() {
+    // A `bank X: chr` declaration reserves CHR space, not PRG.
+    // The linker currently keeps CHR at a single 8 KB slot, so
+    // declaring a CHR bank should NOT add a PRG slot.
+    let source = r#"
+        game "CHRBank" { mapper: MMC1 }
+        bank TileBank: chr
+        bank PrgBank: prg
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).unwrap();
+    // 1 PRG bank declared + 1 fixed = 2 total; TileBank:chr should
+    // NOT bump the PRG count.
+    assert_eq!(info.prg_banks, 2);
+}
+
+#[test]
+fn e2e_mmc1_banked_example_compiles_successfully() {
+    // The examples/mmc1_banked.ne file is the canonical example
+    // the README points at. It must compile cleanly through the
+    // full pipeline and produce a valid multi-bank ROM.
+    let source = include_str!("../examples/mmc1_banked.ne");
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 1, "mmc1_banked example should ship as MMC1");
+    assert!(
+        info.prg_banks >= 2,
+        "mmc1_banked example should ship with at least 2 PRG banks (got {})",
+        info.prg_banks
+    );
+}
+
+#[test]
+fn e2e_large_bank_count_still_produces_valid_rom() {
+    // Stress test: 7 switchable banks (8 total) on UxROM. This
+    // exercises the ROM builder's multi-bank concatenation with
+    // a non-trivial bank count and ensures nothing in the linker
+    // pipeline hard-codes a bank limit.
+    let source = r#"
+        game "LotsOfBanks" { mapper: UxROM }
+        bank A: prg
+        bank B: prg
+        bank C: prg
+        bank D: prg
+        bank E: prg
+        bank F: prg
+        bank G: prg
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).unwrap();
+    assert_eq!(info.prg_banks, 8, "7 switchable + 1 fixed = 8 PRG banks");
+    assert_eq!(rom.len(), 16 + 8 * 16384 + 8192);
+}
+
+#[test]
+fn e2e_banked_rom_ines_header_mapper_bits_encoded_correctly() {
+    // Sanity check: the iNES header's mapper number field is split
+    // across byte 6 (low nibble) and byte 7 (high nibble). For
+    // mapper 1 (MMC1), byte 6 should have $10 in its high nibble
+    // and byte 7 should have $00 in its high nibble.
+    let source = r#"
+        game "HeaderCheck" { mapper: MMC1 }
+        bank Foo: prg
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let byte6_high_nibble = rom[6] & 0xF0;
+    let byte7_high_nibble = rom[7] & 0xF0;
+    assert_eq!(byte6_high_nibble, 0x10, "MMC1 low mapper nibble in byte 6");
+    assert_eq!(byte7_high_nibble, 0x00, "MMC1 high mapper nibble in byte 7");
+}
+
+#[test]
+fn e2e_banked_all_three_mappers_have_correct_vectors() {
+    // For each banked mapper, verify all three vectors (NMI, RESET,
+    // IRQ) live inside the fixed bank address window.
+    for mapper_kw in ["MMC1", "UxROM", "MMC3"] {
+        let source = format!(
+            r#"
+                game "VecCheck" {{ mapper: {mapper_kw} }}
+                bank One: prg
+                on frame {{ wait_frame }}
+                start Main
+            "#
+        );
+        let rom = compile_banked(&source);
+        let info = rom::validate_ines(&rom).unwrap();
+        let prg_end = 16 + info.prg_banks * 16384;
+        let nmi = u16::from_le_bytes([rom[prg_end - 6], rom[prg_end - 5]]);
+        let reset = u16::from_le_bytes([rom[prg_end - 4], rom[prg_end - 3]]);
+        let irq = u16::from_le_bytes([rom[prg_end - 2], rom[prg_end - 1]]);
+        for (name, v) in [("NMI", nmi), ("RESET", reset), ("IRQ", irq)] {
+            assert!(
+                (0xC000..=0xFFFF).contains(&v),
+                "{mapper_kw} {name} vector {v:#06X} should be in fixed-bank window"
+            );
+        }
+    }
+}
+
+#[test]
+fn e2e_bank_declarations_dont_affect_nrom_prg_size() {
+    // Even though the linker REJECTS switchable banks for NROM,
+    // the compiler only passes banks through when they're in the
+    // `program.banks` list — for NROM sources without declarations
+    // nothing is passed, so the NROM path is unchanged. Just
+    // double-check here that a plain NROM ROM is still 1 bank.
+    let source = r#"
+        game "JustNROM" { mapper: NROM }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).unwrap();
+    assert_eq!(info.prg_banks, 1);
+    assert_eq!(info.mapper, 0);
+}
+
+#[test]
+fn e2e_banked_chr_rom_is_preserved() {
+    // CHR ROM should still contain the default smiley sprite at
+    // tile 0 regardless of how many PRG banks the ROM has.
+    let source = r#"
+        game "CHRCheck" { mapper: MMC1 }
+        bank One: prg
+        bank Two: prg
+        on frame { wait_frame }
+        start Main
+    "#;
+    let rom = compile_banked(source);
+    let info = rom::validate_ines(&rom).unwrap();
+    let chr_start = 16 + info.prg_banks * 16384;
+    // Default smiley is non-zero in its first 16 bytes.
+    assert_ne!(&rom[chr_start..chr_start + 16], &[0u8; 16]);
 }

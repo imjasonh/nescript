@@ -13,8 +13,18 @@ const PRG_BANK_SIZE: usize = 16384;
 const CHR_BANK_SIZE: usize = 8192;
 
 /// Build a complete iNES ROM file.
+///
+/// Supports both single-bank (NROM) and multi-bank (MMC1, `UxROM`,
+/// MMC3) layouts. When you call [`RomBuilder::set_prg`] the builder
+/// treats the bytes as a single 16 KB bank and pads out. When you
+/// call [`RomBuilder::set_prg_banks`] the builder writes each bank
+/// back-to-back in the order you provided. The iNES header's PRG
+/// bank count always reflects the actual number of 16 KB slots.
 pub struct RomBuilder {
-    prg_data: Vec<u8>,
+    /// One Vec per 16 KB PRG bank, in physical order. An empty
+    /// outer Vec means no PRG has been set yet; a single inner Vec
+    /// means a classic NROM layout.
+    prg_banks: Vec<Vec<u8>>,
     chr_data: Vec<u8>,
     mapper: u8,
     mirroring: Mirroring,
@@ -23,7 +33,7 @@ pub struct RomBuilder {
 impl RomBuilder {
     pub fn new(mirroring: Mirroring) -> Self {
         Self {
-            prg_data: Vec::new(),
+            prg_banks: Vec::new(),
             chr_data: Vec::new(),
             mapper: 0, // NROM
             mirroring,
@@ -35,9 +45,44 @@ impl RomBuilder {
         self.mapper = mapper;
     }
 
-    /// Set the PRG ROM data. Will be padded to fill 16 KB or 32 KB.
+    /// Set the PRG ROM data as a single bank. Will be padded to fill
+    /// 16 KB or 32 KB. Equivalent to calling `set_prg_banks` with a
+    /// one- or two-element Vec depending on whether the data crosses
+    /// the 16 KB boundary.
     pub fn set_prg(&mut self, data: Vec<u8>) {
-        self.prg_data = data;
+        // Preserve the legacy single-bank behaviour: if the data is
+        // <= 16 KB we emit exactly one 16 KB bank; if it's larger
+        // (but still <= 32 KB) we split into two consecutive banks
+        // so the iNES header byte 4 reflects 2, matching the old
+        // `set_prg` contract used by all current NROM tests.
+        if data.len() <= PRG_BANK_SIZE {
+            self.prg_banks = vec![data];
+        } else {
+            let mut first = data;
+            let second = first.split_off(PRG_BANK_SIZE);
+            self.prg_banks = vec![first, second];
+        }
+    }
+
+    /// Set the PRG ROM data as a list of 16 KB banks. Each bank will
+    /// be padded with $FF to fill its 16 KB slot. The banks are
+    /// written in the order provided — for mapper-specific layouts
+    /// the caller (usually the Linker) is responsible for placing
+    /// the fixed bank last.
+    ///
+    /// # Panics
+    /// Panics if any single bank exceeds 16 KB, which would indicate
+    /// a compiler bug (the allocator is expected to overflow-check
+    /// before calling the rom builder).
+    pub fn set_prg_banks(&mut self, banks: Vec<Vec<u8>>) {
+        for (i, bank) in banks.iter().enumerate() {
+            assert!(
+                bank.len() <= PRG_BANK_SIZE,
+                "PRG bank {i} exceeds 16 KB ({} bytes)",
+                bank.len()
+            );
+        }
+        self.prg_banks = banks;
     }
 
     /// Set the CHR ROM data. Will be padded to fill 8 KB.
@@ -47,12 +92,14 @@ impl RomBuilder {
 
     /// Build the complete .nes file.
     pub fn build(self) -> Vec<u8> {
-        // Determine PRG size: 1 bank (16 KB) or 2 banks (32 KB)
-        let prg_banks = if self.prg_data.len() > PRG_BANK_SIZE {
-            2
+        // Determine PRG size. If no banks were set, fall back to a
+        // single empty bank so the ROM has a valid 16 KB PRG slot.
+        let prg_banks_vec: Vec<Vec<u8>> = if self.prg_banks.is_empty() {
+            vec![Vec::new()]
         } else {
-            1
+            self.prg_banks
         };
+        let prg_banks = prg_banks_vec.len();
         let prg_size = prg_banks * PRG_BANK_SIZE;
 
         // CHR: 1 bank (8 KB), or 0 if using CHR RAM
@@ -81,10 +128,11 @@ impl RomBuilder {
         // Bytes 8-15: padding zeros
         rom.extend_from_slice(&[0u8; 8]);
 
-        // PRG ROM data (padded to fill)
-        let mut prg = self.prg_data;
-        prg.resize(prg_size, 0xFF);
-        rom.extend_from_slice(&prg);
+        // PRG ROM data: each bank padded to 16 KB, concatenated.
+        for mut bank in prg_banks_vec {
+            bank.resize(PRG_BANK_SIZE, 0xFF);
+            rom.extend_from_slice(&bank);
+        }
 
         // CHR ROM data (padded to fill)
         if chr_banks > 0 {

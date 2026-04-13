@@ -23,6 +23,48 @@ pub struct SpriteData {
     pub chr_bytes: Vec<u8>,
 }
 
+/// A switchable PRG bank. Each switchable bank occupies a single
+/// 16 KB slot in the ROM and can be mapped to $8000-$BFFF at runtime
+/// by writing the bank's physical index to the mapper. The linker
+/// places switchable banks in declaration order, followed by the
+/// fixed bank at the end.
+///
+/// `entry_label` is the optional trampoline entry point inside this
+/// bank — when set, the linker emits a `__tramp_<name>` stub in the
+/// fixed bank that selects this bank and JSRs into the label.
+/// `data` is raw bytes to splice verbatim (the compiler currently
+/// only uses empty data and lets the linker pad with $FF).
+#[derive(Debug, Clone)]
+pub struct PrgBank {
+    pub name: String,
+    pub data: Vec<u8>,
+    pub entry_label: Option<String>,
+}
+
+impl PrgBank {
+    /// Create an empty named bank. Convenience for the compiler,
+    /// which currently emits all user code into the fixed bank and
+    /// just wants switchable slots reserved for future use.
+    #[must_use]
+    pub fn empty(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            data: Vec::new(),
+            entry_label: None,
+        }
+    }
+
+    /// Create a bank with a raw byte payload and no trampoline entry.
+    #[must_use]
+    pub fn with_data(name: impl Into<String>, data: Vec<u8>) -> Self {
+        Self {
+            name: name.into(),
+            data,
+            entry_label: None,
+        }
+    }
+}
+
 /// True if `instructions` contains a label definition with the given
 /// name. Labels are emitted as `NOP` pseudo-instructions whose mode
 /// is `AddressingMode::Label(name)`.
@@ -112,12 +154,59 @@ impl Linker {
         sfx: &[SfxData],
         music: &[MusicData],
     ) -> Vec<u8> {
-        // For NROM: everything fits in one 16 KB PRG bank ($C000-$FFFF)
-        // Layout:
-        //   $C000: RESET handler (init + palette load + user code)
-        //   ...  : NMI handler
-        //   ...  : IRQ handler
-        //   $FFFA: Vector table (NMI, RESET, IRQ)
+        self.link_banked(user_code, sprites, sfx, music, &[])
+    }
+
+    /// Link with the full asset pipeline plus zero or more
+    /// switchable PRG banks. The switchable banks are written in
+    /// declaration order and the fixed bank (which contains the
+    /// runtime, NMI/IRQ handlers, vector table, bank-select
+    /// subroutine, and all user code) is always placed last.
+    ///
+    /// For mappers that don't support banking (NROM) this is an
+    /// error if any switchable banks are supplied. For banked
+    /// mappers the linker also splices `gen_mapper_init` into the
+    /// reset path and emits a `__bank_select` subroutine plus one
+    /// `__tramp_<name>` trampoline for every bank that declares an
+    /// `entry_label`.
+    pub fn link_banked(
+        &self,
+        user_code: &[Instruction],
+        sprites: &[SpriteData],
+        sfx: &[SfxData],
+        music: &[MusicData],
+        switchable_banks: &[PrgBank],
+    ) -> Vec<u8> {
+        assert!(
+            switchable_banks.is_empty() || self.mapper != Mapper::NROM,
+            "NROM does not support switchable PRG banks (got {} banks)",
+            switchable_banks.len()
+        );
+        self.link_banked_inner(user_code, sprites, sfx, music, switchable_banks)
+    }
+
+    fn link_banked_inner(
+        &self,
+        user_code: &[Instruction],
+        sprites: &[SpriteData],
+        sfx: &[SfxData],
+        music: &[MusicData],
+        switchable_banks: &[PrgBank],
+    ) -> Vec<u8> {
+        // ROM layout.
+        //
+        // NROM: a single 16 KB PRG bank mapped at $C000-$FFFF.
+        //
+        // Banked (MMC1, UxROM, MMC3): `switchable_banks` switchable
+        // 16 KB banks come first in physical order, followed by the
+        // fixed bank. The fixed bank holds the runtime, NMI/IRQ
+        // handlers, user code, bank-select routine, and all
+        // trampolines — everything needed for control flow to work
+        // at reset. The mapper is configured so the fixed bank
+        // maps to $C000-$FFFF and one of the switchable banks maps
+        // to $8000-$BFFF.
+        let total_banks = switchable_banks.len() + 1;
+        let fixed_bank_index = total_banks - 1;
 
         let mut all_instructions = Vec::new();
 
@@ -127,11 +216,53 @@ impl Linker {
         // Hardware initialization
         all_instructions.extend(runtime::gen_init());
 
+        // Mapper configuration: for banked mappers, set up the PRG
+        // layout so the fixed bank sits at $C000-$FFFF. NROM is a
+        // no-op here.
+        all_instructions.extend(runtime::gen_mapper_init(
+            self.mapper,
+            self.mirroring,
+            total_banks,
+        ));
+
         // Load default palette
         all_instructions.extend(self.gen_palette_load());
 
         // User code (var init + main loop)
         all_instructions.extend(user_code.iter().cloned());
+
+        // Bank-select subroutine plus a trampoline per declared bank
+        // that has an entry label. Emitted only for banked mappers
+        // (NROM has no switchable banks by definition). The helpers
+        // live in the fixed bank so they're always reachable at
+        // $C000-$FFFF regardless of which switchable bank is
+        // currently mapped at $8000.
+        if self.mapper != Mapper::NROM {
+            all_instructions.extend(runtime::gen_bank_select(self.mapper));
+            #[allow(clippy::cast_possible_truncation)]
+            let fixed_bank_num = fixed_bank_index as u8;
+            for (i, bank) in switchable_banks.iter().enumerate() {
+                if let Some(entry) = &bank.entry_label {
+                    #[allow(clippy::cast_possible_truncation)]
+                    let bank_num = i as u8;
+                    all_instructions.extend(runtime::gen_bank_trampoline(
+                        &bank.name,
+                        entry,
+                        bank_num,
+                        fixed_bank_num,
+                    ));
+                }
+            }
+            if self.mapper == Mapper::UxROM {
+                // UxROM needs a 256-byte bank-select bus-conflict
+                // table in the fixed bank. The `__bank_select`
+                // routine for UxROM writes to $FFF0 so the byte
+                // at that address in ROM must match the bank being
+                // selected — we splice in a 0..255 table just before
+                // the vector area.
+                all_instructions.extend(runtime::gen_uxrom_bank_table());
+            }
+        }
 
         // Math runtime routines (included always for simplicity)
         all_instructions.extend(runtime::gen_multiply());
@@ -229,7 +360,28 @@ impl Linker {
         // Build ROM
         let mut builder = RomBuilder::new(self.mirroring);
         builder.set_mapper(crate::rom::mapper_number(self.mapper));
-        builder.set_prg(prg);
+
+        // Multi-bank layout: each switchable bank is an independent
+        // 16 KB slot whose contents the linker takes verbatim from
+        // the caller, followed by the fixed bank (just assembled).
+        // For NROM (no switchable banks) this collapses to the
+        // legacy single-bank path.
+        if switchable_banks.is_empty() {
+            builder.set_prg(prg);
+        } else {
+            let mut banks: Vec<Vec<u8>> = Vec::with_capacity(total_banks);
+            for bank in switchable_banks {
+                assert!(
+                    bank.data.len() <= 16384,
+                    "switchable bank '{}' exceeds 16 KB ({} bytes)",
+                    bank.name,
+                    bank.data.len()
+                );
+                banks.push(bank.data.clone());
+            }
+            banks.push(prg);
+            builder.set_prg_banks(banks);
+        }
 
         // CHR ROM: tile 0 is reserved for the default smiley, followed by
         // any user-declared sprites placed at their assigned tile indices.

@@ -385,3 +385,315 @@ fn divide_routine_assembles() {
         "divide routine should end with RTS"
     );
 }
+
+// ─── Bank switching ────────────────────────────────────────────────
+
+#[test]
+fn mapper_init_nrom_is_empty() {
+    // NROM has no banks and nothing to configure at reset — the
+    // generator must return an empty Vec so the linker doesn't
+    // pay any ROM cost for unused mapper config.
+    let init = gen_mapper_init(Mapper::NROM, Mirroring::Horizontal, 1);
+    assert!(
+        init.is_empty(),
+        "NROM mapper init should be empty, got {} instructions",
+        init.len()
+    );
+}
+
+#[test]
+fn mapper_init_mmc1_pulses_reset_and_writes_control() {
+    // MMC1 init must: (1) pulse bit 7 of any $8000-range write to
+    // reset the shift register, then (2) serialize a 5-bit control
+    // value into the same $8000 register window. We verify:
+    //   * there's at least one STA to $8000 preceded by LDA #$80
+    //   * there are exactly 6 writes to $8000 total (1 reset + 5 bits)
+    let init = gen_mapper_init(Mapper::MMC1, Mirroring::Horizontal, 4);
+    let writes_8000: Vec<_> = init
+        .iter()
+        .enumerate()
+        .filter(|(_, i)| i.opcode == STA && i.mode == AM::Absolute(0x8000))
+        .collect();
+    assert_eq!(
+        writes_8000.len(),
+        6,
+        "MMC1 init should write to $8000 six times (1 reset + 5 control bits), got {}",
+        writes_8000.len()
+    );
+    // The reset write comes first and must be preceded by LDA #$80.
+    let first_idx = writes_8000[0].0;
+    assert!(first_idx > 0);
+    assert_eq!(init[first_idx - 1].opcode, LDA);
+    assert_eq!(init[first_idx - 1].mode, AM::Immediate(0x80));
+}
+
+/// Find the first LDA immediate operand appearing after the MMC1
+/// reset-pulse (`LDA #$80`) inside an MMC1 init sequence. Used by
+/// [`mapper_init_mmc1_horizontal_vs_vertical_control_bits`] to
+/// inspect the first serialized control-register bit.
+fn mmc1_first_control_bit(init: &[Instruction]) -> Option<u8> {
+    let mut saw_reset = false;
+    for inst in init {
+        if !saw_reset {
+            if inst.opcode == LDA && inst.mode == AM::Immediate(0x80) {
+                saw_reset = true;
+            }
+            continue;
+        }
+        if inst.opcode == LDA {
+            if let AM::Immediate(v) = inst.mode {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+#[test]
+fn mapper_init_mmc1_horizontal_vs_vertical_control_bits() {
+    // The control register's bits 0-1 encode mirroring. Our layout
+    // uses $0F for horizontal (0b01111) and $0E for vertical
+    // (0b01110). The first bit sent (LDA #0 or #1) differs between
+    // the two — horizontal bit 0 = 1, vertical bit 0 = 0.
+    let h = gen_mapper_init(Mapper::MMC1, Mirroring::Horizontal, 2);
+    let v = gen_mapper_init(Mapper::MMC1, Mirroring::Vertical, 2);
+    assert_eq!(
+        mmc1_first_control_bit(&h),
+        Some(1),
+        "horizontal mirror bit 0"
+    );
+    assert_eq!(mmc1_first_control_bit(&v), Some(0), "vertical mirror bit 0");
+}
+
+#[test]
+fn mapper_init_uxrom_emits_label_and_nothing_else() {
+    // UxROM powers up with bank 0 at $8000 and the last bank fixed
+    // at $C000 — exactly what the NEScript runtime expects. All we
+    // need is a marker label so debuggers can find the (empty)
+    // init span.
+    let init = gen_mapper_init(Mapper::UxROM, Mirroring::Horizontal, 3);
+    assert_eq!(init.len(), 1);
+    assert!(
+        matches!(&init[0].mode, AM::Label(n) if n == "__uxrom_init"),
+        "UxROM init should emit just the marker label",
+    );
+}
+
+#[test]
+fn mapper_init_mmc3_configures_prg_and_mirroring() {
+    // MMC3 init writes:
+    //   $8000 = 6 (select PRG-0 register)
+    //   $8001 = 0 (bank 0 at $8000)
+    //   $8000 = 7 (select PRG-1 register)
+    //   $8001 = 1 (bank 1 at $A000)
+    //   $A000 = mirroring bit
+    //   $E000 = 0 (disable IRQ)
+    let init = gen_mapper_init(Mapper::MMC3, Mirroring::Vertical, 4);
+    let count_writes = |addr: u16| -> usize {
+        init.iter()
+            .filter(|i| i.opcode == STA && i.mode == AM::Absolute(addr))
+            .count()
+    };
+    assert_eq!(count_writes(0x8000), 2, "MMC3 should write $8000 twice");
+    assert_eq!(count_writes(0x8001), 2, "MMC3 should write $8001 twice");
+    assert_eq!(
+        count_writes(0xA000),
+        1,
+        "MMC3 should write $A000 for mirroring"
+    );
+    assert_eq!(
+        count_writes(0xE000),
+        1,
+        "MMC3 should clear $E000 to disable IRQ"
+    );
+}
+
+#[test]
+fn mapper_init_assembles_for_every_banked_mapper() {
+    // Sanity check: every mapper's init sequence should pass the
+    // assembler without unresolved labels. We splice in a dummy
+    // reset label to prevent branch-range issues.
+    for m in [Mapper::MMC1, Mapper::UxROM, Mapper::MMC3] {
+        let init = gen_mapper_init(m, Mirroring::Horizontal, 2);
+        let result = asm::assemble(&init, 0xC000);
+        // Either empty (UxROM is basically zero-cost) or a short
+        // init stub — all fit comfortably in < 100 bytes.
+        assert!(
+            result.bytes.len() < 100,
+            "mapper {m:?} init is {} bytes, expected < 100",
+            result.bytes.len()
+        );
+    }
+}
+
+#[test]
+fn bank_select_nrom_is_a_plain_rts() {
+    // The NROM bank-select stub exists so user code can
+    // unconditionally call `__bank_select` regardless of mapper.
+    // Its body must RTS immediately — no register writes.
+    let sel = gen_bank_select(Mapper::NROM);
+    assert!(matches!(&sel[0].mode, AM::Label(n) if n == "__bank_select"));
+    assert_eq!(sel.last().unwrap().opcode, RTS);
+    // Must not write to any mapper register.
+    let writes_mapper = sel.iter().any(|i| {
+        i.opcode == STA
+            && matches!(
+                &i.mode,
+                AM::Absolute(a) if (0x8000..=0xFFFF).contains(a)
+            )
+    });
+    assert!(!writes_mapper, "NROM bank-select must not write to $8000+");
+}
+
+#[test]
+fn bank_select_mmc1_serializes_five_bits_to_e000() {
+    // MMC1 bank-select serializes the 5 LSBs of A into the $E000
+    // register. We check: exactly 5 STA $E000 instructions, and
+    // they're interleaved with LSR A shifts between them (4 LSRs
+    // total — one between each pair of writes).
+    let sel = gen_bank_select(Mapper::MMC1);
+    let writes_e000 = sel
+        .iter()
+        .filter(|i| i.opcode == STA && i.mode == AM::Absolute(0xE000))
+        .count();
+    assert_eq!(writes_e000, 5, "MMC1 should write $E000 five times");
+    let lsrs = sel
+        .iter()
+        .filter(|i| i.opcode == LSR && i.mode == AM::Accumulator)
+        .count();
+    assert_eq!(lsrs, 4, "MMC1 should shift A four times between bit writes");
+    assert_eq!(sel.last().unwrap().opcode, RTS);
+}
+
+#[test]
+fn bank_select_uxrom_writes_fff0() {
+    // UxROM bank-select writes A to $FFF0, which lives in the
+    // fixed bank's bus-conflict-safe table.
+    let sel = gen_bank_select(Mapper::UxROM);
+    let has_write = sel
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0xFFF0));
+    assert!(has_write, "UxROM bank-select must write to $FFF0");
+    assert_eq!(sel.last().unwrap().opcode, RTS);
+}
+
+#[test]
+fn bank_select_mmc3_writes_8000_and_8001() {
+    // MMC3 bank-select writes 6 to $8000, then writes A to $8001.
+    // We check both writes happen exactly once.
+    let sel = gen_bank_select(Mapper::MMC3);
+    let writes_8000 = sel
+        .iter()
+        .filter(|i| i.opcode == STA && i.mode == AM::Absolute(0x8000))
+        .count();
+    let writes_8001 = sel
+        .iter()
+        .filter(|i| i.opcode == STA && i.mode == AM::Absolute(0x8001))
+        .count();
+    assert_eq!(writes_8000, 1, "MMC3 should write $8000 once");
+    assert_eq!(writes_8001, 1, "MMC3 should write $8001 once");
+    assert_eq!(sel.last().unwrap().opcode, RTS);
+}
+
+#[test]
+fn bank_select_stashes_bank_number_in_zp() {
+    // Every bank-select routine (including NROM) saves A into
+    // ZP_BANK_CURRENT so trampolines can restore the previous
+    // bank later.
+    for m in [Mapper::NROM, Mapper::MMC1, Mapper::UxROM, Mapper::MMC3] {
+        let sel = gen_bank_select(m);
+        let has_stash = sel
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(ZP_BANK_CURRENT));
+        assert!(
+            has_stash,
+            "mapper {m:?} bank-select must stash A into ZP_BANK_CURRENT"
+        );
+    }
+}
+
+#[test]
+fn bank_select_assembles_for_every_mapper() {
+    for m in [Mapper::NROM, Mapper::MMC1, Mapper::UxROM, Mapper::MMC3] {
+        let sel = gen_bank_select(m);
+        let result = asm::assemble(&sel, 0xC000);
+        assert!(
+            !result.bytes.is_empty(),
+            "mapper {m:?} bank-select produced no bytes"
+        );
+        assert!(
+            result.labels.contains_key("__bank_select"),
+            "mapper {m:?} bank-select must export __bank_select"
+        );
+    }
+}
+
+#[test]
+fn trampoline_switches_target_then_restores_fixed() {
+    // A trampoline must JSR `__bank_select` twice: once with the
+    // target bank's index, once with the fixed bank's index. The
+    // two LDA immediates in the stub should match those two bank
+    // numbers in order.
+    let t = gen_bank_trampoline("Level1", "__bank_Level1_entry", 0, 3);
+    // First instruction is the trampoline label.
+    assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_Level1"));
+    // Extract the sequence of immediate loads.
+    let imms: Vec<u8> = t
+        .iter()
+        .filter_map(|i| {
+            if i.opcode == LDA {
+                if let AM::Immediate(v) = i.mode {
+                    return Some(v);
+                }
+            }
+            None
+        })
+        .collect();
+    assert_eq!(imms, vec![0, 3], "trampoline should load target then fixed");
+    // And two JSRs to __bank_select, plus one JSR to the entry.
+    let jsrs: Vec<&str> = t
+        .iter()
+        .filter_map(|i| {
+            if i.opcode == JSR {
+                if let AM::Label(n) = &i.mode {
+                    return Some(n.as_str());
+                }
+            }
+            None
+        })
+        .collect();
+    assert_eq!(
+        jsrs,
+        vec!["__bank_select", "__bank_Level1_entry", "__bank_select"],
+        "trampoline JSRs must dispatch in the correct order"
+    );
+    // Final instruction returns to caller.
+    assert_eq!(t.last().unwrap().opcode, RTS);
+}
+
+#[test]
+fn trampoline_label_derives_from_bank_name() {
+    // Trampoline labels are consistently named `__tramp_<bank>` so
+    // codegen can reference them without knowing bank indices.
+    let t = gen_bank_trampoline("MusicData", "__music_entry", 1, 3);
+    assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_MusicData"));
+}
+
+#[test]
+fn uxrom_bank_table_is_256_bytes_of_sequential_values() {
+    // The bus-conflict table must contain bytes 0..=255 in order
+    // so that `STA __bank_select_table,X` where X = desired bank
+    // number produces a matching ROM byte.
+    let table = gen_uxrom_bank_table();
+    assert_eq!(table.len(), 2);
+    assert!(matches!(&table[0].mode, AM::Label(n) if n == "__bank_select_table"));
+    match &table[1].mode {
+        AM::Bytes(v) => {
+            assert_eq!(v.len(), 256);
+            for (i, &b) in v.iter().enumerate() {
+                assert_eq!(b as usize, i, "table byte at {i} should equal {i}");
+            }
+        }
+        other => panic!("expected Bytes, got {other:?}"),
+    }
+}
