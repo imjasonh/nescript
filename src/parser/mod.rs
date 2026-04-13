@@ -129,6 +129,8 @@ impl Parser {
         let mut sprites = Vec::new();
         let mut palettes = Vec::new();
         let mut backgrounds = Vec::new();
+        let mut sfx = Vec::new();
+        let mut music = Vec::new();
         let mut banks = Vec::new();
         let mut start_state = None;
         let mut on_frame = None;
@@ -168,6 +170,12 @@ impl Parser {
                 }
                 TokenKind::KwBackground => {
                     backgrounds.push(self.parse_background_decl()?);
+                }
+                TokenKind::KwSfx => {
+                    sfx.push(self.parse_sfx_decl()?);
+                }
+                TokenKind::KwMusic => {
+                    music.push(self.parse_music_decl()?);
                 }
                 TokenKind::KwBank => {
                     banks.push(self.parse_bank_decl()?);
@@ -237,6 +245,8 @@ impl Parser {
             sprites,
             palettes,
             backgrounds,
+            sfx,
+            music,
             banks,
             start_state,
             span,
@@ -760,6 +770,275 @@ impl Parser {
             chr_source,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
+    }
+
+    // ── SFX / Music declarations ──
+
+    /// `sfx Name { duty: N, pitch: [..], volume: [..] }`. Pitch and
+    /// volume arrays must be the same length — each index is one
+    /// frame of the envelope. Duty is optional, default 2 (50%).
+    fn parse_sfx_decl(&mut self) -> Result<SfxDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwSfx)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut duty: u8 = 2;
+        let mut pitch: Option<Vec<u8>> = None;
+        let mut volume: Option<Vec<u8>> = None;
+
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let (key, key_span) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "duty" => {
+                    duty = self.parse_u8_literal("duty")?;
+                    if duty > 3 {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!("sfx 'duty' must be 0-3, got {duty}"),
+                            key_span,
+                        ));
+                    }
+                }
+                "pitch" => {
+                    pitch = Some(self.parse_byte_array("pitch")?);
+                }
+                "volume" => {
+                    let vals = self.parse_byte_array("volume")?;
+                    for v in &vals {
+                        if *v > 15 {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!("sfx 'volume' entries must be 0-15, got {v}"),
+                                key_span,
+                            ));
+                        }
+                    }
+                    volume = Some(vals);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown sfx property '{key}'"),
+                        key_span,
+                    ));
+                }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let pitch = pitch.ok_or_else(|| {
+            Diagnostic::error(ErrorCode::E0201, "sfx requires 'pitch' property", start)
+        })?;
+        let volume = volume.ok_or_else(|| {
+            Diagnostic::error(ErrorCode::E0201, "sfx requires 'volume' property", start)
+        })?;
+
+        if pitch.is_empty() {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                "sfx 'pitch' array must have at least one frame",
+                start,
+            ));
+        }
+        if pitch.len() != volume.len() {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!(
+                    "sfx 'pitch' and 'volume' arrays must have the same length \
+                     (pitch has {}, volume has {})",
+                    pitch.len(),
+                    volume.len()
+                ),
+                start,
+            ));
+        }
+
+        Ok(SfxDecl {
+            name,
+            duty,
+            pitch,
+            volume,
+            span: Span::new(start.file_id, start.start, self.current_span().end),
+        })
+    }
+
+    /// `music Name { duty: N, volume: N, repeat: true|false, notes: [..] }`.
+    /// Notes are encoded as a flat list: `[pitch1, dur1, pitch2, dur2, ...]`.
+    /// Pitch 0 is a rest; nonzero pitches are indices into the builtin
+    /// period table (1 = C1, 60 = B5). Duration is in frames (1-255).
+    fn parse_music_decl(&mut self) -> Result<MusicDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwMusic)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut duty: u8 = 2;
+        let mut volume: u8 = 10;
+        let mut loops: bool = true;
+        let mut notes: Option<Vec<MusicNote>> = None;
+
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let (key, key_span) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "duty" => {
+                    duty = self.parse_u8_literal("duty")?;
+                    if duty > 3 {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!("music 'duty' must be 0-3, got {duty}"),
+                            key_span,
+                        ));
+                    }
+                }
+                "volume" => {
+                    volume = self.parse_u8_literal("volume")?;
+                    if volume > 15 {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!("music 'volume' must be 0-15, got {volume}"),
+                            key_span,
+                        ));
+                    }
+                }
+                "repeat" => match self.peek().clone() {
+                    TokenKind::BoolLiteral(b) => {
+                        self.advance();
+                        loops = b;
+                    }
+                    _ => {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!("expected bool for 'repeat', got '{}'", self.peek()),
+                            key_span,
+                        ));
+                    }
+                },
+                "notes" => {
+                    let flat = self.parse_byte_array("notes")?;
+                    if flat.len() % 2 != 0 {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            "music 'notes' must have an even number of entries \
+                             (pitch, duration, pitch, duration, ...)",
+                            key_span,
+                        ));
+                    }
+                    let mut n = Vec::with_capacity(flat.len() / 2);
+                    for pair in flat.chunks(2) {
+                        let pitch = pair[0];
+                        let duration = pair[1];
+                        if duration == 0 {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                "music note duration must be >= 1",
+                                key_span,
+                            ));
+                        }
+                        if pitch > 60 {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!("music note pitch must be 0 (rest) or 1-60, got {pitch}"),
+                                key_span,
+                            ));
+                        }
+                        n.push(MusicNote { pitch, duration });
+                    }
+                    notes = Some(n);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown music property '{key}'"),
+                        key_span,
+                    ));
+                }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let notes = notes.ok_or_else(|| {
+            Diagnostic::error(ErrorCode::E0201, "music requires 'notes' property", start)
+        })?;
+
+        if notes.is_empty() {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                "music 'notes' must contain at least one (pitch, duration) pair",
+                start,
+            ));
+        }
+
+        Ok(MusicDecl {
+            name,
+            duty,
+            volume,
+            loops,
+            notes,
+            span: Span::new(start.file_id, start.start, self.current_span().end),
+        })
+    }
+
+    /// Parse a `[byte, byte, ...]` array. Used by sfx/music property
+    /// parsing — the main `parse_asset_source` also does this, but
+    /// without the array-literal-only restriction we want here.
+    fn parse_byte_array(&mut self, prop: &str) -> Result<Vec<u8>, Diagnostic> {
+        self.expect(&TokenKind::LBracket)?;
+        let mut out = Vec::new();
+        while *self.peek() != TokenKind::RBracket && *self.peek() != TokenKind::Eof {
+            if let TokenKind::IntLiteral(v) = self.peek().clone() {
+                self.advance();
+                if v > 0xFF {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("'{prop}' entries must fit in a u8, got {v}"),
+                        self.current_span(),
+                    ));
+                }
+                out.push(v as u8);
+            } else {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!("expected byte value in '{prop}', found '{}'", self.peek()),
+                    self.current_span(),
+                ));
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBracket)?;
+        Ok(out)
+    }
+
+    /// Parse a single u8 integer literal for a scalar property.
+    fn parse_u8_literal(&mut self, prop: &str) -> Result<u8, Diagnostic> {
+        match self.peek().clone() {
+            TokenKind::IntLiteral(v) => {
+                self.advance();
+                if v > 0xFF {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("'{prop}' must fit in a u8, got {v}"),
+                        self.current_span(),
+                    ));
+                }
+                Ok(v as u8)
+            }
+            other => Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!("expected integer for '{prop}', got '{other}'"),
+                self.current_span(),
+            )),
+        }
     }
 
     fn parse_asset_source(&mut self) -> Result<AssetSource, Diagnostic> {

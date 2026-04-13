@@ -3,6 +3,7 @@ mod tests;
 
 use crate::asm;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
+use crate::assets::{MusicData, SfxData};
 use crate::parser::ast::{Mapper, Mirroring};
 use crate::rom::RomBuilder;
 use crate::runtime;
@@ -89,8 +90,28 @@ impl Linker {
     }
 
     /// Link all code sections into a .nes ROM, placing sprite CHR data at
-    /// specific tile indices.
+    /// specific tile indices. No audio data is linked — use
+    /// [`Linker::link_with_all_assets`] for audio.
     pub fn link_with_assets(&self, user_code: &[Instruction], sprites: &[SpriteData]) -> Vec<u8> {
+        self.link_with_all_assets(user_code, sprites, &[], &[])
+    }
+
+    /// Link all code sections into a .nes ROM, placing both graphic
+    /// assets (sprite CHR) and audio assets (sfx envelopes, music
+    /// note streams) into the appropriate ROM regions.
+    ///
+    /// Audio data is spliced into PRG ROM under labels derived from
+    /// each blob's name (see `SfxData::label` / `MusicData::label`).
+    /// The linker only emits these blobs and the audio-driver body
+    /// when user code contains the `__audio_used` marker label, so
+    /// programs that never touch audio pay zero ROM cost.
+    pub fn link_with_all_assets(
+        &self,
+        user_code: &[Instruction],
+        sprites: &[SpriteData],
+        sfx: &[SfxData],
+        music: &[MusicData],
+    ) -> Vec<u8> {
         // For NROM: everything fits in one 16 KB PRG bank ($C000-$FFFF)
         // Layout:
         //   $C000: RESET handler (init + palette load + user code)
@@ -116,13 +137,35 @@ impl Linker {
         all_instructions.extend(runtime::gen_multiply());
         all_instructions.extend(runtime::gen_divide());
 
-        // Audio driver body — linked in whenever user code touched
-        // audio. The driver needs to exist before `__nmi` (the NMI
-        // JSR target must be defined before the caller), so emit it
-        // alongside the math routines. No-cost elision when unused:
-        // the `has_label` check below skips the whole block.
-        if has_label(user_code, "__audio_used") {
+        // Audio subsystem — linked in whenever user code touched
+        // audio (detected via the `__audio_used` marker emitted by
+        // the IR codegen). The driver body, period table, and
+        // user/builtin data blobs are all spliced into PRG here.
+        //
+        // Order is important: the audio tick references both the
+        // period table and the data blobs by label, so those labels
+        // must be defined in the same assembly pass. The tick body
+        // also has to exist before `__nmi` because NMI JSRs into
+        // `__audio_tick` — so we emit it alongside the math
+        // routines, well before the NMI handler below.
+        let has_audio = has_label(user_code, "__audio_used");
+        if has_audio {
             all_instructions.extend(runtime::gen_audio_tick());
+            all_instructions.extend(runtime::gen_period_table());
+            // Emit one data block per sfx blob: a label followed by
+            // the envelope bytes. `play Name` codegen emits a
+            // SymbolLo/SymbolHi pair that resolves to this label.
+            for blob in sfx {
+                all_instructions.extend(runtime::gen_data_block(
+                    &blob.label(),
+                    blob.envelope.clone(),
+                ));
+            }
+            // Same for music: label + note stream.
+            for blob in music {
+                all_instructions
+                    .extend(runtime::gen_data_block(&blob.label(), blob.stream.clone()));
+            }
         }
 
         // NMI handler
@@ -138,14 +181,11 @@ impl Linker {
         if has_label(user_code, "__ir_mmc3_reload") {
             all_instructions.push(Instruction::new(JSR, AM::Label("__ir_mmc3_reload".into())));
         }
-        // Audio tick: if the user program ever triggered an SFX or
-        // music (detected by the marker label `__audio_used` emitted
-        // by `IrCodeGen` when it sees any audio op), JSR into the
-        // driver's per-frame tick before the normal NMI body. The
-        // tick decrements the SFX counter and silences pulse 1 when
-        // it reaches zero. Programs that never play audio skip both
-        // the splice and the driver body entirely — no ROM cost.
-        let has_audio = has_label(user_code, "__audio_used");
+        // Audio tick: if audio is in use, JSR into the per-frame
+        // driver tick before the normal NMI body. The tick walks
+        // both the sfx envelope and the music note stream, writing
+        // APU registers as needed. Programs that never use audio
+        // skip this splice entirely — no ROM cost.
         if has_audio {
             all_instructions.push(Instruction::new(JSR, AM::Label("__audio_tick".into())));
         }

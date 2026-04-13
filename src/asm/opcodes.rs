@@ -81,6 +81,13 @@ pub enum AddressingMode {
     LabelRelative(String),
     SymbolLo(String),
     SymbolHi(String),
+
+    /// Raw data payload — emitted verbatim by the assembler as a
+    /// `NOP` pseudo-instruction. Used to splice data tables (audio
+    /// envelopes, note streams, period tables) between code
+    /// sections so they live inside the same PRG bank and get their
+    /// labels resolved by the normal two-pass assembler.
+    Bytes(Vec<u8>),
 }
 
 impl AddressingMode {
@@ -97,6 +104,10 @@ impl AddressingMode {
             | Self::Relative(_) => 1,
             Self::Absolute(_) | Self::AbsoluteX(_) | Self::AbsoluteY(_) | Self::Indirect(_) => 2,
             Self::Label(_) | Self::LabelRelative(_) | Self::SymbolLo(_) | Self::SymbolHi(_) => 0,
+            // `Bytes` is the full emitted payload — the assembler
+            // skips the usual opcode byte for `NOP+Bytes` and writes
+            // the raw vector, so the whole thing is operand.
+            Self::Bytes(v) => v.len(),
         }
     }
 
@@ -117,6 +128,7 @@ impl AddressingMode {
             Self::Label(_) | Self::LabelRelative(_) | Self::SymbolLo(_) | Self::SymbolHi(_) => {
                 vec![]
             }
+            Self::Bytes(v) => v.clone(),
         }
     }
 
@@ -151,8 +163,17 @@ impl Instruction {
     }
 
     /// Total size in bytes (opcode + operand).
+    ///
+    /// The `NOP`+`Label` pair is a label-definition pseudo — zero
+    /// bytes. `NOP`+`Bytes(v)` is a raw-data pseudo — exactly `v.len()`
+    /// bytes (no opcode). All other instructions are 1 byte opcode
+    /// plus operand.
     pub fn size(&self) -> usize {
-        1 + self.mode.operand_size()
+        match &self.mode {
+            AddressingMode::Label(_) if self.opcode == Opcode::NOP => 0,
+            AddressingMode::Bytes(v) if self.opcode == Opcode::NOP => v.len(),
+            _ => 1 + self.mode.operand_size(),
+        }
     }
 }
 

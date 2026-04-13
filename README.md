@@ -50,8 +50,8 @@ start Main
 - **IR-based optimizer** -- constant folding, dead code elimination, strength reduction, copy propagation, peephole passes including INC/DEC fold and live-range slot recycling
 - **Full 16-bit arithmetic** -- u16 add/sub/compare lower to carry-propagating paired operations
 - **Multiple mappers** -- NROM, MMC1, UxROM, MMC3 (including multi-scanline IRQ dispatch per state)
-- **Minimal audio driver** -- `play`/`start_music`/`stop_music` drive a builtin APU engine with no per-program cost when unused
-- **Asset pipeline** -- PNG-to-CHR conversion, palette definitions, inline tile data
+- **Audio subsystem** -- frame-walking pulse driver with user-declared `sfx`/`music` blocks, builtin effects and tracks, period table, and zero-cost elision when unused
+- **Asset pipeline** -- PNG-to-CHR conversion, palette definitions, inline tile data, sfx envelopes, music note streams
 - **Inline assembly** -- `asm { ... }` with `{var}` substitution, plus `raw asm { ... }` for verbatim blocks
 - **Hardware intrinsics** -- `poke(addr, value)` / `peek(addr)` for direct register access
 - **Debug support** -- `--debug` flag, source maps, Mesen-compatible symbol export, `debug.log` / `debug.assert`
@@ -78,7 +78,7 @@ start Main
 | [`mmc1_banked.ne`](examples/mmc1_banked.ne) | MMC1 mapper, bank declarations, multiply |
 | [`structs_enums_for.ne`](examples/structs_enums_for.ne) | Structs, enums, `for` loops, struct literals |
 | [`inline_asm_demo.ne`](examples/inline_asm_demo.ne) | Inline asm with `{var}` substitution, `poke`/`peek` |
-| [`audio_demo.ne`](examples/audio_demo.ne) | Minimal audio driver: `play`, `start_music`, `stop_music` |
+| [`audio_demo.ne`](examples/audio_demo.ne) | Audio subsystem: user `sfx`/`music` blocks, builtin effects, `play`/`start_music`/`stop_music` |
 
 ## Compiler Commands
 

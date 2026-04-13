@@ -47,10 +47,22 @@ const RAM_END: u16 = 0x0800;
 
 /// Analyze a parsed program for semantic errors.
 pub fn analyze(program: &Program) -> AnalysisResult {
+    // Pre-collect declared and builtin-matchable sfx/music names so
+    // the statement walker can check `play` / `start_music` targets.
+    let mut sfx_names = HashSet::new();
+    for decl in &program.sfx {
+        sfx_names.insert(decl.name.clone());
+    }
+    let mut music_names = HashSet::new();
+    for decl in &program.music {
+        music_names.insert(decl.name.clone());
+    }
     let mut analyzer = Analyzer {
         symbols: HashMap::new(),
         var_allocations: Vec::new(),
         diagnostics: Vec::new(),
+        sfx_names,
+        music_names,
         next_ram_addr: 0x0300, // $0300 is first usable RAM after OAM buffer
         next_zp_addr: 0x10,    // $10 is first usable zero-page after reserved area
         call_graph: HashMap::new(),
@@ -78,6 +90,13 @@ struct Analyzer {
     symbols: HashMap<String, Symbol>,
     var_allocations: Vec<VarAllocation>,
     diagnostics: Vec<Diagnostic>,
+    /// Set of sfx names declared in the program (user-provided
+    /// `sfx Name { ... }` blocks). Used to validate `play Name`
+    /// targets. If a name isn't in here and isn't a known builtin,
+    /// the analyzer emits E0505.
+    sfx_names: HashSet<String>,
+    /// Set of music names declared in the program.
+    music_names: HashSet<String>,
     next_ram_addr: u16,
     next_zp_addr: u8,
     call_graph: HashMap<String, Vec<String>>,
@@ -1058,10 +1077,39 @@ impl Analyzer {
                 // codegen parses and validates the body; analysis has
                 // nothing to check.
             }
-            Statement::Play(_, _) | Statement::StartMusic(_, _) | Statement::StopMusic(_) => {
-                // Audio statements are parsed and recognized but
-                // currently generate no code — no audio driver exists.
-                // Users who need audio can use inline `asm` blocks.
+            Statement::Play(name, span) => {
+                // `play Name` is valid if the name refers to a
+                // declared sfx block or to a builtin effect. Anything
+                // else is an E0505 — the runtime driver needs a
+                // known blob to point at, and silently accepting
+                // bad names would hide typos.
+                if !self.sfx_names.contains(name) && !crate::assets::is_builtin_sfx(name) {
+                    self.diagnostics.push(
+                        Diagnostic::error(ErrorCode::E0505, format!("unknown sfx '{name}'"), *span)
+                            .with_help(
+                                "declare one with `sfx Name { pitch: [..], volume: [..] }`, \
+                         or use a builtin: coin, jump, hit, click, cancel, shoot, step",
+                            ),
+                    );
+                }
+            }
+            Statement::StartMusic(name, span) => {
+                if !self.music_names.contains(name) && !crate::assets::is_builtin_music(name) {
+                    self.diagnostics.push(
+                        Diagnostic::error(
+                            ErrorCode::E0505,
+                            format!("unknown music track '{name}'"),
+                            *span,
+                        )
+                        .with_help(
+                            "declare one with `music Name { notes: [..] }`, \
+                         or use a builtin: theme, battle, victory, gameover",
+                        ),
+                    );
+                }
+            }
+            Statement::StopMusic(_) => {
+                // No arguments, nothing to validate.
             }
         }
     }

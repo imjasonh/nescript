@@ -583,6 +583,212 @@ fn parse_set_palette_statement() {
     }
 }
 
+// ── Audio subsystem: sfx / music declarations ──
+
+#[test]
+fn parse_sfx_decl_minimal() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Pickup {
+            pitch: [0x60, 0x58, 0x50, 0x48]
+            volume: [15, 12, 8, 4]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sfx.len(), 1);
+    let sfx = &prog.sfx[0];
+    assert_eq!(sfx.name, "Pickup");
+    assert_eq!(sfx.pitch, vec![0x60, 0x58, 0x50, 0x48]);
+    assert_eq!(sfx.volume, vec![15, 12, 8, 4]);
+    // Default duty is 2 (50% square).
+    assert_eq!(sfx.duty, 2);
+}
+
+#[test]
+fn parse_sfx_decl_with_duty() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Zap {
+            duty: 3
+            pitch: [0x20, 0x22, 0x24]
+            volume: [15, 10, 5]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sfx[0].duty, 3);
+}
+
+#[test]
+fn parse_sfx_decl_rejects_mismatched_array_lengths() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Bad {
+            pitch: [0x20, 0x22]
+            volume: [15, 10, 5]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (_, diags) = parse(src);
+    assert!(
+        diags.iter().any(crate::errors::Diagnostic::is_error),
+        "mismatched pitch/volume lengths should error"
+    );
+}
+
+#[test]
+fn parse_sfx_decl_rejects_volume_over_15() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Bad {
+            pitch: [0x20]
+            volume: [16]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (_, diags) = parse(src);
+    assert!(
+        diags.iter().any(crate::errors::Diagnostic::is_error),
+        "volume > 15 should error"
+    );
+}
+
+#[test]
+fn parse_sfx_decl_rejects_duty_over_3() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Bad {
+            duty: 4
+            pitch: [0x20]
+            volume: [8]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (_, diags) = parse(src);
+    assert!(
+        diags.iter().any(crate::errors::Diagnostic::is_error),
+        "duty > 3 should error"
+    );
+}
+
+#[test]
+fn parse_music_decl_minimal() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        music Theme {
+            notes: [37, 8, 41, 8, 44, 8, 49, 16]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.music.len(), 1);
+    let m = &prog.music[0];
+    assert_eq!(m.name, "Theme");
+    assert_eq!(m.notes.len(), 4);
+    assert_eq!(m.notes[0].pitch, 37);
+    assert_eq!(m.notes[0].duration, 8);
+    assert_eq!(m.notes[3].pitch, 49);
+    assert_eq!(m.notes[3].duration, 16);
+    // Default music loops.
+    assert!(m.loops);
+}
+
+#[test]
+fn parse_music_decl_with_full_properties() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        music Victory {
+            duty: 0
+            volume: 12
+            repeat: false
+            notes: [37, 10, 41, 10, 44, 10, 49, 20]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let m = &prog.music[0];
+    assert_eq!(m.duty, 0);
+    assert_eq!(m.volume, 12);
+    assert!(!m.loops, "repeat: false should disable looping");
+}
+
+#[test]
+fn parse_music_decl_rejects_odd_note_count() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        music Bad {
+            notes: [37, 8, 41]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (_, diags) = parse(src);
+    assert!(
+        diags.iter().any(crate::errors::Diagnostic::is_error),
+        "odd note count should error — notes must come in (pitch, duration) pairs"
+    );
+}
+
+#[test]
+fn parse_music_decl_rejects_pitch_above_60() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        music Bad {
+            notes: [100, 8]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (_, diags) = parse(src);
+    assert!(
+        diags.iter().any(crate::errors::Diagnostic::is_error),
+        "pitch above 60 should error"
+    );
+}
+
+#[test]
+fn parse_music_decl_rejects_zero_duration() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        music Bad {
+            notes: [37, 0]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (_, diags) = parse(src);
+    assert!(
+        diags.iter().any(crate::errors::Diagnostic::is_error),
+        "zero duration should error"
+    );
+}
+
+#[test]
+fn parse_play_and_start_music_statements() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        on frame {
+            play coin
+            start_music theme
+            stop_music
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let stmts = &prog.states[0].on_frame.as_ref().unwrap().statements;
+    assert!(matches!(&stmts[0], Statement::Play(n, _) if n == "coin"));
+    assert!(matches!(&stmts[1], Statement::StartMusic(n, _) if n == "theme"));
+    assert!(matches!(&stmts[2], Statement::StopMusic(_)));
+}
+
 // ── Milestone 4: Optimization & Polish ──
 
 #[test]

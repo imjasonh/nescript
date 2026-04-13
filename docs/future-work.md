@@ -163,18 +163,26 @@ These are defined in `ErrorCode` but never emitted:
 
 ## 12. Audio
 
-**Status**: A minimal APU driver is now in place. `play SfxName` emits
-pulse-1 register writes from a builtin SFX table, `start_music` holds a
-tone on pulse 2, `stop_music` mutes pulse 2. The NMI handler gains a
-`JSR __audio_tick` splice whenever user code triggered audio so the SFX
-countdown counter can mute the tone when its frames are up. Unused
-programs pay zero ROM cost.
+**Status**: A full data-driven audio subsystem is in place. User programs
+can declare `sfx Name { duty, pitch, volume }` blocks (frame-accurate
+pulse-1 envelopes) and `music Name { duty, volume, repeat, notes }`
+blocks (pulse-2 note streams with rests and looping). The resolver
+compiles these into ROM-ready byte tables; the IR codegen emits
+trigger sequences that load pointers into ZP; the runtime NMI tick
+walks the envelope and note stream each frame, indexing into a
+builtin 60-note period table. Builtin effects (`coin`, `jump`, `hit`,
+`click`, `cancel`, `shoot`, `step`) and tracks (`theme`, `battle`,
+`victory`, `gameover`) are synthesized from the same data path so
+programs that don't declare their own audio still make sound.
+Programs that touch no audio pay zero ROM or cycle cost — the whole
+subsystem elides when the `__audio_used` marker is absent.
 
-**Still TODO for a full audio solution**:
+**Still TODO for richer audio**:
+- Triangle/noise/DMC channels (currently only pulse 1 and 2 are used)
+- Multi-channel tracker playback (one `notes` list per channel)
 - `@sfx("file.nsf")` / `@music("file.ftm")` asset directives
 - FamiTracker export format parsing
-- Multi-channel music driver with note tables and envelopes
-- Per-SFX duration override in the declaration rather than the builtin table
+- Per-note pitch changes within a sfx (currently pitch is latched once)
 
 ---
 
@@ -285,14 +293,16 @@ spills to zero-page $02 for comparisons. A proper allocator would:
 
 These items were documented as future work but have since been implemented:
 
-- **Minimal audio driver** — `src/runtime/mod.rs::gen_audio_tick()`
-  plus codegen for `IrOp::PlaySfx` / `StartMusic` / `StopMusic`. SFX
-  and music map through a builtin name table (`coin`, `jump`, `hit`,
-  `theme`, etc.) to APU pulse 1/2 register writes. The NMI handler
-  gains a `JSR __audio_tick` splice (via the linker's `__audio_used`
-  marker lookup) that decrements a per-frame counter and mutes the
-  channel when the tone's time is up. Programs without audio pay
-  zero ROM cost.
+- **Full audio subsystem** — `src/runtime/mod.rs::gen_audio_tick`,
+  `gen_period_table`, and `gen_data_block` implement a frame-walking
+  pulse driver. `src/assets/audio.rs` compiles user `sfx`/`music`
+  declarations (and builtins referenced via `play coin` etc.) into
+  ROM-ready envelope and note-stream byte tables. `IrCodeGen::with_audio`
+  threads the compile-time trigger constants into `play`/`start_music`,
+  which emit pointer loads against per-blob labels. The linker splices
+  driver body, period table, and every blob into PRG gated on the
+  `__audio_used` marker so silent programs pay no cost. Full
+  parser/analyzer/codegen/linker/runtime test coverage.
 - **u16 arithmetic and comparisons** — new IR ops `LoadVarHi`,
   `StoreVarHi`, `Add16`, `Sub16`, `CmpEq16` through `CmpGtEq16`. The
   lowering context tracks variable types via the analyzer's symbol
@@ -422,9 +432,10 @@ These items were documented as future work but have since been implemented:
 - **`for i in start..end { ... }` loops** — half-open range with a
   u8 index variable. Desugared in IR lowering to a while loop with
   a proper continue-edge block so `break`/`continue` work.
-- **Audio statement parsing** — `play SfxName`, `start_music`,
-  `stop_music` parse and analyze as no-ops (no driver yet; users
-  can wire audio via inline `asm` blocks).
+- **Audio subsystem** — full data-driven pulse driver with
+  `sfx`/`music` block declarations, builtin effects, and an
+  NMI-time tick that walks envelope and note-stream tables.
+  See section 12 above for the full writeup.
 - **Constant expression folding** — `const B: u8 = A + 3` evaluates
   at compile time and feeds through to variable initializers too.
 - **`on scanline` codegen (minimal)** — MMC3 IRQ setup at startup
@@ -490,10 +501,12 @@ For someone picking up this codebase, the recommended order of work:
    end-to-end (load/store, +/-, comparisons all propagate through
    16-bit IR ops). Struct fields and array elements are still u8-only
    — the layout machinery needs to grow multi-byte field offsets.
-2. **Full multi-channel music driver** — the current audio engine
-   holds a single tone on each of pulse 1 (SFX) and pulse 2 (music).
-   A proper NSF-style driver with note tables, envelopes, and a
-   multi-track stream would unblock real game music.
+2. **Triangle / noise / DMC channels** — the current audio engine
+   plays sfx on pulse 1 and music on pulse 2 with a full
+   data-driven tracker model (envelope walk, period table,
+   `(pitch, duration)` note streams, loop-back). Wiring triangle
+   and noise channels into the same model would unblock richer
+   multi-part compositions.
 3. **Register allocator** — proper A/X/Y allocation to replace
    zero-page spills used by the current IR codegen. Partially
    mitigated by peephole passes + the new slot recycler, but still

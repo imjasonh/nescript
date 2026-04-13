@@ -25,14 +25,38 @@ pub const ZP_INPUT_P2: u8 = 0x08;
 /// the oldest slot gets overwritten — the classic NES flicker
 /// fallback.
 pub const ZP_OAM_CURSOR: u8 = 0x09;
-/// Pulse-1 SFX countdown frames. `play SfxName` sets this to the
-/// SFX duration and writes the tone registers; the NMI audio tick
-/// decrements it every frame, silencing pulse 1 when it reaches 0.
+/// Pulse-1 SFX envelope pointer (2 bytes, lo/hi) — points at the
+/// *current* frame's $4000 envelope byte inside the sfx blob. The
+/// audio tick reads through this byte, writes to $4000, advances
+/// the pointer, and keeps going until it reads a zero sentinel.
+pub const ZP_SFX_PTR_LO: u8 = 0x0C;
+pub const ZP_SFX_PTR_HI: u8 = 0x0D;
+/// Pulse-2 music note-stream pointer (2 bytes, lo/hi) — points at
+/// the *current* (pitch, duration) note pair inside the music blob.
+pub const ZP_MUSIC_PTR_LO: u8 = 0x0E;
+pub const ZP_MUSIC_PTR_HI: u8 = 0x0F;
+/// Music base pointer (2 bytes) — start of the currently-loaded
+/// track. Used by the loop-back branch when the driver hits the
+/// end-of-track sentinel and the header loop flag is set.
+pub const ZP_MUSIC_BASE_LO: u8 = 0x05;
+pub const ZP_MUSIC_BASE_HI: u8 = 0x06;
+/// Music state byte. Bit layout:
+///   bit 0: 1 = track is looping, 0 = one-shot
+///   bit 1: 1 = music is active (non-zero means "playing")
+///   bits 2-5: latched pulse-2 envelope volume 0-15
+///   bits 6-7: latched pulse-2 duty
+/// Set on `start_music`, cleared (to 0) on `stop_music`. The driver
+/// writes a fresh $4004 envelope byte every time it advances to a
+/// new note using these bits so held notes don't decay.
+pub const ZP_MUSIC_STATE: u8 = 0x07;
+/// Pulse-1 SFX countdown — `0` means no sfx is playing.
+/// Nonzero means the audio tick should read one envelope byte from
+/// `ZP_SFX_PTR` each NMI and write it to $4000. When the tick reads
+/// a zero sentinel it mutes pulse 1 and clears this byte.
 pub const ZP_SFX_COUNTER: u8 = 0x0A;
-/// Pulse-2 music countdown frames. `start_music TrackName` sets
-/// this to `$FF` (infinite sustain) and writes a pulse-2 tone;
-/// `stop_music` zeros it and mutes pulse 2. `$FF` skips the NMI
-/// decrement so music plays until explicitly stopped.
+/// Pulse-2 music duration countdown — frames remaining on the
+/// currently-held music note. When it reaches zero, the tick
+/// advances to the next (pitch, duration) pair.
 pub const ZP_MUSIC_COUNTER: u8 = 0x0B;
 
 /// Generate the NES hardware initialization sequence.
@@ -256,44 +280,336 @@ pub fn gen_multiply() -> Vec<Instruction> {
     out
 }
 
-/// Generate the per-NMI audio tick that ages the SFX counter and
-/// silences pulse 1 when the counter hits zero. Music on pulse 2
-/// uses the sentinel `$FF` for infinite sustain and is never
-/// decremented here — `stop_music` handles mute explicitly.
+/// Generate the per-NMI audio tick. This is the heart of the audio
+/// driver — it walks both the SFX envelope and the music note stream
+/// every frame and writes the resulting APU register values.
 ///
 /// The linker splices a `JSR __audio_tick` into the NMI handler
-/// whenever user code contains any audio ops, so programs that
-/// never call `play`/`start_music`/`stop_music` pay zero cost.
+/// whenever user code contains any audio op (detected by the
+/// `__audio_used` marker label), so programs that never call
+/// `play`/`start_music`/`stop_music` pay zero ROM or cycle cost.
 ///
-/// Contract:
-/// - Input: `ZP_SFX_COUNTER` = remaining frames for pulse 1's tone
-/// - Effect: decrements the counter; on 0→transition mutes $4000
-/// - Clobbers: A (which the NMI handler restores via PLA)
+/// ## SFX channel (pulse 1)
+///
+/// State:
+/// - `ZP_SFX_COUNTER` — nonzero while an sfx is playing
+/// - `ZP_SFX_PTR_LO/HI` — pointer into the current sfx blob,
+///   advanced one byte per frame
+///
+/// Each frame: if the counter is nonzero, read one byte through the
+/// pointer, write it to `$4000`, and advance the pointer. A zero
+/// byte is the sentinel; on it the driver mutes pulse 1 and clears
+/// the counter.
+///
+/// ## Music channel (pulse 2)
+///
+/// State:
+/// - `ZP_MUSIC_COUNTER` — frames remaining on the current note
+/// - `ZP_MUSIC_STATE` — bit 1 set = active; bits encode duty/volume/loop
+/// - `ZP_MUSIC_PTR_LO/HI` — pointer to the next (pitch,dur) pair
+/// - `ZP_MUSIC_BASE_LO/HI` — loop-back start of the current track
+///
+/// Each frame: if the state says "active" and the counter is nonzero,
+/// decrement the counter and bail. When it hits zero, advance past
+/// the current (pitch,dur) pair and read the next one. `0xFF,0xFF`
+/// is the end-of-track sentinel; the driver either rewinds to the
+/// base pointer (looping tracks) or mutes pulse 2 (one-shot tracks).
+///
+/// ## Clobbers
+///
+/// A, X, Y. The NMI handler calls this from inside its own
+/// save/restore block so caller registers are safe.
 pub fn gen_audio_tick() -> Vec<Instruction> {
     let mut out = Vec::new();
 
     out.push(Instruction::new(NOP, AM::Label("__audio_tick".into())));
 
-    // SFX counter check: if 0, nothing to do.
+    // ── SFX tick ──
+    // If counter is zero, no sfx is playing; skip.
     out.push(Instruction::new(LDA, AM::ZeroPage(ZP_SFX_COUNTER)));
     out.push(Instruction::new(
         BEQ,
-        AM::LabelRelative("__audio_tick_done".into()),
+        AM::LabelRelative("__audio_sfx_done".into()),
     ));
-    out.push(Instruction::new(DEC, AM::ZeroPage(ZP_SFX_COUNTER)));
-    // If still non-zero, leave the tone alone.
+    // Read next envelope byte via (ZP_SFX_PTR),Y with Y=0.
+    out.push(Instruction::new(LDY, AM::Immediate(0)));
+    out.push(Instruction::new(LDA, AM::IndirectY(ZP_SFX_PTR_LO)));
+    // If it's the zero sentinel, silence pulse 1 and clear state.
     out.push(Instruction::new(
         BNE,
-        AM::LabelRelative("__audio_tick_done".into()),
+        AM::LabelRelative("__audio_sfx_write".into()),
     ));
-    // Counter just hit 0: silence pulse 1 (volume envelope = mute).
+    // Sentinel branch: write mute byte to $4000 and clear counter.
     out.push(Instruction::new(LDA, AM::Immediate(0x30)));
     out.push(Instruction::new(STA, AM::Absolute(0x4000)));
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_SFX_COUNTER)));
+    out.push(Instruction::new(JMP, AM::Label("__audio_sfx_done".into())));
+    // Non-sentinel branch: write envelope byte to $4000, advance ptr.
+    out.push(Instruction::new(NOP, AM::Label("__audio_sfx_write".into())));
+    out.push(Instruction::new(STA, AM::Absolute(0x4000)));
+    // Advance the 16-bit pointer (lo, hi) by 1.
+    out.push(Instruction::new(INC, AM::ZeroPage(ZP_SFX_PTR_LO)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_sfx_ptr_ok".into()),
+    ));
+    out.push(Instruction::new(INC, AM::ZeroPage(ZP_SFX_PTR_HI)));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_sfx_ptr_ok".into()),
+    ));
+    out.push(Instruction::new(NOP, AM::Label("__audio_sfx_done".into())));
 
-    out.push(Instruction::new(NOP, AM::Label("__audio_tick_done".into())));
+    // ── Music tick ──
+    // Bit 1 of ZP_MUSIC_STATE is "music is active". If clear, skip.
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_MUSIC_STATE)));
+    out.push(Instruction::new(AND, AM::Immediate(0x02)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__audio_music_done".into()),
+    ));
+    // Active. Decrement the note counter; if nonzero after, bail.
+    out.push(Instruction::new(DEC, AM::ZeroPage(ZP_MUSIC_COUNTER)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_music_done".into()),
+    ));
+    // Counter just hit zero — time to advance. Fall through to the
+    // "advance to next note" block below. The runtime calls this
+    // block from two places: end-of-note and start_music (which sets
+    // counter=0 then jumps here to trigger the first note).
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_music_advance".into()),
+    ));
+    // Read the next pitch byte. LDA sets Z based on the value so
+    // we can dispatch on it cheaply:
+    //   pitch == 0    → rest     (fall through to __rest)
+    //   pitch == 0xFF → sentinel (BNE past rest, then CMP + BEQ)
+    //   otherwise     → pitched  (fall through to __pitched)
+    out.push(Instruction::new(LDY, AM::Immediate(0)));
+    out.push(Instruction::new(LDA, AM::IndirectY(ZP_MUSIC_PTR_LO)));
+    // Zero? → rest branch (mute pulse 2, skip period lookup).
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_music_not_rest".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::Immediate(0x30)));
+    out.push(Instruction::new(STA, AM::Absolute(0x4004)));
+    out.push(Instruction::new(
+        JMP,
+        AM::Label("__audio_music_load_dur".into()),
+    ));
+    // Not zero — check sentinel, otherwise it's a real note.
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_music_not_rest".into()),
+    ));
+    out.push(Instruction::new(CMP, AM::Immediate(0xFF)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__audio_music_eot".into()),
+    ));
+    // Fall through to the pitched branch — A still holds pitch.
+    out.push(Instruction::new(
+        JMP,
+        AM::Label("__audio_music_pitched".into()),
+    ));
+    // Pitched branch: A already holds pitch (1..=60). Index the
+    // period table and write $4006 (period lo) and $4007 (period
+    // hi + length counter). Each table entry is 2 bytes.
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_music_pitched".into()),
+    ));
+    // Rewrite envelope byte ($4004) from music state so we don't
+    // depend on pulse-2 length counter. Extract duty (bits 6-7) and
+    // volume (bits 2-5) from state, shift into position, OR with $30
+    // (length-halt + constant volume), write $4004.
+    //
+    // Save pitch in X so we still have it for the period lookup.
+    out.push(Instruction::new(TAX, AM::Implied));
+    // Build envelope byte.
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_MUSIC_STATE)));
+    out.push(Instruction::new(AND, AM::Immediate(0xC0))); // keep duty bits
+    out.push(Instruction::new(STA, AM::ZeroPage(0x04))); // scratch
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_MUSIC_STATE)));
+    out.push(Instruction::new(AND, AM::Immediate(0x3C))); // keep volume<<2
+    out.push(Instruction::new(LSR, AM::Accumulator));
+    out.push(Instruction::new(LSR, AM::Accumulator));
+    out.push(Instruction::new(ORA, AM::ZeroPage(0x04)));
+    out.push(Instruction::new(ORA, AM::Immediate(0x30)));
+    out.push(Instruction::new(STA, AM::Absolute(0x4004)));
+
+    // Period lookup via a ZP pointer. X holds pitch (1..=60).
+    //
+    //   1. Set (ZP_SCRATCH = __period_table).
+    //   2. A = (pitch - 1) * 2 — byte offset in the 2-byte-per-entry
+    //      table.
+    //   3. Y = A.
+    //   4. LDA (ZP_SCRATCH),Y → period_lo → STA $4006.
+    //   5. INY; LDA (ZP_SCRATCH),Y → period_hi → STA $4007.
+    //
+    // `$02`/`$03` are the multiply/divide scratch slots but the NMI
+    // audio tick never calls mul/div, so they're free to reuse here.
+    // A proper `Absolute,Y` addressing mode with a symbolic label
+    // would save the pointer setup, but our asm layer doesn't have
+    // that yet and the extra 8 cycles per frame are negligible.
+    out.push(Instruction::new(LDA, AM::SymbolLo("__period_table".into())));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+    out.push(Instruction::new(LDA, AM::SymbolHi("__period_table".into())));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+    out.push(Instruction::new(TXA, AM::Implied));
+    out.push(Instruction::new(SEC, AM::Implied));
+    out.push(Instruction::new(SBC, AM::Immediate(1)));
+    out.push(Instruction::new(ASL, AM::Accumulator));
+    out.push(Instruction::new(TAY, AM::Implied));
+    out.push(Instruction::new(LDA, AM::IndirectY(0x02)));
+    out.push(Instruction::new(STA, AM::Absolute(0x4006)));
+    out.push(Instruction::new(INY, AM::Implied));
+    out.push(Instruction::new(LDA, AM::IndirectY(0x02)));
+    // The period-table high byte already has the length-counter
+    // load bits baked in (see `gen_period_table`), so a raw store
+    // here retriggers the note. But retriggering every time the
+    // duration expires is fine — it's how trackers work.
+    out.push(Instruction::new(STA, AM::Absolute(0x4007)));
+
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_music_load_dur".into()),
+    ));
+    // Advance pointer past the pitch byte we just consumed.
+    out.push(Instruction::new(INC, AM::ZeroPage(ZP_MUSIC_PTR_LO)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_music_dur_hi_ok".into()),
+    ));
+    out.push(Instruction::new(INC, AM::ZeroPage(ZP_MUSIC_PTR_HI)));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_music_dur_hi_ok".into()),
+    ));
+    // Read duration through the advanced pointer and stash it in
+    // ZP_MUSIC_COUNTER.
+    out.push(Instruction::new(LDY, AM::Immediate(0)));
+    out.push(Instruction::new(LDA, AM::IndirectY(ZP_MUSIC_PTR_LO)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_MUSIC_COUNTER)));
+    // Advance past the duration byte.
+    out.push(Instruction::new(INC, AM::ZeroPage(ZP_MUSIC_PTR_LO)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_music_ptr2_ok".into()),
+    ));
+    out.push(Instruction::new(INC, AM::ZeroPage(ZP_MUSIC_PTR_HI)));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_music_ptr2_ok".into()),
+    ));
+    out.push(Instruction::new(
+        JMP,
+        AM::Label("__audio_music_done".into()),
+    ));
+
+    // ── End-of-track branch ──
+    out.push(Instruction::new(NOP, AM::Label("__audio_music_eot".into())));
+    // Check loop flag (bit 0 of ZP_MUSIC_STATE). If set, rewind ptr
+    // to base and re-enter the advance path. Otherwise stop.
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_MUSIC_STATE)));
+    out.push(Instruction::new(AND, AM::Immediate(0x01)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__audio_music_stop".into()),
+    ));
+    // Looping: copy base pointer back into current pointer and
+    // re-enter the advance path.
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_MUSIC_BASE_LO)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_MUSIC_PTR_LO)));
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_MUSIC_BASE_HI)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_MUSIC_PTR_HI)));
+    out.push(Instruction::new(
+        JMP,
+        AM::Label("__audio_music_advance".into()),
+    ));
+    // Non-looping stop: mute pulse 2 and clear music state.
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_music_stop".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::Immediate(0x30)));
+    out.push(Instruction::new(STA, AM::Absolute(0x4004)));
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_MUSIC_STATE)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_MUSIC_COUNTER)));
+
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_music_done".into()),
+    ));
     out.push(Instruction::implied(RTS));
 
     out
+}
+
+/// Generate the builtin period table that the music tick uses to
+/// translate note indices into pulse-channel period values. The
+/// table covers five octaves (C1–B5) for 60 entries, 2 bytes each.
+///
+/// Entry 0 is `C1` (index 1 in user notes), entry 59 is `B5` (index
+/// 60). Pitch 0 is the "rest" sentinel and is not present in the
+/// table — the driver handles rests before indexing.
+///
+/// The high byte of each entry is `((period >> 8) & 0x07) | 0x08`.
+/// Setting bit 3 pre-loads the length counter to index 1 (254 frames)
+/// so any note held beyond the envelope will still play out naturally
+/// when the track later falls into a rest — without this, pulse 2
+/// would silence itself after ~4 frames on hardware.
+#[must_use]
+pub fn gen_period_table() -> Vec<Instruction> {
+    // NTSC CPU = 1.789773 MHz. Pulse channel frequency:
+    //   f = CPU / (16 * (period + 1))
+    // Solving for period given a target frequency f:
+    //   period = CPU / (16 * f) - 1
+    //
+    // We compute the 60 entries once at build time (here) using
+    // equal-tempered tuning anchored at A4 = 440 Hz.
+    const CPU: f64 = 1_789_773.0;
+    const A4_HZ: f64 = 440.0;
+
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__period_table".into())));
+    // Semitone offset from A4 for index `i` (0-based from C1).
+    // A4 is MIDI 69. C1 is MIDI 24. So semitones from A4 to C1 is
+    // -45 — our table starts at C1 so `offset(i) = i - 45`.
+    let mut bytes: Vec<u8> = Vec::with_capacity(120);
+    for i in 0i32..60 {
+        let semitone_offset = f64::from(i - 45);
+        let freq = A4_HZ * 2f64.powf(semitone_offset / 12.0);
+        let period_f = CPU / (16.0 * freq) - 1.0;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let period = period_f.round().clamp(0.0, 2047.0) as u16;
+        let lo = (period & 0xFF) as u8;
+        // High 3 bits of period + length counter load bits.
+        // 0x08 = length counter index 1 = 254 frames.
+        let hi = ((period >> 8) as u8 & 0x07) | 0x08;
+        bytes.push(lo);
+        bytes.push(hi);
+    }
+    out.push(Instruction::new(NOP, AM::Bytes(bytes)));
+    out
+}
+
+/// Generate a labelled data block emitting `bytes` verbatim into the
+/// ROM at the address the assembler places this block. Used by the
+/// linker to splice compiled sfx and music blobs into the code
+/// section so that `LDA #<Name; STA ptr_lo` from the IR codegen can
+/// resolve to the right in-ROM address.
+#[must_use]
+pub fn gen_data_block(label: &str, bytes: Vec<u8>) -> Vec<Instruction> {
+    vec![
+        Instruction::new(NOP, AM::Label(label.to_string())),
+        Instruction::new(NOP, AM::Bytes(bytes)),
+    ]
 }
 
 /// Generate 8 / 8 -> 8 software divide routine (restoring division).

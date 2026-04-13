@@ -164,6 +164,195 @@ fn multiply_routine_assembles() {
     );
 }
 
+// ── Audio driver tests ──
+
+#[test]
+fn audio_tick_defines_required_labels() {
+    let tick = gen_audio_tick();
+    // The IR codegen JSRs into `__audio_tick`; that's the entry.
+    let has_entry = tick
+        .iter()
+        .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_tick"));
+    assert!(has_entry, "audio tick must define __audio_tick entry label");
+    // The tick references `__period_table` via SymbolLo/SymbolHi —
+    // the period table itself is linked in separately.
+    let refs_period = tick.iter().any(|i| {
+        matches!(&i.mode, AM::SymbolLo(n) if n == "__period_table")
+            || matches!(&i.mode, AM::SymbolHi(n) if n == "__period_table")
+    });
+    assert!(
+        refs_period,
+        "audio tick must reference the __period_table label"
+    );
+}
+
+#[test]
+fn audio_tick_ends_with_rts() {
+    let tick = gen_audio_tick();
+    assert_eq!(
+        tick.last().unwrap().opcode,
+        RTS,
+        "audio tick must return to caller"
+    );
+}
+
+#[test]
+fn audio_tick_reads_sfx_envelope_via_indirect_y() {
+    // The sfx branch walks the envelope via (ZP_SFX_PTR_LO),Y with
+    // Y=0 — each NMI reads one byte through the pointer and writes
+    // it to $4000. Verify the indirect-indexed load is present.
+    let tick = gen_audio_tick();
+    let has_load = tick
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::IndirectY(ZP_SFX_PTR_LO));
+    assert!(
+        has_load,
+        "audio tick must read envelope via (ZP_SFX_PTR_LO),Y"
+    );
+}
+
+#[test]
+fn audio_tick_writes_pulse1_envelope_register() {
+    // After reading the envelope byte the tick writes it to $4000.
+    let tick = gen_audio_tick();
+    let has_store = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4000));
+    assert!(has_store, "audio tick must write pulse-1 envelope to $4000");
+}
+
+#[test]
+fn audio_tick_mutes_pulse2_on_non_looping_end_of_track() {
+    // When a non-looping track hits the (0xFF, 0xFF) sentinel, the
+    // tick writes $30 to $4004 and clears ZP_MUSIC_STATE. We verify
+    // the mute path exists by checking both writes exist somewhere
+    // in the tick body.
+    let tick = gen_audio_tick();
+    let has_mute = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4004));
+    assert!(has_mute, "audio tick must mute pulse-2 on end-of-track");
+    let has_state_clear = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(ZP_MUSIC_STATE));
+    assert!(
+        has_state_clear,
+        "audio tick must clear ZP_MUSIC_STATE on stop"
+    );
+}
+
+#[test]
+fn audio_tick_assembles_without_error() {
+    // Splice the period table into the same assembly pass so the
+    // tick's SymbolLo/SymbolHi references resolve. The tick also
+    // uses label-relative branches internally which need to fit
+    // within ±127 bytes — if the body grows past that the branches
+    // will panic at assemble time.
+    let mut combined = gen_audio_tick();
+    combined.extend(gen_period_table());
+    let result = asm::assemble(&combined, 0xC000);
+    assert!(
+        !result.bytes.is_empty(),
+        "audio tick + period table should assemble"
+    );
+    assert!(
+        result.labels.contains_key("__audio_tick"),
+        "audio tick entry label should be exported"
+    );
+    assert!(
+        result.labels.contains_key("__period_table"),
+        "period table label should be exported"
+    );
+}
+
+#[test]
+fn period_table_has_60_entries_of_2_bytes() {
+    // The table covers C1..B5 inclusive = 60 semitones, 2 bytes
+    // each for period_lo and period_hi. Total = 120 data bytes
+    // plus the leading label pseudo-instruction.
+    let table = gen_period_table();
+    // Count the raw bytes in the single `Bytes` block.
+    let total: usize = table
+        .iter()
+        .filter_map(|i| match &i.mode {
+            AM::Bytes(v) => Some(v.len()),
+            _ => None,
+        })
+        .sum();
+    assert_eq!(total, 120, "period table should be 60 entries × 2 bytes");
+}
+
+#[test]
+fn period_table_high_bytes_include_length_counter_bit() {
+    // Every period_hi byte must have bit 3 set ($08) so the length
+    // counter holds the note indefinitely. Without that bit, pulse
+    // 2 would silence after a few frames.
+    let table = gen_period_table();
+    let bytes: Vec<u8> = table
+        .iter()
+        .filter_map(|i| match &i.mode {
+            AM::Bytes(v) => Some(v.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    for (i, chunk) in bytes.chunks(2).enumerate() {
+        let hi = chunk[1];
+        assert!(
+            hi & 0x08 != 0,
+            "period table entry {i} high byte ${hi:02X} missing length-counter bit"
+        );
+    }
+}
+
+#[test]
+fn period_table_a4_matches_440hz() {
+    // Entry for A4 should produce ~253 period. Sanity check the
+    // rounding: CPU/(16*440)-1 ≈ 253.12.
+    let table = gen_period_table();
+    let bytes: Vec<u8> = table
+        .iter()
+        .filter_map(|i| match &i.mode {
+            AM::Bytes(v) => Some(v.clone()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    // A4 is semitone 69 in MIDI. C1 is MIDI 24 (entry 0 in the
+    // table). A4 = entry 69 - 24 = 45. Each entry is 2 bytes.
+    let lo = bytes[45 * 2];
+    let hi = bytes[45 * 2 + 1] & 0x07; // strip length-counter bit
+    let period = u16::from_le_bytes([lo, hi]);
+    // Expect period ≈ 253 (±1 for rounding).
+    assert!(
+        (252..=254).contains(&period),
+        "A4 period {period} should be ~253"
+    );
+}
+
+#[test]
+fn gen_data_block_emits_label_and_bytes() {
+    let block = gen_data_block("__sfx_test", vec![0xDE, 0xAD, 0xBE, 0xEF]);
+    assert_eq!(block.len(), 2);
+    assert!(matches!(&block[0].mode, AM::Label(n) if n == "__sfx_test"));
+    match &block[1].mode {
+        AM::Bytes(v) => assert_eq!(v, &[0xDE, 0xAD, 0xBE, 0xEF]),
+        other => panic!("expected Bytes, got {other:?}"),
+    }
+}
+
+#[test]
+fn data_block_assembles_verbatim() {
+    // A labelled data block must emit exactly the payload bytes
+    // (no opcode prefix) and register the label at the payload's
+    // address. Verifies the `NOP+Bytes` pseudo doesn't accidentally
+    // get wrapped with an instruction byte.
+    let block = gen_data_block("__test", vec![0x11, 0x22, 0x33]);
+    let result = asm::assemble(&block, 0x8000);
+    assert_eq!(result.bytes, vec![0x11, 0x22, 0x33]);
+    assert_eq!(result.labels.get("__test").copied(), Some(0x8000));
+}
+
 #[test]
 fn divide_routine_assembles() {
     let div = gen_divide();

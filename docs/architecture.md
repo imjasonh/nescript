@@ -65,10 +65,10 @@ Assigns addresses to code and data segments, resolves fixups/relocations (`fixup
 Builds the final iNES ROM file. Generates the 16-byte iNES header (`header.rs`) and places the NMI/RESET/IRQ vector table (`vectors.rs`).
 
 ### `runtime/`
-Contains built-in runtime code that the compiler emits into every ROM: NES hardware initialization (`init.rs`), NMI handler generation (`nmi.rs`), controller read routines (`input.rs`), OAM DMA setup (`oam.rs`), PPU helper routines (`ppu.rs`), and software multiply/divide (`math.rs`).
+Contains built-in runtime code that the compiler emits into every ROM: NES hardware initialization, NMI handler generation, controller read routines, OAM DMA setup, software multiply/divide, and the frame-walking audio driver (`gen_audio_tick`, `gen_period_table`, `gen_data_block`).
 
 ### `assets/`
-The asset pipeline. Converts PNG images to CHR tile data (`chr.rs`), generates nametables from full-screen images (`nametable.rs`), extracts and maps palettes (`palette.rs`), and handles audio import stubs (`audio.rs`).
+The asset pipeline. Converts PNG images to CHR tile data (`chr.rs`), maps RGB colors to the NES palette (`palette.rs`), resolves `sprite`/`background` declarations into tile-indexed CHR blocks (`resolve.rs`), and compiles `sfx`/`music` declarations into ROM-ready envelope and note-stream byte tables (`audio.rs`) — plus the builtin effect/track tables used as fallbacks when programs reference audio names without declaring them.
 
 ### `debug/`
 Debug instrumentation output. Generates source maps relating ROM addresses to source locations (`source_map.rs`), symbol tables compatible with Mesen (`symbols.rs`), and runtime check code for debug builds (`checks.rs`).
