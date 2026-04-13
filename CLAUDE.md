@@ -70,29 +70,31 @@ tests/emulator/
 The harness is **separate** from `cargo test`. You have to run it by hand:
 
 ```bash
-# 1. Install node deps (once per worktree; node_modules/ is gitignored).
+# 1. Rebuild every example with the current compiler. The harness
+#    reads whatever sits under examples/*.nes — if you want to test
+#    your working copy you have to rebuild them first.
+cargo build --release
+for f in examples/*.ne; do ./target/release/nescript build "$f"; done
+
+# 2. Install node deps (once per worktree; node_modules/ is gitignored).
 cd tests/emulator
 npm install          # or `npm ci` in CI
 
-# 2. Verify every committed ROM still matches its golden.
+# 3. Verify every ROM still matches its golden.
 node run_examples.mjs
 # → "22/22 ROMs match their goldens" on success
 # → FAIL / MISS lines + `actual/<name>.png`, `actual/<name>.diff.png`,
 #   `actual/<name>.wav` written for any ROM that mismatched
 ```
 
-The harness reads the committed `examples/*.nes` files directly —
-since those are rebuilt and diffed by the `examples` CI job, the
-emulator job doesn't need a compiler toolchain at all. If you're
-iterating on the compiler locally, rebuild the example ROM(s) you
-care about before re-running the harness:
-
-```bash
-cargo build --release
-./target/release/nescript build examples/hello_sprite.ne
-# then:
-(cd tests/emulator && node run_examples.mjs)
-```
+The harness always runs against whatever sits in `examples/*.nes`,
+so iterating on the compiler means rebuilding the example first.
+CI's `emulator` job does this too — it builds the compiler, compiles
+every `.ne` into the workspace (overwriting the committed ROMs,
+which are ephemeral in the CI checkout), and then runs the harness.
+The committed ROMs are a PR-review convenience and a "did this
+change affect codegen" tripwire via the `examples` job's
+reproducibility diff; they are **not** what the emulator job tests.
 
 ### Updating goldens
 

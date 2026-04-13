@@ -97,6 +97,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
@@ -122,13 +124,26 @@ jobs:
             libxkbcommon0 \
             libxrandr2 \
             libasound2t64
-      # No compiler build needed — the `.nes` files are committed
-      # alongside their `.ne` sources, and the `examples` CI job
-      # fails on any stale ROM, so the emulator job can trust them.
+      - name: Build compiler
+        run: cargo build --release
+      - name: Compile all .ne examples
+        # Overwrites the committed examples/*.nes in the CI workspace
+        # (the workspace is ephemeral; the committed ROMs aren't
+        # touched). This is load-bearing: the goldens must be diffed
+        # against what *this* compiler produces, not against the ROMs
+        # an earlier commit happened to ship, otherwise a broken
+        # compiler change can still pass the emulator job as long as
+        # the contributor forgot to rebuild the ROMs. The `examples`
+        # job catches that second case via its reproducibility diff.
+        run: |
+          for f in examples/*.ne; do
+            echo "==> Compiling $f"
+            ./target/release/nescript build "$f"
+          done
       - name: Install emulator harness dependencies
         working-directory: tests/emulator
         run: npm ci
-      - name: Diff each ROM's framebuffer against its committed golden
+      - name: Diff each ROM's framebuffer against its golden
         working-directory: tests/emulator
         run: node run_examples.mjs
       - name: Upload actual + diff PNGs on failure
