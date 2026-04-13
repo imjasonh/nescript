@@ -1,7 +1,7 @@
-// Sprites and Palettes — demonstrates M3 asset features.
+// Sprites and Scroll — demonstrates M3/M4 asset features.
 //
-// Shows: sprite declarations with inline CHR data,
-// palette declarations, set_palette, type casting, scroll.
+// Shows: sprite declarations with inline CHR data, type casting,
+// PPU scroll writes.
 //
 // Build: cargo run -- build examples/sprites_and_palettes.ne
 
@@ -22,19 +22,9 @@ sprite Heart {
           0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18, 0x00]
 }
 
-// Custom color palette
-palette Warm {
-    colors: [0x0F, 0x06, 0x16, 0x26]
-}
-
-palette Cool {
-    colors: [0x0F, 0x01, 0x11, 0x21]
-}
-
 var px: u8 = 128
 var py: u8 = 120
 var scroll_x: u8 = 0
-var use_warm: u8 = 1
 
 on frame {
     // Movement
@@ -46,17 +36,6 @@ on frame {
     // Scroll background
     scroll_x += 1
     scroll(scroll_x, 0)
-
-    // Toggle palette with A button
-    if button.a {
-        if use_warm == 1 {
-            set_palette Cool
-            use_warm = 0
-        } else {
-            set_palette Warm
-            use_warm = 1
-        }
-    }
 
     // Type cast demo
     var wide: u16 = px as u16

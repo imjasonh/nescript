@@ -41,20 +41,20 @@ start Main
 
 ## Features
 
-- **Game-aware syntax** -- states, sprites, palettes, and input are first-class constructs
+- **Game-aware syntax** -- states, sprites, and input are first-class constructs
 - **Full type system** -- `u8`, `i8`, `u16`, `bool`, fixed-size arrays (`u8[N]`), `enum`, `struct`
 - **Rich control flow** -- `if`/`else`, `while`, `for i in 0..N`, `loop`, `match`
 - **Functions** -- with parameters, return types, `inline` hint, recursion detection
 - **State machines** -- `state` with `on enter`, `on exit`, `on frame`, `on scanline(N)` handlers
 - **Compile-time safety** -- call depth limits, recursion detection, type checking, unused-var warnings
-- **IR-based optimizer** -- constant folding, dead code elimination, strength reduction, copy propagation, peephole passes including INC/DEC fold and live-range slot recycling
+- **IR-based optimizer** -- constant folding, dead code elimination, strength reduction (incl. div/mod by power-of-two), copy propagation, peephole passes including INC/DEC fold and live-range slot recycling
 - **Full 16-bit arithmetic** -- u16 add/sub/compare lower to carry-propagating paired operations
 - **Multiple mappers** -- NROM, MMC1, UxROM, MMC3 (including multi-scanline IRQ dispatch per state)
 - **Audio subsystem** -- frame-walking pulse driver with user-declared `sfx`/`music` blocks, builtin effects and tracks, period table, and zero-cost elision when unused
-- **Asset pipeline** -- PNG-to-CHR conversion, palette definitions, inline tile data, sfx envelopes, music note streams
+- **Asset pipeline** -- PNG-to-CHR conversion, inline tile data, sfx envelopes, music note streams
 - **Inline assembly** -- `asm { ... }` with `{var}` substitution, plus `raw asm { ... }` for verbatim blocks
 - **Hardware intrinsics** -- `poke(addr, value)` / `peek(addr)` for direct register access
-- **Debug support** -- `--debug` flag, source maps, Mesen-compatible symbol export, `debug.log` / `debug.assert`
+- **Debug support** -- `--debug` flag enables `debug.log` / `debug.assert` writes to the emulator debug port
 - **Compile-time diagnostics** -- `--dump-ir`, `--memory-map`, `--call-graph` flags
 - **Single binary** -- no dependencies on ca65, Python, or any external tools
 
@@ -74,7 +74,7 @@ start Main
 | [`coin_cavern.ne`](examples/coin_cavern.ne) | Multi-state game, functions, constants, gravity |
 | [`arrays_and_functions.ne`](examples/arrays_and_functions.ne) | Arrays, functions, while loops, inline functions |
 | [`state_machine.ne`](examples/state_machine.ne) | State transitions, on enter/exit, timers |
-| [`sprites_and_palettes.ne`](examples/sprites_and_palettes.ne) | Inline CHR data, palettes, scroll, type casting |
+| [`sprites_and_palettes.ne`](examples/sprites_and_palettes.ne) | Inline CHR data, scroll, type casting |
 | [`mmc1_banked.ne`](examples/mmc1_banked.ne) | MMC1 mapper, bank declarations, multiply |
 | [`structs_enums_for.ne`](examples/structs_enums_for.ne) | Structs, enums, `for` loops, struct literals |
 | [`inline_asm_demo.ne`](examples/inline_asm_demo.ne) | Inline asm with `{var}` substitution, `poke`/`peek` |
@@ -115,11 +115,11 @@ NEScript implements all five planned milestones:
 |-----------|--------|-------------|
 | M1: Hello Sprite | Done | Full compiler pipeline, assembler, ROM builder |
 | M2: Game Loop | Done | Functions, arrays, IR, optimizer, call graph analysis |
-| M3: Asset Pipeline | Done | PNG-to-CHR, sprites, palettes, debug symbols |
+| M3: Asset Pipeline | Done | PNG-to-CHR, sprites, `debug.log` / `debug.assert` |
 | M4: Optimization | Done | Strength reduction, ZP promotion, type casting, asm-dump |
 | M5: Bank Switching | Done | MMC1/UxROM/MMC3, bank declarations, software mul/div |
 
-210 tests across 14 modules, with CI running fmt, clippy, test, and example compilation on every push.
+465 tests across the lexer, parser, analyzer, IR, optimizer, codegen, assembler, linker, runtime, ROM, and asset modules, with CI running fmt, clippy, test, and example compilation on every push.
 
 ## License
 

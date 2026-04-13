@@ -802,7 +802,7 @@ fn audio_pipeline_drops_period_table_cost_when_unused() {
 // ── M3 Tests ──
 
 #[test]
-fn program_with_sprites_and_palette() {
+fn program_with_inline_sprite_chr() {
     let source = r#"
         game "M3 Assets" { mapper: NROM }
 
@@ -811,22 +811,10 @@ fn program_with_sprites_and_palette() {
                   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
         }
 
-        palette MainPal {
-            colors: [0x0F, 0x00, 0x10, 0x20]
-        }
-
-        background TitleBg {
-            chr: @binary("title.bin")
-        }
-
         var px: u8 = 128
         var py: u8 = 120
 
         state Title {
-            on enter {
-                load_background TitleBg
-                set_palette MainPal
-            }
             on frame {
                 if button.right { px += 2 }
                 if button.left  { px -= 2 }

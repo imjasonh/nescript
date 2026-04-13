@@ -290,6 +290,35 @@ impl<'a> IrCodeGen<'a> {
         self.emit(STA, AM::ZeroPage(addr));
     }
 
+    /// Emit a runtime-variable shift loop: loads `src` into A, then
+    /// `amt` iterations of `shift_op` (`ASL` / `LSR`), storing into
+    /// `dest`. An iteration count of zero is handled by a leading
+    /// BEQ over the loop so the source value is preserved.
+    fn gen_shift_var(
+        &mut self,
+        dest: IrTemp,
+        src: IrTemp,
+        amt: IrTemp,
+        shift_op: crate::asm::Opcode,
+    ) {
+        let suffix = self.instructions.len();
+        let loop_label = format!("__ir_shift_loop_{suffix}");
+        let done_label = format!("__ir_shift_done_{suffix}");
+        let amt_addr = self.temp_addr(amt);
+        self.emit(LDX, AM::ZeroPage(amt_addr));
+        self.load_temp(src);
+        // Skip straight to the store if the count is zero — saves an
+        // iteration and is required because the loop decrements
+        // before checking.
+        self.emit(BEQ, AM::LabelRelative(done_label.clone()));
+        self.emit_label(&loop_label);
+        self.emit(shift_op, AM::Accumulator);
+        self.emit(DEX, AM::Implied);
+        self.emit(BNE, AM::LabelRelative(loop_label));
+        self.emit_label(&done_label);
+        self.store_temp(dest);
+    }
+
     /// Generate instructions for an entire IR program.
     ///
     /// Layout:
@@ -605,6 +634,34 @@ impl<'a> IrCodeGen<'a> {
                 for _ in 0..*count {
                     self.emit(LSR, AM::Accumulator);
                 }
+                self.store_temp(*d);
+            }
+            IrOp::ShiftLeftVar(d, a, amt) => self.gen_shift_var(*d, *a, *amt, ASL),
+            IrOp::ShiftRightVar(d, a, amt) => self.gen_shift_var(*d, *a, *amt, LSR),
+            IrOp::Div(d, a, b) => {
+                // Software divide: dividend in A, divisor in $02.
+                // `__divide` returns quotient in A and leaves
+                // remainder in ZP $03.
+                self.load_temp(*a);
+                self.emit(PHA, AM::Implied);
+                let b_addr = self.temp_addr(*b);
+                self.emit(LDA, AM::ZeroPage(b_addr));
+                self.emit(STA, AM::ZeroPage(0x02));
+                self.emit(PLA, AM::Implied);
+                self.emit(JSR, AM::Label("__divide".into()));
+                self.store_temp(*d);
+            }
+            IrOp::Mod(d, a, b) => {
+                // Modulo reuses __divide and reads the remainder out
+                // of ZP $03 afterwards.
+                self.load_temp(*a);
+                self.emit(PHA, AM::Implied);
+                let b_addr = self.temp_addr(*b);
+                self.emit(LDA, AM::ZeroPage(b_addr));
+                self.emit(STA, AM::ZeroPage(0x02));
+                self.emit(PLA, AM::Implied);
+                self.emit(JSR, AM::Label("__divide".into()));
+                self.emit(LDA, AM::ZeroPage(0x03));
                 self.store_temp(*d);
             }
             IrOp::Negate(d, src) => {
@@ -1430,9 +1487,13 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
         IrOp::Add(_, a, b)
         | IrOp::Sub(_, a, b)
         | IrOp::Mul(_, a, b)
+        | IrOp::Div(_, a, b)
+        | IrOp::Mod(_, a, b)
         | IrOp::And(_, a, b)
         | IrOp::Or(_, a, b)
         | IrOp::Xor(_, a, b)
+        | IrOp::ShiftLeftVar(_, a, b)
+        | IrOp::ShiftRightVar(_, a, b)
         | IrOp::CmpEq(_, a, b)
         | IrOp::CmpNe(_, a, b)
         | IrOp::CmpLt(_, a, b)

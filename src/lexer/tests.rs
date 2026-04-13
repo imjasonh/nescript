@@ -143,8 +143,6 @@ fn lex_all_keywords() {
         ("start", TokenKind::KwStart),
         ("transition", TokenKind::KwTransition),
         ("sprite", TokenKind::KwSprite),
-        ("background", TokenKind::KwBackground),
-        ("palette", TokenKind::KwPalette),
         ("draw", TokenKind::KwDraw),
         ("play", TokenKind::KwPlay),
         ("asm", TokenKind::KwAsm),

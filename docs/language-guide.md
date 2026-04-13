@@ -641,22 +641,6 @@ Set the PPU scroll position:
 scroll(scroll_x, scroll_y)
 ```
 
-### Load Background
-
-Load a background nametable:
-
-```
-load_background TitleBG
-```
-
-### Set Palette
-
-Apply a palette:
-
-```
-set_palette GamePalette
-```
-
 ### Function Calls as Statements
 
 ```
@@ -677,29 +661,6 @@ sprite Player {
 
 sprite Coin {
     chr: @binary("assets/coin.bin")
-}
-```
-
-### Palette Declarations
-
-Define color palettes using NES PPU color indices (`$00`-`$3F`):
-
-```
-palette GamePalette {
-    colors: [0x0F, 0x00, 0x10, 0x30,
-             0x0F, 0x07, 0x17, 0x27,
-             0x0F, 0x09, 0x19, 0x29,
-             0x0F, 0x01, 0x11, 0x21]
-}
-```
-
-Each group of 4 values is a sub-palette. The first color is typically `0x0F` (black) as the shared background color.
-
-### Background Declarations
-
-```
-background TitleBG {
-    chr: @chr("assets/title_screen.png")
 }
 ```
 
@@ -964,7 +925,6 @@ reference NEScript variables.
 | Code   | Description                |
 |--------|----------------------------|
 | E0201  | Type mismatch              |
-| E0202  | Invalid cast               |
 | E0203  | Invalid operation for type |
 
 ### Memory Errors (E03xx)
@@ -979,7 +939,6 @@ reference NEScript variables.
 |--------|----------------------------|
 | E0401  | Call depth exceeded        |
 | E0402  | Recursion detected         |
-| E0403  | Unreachable state          |
 | E0404  | Transition to undefined state |
 
 ### Declaration Errors (E05xx)
@@ -999,7 +958,7 @@ reference NEScript variables.
 | W0101  | Expensive multiply/divide operation      |
 | W0102  | Loop without break or wait_frame         |
 | W0103  | Unused variable                          |
-| W0104  | Unreachable code                         |
+| W0104  | Unreachable code (after return/break/transition, or state unreachable from start) |
 
 ### Example Error Output
 

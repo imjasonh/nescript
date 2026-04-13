@@ -5,8 +5,6 @@ use std::fmt;
 pub enum Level {
     Error,
     Warning,
-    #[allow(dead_code)]
-    Info,
 }
 
 /// Error codes organized by compiler phase.
@@ -19,8 +17,6 @@ pub enum ErrorCode {
 
     // E02xx: Type errors
     E0201, // type mismatch
-    #[allow(dead_code)]
-    E0202, // invalid cast
     E0203, // invalid operation for type
 
     // E03xx: Memory errors
@@ -29,8 +25,6 @@ pub enum ErrorCode {
     // E04xx: Control flow errors
     E0401, // call depth exceeded
     E0402, // recursion detected
-    #[allow(dead_code)]
-    E0403, // unreachable state
     E0404, // transition to undefined state
 
     // E05xx: Declaration errors
@@ -44,7 +38,7 @@ pub enum ErrorCode {
     W0101, // expensive multiply/divide operation
     W0102, // loop without break or wait_frame
     W0103, // unused variable
-    W0104, // unreachable state
+    W0104, // unreachable code after terminator, or unreachable state
 }
 
 impl fmt::Display for ErrorCode {
@@ -54,12 +48,10 @@ impl fmt::Display for ErrorCode {
             Self::E0102 => "E0102",
             Self::E0103 => "E0103",
             Self::E0201 => "E0201",
-            Self::E0202 => "E0202",
             Self::E0203 => "E0203",
             Self::E0301 => "E0301",
             Self::E0401 => "E0401",
             Self::E0402 => "E0402",
-            Self::E0403 => "E0403",
             Self::E0404 => "E0404",
             Self::E0501 => "E0501",
             Self::E0502 => "E0502",
@@ -152,7 +144,6 @@ impl fmt::Display for Diagnostic {
         let level = match self.level {
             Level::Error => "error",
             Level::Warning => "warning",
-            Level::Info => "info",
         };
         write!(f, "{level}[{}]: {}", self.code, self.message)
     }

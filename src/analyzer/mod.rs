@@ -1060,9 +1060,7 @@ impl Analyzer {
                     ));
                 }
             }
-            Statement::WaitFrame(_)
-            | Statement::LoadBackground(_, _)
-            | Statement::SetPalette(_, _) => {}
+            Statement::WaitFrame(_) => {}
             Statement::DebugLog(args, _) => {
                 for arg in args {
                     self.walk_expr_reads(arg);
@@ -1365,8 +1363,6 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
         | Statement::WaitFrame(_)
         | Statement::Break(_)
         | Statement::Continue(_)
-        | Statement::LoadBackground(_, _)
-        | Statement::SetPalette(_, _)
         | Statement::InlineAsm(_, _)
         | Statement::RawAsm(_, _)
         | Statement::Play(_, _)

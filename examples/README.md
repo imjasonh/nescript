@@ -24,7 +24,7 @@ Open any `.nes` file in an NES emulator ([Mesen](https://www.mesen.ca/), [FCEUX]
 | `coin_cavern.ne` | states, functions, constants | 3-state game with gravity and coin collection |
 | `arrays_and_functions.ne` | arrays, functions, while | Enemy array with collision detection |
 | `state_machine.ne` | on enter/exit, transitions | Multi-state flow with timers |
-| `sprites_and_palettes.ne` | sprites, palettes, scroll, cast | Inline CHR data, palette switching, type casting |
+| `sprites_and_palettes.ne` | sprites, scroll, cast | Inline CHR data, PPU scroll writes, type casting |
 | `mmc1_banked.ne` | MMC1, banks, multiply | Banked mapper with software multiply |
 
 ## Emulator Controls

@@ -377,3 +377,137 @@ fn for_loop_counter_is_registered_as_handler_local() {
         frame_fn.locals
     );
 }
+
+// Regression tests: shift / div / mod used to miscompile silently.
+// `x << n` with a literal `n` always emitted ShiftLeft(..., 1) and
+// `x / n` / `x % n` always emitted LoadImm(..., 0). These tests
+// anchor the fixes from the code-review cleanup pass.
+
+#[test]
+fn lower_shift_left_with_literal_count_uses_that_count() {
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var x: u8 = 1
+        on frame { x = x << 3 }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let has_shift3 = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::ShiftLeft(_, _, 3)));
+    assert!(
+        has_shift3,
+        "expected ShiftLeft with count=3, got ops: {:?}",
+        frame_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn lower_shift_right_with_variable_count_uses_runtime_variant() {
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var x: u8 = 128
+        var n: u8 = 2
+        on frame { x = x >> n }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let has_shift_var = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::ShiftRightVar(..)));
+    assert!(
+        has_shift_var,
+        "expected ShiftRightVar for runtime shift amount, got ops: {:?}",
+        frame_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn lower_divide_emits_div_op_not_load_imm_zero() {
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var x: u8 = 100
+        var d: u8 = 7
+        var q: u8 = 0
+        on frame { q = x / d }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let has_div = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::Div(..)));
+    assert!(
+        has_div,
+        "expected IrOp::Div for `q = x / d`, got ops: {:?}",
+        frame_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn lower_modulo_emits_mod_op_not_load_imm_zero() {
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var x: u8 = 17
+        var d: u8 = 5
+        var r: u8 = 0
+        on frame { r = x % d }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let has_mod = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::Mod(..)));
+    assert!(
+        has_mod,
+        "expected IrOp::Mod for `r = x % d`, got ops: {:?}",
+        frame_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .collect::<Vec<_>>()
+    );
+}

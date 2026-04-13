@@ -59,16 +59,17 @@ The following identifiers are reserved:
 
 ```
 game      state     on        fun       var       const
-if        else      while     break     continue  return
+if        else      while     for       in        match
+break     continue  return
 true      false     not       and       or
 fast      slow      include   start     transition
-sprite    background palette  sfx       music
+sprite    sfx       music
 draw      play      stop_music start_music
-load_background set_palette
 asm       raw       bank
 loop      wait_frame
 u8        i8        u16       bool
-debug
+enum      struct
+debug     as
 ```
 
 ### 2.4 Identifiers
@@ -497,20 +498,7 @@ The compiler auto-generates the controller read routine and previous-frame track
 
 ### 10.1 Palettes
 
-The NES has 4 background palettes and 4 sprite palettes, each containing 4 colors selected from the NES's 64-color master palette.
-
-```
-palette my_palette {
-  [0x0F, 0x00, 0x10, 0x30]    // sub-palette 0
-  [0x0F, 0x07, 0x17, 0x27]    // sub-palette 1
-  [0x0F, 0x09, 0x19, 0x29]    // sub-palette 2
-  [0x0F, 0x01, 0x11, 0x21]    // sub-palette 3
-}
-
-set_palette my_palette          // applies during vblank
-```
-
-Color values are NES PPU color indices ($00–$3F). The first color in each sub-palette is typically $0F (black) as it serves as the shared background color.
+The NES has 4 background palettes and 4 sprite palettes, each containing 4 colors selected from the NES's 64-color master palette. First-class `palette` declarations and `set_palette` / `load_background` statements are not yet in the language — see `docs/future-work.md`. Until then, push palette and nametable bytes directly via `poke(0x2006, ...)` / `poke(0x2007, ...)` inside an `on frame` handler (immediately after vblank).
 
 ### 10.2 Sprites
 
@@ -537,13 +525,7 @@ The `draw` statement writes to the OAM shadow buffer. The compiler manages OAM s
 
 ### 10.3 Backgrounds
 
-```
-background BGName {
-  data: @nametable("file.png")     // full-screen image → tile + nametable data
-}
-
-load_background BGName             // writes nametable during vblank
-```
+First-class `background` declarations and `load_background` are not yet in the language. See `docs/future-work.md` for the roadmap; for now, use `poke` inside a frame handler to push nametable bytes directly to PPU `$2006/$2007`.
 
 ### 10.4 Scrolling
 
@@ -677,15 +659,7 @@ debug.log("Coin collected! Score: ", score)
 
 In debug mode, `debug.log` writes to the emulator's debug console (using a mapper-specific debug register or a standardized debug output port at $4800). In release mode, all `debug.*` statements are stripped entirely — zero bytes, zero cycles.
 
-### 14.2 Debug Overlay
-
-```
-debug.overlay("PX:", px, " VY:", vy)
-```
-
-Renders debug text on-screen using a reserved section of the nametable. Stripped in release mode.
-
-### 14.3 Debug Assertions
+### 14.2 Debug Assertions
 
 ```
 debug.assert(lives > 0, "Lives should never be negative here")
@@ -694,18 +668,17 @@ debug.assert(px < 255, "Player out of bounds")
 
 In debug mode, a failed assertion halts execution and outputs the message. In release mode, stripped entirely.
 
-### 14.4 Runtime Checks (Debug Only)
+### 14.3 Runtime Checks (future)
 
-The following checks are inserted automatically in debug mode:
+The following checks are planned for debug mode but are not yet emitted (see `docs/future-work.md`):
 
-- **Array bounds checking**: Indexed access emits a bounds test before the load/store.
-- **Overflow warnings**: Arithmetic operations test for carry/overflow and log a warning.
-- **Stack depth monitoring**: Each function entry checks remaining stack space.
-- **Frame overrun detection**: A timer checks whether the frame handler took longer than one vblank period (~29,780 CPU cycles) and logs a warning.
+- **Array bounds checking**: Indexed access should emit a bounds test before the load/store.
+- **Stack depth monitoring**: Each function entry should check remaining stack space.
+- **Frame overrun detection**: A timer should check whether the frame handler took longer than one vblank period (~29,780 CPU cycles) and log a warning.
 
-### 14.5 Source Maps
+### 14.4 Source Maps (future)
 
-The compiler outputs a `.dbg` source map file relating ROM addresses to NEScript source locations (file, line, column). Debug-aware emulators can use this to set breakpoints on NEScript lines and display NEScript variable names in watch windows.
+A debug-symbol output (`.dbg` / `.mlb` / `.sym`) relating ROM addresses to NEScript source locations is planned but not yet emitted. See `docs/future-work.md`.
 
 ---
 
@@ -874,8 +847,7 @@ game_prop       = IDENT ":" ( IDENT | INTEGER ) ;
 include         = "include" STRING ;
 
 top_level_decl  = var_decl | const_decl | fun_decl | state_decl
-                | sprite_decl | background_decl | palette_decl
-                | sfx_decl | music_decl | bank_decl ;
+                | sprite_decl | sfx_decl | music_decl | bank_decl ;
 
 var_decl        = ["fast" | "slow"] "var" IDENT ":" type ["=" expr] ;
 const_decl      = "const" IDENT ":" type "=" expr ;
@@ -894,14 +866,11 @@ event_kind      = "enter" | "exit" | "frame" | "scanline" "(" INTEGER ")" ;
 sprite_decl     = "sprite" IDENT "{" { sprite_prop } "}" ;
 sprite_prop     = IDENT ":" expr ;
 
-background_decl = "background" IDENT "{" { bg_prop } "}" ;
-bg_prop         = IDENT ":" expr ;
-
-palette_decl    = "palette" IDENT "{" { palette_row } "}" ;
-palette_row     = "[" INTEGER "," INTEGER "," INTEGER "," INTEGER "]" ;
-
-sfx_decl        = "sfx" IDENT "{" "data" ":" asset_ref "}" ;
-music_decl      = "music" IDENT "{" "data" ":" asset_ref "}" ;
+sfx_decl        = "sfx" IDENT "{" sfx_prop { sfx_prop } "}" ;
+sfx_prop        = ("duty" ":" INTEGER | "pitch" ":" "[" int_list "]" | "volume" ":" "[" int_list "]") ;
+music_decl      = "music" IDENT "{" music_prop { music_prop } "}" ;
+music_prop      = ("duty" ":" INTEGER | "volume" ":" INTEGER | "repeat" ":" BOOL | "notes" ":" "[" int_list "]") ;
+int_list        = INTEGER { "," INTEGER } ;
 
 bank_decl       = "bank" INTEGER "{" { top_level_decl } "}" ;
 
@@ -909,13 +878,14 @@ asset_ref       = "@" IDENT "(" STRING { "," IDENT ":" expr } ")" ;
 
 block           = "{" { statement } "}" ;
 statement       = var_decl | const_decl | assign_stmt | if_stmt | while_stmt
-                | loop_stmt | return_stmt | break_stmt | continue_stmt
+                | for_stmt | loop_stmt | return_stmt | break_stmt | continue_stmt
                 | draw_stmt | play_stmt | transition_stmt | fun_call
                 | asm_block | debug_stmt | music_stmt | scroll_stmt
-                | load_bg_stmt | set_palette_stmt | wait_frame_stmt ;
+                | wait_frame_stmt ;
 
 if_stmt         = "if" expr block { "else" "if" expr block } [ "else" block ] ;
 while_stmt      = "while" expr block ;
+for_stmt        = "for" IDENT "in" expr ".." expr block ;
 loop_stmt       = "loop" block ;
 return_stmt     = "return" [expr] ;
 break_stmt      = "break" ;
@@ -928,12 +898,9 @@ play_stmt       = "play" IDENT ;
 music_stmt      = ("start_music" | "stop_music") [IDENT] ;
 transition_stmt = "transition" IDENT ;
 scroll_stmt     = "scroll" "(" expr "," expr ")" ;
-load_bg_stmt    = "load_background" IDENT ;
-set_palette_stmt= "set_palette" IDENT ;
 wait_frame_stmt = "wait_frame" "(" ")" ;
 
-debug_stmt      = "debug" "." ( "log" | "overlay" | "assert" )
-                  "(" expr { "," expr } ")" ;
+debug_stmt      = "debug" "." ( "log" | "assert" ) "(" expr { "," expr } ")" ;
 
 asm_block       = "asm" "{" ASM_BODY "}" ;
                 | "raw" "asm" "{" ASM_BODY "}" ;

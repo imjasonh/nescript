@@ -114,39 +114,89 @@ fn strength_reduce_block(block: &mut IrBasicBlock) {
         }
     }
 
-    // Now scan for Mul ops where one operand is a known constant
+    // Now scan for Mul / Div / Mod / ShiftVar ops where one operand
+    // is a known constant. Each reduces to a shift, AND, or Add chain.
     let mut replacements: Vec<(usize, Vec<IrOp>)> = Vec::new();
 
     for (i, op) in block.ops.iter().enumerate() {
-        if let IrOp::Mul(dest, a, b) = op {
-            // Check if b is a known constant
-            if let Some(&val) = constants.get(b) {
-                if val.is_power_of_two() && val > 1 {
-                    let shift = val.trailing_zeros() as u8;
-                    replacements.push((i, vec![IrOp::ShiftLeft(*dest, *a, shift)]));
-                } else if val == 3 {
-                    // Mul by 3: tmp = a + a; dest = tmp + a
-                    // We reuse dest as tmp in first step, then compute final
-                    // Actually need a temp. Use dest for the intermediate.
-                    replacements.push((
-                        i,
-                        vec![IrOp::Add(*dest, *a, *a), IrOp::Add(*dest, *dest, *a)],
-                    ));
+        match op {
+            IrOp::Mul(dest, a, b) => {
+                // Check if b is a known constant
+                if let Some(&val) = constants.get(b) {
+                    if val.is_power_of_two() && val > 1 {
+                        let shift = val.trailing_zeros() as u8;
+                        replacements.push((i, vec![IrOp::ShiftLeft(*dest, *a, shift)]));
+                    } else if val == 3 {
+                        // Mul by 3: tmp = a + a; dest = tmp + a
+                        // We reuse dest as tmp in first step, then compute final
+                        replacements.push((
+                            i,
+                            vec![IrOp::Add(*dest, *a, *a), IrOp::Add(*dest, *dest, *a)],
+                        ));
+                    }
+                    continue;
                 }
-                continue;
-            }
-            // Check if a is a known constant (commutative)
-            if let Some(&val) = constants.get(a) {
-                if val.is_power_of_two() && val > 1 {
-                    let shift = val.trailing_zeros() as u8;
-                    replacements.push((i, vec![IrOp::ShiftLeft(*dest, *b, shift)]));
-                } else if val == 3 {
-                    replacements.push((
-                        i,
-                        vec![IrOp::Add(*dest, *b, *b), IrOp::Add(*dest, *dest, *b)],
-                    ));
+                // Check if a is a known constant (commutative)
+                if let Some(&val) = constants.get(a) {
+                    if val.is_power_of_two() && val > 1 {
+                        let shift = val.trailing_zeros() as u8;
+                        replacements.push((i, vec![IrOp::ShiftLeft(*dest, *b, shift)]));
+                    } else if val == 3 {
+                        replacements.push((
+                            i,
+                            vec![IrOp::Add(*dest, *b, *b), IrOp::Add(*dest, *dest, *b)],
+                        ));
+                    }
                 }
             }
+            // `x / 2ⁿ` → right shift; `x % 2ⁿ` → AND with `2ⁿ - 1`.
+            // Only the divisor side is interesting — `const / x` and
+            // `const % x` still need the runtime routine.
+            IrOp::Div(dest, a, b) => {
+                if let Some(&val) = constants.get(b) {
+                    if val.is_power_of_two() && val > 1 {
+                        let shift = val.trailing_zeros() as u8;
+                        replacements.push((i, vec![IrOp::ShiftRight(*dest, *a, shift)]));
+                    } else if val == 1 {
+                        // `x / 1 == x` — copy via `a | 0`. Reusing the
+                        // existing LoadImm at `b` saves us from
+                        // having to synthesize a new temp.
+                        replacements.push((i, vec![IrOp::Or(*dest, *a, *b)]));
+                    }
+                }
+            }
+            IrOp::Mod(dest, a, b) => {
+                if let Some(&val) = constants.get(b) {
+                    if val.is_power_of_two() && val > 1 {
+                        // `x % 2ⁿ == x & (2ⁿ - 1)`. We need a LoadImm
+                        // temp for the mask; reuse `b`'s slot via a
+                        // fresh LoadImm so later ops that read `b`
+                        // still see the original divisor. Emitting a
+                        // second LoadImm into the same temp is
+                        // tolerated because use counts treat it as a
+                        // redefinition.
+                        let mask = val - 1;
+                        replacements
+                            .push((i, vec![IrOp::LoadImm(*b, mask), IrOp::And(*dest, *a, *b)]));
+                    } else if val == 1 {
+                        // `x % 1 == 0`.
+                        replacements.push((i, vec![IrOp::LoadImm(*dest, 0)]));
+                    }
+                }
+            }
+            IrOp::ShiftLeftVar(dest, a, b) => {
+                if let Some(&val) = constants.get(b) {
+                    let count = val.min(8);
+                    replacements.push((i, vec![IrOp::ShiftLeft(*dest, *a, count)]));
+                }
+            }
+            IrOp::ShiftRightVar(dest, a, b) => {
+                if let Some(&val) = constants.get(b) {
+                    let count = val.min(8);
+                    replacements.push((i, vec![IrOp::ShiftRight(*dest, *a, count)]));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -260,6 +310,41 @@ fn const_fold_block(block: &mut IrBasicBlock) {
                     constants.insert(dest, result);
                 }
             }
+            IrOp::Mul(dest, a, b) => {
+                if let (Some(&va), Some(&vb)) = (constants.get(&a), constants.get(&b)) {
+                    let result = va.wrapping_mul(vb);
+                    *op = IrOp::LoadImm(dest, result);
+                    constants.insert(dest, result);
+                }
+            }
+            IrOp::Div(dest, a, b) => {
+                if let (Some(&va), Some(&vb)) = (constants.get(&a), constants.get(&b)) {
+                    let result = if vb == 0 { 0 } else { va / vb };
+                    *op = IrOp::LoadImm(dest, result);
+                    constants.insert(dest, result);
+                }
+            }
+            IrOp::Mod(dest, a, b) => {
+                if let (Some(&va), Some(&vb)) = (constants.get(&a), constants.get(&b)) {
+                    let result = if vb == 0 { 0 } else { va % vb };
+                    *op = IrOp::LoadImm(dest, result);
+                    constants.insert(dest, result);
+                }
+            }
+            IrOp::ShiftLeft(dest, a, count) => {
+                if let Some(&va) = constants.get(&a) {
+                    let result = va.wrapping_shl(u32::from(count));
+                    *op = IrOp::LoadImm(dest, result);
+                    constants.insert(dest, result);
+                }
+            }
+            IrOp::ShiftRight(dest, a, count) => {
+                if let Some(&va) = constants.get(&a) {
+                    let result = va.wrapping_shr(u32::from(count));
+                    *op = IrOp::LoadImm(dest, result);
+                    constants.insert(dest, result);
+                }
+            }
             _ => {}
         }
     }
@@ -342,9 +427,13 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         IrOp::Add(_, a, b)
         | IrOp::Sub(_, a, b)
         | IrOp::Mul(_, a, b)
+        | IrOp::Div(_, a, b)
+        | IrOp::Mod(_, a, b)
         | IrOp::And(_, a, b)
         | IrOp::Or(_, a, b)
         | IrOp::Xor(_, a, b)
+        | IrOp::ShiftLeftVar(_, a, b)
+        | IrOp::ShiftRightVar(_, a, b)
         | IrOp::CmpEq(_, a, b)
         | IrOp::CmpNe(_, a, b)
         | IrOp::CmpLt(_, a, b)
@@ -479,11 +568,15 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::Add(d, _, _)
         | IrOp::Sub(d, _, _)
         | IrOp::Mul(d, _, _)
+        | IrOp::Div(d, _, _)
+        | IrOp::Mod(d, _, _)
         | IrOp::And(d, _, _)
         | IrOp::Or(d, _, _)
         | IrOp::Xor(d, _, _)
         | IrOp::ShiftLeft(d, _, _)
         | IrOp::ShiftRight(d, _, _)
+        | IrOp::ShiftLeftVar(d, _, _)
+        | IrOp::ShiftRightVar(d, _, _)
         | IrOp::Negate(d, _)
         | IrOp::Complement(d, _)
         | IrOp::CmpEq(d, _, _)

@@ -10,8 +10,6 @@ pub struct Program {
     pub functions: Vec<FunDecl>,
     pub states: Vec<StateDecl>,
     pub sprites: Vec<SpriteDecl>,
-    pub palettes: Vec<PaletteDecl>,
-    pub backgrounds: Vec<BackgroundDecl>,
     pub sfx: Vec<SfxDecl>,
     pub music: Vec<MusicDecl>,
     pub banks: Vec<BankDecl>,
@@ -50,20 +48,6 @@ pub struct StructField {
 
 #[derive(Debug, Clone)]
 pub struct SpriteDecl {
-    pub name: String,
-    pub chr_source: AssetSource,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct PaletteDecl {
-    pub name: String,
-    pub colors: Vec<u8>,
-    pub span: Span,
-}
-
-#[derive(Debug, Clone)]
-pub struct BackgroundDecl {
     pub name: String,
     pub chr_source: AssetSource,
     pub span: Span,
@@ -343,8 +327,6 @@ pub enum Statement {
     Transition(String, Span),
     WaitFrame(Span),
     Call(String, Vec<Expr>, Span),
-    LoadBackground(String, Span),
-    SetPalette(String, Span),
     Scroll(Expr, Expr, Span),
     /// debug.log(expr, ...) — writes values to the emulator debug port.
     /// Stripped in release mode.
@@ -357,14 +339,14 @@ pub enum Statement {
     /// skip variable substitution for completely unmanaged bytes.
     InlineAsm(String, Span),
     RawAsm(String, Span),
-    /// Audio: `play SfxName` — trigger a one-shot sound effect.
-    /// Currently a no-op at codegen time; no audio driver exists.
+    /// Audio: `play SfxName` — trigger a one-shot sound effect on pulse 1.
+    /// Compiles to a trigger sequence plus an envelope pointer store;
+    /// the runtime NMI tick walks the envelope at one byte per frame.
     Play(String, Span),
-    /// Audio: `start_music TrackName` — begin playing background music.
-    /// Currently a no-op at codegen time.
+    /// Audio: `start_music TrackName` — begin playing a looping music
+    /// track on pulse 2, driven by the same NMI tick.
     StartMusic(String, Span),
-    /// Audio: `stop_music` — stop any currently-playing music.
-    /// Currently a no-op at codegen time.
+    /// Audio: `stop_music` — silence pulse 2 and the music state machine.
     StopMusic(Span),
 }
 
@@ -384,8 +366,6 @@ impl Statement {
             | Self::Transition(_, s)
             | Self::WaitFrame(s)
             | Self::Call(_, _, s)
-            | Self::LoadBackground(_, s)
-            | Self::SetPalette(_, s)
             | Self::Scroll(_, _, s)
             | Self::DebugLog(_, s)
             | Self::DebugAssert(_, s)

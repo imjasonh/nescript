@@ -228,6 +228,95 @@ fn strength_reduce_mul_by_3() {
 }
 
 #[test]
+fn strength_reduce_div_by_power_of_two() {
+    // Div(t2, t0, t1) where t1 = 4 -> ShiftRight(t2, t0, 2)
+    let t0 = IrTemp(0);
+    let t1 = IrTemp(1);
+    let t2 = IrTemp(2);
+
+    let ops = vec![
+        IrOp::LoadImm(t0, 40),
+        IrOp::LoadImm(t1, 4),
+        IrOp::Div(t2, t0, t1),
+    ];
+    let mut prog = make_program(ops, IrTerminator::Return(Some(t2)));
+    strength_reduce(&mut prog);
+
+    let block = &prog.functions[0].blocks[0];
+    assert!(
+        block
+            .ops
+            .iter()
+            .any(|op| matches!(op, IrOp::ShiftRight(d, s, 2) if *d == t2 && *s == t0)),
+        "expected ShiftRight(t2, t0, 2), got {:?}",
+        block.ops
+    );
+    assert!(
+        !block.ops.iter().any(|op| matches!(op, IrOp::Div(..))),
+        "Div should have been replaced"
+    );
+}
+
+#[test]
+fn strength_reduce_mod_by_power_of_two() {
+    // Mod(t2, t0, t1) where t1 = 8 -> And(t2, t0, mask=7)
+    let t0 = IrTemp(0);
+    let t1 = IrTemp(1);
+    let t2 = IrTemp(2);
+
+    let ops = vec![
+        IrOp::LoadImm(t0, 19),
+        IrOp::LoadImm(t1, 8),
+        IrOp::Mod(t2, t0, t1),
+    ];
+    let mut prog = make_program(ops, IrTerminator::Return(Some(t2)));
+    strength_reduce(&mut prog);
+
+    let block = &prog.functions[0].blocks[0];
+    assert!(
+        block
+            .ops
+            .iter()
+            .any(|op| matches!(op, IrOp::And(d, a, _) if *d == t2 && *a == t0)),
+        "expected And(t2, t0, _), got {:?}",
+        block.ops
+    );
+    assert!(
+        !block.ops.iter().any(|op| matches!(op, IrOp::Mod(..))),
+        "Mod should have been replaced"
+    );
+}
+
+#[test]
+fn strength_reduce_shift_var_with_constant_amount() {
+    // ShiftLeftVar(t2, t0, t1) where t1 = 3 -> ShiftLeft(t2, t0, 3).
+    // Regression: before the fix, lowering silently emitted
+    // ShiftLeft(..., 1) for *every* shift, so `x << 3` quietly
+    // miscompiled to `x << 1`.
+    let t0 = IrTemp(0);
+    let t1 = IrTemp(1);
+    let t2 = IrTemp(2);
+
+    let ops = vec![
+        IrOp::LoadImm(t0, 2),
+        IrOp::LoadImm(t1, 3),
+        IrOp::ShiftLeftVar(t2, t0, t1),
+    ];
+    let mut prog = make_program(ops, IrTerminator::Return(Some(t2)));
+    strength_reduce(&mut prog);
+
+    let block = &prog.functions[0].blocks[0];
+    assert!(
+        block
+            .ops
+            .iter()
+            .any(|op| matches!(op, IrOp::ShiftLeft(d, s, 3) if *d == t2 && *s == t0)),
+        "expected ShiftLeft(t2, t0, 3), got {:?}",
+        block.ops
+    );
+}
+
+#[test]
 fn strength_reduce_leaves_non_power() {
     // Mul by 5 should NOT be replaced
     let t0 = IrTemp(0);

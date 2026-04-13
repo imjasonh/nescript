@@ -462,16 +462,12 @@ impl<'a> Lexer<'a> {
             "start" => TokenKind::KwStart,
             "transition" => TokenKind::KwTransition,
             "sprite" => TokenKind::KwSprite,
-            "background" => TokenKind::KwBackground,
-            "palette" => TokenKind::KwPalette,
             "sfx" => TokenKind::KwSfx,
             "music" => TokenKind::KwMusic,
             "draw" => TokenKind::KwDraw,
             "play" => TokenKind::KwPlay,
             "stop_music" => TokenKind::KwStopMusic,
             "start_music" => TokenKind::KwStartMusic,
-            "load_background" => TokenKind::KwLoadBackground,
-            "set_palette" => TokenKind::KwSetPalette,
             "scroll" => TokenKind::KwScroll,
             "asm" => {
                 self.asm_body_pending = true;

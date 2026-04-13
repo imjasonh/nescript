@@ -127,8 +127,6 @@ impl Parser {
         let mut functions = Vec::new();
         let mut states = Vec::new();
         let mut sprites = Vec::new();
-        let mut palettes = Vec::new();
-        let mut backgrounds = Vec::new();
         let mut sfx = Vec::new();
         let mut music = Vec::new();
         let mut banks = Vec::new();
@@ -164,12 +162,6 @@ impl Parser {
                 }
                 TokenKind::KwSprite => {
                     sprites.push(self.parse_sprite_decl()?);
-                }
-                TokenKind::KwPalette => {
-                    palettes.push(self.parse_palette_decl()?);
-                }
-                TokenKind::KwBackground => {
-                    backgrounds.push(self.parse_background_decl()?);
                 }
                 TokenKind::KwSfx => {
                     sfx.push(self.parse_sfx_decl()?);
@@ -243,8 +235,6 @@ impl Parser {
             functions,
             states,
             sprites,
-            palettes,
-            backgrounds,
             sfx,
             music,
             banks,
@@ -672,106 +662,6 @@ impl Parser {
         })
     }
 
-    fn parse_palette_decl(&mut self) -> Result<PaletteDecl, Diagnostic> {
-        let start = self.current_span();
-        self.expect(&TokenKind::KwPalette)?;
-        let (name, _) = self.expect_ident()?;
-        self.expect(&TokenKind::LBrace)?;
-
-        let mut colors = None;
-
-        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
-            let (key, _) = self.expect_ident()?;
-            self.expect(&TokenKind::Colon)?;
-            match key.as_str() {
-                "colors" => {
-                    self.expect(&TokenKind::LBracket)?;
-                    let mut vals = Vec::new();
-                    while *self.peek() != TokenKind::RBracket && *self.peek() != TokenKind::Eof {
-                        if let TokenKind::IntLiteral(v) = self.peek().clone() {
-                            self.advance();
-                            vals.push(v as u8);
-                        } else {
-                            return Err(Diagnostic::error(
-                                ErrorCode::E0201,
-                                format!("expected color index, found '{}'", self.peek()),
-                                self.current_span(),
-                            ));
-                        }
-                        if *self.peek() == TokenKind::Comma {
-                            self.advance();
-                        }
-                    }
-                    self.expect(&TokenKind::RBracket)?;
-                    colors = Some(vals);
-                }
-                _ => {
-                    return Err(Diagnostic::error(
-                        ErrorCode::E0201,
-                        format!("unknown palette property '{key}'"),
-                        self.current_span(),
-                    ));
-                }
-            }
-        }
-        self.expect(&TokenKind::RBrace)?;
-
-        let colors = colors.ok_or_else(|| {
-            Diagnostic::error(
-                ErrorCode::E0201,
-                "palette requires 'colors' property",
-                start,
-            )
-        })?;
-
-        Ok(PaletteDecl {
-            name,
-            colors,
-            span: Span::new(start.file_id, start.start, self.current_span().end),
-        })
-    }
-
-    fn parse_background_decl(&mut self) -> Result<BackgroundDecl, Diagnostic> {
-        let start = self.current_span();
-        self.expect(&TokenKind::KwBackground)?;
-        let (name, _) = self.expect_ident()?;
-        self.expect(&TokenKind::LBrace)?;
-
-        let mut chr_source = None;
-
-        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
-            let (key, _) = self.expect_ident()?;
-            self.expect(&TokenKind::Colon)?;
-            match key.as_str() {
-                "chr" => {
-                    chr_source = Some(self.parse_asset_source()?);
-                }
-                _ => {
-                    return Err(Diagnostic::error(
-                        ErrorCode::E0201,
-                        format!("unknown background property '{key}'"),
-                        self.current_span(),
-                    ));
-                }
-            }
-        }
-        self.expect(&TokenKind::RBrace)?;
-
-        let chr_source = chr_source.ok_or_else(|| {
-            Diagnostic::error(
-                ErrorCode::E0201,
-                "background requires 'chr' property",
-                start,
-            )
-        })?;
-
-        Ok(BackgroundDecl {
-            name,
-            chr_source,
-            span: Span::new(start.file_id, start.start, self.current_span().end),
-        })
-    }
-
     // ── SFX / Music declarations ──
 
     /// `sfx Name { duty: N, pitch: [..], volume: [..] }`. Pitch and
@@ -1169,18 +1059,6 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
                 Ok(Statement::WaitFrame(span))
-            }
-            TokenKind::KwLoadBackground => {
-                let span = self.current_span();
-                self.advance();
-                let (name, _) = self.expect_ident()?;
-                Ok(Statement::LoadBackground(name, span))
-            }
-            TokenKind::KwSetPalette => {
-                let span = self.current_span();
-                self.advance();
-                let (name, _) = self.expect_ident()?;
-                Ok(Statement::SetPalette(name, span))
             }
             TokenKind::KwScroll => {
                 let span = self.current_span();
