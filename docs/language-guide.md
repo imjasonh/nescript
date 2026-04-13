@@ -675,6 +675,12 @@ update_physics(player_x, player_y)
 
 ### Sprite Declarations
 
+Sprites can be authored in two ways. Pick whichever maps best to how
+your art starts out.
+
+**Raw CHR bytes.** Supply 16 bytes of 2-bitplane CHR per tile — the
+form every NES toolchain consumes:
+
 ```
 sprite Player {
     chr: @chr("assets/player.png")
@@ -683,41 +689,116 @@ sprite Player {
 sprite Coin {
     chr: @binary("assets/coin.bin")
 }
-```
 
-### Palette Declarations
-
-```
-palette MainPalette {
-    colors: [0x0F, 0x01, 0x11, 0x21,
-             0x0F, 0x06, 0x16, 0x26,
-             0x0F, 0x09, 0x19, 0x29,
-             0x0F, 0x0B, 0x1B, 0x2B,
-             0x0F, 0x01, 0x11, 0x21,
-             0x0F, 0x16, 0x27, 0x30,
-             0x0F, 0x14, 0x24, 0x34,
-             0x0F, 0x0B, 0x1B, 0x2B]
+sprite Heart {
+    chr: [0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18, 0x00,
+          0x66, 0xFF, 0xFF, 0xFF, 0x7E, 0x3C, 0x18, 0x00]
 }
 ```
 
-Each byte is an NES master-palette index (`$00-$3F`). The 32 bytes
-map directly to PPU palette RAM `$3F00-$3F1F` in the canonical NES
-layout:
+**ASCII pixel art.** One string per 8-pixel row, one character per
+pixel. Far easier to hand-author, and the compiler does the 2-bitplane
+encoding for you:
 
-| Offset          | Contents                            |
-|-----------------|-------------------------------------|
-| `$00`-`$03`    | Background sub-palette 0 (4 colours) |
-| `$04`-`$07`    | Background sub-palette 1             |
-| `$08`-`$0B`    | Background sub-palette 2             |
-| `$0C`-`$0F`    | Background sub-palette 3             |
-| `$10`-`$13`    | Sprite sub-palette 0                 |
-| `$14`-`$17`    | Sprite sub-palette 1                 |
-| `$18`-`$1B`    | Sprite sub-palette 2                 |
-| `$1C`-`$1F`    | Sprite sub-palette 3                 |
+```
+sprite Arrow {
+    pixels: [
+        "...##...",
+        "...###..",
+        "########",
+        "########",
+        "########",
+        "########",
+        "...###..",
+        "...##..."
+    ]
+}
+```
 
-The first byte of each sub-palette is typically `$0F` (black); it
-serves as the shared background colour. Lists shorter than 32 bytes
-are zero-padded; lists longer than 32 are a compile error.
+Characters map to 2-bit palette indices:
+
+| Char(s)     | Index | Meaning                  |
+|-------------|-------|--------------------------|
+| `.` ` ` `0` | 0     | transparent / background |
+| `#` `1`     | 1     | sub-palette colour 1     |
+| `%` `2`     | 2     | sub-palette colour 2     |
+| `@` `3`     | 3     | sub-palette colour 3     |
+
+Both dimensions must be multiples of 8. Multi-tile sprites (16×8,
+8×16, 16×16, …) are split into 8×8 tiles in row-major reading order
+so consecutive tile indices match what your eye reads.
+
+### Palette Declarations
+
+Palettes can be authored in two styles. Both produce the same 32-byte
+PPU palette blob (background + sprite, in the canonical
+`$3F00-$3F1F` layout) — pick whichever reads best.
+
+**Flat form.** The raw 32-byte list, matching how PPU palette RAM is
+laid out. Every entry can be a byte literal *or* a named NES colour:
+
+```
+palette MainPalette {
+    colors: [
+        black, dk_blue,  blue,    sky_blue,   // bg sub-palette 0
+        black, dk_red,   red,     peach,      // bg sub-palette 1
+        black, dk_green, green,   mint,       // bg sub-palette 2
+        black, dk_gray,  lt_gray, white,      // bg sub-palette 3
+        black, dk_blue,  blue,    sky_blue,   // sp sub-palette 0
+        black, dk_red,   red,     peach,      // sp sub-palette 1
+        black, dk_green, green,   mint,       // sp sub-palette 2
+        black, dk_gray,  lt_gray, white       // sp sub-palette 3
+    ]
+}
+```
+
+**Grouped form.** Declare each sub-palette by name and supply a shared
+`universal:` colour. The compiler auto-fills every sub-palette's
+first byte with the universal, which fixes the notorious
+`$3F10 / $3F14 / $3F18 / $3F1C` mirror trap: when a program writes
+all 32 bytes sequentially, the last four "sprite sub-palette 0"
+bytes would otherwise overwrite the shared background colour.
+
+```
+palette Sunset {
+    universal: black
+    bg0: [dk_blue,  blue,    sky_blue]
+    bg1: [dk_red,   red,     peach]
+    bg2: [dk_olive, olive,   cream]
+    bg3: [dk_gray,  lt_gray, white]
+    sp0: [dk_blue,  blue,    sky_blue]
+    sp1: [dk_red,   red,     peach]
+    sp2: [dk_green, green,   mint]
+    sp3: [dk_gray,  lt_gray, white]
+}
+```
+
+Each `bgN` / `spN` field takes 3 colours (the universal is
+prepended); giving 4 colours instead overrides the universal for
+that slot only. Omitted slots default to `[universal, 0, 0, 0]`.
+
+**Named colours.** Friendlier than hex bytes, and the names are the
+same ones you'd find on a NES palette poster. Names are
+case-insensitive, and `dark_red` / `dk_red` / `dark-red` are all
+synonyms.
+
+| Group      | Names                                                           |
+|------------|-----------------------------------------------------------------|
+| Grayscale  | `black`, `dk_gray`, `gray`, `lt_gray`, `white`, `off_white`     |
+| Blues      | `dk_blue`, `blue`, `sky_blue`, `pale_blue`, `indigo`, `royal_blue`, `periwinkle`, `ice_blue` |
+| Purples    | `dk_purple`, `purple` (`violet`), `lavender`, `pale_purple`, `dk_magenta`, `magenta`, `pink`, `pale_pink` |
+| Pinks      | `maroon`, `rose`, `hot_pink`, `pale_rose`                       |
+| Reds       | `dk_red`, `red`, `lt_red`, `peach`                              |
+| Oranges    | `brown`, `dk_orange`, `orange`, `tan`                           |
+| Yellows    | `dk_olive`, `olive`, `yellow`, `cream`                          |
+| Greens     | `dk_green`, `green`, `lime`, `pale_green`, `forest`, `bright_green`, `neon_green`, `mint` |
+| Teals      | `dk_teal`, `teal`, `aqua`, `pale_teal`                          |
+| Cyans      | `dk_cyan`, `cyan`, `lt_cyan`, `pale_cyan`                       |
+
+`black` maps to `$0F`, the canonical "one true black" slot the
+hardware guarantees to render as `(0, 0, 0)` on every TV. If a
+colour name you want isn't listed, reach for a hex byte literal —
+the palette helper resolves every NES master-palette index `$00-$3F`.
 
 The *first* `palette` declared in a program is loaded into VRAM at
 reset time, before rendering is enabled, so the title screen boots
@@ -727,6 +808,12 @@ which queues the write for the next vblank.
 
 ### Background Declarations
 
+Like palettes and sprites, backgrounds can be authored two ways.
+
+**Raw byte form.** A flat `tiles:` list (up to 960 bytes, row-major)
+and an optional `attributes:` list (up to 64 bytes). Best if you've
+already generated the nametable with an external tool.
+
 ```
 background TitleScreen {
     tiles: [0x00, 0x01, 0x01, 0x00,  /* ... up to 960 bytes ... */]
@@ -734,15 +821,48 @@ background TitleScreen {
 }
 ```
 
-A background is a 32×30 nametable. `tiles` is the nametable itself
-— 960 bytes of CHR tile indices, one per 8×8 cell, in row-major
-order (left-to-right, top-to-bottom). `attributes` is the 8×8
-attribute table (64 bytes) that controls which sub-palette each
-16×16 metatile uses.
+**Tilemap form.** A `legend { }` block names single characters, a
+`map:` list-of-strings paints the nametable one row at a time, and
+an optional `palette_map:` grid of digit characters packs the 64-byte
+attribute table automatically:
 
-Both lists are zero-padded up to their fixed sizes; `attributes`
-may be omitted entirely, in which case every cell uses background
-sub-palette 0.
+```
+background StageOne {
+    legend {
+        ".": 0       // empty / sky
+        "#": 1       // brick
+        "X": 2       // coin
+    }
+    map: [
+        "................................",
+        "................................",
+        "......##........##..............",
+        "....##..##....##..##............",
+        "..##......##.##.....##..........",
+        "##..........###.......##........"
+    ]
+    palette_map: [
+        "0000000000000000",   // 16 cells wide; one entry per 16×16 metatile
+        "0000000000000000",
+        "0000111111110000",
+        "0000111111110000",
+        "2222222222222222"
+        // ... up to 15 rows total
+    ]
+}
+```
+
+Rules:
+- `map:` strings must be ≤ 32 characters; shorter rows are
+  right-padded with tile 0. No more than 30 rows.
+- Every character in a `map:` string must be defined in the legend
+  (otherwise `E0201`).
+- `palette_map:` rows are ≤ 16 digit characters (`0`-`3`, plus
+  `.` / space as a sub-palette 0 alias), no more than 15 rows. The
+  parser packs adjacent 2×2 metatile groups into the awkward
+  `(br<<6)|(bl<<4)|(tr<<2)|tl` attribute-byte layout for you.
+- Raw and tilemap forms are mutually exclusive per field
+  (`tiles:` vs `map:`, `attributes:` vs `palette_map:`).
 
 The *first* `background` declared is loaded into nametable 0 at
 reset time and background rendering is enabled automatically.
@@ -779,45 +899,86 @@ Each statement looks up the name in the program's user declarations first, then 
 
 ### SFX Declarations
 
-An `sfx` block is a frame-accurate envelope for pulse 1. `pitch` latches the pulse period on trigger; `volume` runs one entry per frame, so the envelope length controls the effect duration.
+An `sfx` block is a frame-accurate envelope for pulse 1. The v1
+audio driver latches the pulse period *once* on trigger (it never
+updates `$4002/$4003` mid-effect), so a scalar pitch is the natural
+way to write one. `volume` / `envelope` runs one byte per frame, so
+the envelope length controls the effect duration:
 
 ```
 sfx Pickup {
-    duty: 2                                   // 0-3, 2 = 50% square (default)
-    pitch: [0x50, 0x50, 0x50, 0x50, 0x50]     // period for each frame
-    volume: [15, 12, 9, 6, 3]                  // 0-15, one per frame
+    duty: 2                                // 0-3, 2 = 50% square (default)
+    pitch: 0x50                            // latched period byte
+    envelope: [15, 12, 9, 6, 3]            // 0-15, one entry per frame
 }
 ```
 
+Both spellings are interchangeable:
+
+- `pitch: 0x50` — single byte, latched once on trigger.
+- `pitch: [0x50, 0x50, ...]` — per-frame array, still accepted for
+  backwards compatibility; the analyzer requires its length to
+  match `volume`.
+- `envelope: [...]` and `volume: [...]` — aliases for the same
+  field. Use whichever reads better in context.
+
 Rules:
-- `pitch` and `volume` must have the same length (the frame count).
-- `volume` values are 0-15 (4-bit pulse volume).
+- `envelope` / `volume` values are 0-15 (4-bit pulse volume).
 - `duty` is 0-3 and defaults to 2.
 - Maximum 120 frames (2 seconds at 60 fps).
 
 ### Music Declarations
 
-A `music` block is a flat list of `(pitch, duration)` note pairs played on pulse 2. Pitch 0 is a rest; pitches 1-60 are indices into the builtin 60-note period table (C1 through B5, with middle C at index 37). Duration is in frames (so at 60 fps, `30` is half a second).
+A `music` block is a list of `(pitch, duration)` pairs played on
+pulse 2. Two authoring styles are available; the parser picks
+between them based on whether `tempo:` is set.
+
+**Note-name form** — set `tempo:` to the default frames-per-note and
+write each note as a name (C4, Eb4, Fs4, …, rest) with an optional
+per-note duration override:
 
 ```
 music Theme {
-    duty: 2                                   // 0-3 (default 2)
-    volume: 10                                // 0-15 (default 10)
-    repeat: true                              // loop when track ends (default true)
+    duty: 2                              // 0-3 (default 2)
+    volume: 10                           // 0-15 (default 10)
+    repeat: true                         // loop when track ends (default true)
+    tempo: 20                            // default frames per note
+    notes: [
+        C4, E4, G4, C5,                  // each note lasts 20 frames
+        G4 40,                           // held twice as long
+        rest 10,                         // short rest
+        E4, C4
+    ]
+}
+```
+
+**Raw-pair form** — leave `tempo:` unset and write a flat list of
+`pitch, duration, pitch, duration, ...` integer pairs:
+
+```
+music Theme {
+    duty: 2
+    volume: 10
     notes: [
         37, 20,    // C4 for 20 frames
         41, 20,    // E4
         44, 20,    // G4
         49, 20,    // C5
-        0, 10,     // rest for 10 frames
+        0, 10      // rest for 10 frames
     ]
 }
 ```
 
+Note names cover C1..B5 (60 entries in the builtin period table,
+middle C at index 37). Accidentals use `s` for sharp and `b` for
+flat (e.g. `Cs4` = C#4 = `Db4`) because `#` / `♭` aren't valid
+identifier characters. `rest` (or the alias `_`) is pitch 0.
+
 Rules:
-- `notes` must contain an even number of bytes (pitch + duration pairs).
+- Raw-pair form must contain an even number of entries.
 - Pitches are 0 (rest) or 1-60 (period table index).
 - Duration must be ≥ 1 frame.
+- `tempo` must be ≥ 1 frame (only present in note-name form).
 - Maximum 256 notes per track.
 
 ### Builtin Names

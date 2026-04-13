@@ -1532,3 +1532,571 @@ fn parse_debug_assert() {
     let frame = prog.states[0].on_frame.as_ref().unwrap();
     assert!(matches!(frame.statements[0], Statement::DebugAssert(..)));
 }
+
+// ── Named colour palettes ──
+
+#[test]
+fn parse_palette_with_named_colors_in_flat_list() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        palette Main {
+            colors: [
+                black, dk_blue, blue, sky_blue,
+                black, dk_red, red, peach,
+                black, dk_green, green, mint,
+                black, dk_gray, lt_gray, white,
+                black, dk_blue, blue, sky_blue,
+                black, dk_red, red, peach,
+                black, dk_green, green, mint,
+                black, dk_gray, lt_gray, white
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.palettes.len(), 1);
+    assert_eq!(prog.palettes[0].colors.len(), 32);
+    // `black` must resolve to the canonical `$0F` universal slot.
+    assert_eq!(prog.palettes[0].colors[0], 0x0F);
+    // `dk_blue` must resolve to `$01`.
+    assert_eq!(prog.palettes[0].colors[1], 0x01);
+}
+
+#[test]
+fn parse_palette_flat_colors_still_accept_hex() {
+    // Backward compat: a pre-existing palette that uses raw bytes
+    // must keep parsing identically.
+    let src = r#"
+        game "T" { mapper: NROM }
+        palette Legacy {
+            colors: [
+                0x0F, 0x01, 0x11, 0x21,
+                0x0F, 0x02, 0x12, 0x22,
+                0x0F, 0x0C, 0x1C, 0x2C,
+                0x0F, 0x0B, 0x1B, 0x2B,
+                0x0F, 0x01, 0x11, 0x21,
+                0x0F, 0x16, 0x27, 0x30,
+                0x0F, 0x14, 0x24, 0x34,
+                0x0F, 0x0B, 0x1B, 0x2B
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.palettes[0].colors[0], 0x0F);
+    assert_eq!(prog.palettes[0].colors[1], 0x01);
+    assert_eq!(prog.palettes[0].colors[6], 0x12);
+}
+
+#[test]
+fn parse_palette_with_grouped_subpalettes() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        palette Pretty {
+            universal: black
+            bg0: [dk_blue,  blue,   sky_blue]
+            bg1: [dk_red,   red,    peach]
+            bg2: [dk_green, green,  mint]
+            bg3: [dk_gray,  lt_gray, white]
+            sp0: [dk_blue,  blue,   sky_blue]
+            sp1: [dk_red,   red,    peach]
+            sp2: [dk_green, green,  mint]
+            sp3: [dk_gray,  lt_gray, white]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let colors = &prog.palettes[0].colors;
+    assert_eq!(colors.len(), 32);
+    // Every sub-palette's first byte must equal the universal
+    // (black = $0F). This is the whole reason grouped form exists —
+    // it auto-fixes the $3F10 mirror trap.
+    for i in 0..8 {
+        assert_eq!(
+            colors[i * 4],
+            0x0F,
+            "sub-palette {i} universal byte should be black"
+        );
+    }
+    assert_eq!(colors[1], 0x01); // dk_blue
+    assert_eq!(colors[2], 0x11); // blue
+    assert_eq!(colors[3], 0x21); // sky_blue
+    assert_eq!(colors[5], 0x06); // bg1 dk_red
+}
+
+#[test]
+fn parse_palette_grouped_without_universal_defaults_to_black() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        palette Pretty {
+            bg0: [dk_blue, blue, sky_blue]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(
+        prog.palettes[0].colors[0], 0x0F,
+        "default universal = black"
+    );
+}
+
+#[test]
+fn parse_palette_grouped_allows_full_4_entry_slot_overriding_universal() {
+    // Edge case: if the user provides all 4 colours for a slot, the
+    // leading colour *overrides* the universal for that slot. This is
+    // rarely useful but matches what a by-hand `colors:` list can do.
+    let src = r#"
+        game "T" { mapper: NROM }
+        palette Mixed {
+            universal: black
+            bg0: [white, dk_blue, blue, sky_blue]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.palettes[0].colors[0], 0x30); // white overrides black
+    assert_eq!(prog.palettes[0].colors[1], 0x01);
+}
+
+#[test]
+fn parse_palette_rejects_mixing_flat_and_grouped_forms() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        palette Broken {
+            colors: [0x0F, 0x01, 0x11, 0x21]
+            bg0: [blue, sky_blue, white]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let diags = parse_err(src);
+    assert!(
+        diags.contains(&crate::errors::ErrorCode::E0201),
+        "expected type-mismatch error for mixed palette form, got {diags:?}"
+    );
+}
+
+#[test]
+fn parse_palette_rejects_unknown_color_name() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        palette Bad {
+            colors: [mauve, 0x01, 0x11, 0x21]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let diags = parse_err(src);
+    assert!(diags.contains(&crate::errors::ErrorCode::E0201));
+}
+
+// ── Pixel-art sprites ──
+
+#[test]
+fn parse_sprite_with_pixel_art() {
+    // A simple arrow. The lower-left `#` column is index 1 and the
+    // right column is `@` = index 3, so we can check both planes.
+    let src = r#"
+        game "T" { mapper: NROM }
+        sprite Arrow {
+            pixels: [
+                "........",
+                "...##...",
+                "..###...",
+                ".####@@@",
+                ".####@@@",
+                "..###...",
+                "...##...",
+                "........"
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sprites.len(), 1);
+    match &prog.sprites[0].chr_source {
+        AssetSource::Inline(bytes) => {
+            // 8×8 tile = 16 bytes of CHR.
+            assert_eq!(bytes.len(), 16);
+            // Row 3 (`. # # # # @ @ @`) is palette indices
+            // `0 1 1 1 1 3 3 3`. Bitplane 0 (bit 0 of each index) is
+            // `0 1 1 1 1 1 1 1` = 0b0111_1111 = 0x7F.
+            // Bitplane 1 (bit 1 of each index) is `0 0 0 0 0 1 1 1`
+            // = 0b0000_0111 = 0x07.
+            assert_eq!(bytes[3], 0x7F, "row 3 plane 0");
+            assert_eq!(bytes[11], 0x07, "row 3 plane 1");
+        }
+        _ => panic!("expected inline CHR bytes from pixel art"),
+    }
+}
+
+#[test]
+fn parse_sprite_pixel_art_multi_tile() {
+    // 16×8 sprite → 2 tiles = 32 bytes, emitted in reading order.
+    // (Escaped quotes because the pixel rows contain long `#` runs
+    //  that collide with Rust's raw-string delimiter.)
+    let filled = "\"################\"";
+    let src = format!(
+        "game \"T\" {{ mapper: NROM }}\n\
+         sprite Wide {{\n\
+             pixels: [{filled},{filled},{filled},{filled},\
+                      {filled},{filled},{filled},{filled}]\n\
+         }}\n\
+         on frame {{ wait_frame }}\n\
+         start Main\n"
+    );
+    let src = src.as_str();
+    let prog = parse_ok(src);
+    match &prog.sprites[0].chr_source {
+        AssetSource::Inline(bytes) => {
+            assert_eq!(bytes.len(), 32, "16x8 = 2 tiles = 32 bytes");
+            // Every pixel is index 1: bitplane 0 = 0xFF, bitplane 1 = 0x00.
+            for tile in 0..2 {
+                for row in 0..8 {
+                    assert_eq!(bytes[tile * 16 + row], 0xFF);
+                    assert_eq!(bytes[tile * 16 + 8 + row], 0x00);
+                }
+            }
+        }
+        _ => panic!("expected inline CHR"),
+    }
+}
+
+#[test]
+fn parse_sprite_pixel_art_rejects_non_multiple_of_8() {
+    let src = "\
+        game \"T\" { mapper: NROM }\n\
+        sprite Bad { pixels: [\"....\", \"####\", \"####\", \"....\"] }\n\
+        on frame { wait_frame }\n\
+        start Main\n\
+    ";
+    let diags = parse_err(src);
+    assert!(diags.contains(&crate::errors::ErrorCode::E0201));
+}
+
+#[test]
+fn parse_sprite_pixel_art_rejects_ragged_rows() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sprite Bad {
+            pixels: [
+                "........",
+                "......."
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let diags = parse_err(src);
+    assert!(diags.contains(&crate::errors::ErrorCode::E0201));
+}
+
+// ── SFX with scalar pitch + envelope alias ──
+
+#[test]
+fn parse_sfx_with_scalar_pitch_and_envelope_alias() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Pickup {
+            duty: 2
+            pitch: 0x50
+            envelope: [15, 12, 9, 6, 3]
+        }
+        on frame { play Pickup }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sfx.len(), 1);
+    let s = &prog.sfx[0];
+    // Scalar pitch expands to repeat for every envelope frame.
+    assert_eq!(s.pitch, vec![0x50; 5]);
+    assert_eq!(s.volume, vec![15, 12, 9, 6, 3]);
+}
+
+#[test]
+fn parse_sfx_with_legacy_pitch_array_still_works() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Pickup {
+            duty: 2
+            pitch: [0x50, 0x50, 0x50]
+            volume: [15, 10, 5]
+        }
+        on frame { play Pickup }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sfx[0].pitch, vec![0x50, 0x50, 0x50]);
+    assert_eq!(prog.sfx[0].volume, vec![15, 10, 5]);
+}
+
+#[test]
+fn parse_sfx_rejects_mixing_volume_and_envelope() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Bad {
+            pitch: 0x50
+            volume: [10]
+            envelope: [10]
+        }
+        on frame { play Bad }
+        start Main
+    "#;
+    let diags = parse_err(src);
+    assert!(diags.contains(&crate::errors::ErrorCode::E0201));
+}
+
+// ── Music with note names + tempo ──
+
+#[test]
+fn parse_music_with_note_names_and_tempo_default() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        music Theme {
+            duty: 2
+            volume: 10
+            repeat: true
+            tempo: 20
+            notes: [C4, E4, G4, C5, G4, E4]
+        }
+        on frame { start_music Theme }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let t = &prog.music[0];
+    assert_eq!(t.notes.len(), 6);
+    // C4 is index 37, E4 = 41, G4 = 44, C5 = 49.
+    assert_eq!(t.notes[0].pitch, 37);
+    assert_eq!(t.notes[0].duration, 20); // from tempo
+    assert_eq!(t.notes[1].pitch, 41);
+    assert_eq!(t.notes[2].pitch, 44);
+    assert_eq!(t.notes[3].pitch, 49);
+    assert_eq!(t.notes[3].duration, 20);
+}
+
+#[test]
+fn parse_music_with_per_note_duration_override() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        music Theme {
+            tempo: 20
+            notes: [
+                C4,
+                E4 40,
+                rest 10,
+                G4
+            ]
+        }
+        on frame { start_music Theme }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let t = &prog.music[0];
+    assert_eq!(t.notes[0].pitch, 37);
+    assert_eq!(t.notes[0].duration, 20);
+    assert_eq!(t.notes[1].pitch, 41);
+    assert_eq!(t.notes[1].duration, 40); // override
+    assert_eq!(t.notes[2].pitch, 0); // rest
+    assert_eq!(t.notes[2].duration, 10);
+    assert_eq!(t.notes[3].pitch, 44);
+    assert_eq!(t.notes[3].duration, 20);
+}
+
+#[test]
+fn parse_music_enharmonic_note_names() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        music Theme {
+            tempo: 10
+            notes: [Cs4, Db4, Ds4, Eb4]
+        }
+        on frame { start_music Theme }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let t = &prog.music[0];
+    // Cs4 == Db4 and Ds4 == Eb4.
+    assert_eq!(t.notes[0].pitch, t.notes[1].pitch);
+    assert_eq!(t.notes[2].pitch, t.notes[3].pitch);
+}
+
+#[test]
+fn parse_music_legacy_flat_pair_form_still_works() {
+    // No `tempo:` → legacy (pitch, duration) pair form.
+    let src = r#"
+        game "T" { mapper: NROM }
+        music Theme {
+            duty: 2
+            volume: 10
+            notes: [
+                37, 20,
+                41, 20,
+                44, 20
+            ]
+        }
+        on frame { start_music Theme }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let t = &prog.music[0];
+    assert_eq!(t.notes.len(), 3);
+    assert_eq!(t.notes[0].pitch, 37);
+    assert_eq!(t.notes[0].duration, 20);
+}
+
+#[test]
+fn parse_music_rejects_unknown_note_name() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        music Theme {
+            tempo: 20
+            notes: [C4, Z9, G4]
+        }
+        on frame { start_music Theme }
+        start Main
+    "#;
+    let diags = parse_err(src);
+    assert!(diags.contains(&crate::errors::ErrorCode::E0201));
+}
+
+// ── Background tilemap + legend + palette_map ──
+
+#[test]
+fn parse_background_with_tilemap_and_legend() {
+    let src = r##"
+        game "T" { mapper: NROM }
+        background StageOne {
+            legend {
+                ".": 0
+                "#": 1
+                "X": 2
+            }
+            map: [
+                "................................",
+                "................................",
+                "......##........##..............",
+                "....##..##....##..##............"
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "##;
+    let prog = parse_ok(src);
+    assert_eq!(prog.backgrounds.len(), 1);
+    let tiles = &prog.backgrounds[0].tiles;
+    // Four rows × 32 cells = 128 bytes declared.
+    assert_eq!(tiles.len(), 128);
+    // Row 2 (index 2*32 = 64), columns 6 and 7 should be tile 1.
+    assert_eq!(tiles[2 * 32 + 6], 1);
+    assert_eq!(tiles[2 * 32 + 7], 1);
+    // Column 5 of row 2 is still the empty tile 0.
+    assert_eq!(tiles[2 * 32 + 5], 0);
+}
+
+#[test]
+fn parse_background_map_short_rows_pad_to_32_cells() {
+    let src = "\
+        game \"T\" { mapper: NROM }\n\
+        background StageOne {\n\
+            legend { \".\": 0, \"#\": 1 }\n\
+            map: [\"##\", \"#.\"]\n\
+        }\n\
+        on frame { wait_frame }\n\
+        start Main\n\
+    ";
+    let prog = parse_ok(src);
+    let tiles = &prog.backgrounds[0].tiles;
+    // 2 rows × 32 cols = 64 bytes. First two cells of row 0 are 1,
+    // rest of row 0 is 0.
+    assert_eq!(tiles.len(), 64);
+    assert_eq!(tiles[0], 1);
+    assert_eq!(tiles[1], 1);
+    assert_eq!(tiles[2], 0);
+    assert_eq!(tiles[32], 1); // row 1 col 0
+    assert_eq!(tiles[33], 0); // row 1 col 1
+}
+
+#[test]
+fn parse_background_map_rejects_unknown_legend_char() {
+    let src = r##"
+        game "T" { mapper: NROM }
+        background Bad {
+            legend { ".": 0, "#": 1 }
+            map: ["..?.."]
+        }
+        on frame { wait_frame }
+        start Main
+    "##;
+    let diags = parse_err(src);
+    assert!(diags.contains(&crate::errors::ErrorCode::E0201));
+}
+
+#[test]
+fn parse_background_map_requires_legend() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        background Bad {
+            map: ["..##.."]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let diags = parse_err(src);
+    assert!(diags.contains(&crate::errors::ErrorCode::E0201));
+}
+
+#[test]
+fn parse_background_palette_map_packs_attributes() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        background Stage {
+            legend { ".": 0 }
+            map: ["................................"]
+            palette_map: [
+                "0011001100110011",
+                "0011001100110011"
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let attrs = &prog.backgrounds[0].attributes;
+    assert_eq!(attrs.len(), 64, "always packs to 64 attribute bytes");
+    // Attribute byte [0,0] covers metatiles at:
+    //   TL = grid[0][0] = 0
+    //   TR = grid[0][1] = 0
+    //   BL = grid[1][0] = 0
+    //   BR = grid[1][1] = 0
+    // So byte[0] = 0.
+    assert_eq!(attrs[0], 0);
+    // Byte [0,1] covers metatiles:
+    //   TL = grid[0][2] = 1  TR = grid[0][3] = 1
+    //   BL = grid[1][2] = 1  BR = grid[1][3] = 1
+    // = (1) | (1 << 2) | (1 << 4) | (1 << 6) = 0x55
+    assert_eq!(attrs[1], 0x55);
+}
+
+#[test]
+fn parse_background_raw_tiles_and_attributes_still_work() {
+    // Backward compat: legacy inline byte arrays should keep parsing
+    // identically.
+    let src = r#"
+        game "T" { mapper: NROM }
+        background Legacy {
+            tiles: [0, 1, 2, 3]
+            attributes: [0xFF, 0x55]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.backgrounds[0].tiles, vec![0, 1, 2, 3]);
+    assert_eq!(prog.backgrounds[0].attributes, vec![0xFF, 0x55]);
+}

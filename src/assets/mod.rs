@@ -6,11 +6,11 @@ pub mod resolve;
 mod tests;
 
 pub use audio::{
-    builtin_music, builtin_sfx, is_builtin_music, is_builtin_sfx, resolve_music, resolve_sfx,
-    MusicData, SfxData,
+    builtin_music, builtin_sfx, is_builtin_music, is_builtin_sfx, note_name_to_index,
+    resolve_music, resolve_sfx, MusicData, SfxData,
 };
 pub use chr::png_to_chr;
-pub use palette::{nearest_nes_color, NES_COLORS};
+pub use palette::{color_name_to_index, nearest_nes_color, NES_COLORS};
 pub use resolve::{
     resolve_backgrounds, resolve_palettes, resolve_sprites, BackgroundData, PaletteData,
 };
