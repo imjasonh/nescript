@@ -136,3 +136,85 @@ fn mapper_mmc3_encoded() {
     let info = validate_ines(&rom).unwrap();
     assert_eq!(info.mapper, 4);
 }
+
+// ─── Multi-bank PRG layout ─────────────────────────────────────────
+
+#[test]
+fn set_prg_banks_with_two_banks_pads_and_concatenates() {
+    let mut builder = RomBuilder::new(Mirroring::Horizontal);
+    builder.set_prg_banks(vec![vec![0xAA, 0xAA, 0xAA], vec![0xBB, 0xBB]]);
+    let rom = builder.build();
+    // Header reports 2 banks.
+    assert_eq!(rom[4], 2);
+    // Total file size: 16 header + 2 * 16 KB
+    assert_eq!(rom.len(), 16 + 2 * 16384);
+    // First bank: 0xAA at the start, $FF padding, then second bank.
+    assert_eq!(&rom[16..19], &[0xAA, 0xAA, 0xAA]);
+    assert_eq!(rom[19], 0xFF); // padding continues in bank 0
+                               // Second bank starts at 16 + 16384.
+    let bank1 = 16 + 16384;
+    assert_eq!(&rom[bank1..bank1 + 2], &[0xBB, 0xBB]);
+    assert_eq!(rom[bank1 + 2], 0xFF); // padding in bank 1
+}
+
+#[test]
+fn set_prg_banks_with_four_banks_produces_64kb_prg() {
+    let mut builder = RomBuilder::new(Mirroring::Horizontal);
+    builder.set_prg_banks(vec![vec![0x00], vec![0x01], vec![0x02], vec![0x03]]);
+    let rom = builder.build();
+    assert_eq!(rom[4], 4, "header should report 4 PRG banks");
+    assert_eq!(rom.len(), 16 + 4 * 16384);
+    // Each bank's first byte should be the bank index.
+    for i in 0..4 {
+        let offset = 16 + i * 16384;
+        assert_eq!(rom[offset], i as u8, "bank {i} should start with byte {i}");
+    }
+}
+
+#[test]
+#[should_panic(expected = "exceeds 16 KB")]
+fn set_prg_banks_panics_when_bank_too_large() {
+    let mut builder = RomBuilder::new(Mirroring::Horizontal);
+    // 16 KB + 1 byte overflows a single 16 KB bank slot.
+    builder.set_prg_banks(vec![vec![0x00; 16385]]);
+}
+
+#[test]
+fn set_prg_banks_preserves_content_exactly() {
+    // Verify byte-for-byte fidelity: if the caller provides bytes
+    // A, B, C in a bank, they must land at bank_start, bank_start+1,
+    // bank_start+2 with no rearrangement.
+    let mut builder = RomBuilder::new(Mirroring::Horizontal);
+    builder.set_prg_banks(vec![(0u8..=9).collect(), (100u8..=109).collect()]);
+    let rom = builder.build();
+    assert_eq!(&rom[16..26], &(0u8..=9).collect::<Vec<_>>()[..]);
+    let bank1 = 16 + 16384;
+    assert_eq!(
+        &rom[bank1..bank1 + 10],
+        &(100u8..=109).collect::<Vec<_>>()[..]
+    );
+}
+
+#[test]
+fn validate_detects_multi_bank_prg() {
+    // A ROM built with 3 banks should validate with prg_banks=3.
+    let mut builder = RomBuilder::new(Mirroring::Vertical);
+    builder.set_mapper(1); // MMC1
+    builder.set_prg_banks(vec![vec![0x11; 10], vec![0x22; 10], vec![0x33; 10]]);
+    let rom = builder.build();
+    let info = validate_ines(&rom).unwrap();
+    assert_eq!(info.prg_banks, 3);
+    assert_eq!(info.mapper, 1);
+    assert_eq!(info.mirroring, Mirroring::Vertical);
+}
+
+#[test]
+fn empty_prg_banks_fallback_to_single_bank() {
+    // If a caller doesn't call set_prg or set_prg_banks, the builder
+    // still produces a valid single-bank ROM so tests that only
+    // exercise the CHR path keep working.
+    let builder = RomBuilder::new(Mirroring::Horizontal);
+    let rom = builder.build();
+    assert_eq!(rom[4], 1, "default should be 1 PRG bank");
+    assert_eq!(rom.len(), 16 + 16384);
+}

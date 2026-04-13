@@ -1,6 +1,6 @@
 use super::*;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
-use crate::parser::ast::Mirroring;
+use crate::parser::ast::{Mapper, Mirroring};
 use crate::rom;
 
 #[test]
@@ -293,6 +293,274 @@ fn link_without_audio_marker_does_not_emit_period_table() {
         !found,
         "unused sfx data should not be spliced when __audio_used is absent"
     );
+}
+
+// ─── Banked linking ────────────────────────────────────────────────
+
+#[test]
+fn link_banked_mmc1_produces_multi_bank_rom() {
+    // MMC1 with two switchable banks should produce a 3-bank ROM
+    // (2 switchable + 1 fixed). The iNES header must report 3 PRG
+    // banks, mapper number 1, and the file size must match.
+    let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::MMC1);
+    let user_code = vec![Instruction::implied(NOP)];
+    let banks = vec![PrgBank::empty("Level1"), PrgBank::empty("Level2")];
+    let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
+    let info = rom::validate_ines(&rom).unwrap();
+    assert_eq!(info.prg_banks, 3);
+    assert_eq!(info.mapper, 1);
+    assert_eq!(rom.len(), 16 + 3 * 16384 + 8192);
+}
+
+#[test]
+fn link_banked_uxrom_produces_multi_bank_rom() {
+    let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::UxROM);
+    let user_code = vec![Instruction::implied(NOP)];
+    // Four switchable banks = 5 PRG banks total.
+    let banks = vec![
+        PrgBank::empty("BankA"),
+        PrgBank::empty("BankB"),
+        PrgBank::empty("BankC"),
+        PrgBank::empty("BankD"),
+    ];
+    let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
+    let info = rom::validate_ines(&rom).unwrap();
+    assert_eq!(info.prg_banks, 5);
+    assert_eq!(info.mapper, 2);
+}
+
+#[test]
+fn link_banked_mmc3_produces_multi_bank_rom() {
+    let linker = Linker::with_mapper(Mirroring::Vertical, Mapper::MMC3);
+    let user_code = vec![Instruction::implied(NOP)];
+    let banks = vec![
+        PrgBank::empty("Stage1"),
+        PrgBank::empty("Stage2"),
+        PrgBank::empty("Stage3"),
+    ];
+    let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
+    let info = rom::validate_ines(&rom).unwrap();
+    assert_eq!(info.prg_banks, 4);
+    assert_eq!(info.mapper, 4);
+    // Vertical mirroring must propagate through the builder.
+    assert_eq!(info.mirroring, Mirroring::Vertical);
+}
+
+#[test]
+#[should_panic(expected = "NROM does not support switchable PRG banks")]
+fn link_banked_nrom_rejects_switchable_banks() {
+    let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::NROM);
+    let _ = linker.link_banked(
+        &[Instruction::implied(NOP)],
+        &[],
+        &[],
+        &[],
+        &[PrgBank::empty("Nope")],
+    );
+}
+
+#[test]
+fn link_banked_fixed_bank_lives_at_end_of_prg() {
+    // The linker must place the fixed bank *last* so it maps to
+    // $C000-$FFFF at reset. The vector table at $FFFA..$FFFF must
+    // land in the final bank. We verify by reading the reset vector
+    // and checking it points into the fixed bank's address window.
+    let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::MMC1);
+    let user_code = vec![Instruction::implied(NOP)];
+    let banks = vec![PrgBank::empty("A"), PrgBank::empty("B")];
+    let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
+    // Three PRG banks = 48 KB; the fixed bank is the last 16 KB
+    // slot in the file, and its $FFFA..$FFFF area holds the
+    // vector table.
+    let fixed_bank_offset = 16 + 2 * 16384;
+    // Vectors live at the last 6 bytes of the fixed bank.
+    let vec_offset = fixed_bank_offset + 16384 - 6;
+    let reset = u16::from_le_bytes([rom[vec_offset + 2], rom[vec_offset + 3]]);
+    assert!(
+        reset >= 0xC000,
+        "RESET vector {reset:#06X} should point into fixed bank ($C000-$FFFF)"
+    );
+}
+
+#[test]
+fn link_banked_switchable_banks_are_padded_with_ff() {
+    // Empty switchable banks should end up as 16 KB of $FF — the
+    // same pad value the ROM builder uses for unset code. This is
+    // important so banks are always a known shape regardless of
+    // payload.
+    let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::MMC1);
+    let user_code = vec![Instruction::implied(NOP)];
+    let banks = vec![PrgBank::empty("Empty")];
+    let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
+    // Bank 0 is at offset 16; check a few bytes are $FF.
+    assert_eq!(rom[16], 0xFF);
+    assert_eq!(rom[16 + 100], 0xFF);
+    // Last byte of bank 0 (just before bank 1 begins).
+    assert_eq!(rom[16 + 16384 - 1], 0xFF);
+}
+
+#[test]
+fn link_banked_preserves_switchable_bank_payload_bytes() {
+    // When a caller provides raw bytes for a switchable bank, the
+    // linker must splice them in verbatim at the start of that
+    // bank's slot. This is the hook the compiler uses to ship data
+    // tables without touching the fixed bank.
+    let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::UxROM);
+    let user_code = vec![Instruction::implied(NOP)];
+    let data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x13];
+    let banks = vec![PrgBank::with_data("DataBank", data.clone())];
+    let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
+    // Bank 0 starts at offset 16. Verify payload lands at the very
+    // start.
+    assert_eq!(&rom[16..16 + data.len()], &data[..]);
+}
+
+#[test]
+fn link_banked_fixed_bank_contains_bank_select_subroutine() {
+    // The linker must emit `__bank_select` (as labelled 6502 code)
+    // somewhere in the fixed bank whenever the mapper isn't NROM.
+    // We verify by assembling a minimal program and searching for
+    // the opcode signature of the MMC1 bank-select tail — 5 STAs
+    // to $E000 ($8D $00 $E0).
+    let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::MMC1);
+    let user_code = vec![Instruction::implied(NOP)];
+    let banks = vec![PrgBank::empty("Foo")];
+    let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
+    // Fixed bank starts at offset 16 + 16384.
+    let fixed = &rom[16 + 16384..16 + 2 * 16384];
+    // Find five consecutive STA $E000 (opcode $8D operand $00 $E0)
+    // instructions with LSR A ($4A) between pairs. This is the
+    // signature pattern generated by `gen_bank_select(MMC1)`.
+    let sta_e000 = [0x8D, 0x00, 0xE0];
+    let lsr_then_sta_e000 = [0x4A, 0x8D, 0x00, 0xE0];
+    let has_tail = fixed
+        .windows(lsr_then_sta_e000.len())
+        .any(|w| w == lsr_then_sta_e000);
+    let sta_e000_count = fixed
+        .windows(sta_e000.len())
+        .filter(|w| w == &sta_e000)
+        .count();
+    assert!(
+        has_tail,
+        "MMC1 fixed bank should contain LSR A ; STA $E000 pattern"
+    );
+    assert!(
+        sta_e000_count >= 5,
+        "MMC1 fixed bank should contain >= 5 STA $E000 writes (bank-select + init), got {sta_e000_count}"
+    );
+}
+
+#[test]
+fn link_banked_fixed_bank_contains_trampolines_for_declared_banks() {
+    // When a bank declares an entry label, the linker must emit a
+    // matching `__tramp_<name>` stub in the fixed bank. We check
+    // by constructing a bank with an entry label and verifying the
+    // assembled labels map (via the indirect check: the ROM builds
+    // without panicking on unresolved labels, which means the
+    // trampoline's target label — here spliced via a dummy NOP
+    // label in the fixed bank — resolved).
+    let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::MMC1);
+    // We splice a fake target label into the user code so the
+    // trampoline's internal JSR resolves. This simulates the path
+    // codegen will eventually take (emit the entry label alongside
+    // the banked user code; the linker resolves it via the banked
+    // assembler).
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__fake_bank_entry".into())),
+        Instruction::implied(NOP),
+    ];
+    let banks = vec![PrgBank {
+        name: "Level1".into(),
+        data: Vec::new(),
+        entry_label: Some("__fake_bank_entry".into()),
+    }];
+    // Should not panic — trampoline and entry label both present.
+    let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
+    let info = rom::validate_ines(&rom).unwrap();
+    assert_eq!(info.prg_banks, 2);
+}
+
+#[test]
+fn link_banked_reset_vector_points_into_fixed_bank_window() {
+    // The reset vector must land somewhere in $C000-$FFFF — that's
+    // the CPU address where the fixed bank maps in at boot on every
+    // supported mapper (NROM, MMC1, UxROM, MMC3).
+    for mapper in [Mapper::NROM, Mapper::MMC1, Mapper::UxROM, Mapper::MMC3] {
+        let linker = Linker::with_mapper(Mirroring::Horizontal, mapper);
+        let user_code = vec![Instruction::implied(NOP)];
+        let banks: Vec<PrgBank> = if mapper == Mapper::NROM {
+            Vec::new()
+        } else {
+            vec![PrgBank::empty("X")]
+        };
+        let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
+        // Last 6 bytes of PRG = vectors.
+        let prg_end = 16 + rom::validate_ines(&rom).unwrap().prg_banks * 16384;
+        let reset_bytes = [rom[prg_end - 4], rom[prg_end - 3]];
+        let reset = u16::from_le_bytes(reset_bytes);
+        assert!(
+            (0xC000..=0xFFFF).contains(&reset),
+            "{mapper:?} reset vector {reset:#06X} must live in fixed-bank window"
+        );
+    }
+}
+
+#[test]
+fn link_banked_rom_size_matches_bank_count() {
+    // For each banked mapper, verify total ROM file size =
+    // 16 header + N * 16 KB PRG + 8 KB CHR.
+    for (mapper, switchable) in [
+        (Mapper::MMC1, 0usize),
+        (Mapper::MMC1, 1),
+        (Mapper::MMC1, 3),
+        (Mapper::UxROM, 0),
+        (Mapper::UxROM, 7),
+        (Mapper::MMC3, 0),
+        (Mapper::MMC3, 15),
+    ] {
+        let linker = Linker::with_mapper(Mirroring::Horizontal, mapper);
+        let user_code = vec![Instruction::implied(NOP)];
+        let banks: Vec<PrgBank> = (0..switchable)
+            .map(|i| PrgBank::empty(format!("B{i}")))
+            .collect();
+        let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
+        let expected_prg_banks = switchable + 1;
+        let expected_len = 16 + expected_prg_banks * 16384 + 8192;
+        assert_eq!(
+            rom.len(),
+            expected_len,
+            "{mapper:?} with {switchable} switchable banks: expected {expected_len} bytes, got {}",
+            rom.len(),
+        );
+    }
+}
+
+#[test]
+fn link_with_mapper_nrom_produces_single_bank_rom() {
+    // Regression: calling link_banked with NROM and no switchable
+    // banks should produce the same 1-bank layout as the legacy
+    // `link_with_all_assets` — no extra cost for the new API.
+    let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::NROM);
+    let user_code = vec![Instruction::implied(NOP)];
+    let rom = linker.link_banked(&user_code, &[], &[], &[], &[]);
+    let info = rom::validate_ines(&rom).unwrap();
+    assert_eq!(info.prg_banks, 1);
+    assert_eq!(info.mapper, 0);
+    assert_eq!(rom.len(), 16 + 16384 + 8192);
+}
+
+#[test]
+fn link_banked_chr_rom_survives_with_switchable_banks() {
+    // The default smiley + any sprites should still appear in CHR
+    // ROM even when switchable PRG banks are present.
+    let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::MMC1);
+    let user_code = vec![Instruction::implied(NOP)];
+    let banks = vec![PrgBank::empty("X")];
+    let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
+    // CHR starts after 2 PRG banks.
+    let chr_start = 16 + 2 * 16384;
+    // First 16 bytes = smiley tile, non-zero.
+    assert_ne!(&rom[chr_start..chr_start + 16], &[0u8; 16]);
 }
 
 #[test]

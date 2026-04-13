@@ -2,6 +2,7 @@
 mod tests;
 
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
+use crate::parser::ast::{Mapper, Mirroring};
 
 /// PPU register addresses
 const PPU_CTRL: u16 = 0x2000;
@@ -672,4 +673,266 @@ pub fn gen_divide() -> Vec<Instruction> {
     out.push(Instruction::implied(RTS));
 
     out
+}
+
+// ─── Bank switching ────────────────────────────────────────────────
+//
+// NEScript supports bank switching for MMC1, UxROM, and MMC3. The
+// linker lays out PRG ROM with a single fixed bank ($C000-$FFFF)
+// holding the runtime, NMI, IRQ vectors, and any cross-bank
+// trampolines, plus zero or more switchable 16 KB banks mapped at
+// $8000-$BFFF. The helpers below emit:
+//
+//   * `gen_mapper_init` — reset-time configuration that puts the
+//     last physical bank at $C000 and (depending on the mapper)
+//     sets a known mirroring mode so the compiler's
+//     `Mirroring::{Horizontal,Vertical}` selection matches.
+//   * `gen_bank_select` — a subroutine callable with the target bank
+//     number in A that selects the correct switchable bank at $8000.
+//   * `gen_bank_trampoline` — a per-(target, bank) stub placed in
+//     the fixed bank. Callers `JSR` into the trampoline, which
+//     records the current bank, switches to the target bank, calls
+//     the entry label in that bank, and switches back.
+//
+// The trampolines never physically return to the switchable bank —
+// control is always handed back to the fixed bank after the callee
+// returns. Users don't touch these routines directly; the linker
+// emits them from the `bank` declarations in the program AST.
+
+/// Zero-page slot used by the bank-select routine to stash the
+/// requested bank number so `__bank_return` can restore it when a
+/// trampoline finishes.
+pub const ZP_BANK_CURRENT: u8 = 0x10;
+
+/// Generate the reset-time mapper initialization sequence. Splices
+/// after `gen_init` but before any user code runs. For NROM this is
+/// a no-op — `gen_init` already sets up everything NROM needs.
+///
+/// `total_prg_banks` is the total number of 16 KB PRG banks in the
+/// ROM; MMC1/MMC3 need this to fix the *last* physical bank at
+/// $C000. `UxROM` is hardwired — its last bank is always fixed.
+#[must_use]
+pub fn gen_mapper_init(
+    mapper: Mapper,
+    mirroring: Mirroring,
+    total_prg_banks: usize,
+) -> Vec<Instruction> {
+    match mapper {
+        Mapper::NROM => Vec::new(),
+        Mapper::MMC1 => gen_mmc1_init(mirroring),
+        Mapper::UxROM => gen_uxrom_init(total_prg_banks),
+        Mapper::MMC3 => gen_mmc3_init(mirroring),
+    }
+}
+
+/// MMC1 reset: pulse the reset bit, then write the control register.
+/// Control-register layout (5 bits, serialized LSB-first into any
+/// $8000-$FFFF address):
+///   bit 4   — CHR bank mode (0 = 8 KB, 1 = two 4 KB banks)
+///   bit 3   — PRG bank mode bit 1
+///   bit 2   — PRG bank mode bit 0
+///             11 = 16 KB banks, fix last at $C000, switchable at $8000
+///   bit 1-0 — mirroring
+///             00 = 1-screen lo, 01 = 1-screen hi,
+///             10 = vertical,    11 = horizontal
+///
+/// We pick mode `11` (fixed last bank) so the fixed bank appears at
+/// $C000 exactly the same way as NROM, which lets us reuse the NROM
+/// layout for all the runtime code that already exists.
+fn gen_mmc1_init(mirroring: Mirroring) -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__mmc1_init".into())));
+    // Reset pulse: any $8000-range write with bit 7 set flushes the
+    // 5-bit shift register and resets the internal config to
+    // mode 3 (fixed last, 16 KB banks).
+    out.push(Instruction::new(LDA, AM::Immediate(0x80)));
+    out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+    // Control register value.
+    let mirror_bits = match mirroring {
+        Mirroring::Horizontal => 0b11,
+        Mirroring::Vertical => 0b10,
+    };
+    // 16 KB PRG, fix last at $C000 (bits 2-3 = 11), 8 KB CHR
+    // (bit 4 = 0), plus mirroring bits.
+    let control: u8 = 0b0_11_00 | mirror_bits;
+    // Serialize the 5 bits into the shift register. Each write
+    // uses STA $8000 (which maps to the control register because
+    // the address falls in the $8000-$9FFF range).
+    out.extend(gen_mmc1_serial_write(control, 0x8000));
+    out
+}
+
+/// Emit 5 serialized writes of `value` to `addr`, shifting right
+/// between writes. Used by MMC1 bank-switch code (registers all live
+/// in $8000-$FFFF and are selected by the top two address bits).
+fn gen_mmc1_serial_write(value: u8, addr: u16) -> Vec<Instruction> {
+    let mut out = Vec::new();
+    // Bit 0 goes out first, then bit 1, etc. We use immediate loads
+    // for each bit so the sequence has no hidden dependencies on
+    // the current A register.
+    for i in 0..5 {
+        let bit = (value >> i) & 1;
+        out.push(Instruction::new(LDA, AM::Immediate(bit)));
+        out.push(Instruction::new(STA, AM::Absolute(addr)));
+    }
+    out
+}
+
+/// `UxROM` reset: the last 16 KB PRG bank is always fixed at $C000,
+/// and the switchable bank at $8000 defaults to bank 0 on power-on.
+/// Some `UxROM` boards have bus conflicts — any write must match the
+/// byte in ROM — so we use a small bank-select table at a known
+/// address (`__bank_select_table`) generated into the fixed bank.
+fn gen_uxrom_init(_total_banks: usize) -> Vec<Instruction> {
+    // No explicit init required: UxROM powers up with bank 0 at
+    // $8000 and the last bank fixed at $C000, which is exactly
+    // what we want. We still emit the label so debuggers can find
+    // the (empty) init span.
+    vec![Instruction::new(NOP, AM::Label("__uxrom_init".into()))]
+}
+
+/// MMC3 reset: choose PRG mode 0 (last two banks fixed at
+/// $C000-$FFFF) and initialise bank 0 at $8000, bank 1 at $A000.
+/// Mirroring is programmed via $A000 (only meaningful when CHR
+/// uses the internal mode — for our CHR ROM layout it's still
+/// the safest place to latch).
+fn gen_mmc3_init(mirroring: Mirroring) -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__mmc3_init".into())));
+
+    // Select PRG-bank-0 register (6) with PRG mode bit 6 = 0
+    // (meaning $8000 is switchable, $C000/$E000 are fixed at the
+    // last two banks).
+    out.push(Instruction::new(LDA, AM::Immediate(0x06)));
+    out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+    out.push(Instruction::new(LDA, AM::Immediate(0x00))); // bank 0 at $8000
+    out.push(Instruction::new(STA, AM::Absolute(0x8001)));
+
+    // Select PRG-bank-1 register (7) and load bank 1 at $A000.
+    out.push(Instruction::new(LDA, AM::Immediate(0x07)));
+    out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+    out.push(Instruction::new(LDA, AM::Immediate(0x01)));
+    out.push(Instruction::new(STA, AM::Absolute(0x8001)));
+
+    // Mirroring: $A000, bit 0 — 0 = vertical, 1 = horizontal.
+    let mirror = match mirroring {
+        Mirroring::Horizontal => 0x01,
+        Mirroring::Vertical => 0x00,
+    };
+    out.push(Instruction::new(LDA, AM::Immediate(mirror)));
+    out.push(Instruction::new(STA, AM::Absolute(0xA000)));
+
+    // Leave IRQs disabled until the user code enables them.
+    out.push(Instruction::new(STA, AM::Absolute(0xE000)));
+
+    out
+}
+
+/// Generate the `__bank_select` subroutine. Input: A = desired bank
+/// number (0-based, physical PRG bank index). Output: that bank is
+/// mapped to $8000-$BFFF. Clobbers A (and the internal shift
+/// registers where applicable). The routine ends in RTS so callers
+/// can `JSR __bank_select` anywhere it's callable from.
+///
+/// The bank number is stashed in `ZP_BANK_CURRENT` so `__bank_select`
+/// and its trampolines can restore it after a callee returns.
+#[must_use]
+pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__bank_select".into())));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_BANK_CURRENT)));
+    match mapper {
+        Mapper::NROM => {
+            // NROM has no switchable banks, so the routine is a
+            // no-op. We still emit it so user code can unconditionally
+            // call `__bank_select` regardless of mapper.
+            out.push(Instruction::implied(RTS));
+        }
+        Mapper::MMC1 => {
+            // Write 5 bits of A (LSB first) into the shift register
+            // at $E000 (PRG-bank select). Between writes we LSR A
+            // to shift the next bit into position 0.
+            for i in 0..5 {
+                if i > 0 {
+                    out.push(Instruction::new(LSR, AM::Accumulator));
+                }
+                out.push(Instruction::new(STA, AM::Absolute(0xE000)));
+            }
+            out.push(Instruction::implied(RTS));
+        }
+        Mapper::UxROM => {
+            // UxROM: write bank number to any address in $8000-$FFFF.
+            // We use $FFF0 so the write lands in the fixed bank's
+            // tail area where the linker can back it with a matching
+            // bank-table byte to avoid bus conflicts.
+            out.push(Instruction::new(STA, AM::Absolute(0xFFF0)));
+            out.push(Instruction::implied(RTS));
+        }
+        Mapper::MMC3 => {
+            // MMC3: `$8000 = 6` selects PRG-bank-0 register, then
+            // write bank to `$8001`. We save/restore X because
+            // some callers use X as a loop counter across the
+            // switch.
+            out.push(Instruction::implied(PHA));
+            out.push(Instruction::new(LDA, AM::Immediate(0x06)));
+            out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+            out.push(Instruction::implied(PLA));
+            out.push(Instruction::new(STA, AM::Absolute(0x8001)));
+            out.push(Instruction::implied(RTS));
+        }
+    }
+    out
+}
+
+/// Generate a cross-bank trampoline stub. Placed in the fixed bank
+/// and called by user code (also in the fixed bank) via
+/// `JSR __tramp_<bank_name>`. Behavior:
+///
+///   1. Save the caller's bank number (always the fixed bank's index).
+///   2. Load the target bank number into A, JSR `__bank_select`.
+///   3. JSR the entry label in the target bank.
+///   4. Load the fixed bank number, JSR `__bank_select` to restore.
+///   5. RTS.
+///
+/// `bank_name` is the user-declared bank name from the `.ne` source.
+/// `entry_label` is the label inside that bank the trampoline
+/// should call (conventionally `__bank_<name>_entry`). `bank_index`
+/// is the physical bank number. `fixed_bank_index` is the physical
+/// bank number of the fixed bank (always `total_banks - 1`).
+#[must_use]
+pub fn gen_bank_trampoline(
+    bank_name: &str,
+    entry_label: &str,
+    bank_index: u8,
+    fixed_bank_index: u8,
+) -> Vec<Instruction> {
+    let mut out = Vec::new();
+    let tramp_label = format!("__tramp_{bank_name}");
+    out.push(Instruction::new(NOP, AM::Label(tramp_label)));
+    // Switch to target bank.
+    out.push(Instruction::new(LDA, AM::Immediate(bank_index)));
+    out.push(Instruction::new(JSR, AM::Label("__bank_select".into())));
+    // Call the user's entry point in that bank. The label lives in
+    // the switchable bank and is resolved during banked assembly.
+    out.push(Instruction::new(JSR, AM::Label(entry_label.to_string())));
+    // Restore the fixed bank.
+    out.push(Instruction::new(LDA, AM::Immediate(fixed_bank_index)));
+    out.push(Instruction::new(JSR, AM::Label("__bank_select".into())));
+    out.push(Instruction::implied(RTS));
+    out
+}
+
+/// Generate the bus-conflict avoidance table used by `UxROM`. The table
+/// lives at a known offset in the fixed bank and contains 256 bytes
+/// of increasing values (0, 1, 2, ...). Writing bank `n` to
+/// `__bank_select_table + n` guarantees the bus value matches the
+/// ROM byte at that address, avoiding conflict-driven glitches on
+/// real `UxROM` hardware.
+#[must_use]
+pub fn gen_uxrom_bank_table() -> Vec<Instruction> {
+    let bytes: Vec<u8> = (0..=255u16).map(|i| i as u8).collect();
+    vec![
+        Instruction::new(NOP, AM::Label("__bank_select_table".into())),
+        Instruction::new(NOP, AM::Bytes(bytes)),
+    ]
 }

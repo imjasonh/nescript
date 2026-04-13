@@ -6,8 +6,9 @@ use nescript::assets;
 use nescript::codegen::IrCodeGen;
 use nescript::errors::render_diagnostics;
 use nescript::ir;
-use nescript::linker::Linker;
+use nescript::linker::{Linker, PrgBank};
 use nescript::optimizer;
+use nescript::parser::ast::BankType;
 
 #[derive(Parser)]
 #[command(name = "nescript", about = "NEScript compiler — NES game development")]
@@ -318,8 +319,22 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     // reflects the source's `mapper:` declaration — without this
     // the CLI always shipped mapper 0 (NROM) regardless of whether
     // the program actually needed MMC1/MMC3 bank switching.
+    //
+    // For banked mappers (MMC1, UxROM, MMC3) we collect the
+    // declared `bank X: prg` entries and turn each into an empty
+    // 16 KB switchable slot. User code currently still lives in
+    // the fixed bank — the declared banks exist so programs that
+    // outgrow 16 KB have real ROM space to grow into and so
+    // mapper-specific fixtures (vectors, trampolines, bank-select
+    // helpers) land in the right place.
     let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
-    let rom = linker.link_with_all_assets(&instructions, &sprites, &sfx, &music);
+    let switchable_banks: Vec<PrgBank> = program
+        .banks
+        .iter()
+        .filter(|b| b.bank_type == BankType::Prg)
+        .map(|b| PrgBank::empty(&b.name))
+        .collect();
+    let rom = linker.link_banked(&instructions, &sprites, &sfx, &music, &switchable_banks);
 
     Ok(rom)
 }
