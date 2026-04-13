@@ -3,12 +3,13 @@
 // one program: custom CHR tiles, a full 32×30 background nametable
 // with per-region attribute palettes, a multi-tile metasprite
 // player with gravity/jump physics, wrap-around horizontal
-// scrolling, moving enemies, collectible coins, a user-declared
-// SFX envelope, a user-declared music track, and a title →
-// playing → game-over state machine driven by both controller
-// input and an autopilot so the jsnes golden harness (which runs
-// headless with no simulated buttons) still captures an
-// interesting frame-180 composition.
+// scrolling, moving enemies with stomp-or-die contact logic, a
+// coin HUD that tracks live score, collectible coins, user-declared
+// SFX envelopes, a user-declared music track, and a
+// title → playing → game-over state machine driven by both
+// controller input and an autopilot so the jsnes golden harness
+// (which runs headless with no simulated buttons) still captures
+// the full gameplay loop inside the first ~6 seconds of demo.
 //
 // Controls (when played by a human):
 //     D-pad left/right  — walk
@@ -358,6 +359,12 @@ const ENEMY2_WORLD_X:  u8 = 200
 const COIN1_WORLD_X:   u8 = 50
 const COIN2_WORLD_X:   u8 = 150
 
+// How many auto-jumps the autopilot will pre-queue per life. Two
+// is exactly enough to stomp enemy 1 and enemy 2 once each; after
+// that the autopilot stops assisting so the headless harness gets
+// to see the player walk into the next enemy, die, and retry.
+const AUTOPILOT_JUMPS: u8 = 2
+
 // ── Game state ──────────────────────────────────────────────
 
 // Player physics
@@ -369,8 +376,12 @@ var fall_vy:    u8 = 0     // gravity accumulator
 // World/camera
 var camera_x:   u8 = 0
 var frame_tick: u8 = 0     // free-running frame counter
-var jump_timer: u8 = 0     // autopilot: jump every N frames
 var anim_tick:  u8 = 0     // visual animation phase
+
+// Gameplay
+var alive:       u8 = 1    // 0 = dying/dead, 1 = playable
+var stomp_count: u8 = 0    // successful enemy stomps this life
+var auto_jumps:  u8 = 0    // proximity pre-jumps used this life
 
 // ── Helper functions ────────────────────────────────────────
 
@@ -423,6 +434,54 @@ fun draw_player() {
     draw Tileset at: (PLAYER_SCREEN_X + 8, player_y + 8) frame: TILE_PLAYER_BR
 }
 
+// Resolve contact with an enemy whose screen X is `e_sx`. Mutates
+// the player's physics / alive flag directly and returns 1 on a
+// successful stomp, 0 on no contact or a fatal hit. The caller
+// checks `alive` after invocation to decide whether to keep
+// running the frame.
+//
+// The player's 16×16 hitbox is at ([80, 96), [player_y, player_y+16)).
+// Each enemy's 8×8 hitbox is at ([e_sx, e_sx+8), [168, 176)). Those
+// overlap horizontally when e_sx ∈ (72, 96) and overlap vertically
+// when player_y ∈ (152, 176).
+//
+// Outcomes:
+//   - No overlap                                  → no-op
+//   - Overlap while rising (rise_count > 0)       → graceful
+//     pass-through. rise_count > 0 only happens right after a
+//     successful stomp bounce (try_jump() clears rise_count by
+//     the end of the same frame) or on the stomp's own upward
+//     leg, which we don't want to retrigger.
+//   - Overlap while falling, feet near enemy head → STOMP: bounce
+//     up, increment `stomp_count`, play Boing
+//   - Any other overlap (walking, on ground)      → DEATH: set
+//     `alive = 0` and play the builtin `hit` sfx
+fun resolve_enemy_hit(e_sx: u8) -> u8 {
+    if e_sx > 72 {
+        if e_sx < 96 {
+            if player_y > 152 {
+                if player_y < 176 {
+                    // Real contact. Stomp if falling; otherwise, if
+                    // we're not in the post-bounce grace window,
+                    // die.
+                    if fall_vy > 0 {
+                        rise_count = 6
+                        fall_vy = 0
+                        stomp_count += 1
+                        play Boing
+                        return 1
+                    }
+                    if rise_count == 0 {
+                        alive = 0
+                        play hit
+                    }
+                }
+            }
+        }
+    }
+    return 0
+}
+
 // ── States ──────────────────────────────────────────────────
 
 state Title {
@@ -468,8 +527,11 @@ state Playing {
         fall_vy = 0
         camera_x = 0
         frame_tick = 0
-        jump_timer = 0
         anim_tick = 0
+        alive = 1
+        stomp_count = 0
+        auto_jumps = 0
+        start_music Theme
     }
 
     on frame {
@@ -490,31 +552,40 @@ state Playing {
             camera_x -= 1
         }
 
-        // ── Autopilot ────────────────────────────────────────
-        // The headless golden harness never presses buttons, so
-        // we advance the camera and periodically hop all by
-        // ourselves. A human holding right still accelerates
-        // forward — the two effects compose.
+        // Always advance camera one px per frame (baseline scroll).
         camera_x += 1
-        jump_timer += 1
-        if jump_timer >= 40 {
-            jump_timer = 0
-            try_jump()
-        }
 
-        // ── Physics ──────────────────────────────────────────
-        step_physics()
-
-        // ── Collisions ───────────────────────────────────────
-        // Coin pickup when the player's screen X is within ±8 of
-        // a coin's screen position and the coin's Y range overlaps
-        // the player. Uses u8 subtraction so "screen X" of a
-        // world entity is just (world_x - camera_x).
+        // ── Compute screen positions of world entities ──────
         var e1_sx: u8 = ENEMY1_WORLD_X - camera_x
         var e2_sx: u8 = ENEMY2_WORLD_X - camera_x
         var c1_sx: u8 = COIN1_WORLD_X - camera_x
         var c2_sx: u8 = COIN2_WORLD_X - camera_x
 
+        // ── Proximity autopilot ─────────────────────────────
+        // Pre-jump when an enemy is 19 px ahead. The fall phase of
+        // a JUMP_RISE=12, GRAVITY_CAP=4 jump lands the player's
+        // feet at enemy head height ~20 frames later, by which
+        // point the autopilot camera has scrolled the enemy under
+        // the player. Limited to AUTOPILOT_JUMPS hops per life so
+        // the third enemy encounter becomes a scripted death,
+        // giving the golden harness a visible game-over sequence.
+        if auto_jumps < AUTOPILOT_JUMPS {
+            if on_ground == 1 {
+                if e1_sx == 99 {
+                    try_jump()
+                    auto_jumps += 1
+                }
+                if e2_sx == 99 {
+                    try_jump()
+                    auto_jumps += 1
+                }
+            }
+        }
+
+        // ── Physics ──────────────────────────────────────────
+        step_physics()
+
+        // ── Coin pickups ─────────────────────────────────────
         // Coin collect: player occupies [80..96). A coin is "hit"
         // when its screen X is in [72..96) (8-px tolerance on each
         // side of the player's left edge).
@@ -529,24 +600,17 @@ state Playing {
             }
         }
 
-        // Enemy stomp: if we're above an enemy horizontally *and*
-        // we're mid-fall (fall_vy > 0), count the stomp and
-        // bounce. Otherwise just ignore — the enemy slides past.
-        if e1_sx >= 72 and e1_sx < 96 {
-            if fall_vy > 0 {
-                if player_y + 16 >= ENEMY_Y {
-                    play hit
-                    rise_count = 6
-                    fall_vy = 0
-                }
-            }
-        }
+        // ── Enemy collisions ────────────────────────────────
+        // Both enemies get the full stomp-or-die check; the helper
+        // mutates player state directly. If `alive` flips to 0
+        // we fall through the rest of the frame (drawing is
+        // guarded below) and transition to GameOver at the end.
+        resolve_enemy_hit(e1_sx)
+        resolve_enemy_hit(e2_sx)
 
         // ── Drawing ──────────────────────────────────────────
-        draw_player()
-
-        // Enemies — walking on the grass line. anim_tick drives
-        // a small vertical bob so they visibly move on the golden.
+        // Enemies and coins are always drawn so the scene stays
+        // coherent even on the fatal-contact frame.
         var ey: u8 = ENEMY_Y
         if (anim_tick & 16) != 0 {
             ey = ENEMY_Y - 2
@@ -554,9 +618,6 @@ state Playing {
         draw Tileset at: (e1_sx, ey)       frame: TILE_ENEMY
         draw Tileset at: (e2_sx, ENEMY_Y)  frame: TILE_ENEMY
 
-        // Coins — alternate two vertical positions to fake a
-        // spin via position change (OAM attr flip isn't wired up
-        // in the current runtime).
         var cy: u8 = COIN_Y
         if (anim_tick & 8) != 0 {
             cy = COIN_Y - 1
@@ -564,11 +625,85 @@ state Playing {
         draw Tileset at: (c1_sx, cy)       frame: TILE_COIN
         draw Tileset at: (c2_sx, COIN_Y)   frame: TILE_COIN
 
+        // Live HUD: draw one coin per stomp in the top-left. The
+        // background palette-1 region covers this strip so the
+        // sprite coins read correctly against the brick band.
+        if stomp_count >= 1 {
+            draw Tileset at: (16, 24) frame: TILE_COIN
+        }
+        if stomp_count >= 2 {
+            draw Tileset at: (28, 24) frame: TILE_COIN
+        }
+        if stomp_count >= 3 {
+            draw Tileset at: (40, 24) frame: TILE_COIN
+        }
+        if stomp_count >= 4 {
+            draw Tileset at: (52, 24) frame: TILE_COIN
+        }
+
+        // Player is only drawn while alive — on the dying frame
+        // we show the scene without the hero on top of the enemy
+        // that killed them, which reads as "player got got".
+        if alive == 1 {
+            draw_player()
+        }
+
         // ── PPU scroll latch ─────────────────────────────────
         // Write the scroll at the very end of the frame so it's
         // the last $2005 pair before the implicit wait_frame /
         // NMI handshake, minimizing mid-frame artifacts.
         scroll(camera_x, 0)
+
+        // Fatal contact this frame → kick the state machine over
+        // to GameOver on the next frame.
+        if alive == 0 {
+            transition GameOver
+        }
+    }
+}
+
+state GameOver {
+    var linger: u8 = 0
+
+    on enter {
+        linger = 0
+        stop_music
+    }
+
+    on frame {
+        linger += 1
+
+        // "GAME OVER" marker: a row of enemy tiles across the
+        // middle of the screen, plus a live readout of how many
+        // stomps the player racked up before dying (drawn as
+        // coins right underneath). The death-screen backdrop is
+        // whatever Playing last scrolled to — we don't clear it.
+        draw Tileset at: (96,  112) frame: TILE_ENEMY
+        draw Tileset at: (112, 112) frame: TILE_ENEMY
+        draw Tileset at: (128, 112) frame: TILE_ENEMY
+        draw Tileset at: (144, 112) frame: TILE_ENEMY
+
+        if stomp_count >= 1 {
+            draw Tileset at: (96,  128) frame: TILE_COIN
+        }
+        if stomp_count >= 2 {
+            draw Tileset at: (112, 128) frame: TILE_COIN
+        }
+        if stomp_count >= 3 {
+            draw Tileset at: (128, 128) frame: TILE_COIN
+        }
+        if stomp_count >= 4 {
+            draw Tileset at: (144, 128) frame: TILE_COIN
+        }
+
+        // Auto-retry after ~1 s so the headless harness sees the
+        // full loop. A human can hit Start to retry immediately.
+        if linger >= 60 {
+            transition Playing
+        }
+        if button.start {
+            transition Playing
+        }
     }
 }
 

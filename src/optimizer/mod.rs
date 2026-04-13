@@ -218,13 +218,22 @@ fn strength_reduce_block(block: &mut IrBasicBlock) {
 /// destination temps are no longer referenced anywhere in the block.
 fn const_fold(program: &mut IrProgram) {
     for func in &mut program.functions {
+        // Pre-compute function-wide source-operand usage: a LoadImm's
+        // destination may be read by an op in a sibling block or
+        // consumed by a branch/jump terminator in another block, so
+        // the per-block DCE below can't decide liveness by looking
+        // at its own block alone. Cf. the `and` / `or` short-circuit
+        // lowering: the false path writes `LoadImm(result, 0)` but
+        // `result` is read by the merge block's branch, not in the
+        // false block itself.
+        let func_used = collect_used_temps(func);
         for block in &mut func.blocks {
-            const_fold_block(block);
+            const_fold_block(block, &func_used);
         }
     }
 }
 
-fn const_fold_block(block: &mut IrBasicBlock) {
+fn const_fold_block(block: &mut IrBasicBlock, func_used: &HashSet<IrTemp>) {
     let mut constants: HashMap<IrTemp, u8> = HashMap::new();
 
     // First pass: fold arithmetic / comparison ops into LoadImm where possible.
@@ -349,12 +358,21 @@ fn const_fold_block(block: &mut IrBasicBlock) {
         }
     }
 
-    // Second pass: remove LoadImm ops whose dest temps are no longer referenced
-    // as source operands by anything else in the block (ops + terminator).
-    let used = collect_used_temps_in_block(block);
+    // Second pass: remove LoadImm ops whose dest temps are no longer
+    // referenced locally AND aren't referenced function-wide. The
+    // function-wide check is what makes this pass correct in the
+    // presence of control-flow merges — a LoadImm written in one
+    // block and consumed in another (for example the `and`/`or`
+    // short-circuit false path, whose `LoadImm(result, 0)` is only
+    // read by the downstream merge block's branch terminator) must
+    // not be dropped. The previous implementation only consulted
+    // block-local usage and silently dropped these cross-block
+    // LoadImms, leaving the zero-page result slot to carry whatever
+    // value the *previous* AND/OR had written into it.
+    let used_local = collect_used_temps_in_block(block);
     block.ops.retain(|op| {
         if let IrOp::LoadImm(t, _) = op {
-            used.contains(t)
+            used_local.contains(t) || func_used.contains(t)
         } else {
             true
         }
@@ -397,7 +415,10 @@ fn collect_used_temps(func: &IrFunction) -> HashSet<IrTemp> {
     used
 }
 
-/// Collect temps used as source operands within a single block (ops + terminator).
+/// Collect temps used as source operands within a single block
+/// (ops + terminator). Used by the per-block `LoadImm` DCE so we
+/// can cheaply find local uses before falling back on the
+/// function-wide liveness set.
 fn collect_used_temps_in_block(block: &IrBasicBlock) -> HashSet<IrTemp> {
     let mut used = HashSet::new();
     collect_used_from_block(block, &mut used);

@@ -436,3 +436,85 @@ fn inline_removes_trivial() {
         .any(|op| matches!(op, IrOp::Call(..)));
     assert!(!has_call, "call to trivial function should be removed");
 }
+
+// ---------------------------------------------------------------------------
+// Cross-block LoadImm liveness (regression for stale-and-result bug)
+// ---------------------------------------------------------------------------
+
+/// A `LoadImm(result, 0)` in a predecessor block whose only consumer
+/// is a branch terminator in a *successor* block must not be dropped
+/// by the const-folding pass. This is the shape the logical-`and`
+/// short-circuit false path lowers to, and dropping the `LoadImm`
+/// leaves the zero-page slot holding whichever value the previous
+/// `and` evaluation wrote — which was observable in the platformer
+/// example as spurious enemy-stomp bounces firing whenever coin 2
+/// happened to be in its pickup window.
+#[test]
+fn const_fold_preserves_loadimm_used_by_sibling_branch() {
+    let cond = IrTemp(0);
+    let result = IrTemp(1);
+    let zero = IrTemp(2);
+
+    // Shape mirrors `lower_logical_and`: an entry block that branches
+    // on `cond`, a right-side block that writes `result` via an
+    // `Or(result, <true-case>, zero)`, a false-side block that only
+    // writes `LoadImm(result, 0)`, and a merge block whose terminator
+    // reads `result`.
+    let entry = IrBasicBlock {
+        label: "entry".to_string(),
+        ops: vec![IrOp::LoadImm(cond, 1)],
+        terminator: IrTerminator::Branch(cond, "right".to_string(), "false_path".to_string()),
+    };
+    let right = IrBasicBlock {
+        label: "right".to_string(),
+        ops: vec![IrOp::LoadImm(zero, 0), IrOp::Or(result, cond, zero)],
+        terminator: IrTerminator::Jump("end".to_string()),
+    };
+    // This is the block that previously tripped the bug: its
+    // `LoadImm(result, 0)` is the only op, and `result` is not used
+    // as a source operand anywhere *within* this block — but it is
+    // read by the `end` block's branch terminator.
+    let false_path = IrBasicBlock {
+        label: "false_path".to_string(),
+        ops: vec![IrOp::LoadImm(result, 0)],
+        terminator: IrTerminator::Jump("end".to_string()),
+    };
+    let end = IrBasicBlock {
+        label: "end".to_string(),
+        ops: vec![],
+        terminator: IrTerminator::Return(Some(result)),
+    };
+
+    let mut prog = IrProgram {
+        functions: vec![IrFunction {
+            name: "and_like".to_string(),
+            blocks: vec![entry, right, false_path, end],
+            locals: vec![],
+            param_count: 0,
+            has_return: true,
+            source_span: Span::new(0, 0, 0),
+        }],
+        globals: vec![],
+        rom_data: vec![],
+        states: vec![],
+        start_state: String::new(),
+    };
+
+    optimize(&mut prog);
+
+    // Find the false_path block post-optimization and verify that
+    // its LoadImm(result, 0) is still there.
+    let func = &prog.functions[0];
+    let fp = func
+        .blocks
+        .iter()
+        .find(|b| b.label == "false_path")
+        .expect("false_path block should survive as reachable");
+    assert!(
+        fp.ops
+            .iter()
+            .any(|op| matches!(op, IrOp::LoadImm(t, 0) if *t == result)),
+        "false-path LoadImm(result, 0) must survive optimization; block ops were {:?}",
+        fp.ops
+    );
+}

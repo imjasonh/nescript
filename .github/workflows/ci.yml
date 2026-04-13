@@ -146,6 +146,21 @@ jobs:
       - name: Diff each ROM's framebuffer against its golden
         working-directory: tests/emulator
         run: node run_examples.mjs
+      - name: Verify docs/platformer.gif is up to date
+        # The README embeds docs/platformer.gif as the project demo.
+        # gifenc + jsnes are deterministic, so rebuilding the gif from
+        # the current compiler should byte-match the committed copy.
+        # If it doesn't, the contributor changed the compiler / source
+        # / harness in a way that affects the observable gameplay of
+        # platformer.ne but forgot to regenerate the gif — the fix is
+        # the exact command printed in the error.
+        working-directory: tests/emulator
+        run: |
+          node record_gif.mjs platformer 360 2 /tmp/platformer.gif
+          if ! cmp -s ../../docs/platformer.gif /tmp/platformer.gif; then
+            echo "::error file=docs/platformer.gif::committed docs/platformer.gif is stale; rerun \`node tests/emulator/record_gif.mjs platformer 360 2 docs/platformer.gif\` and commit the new gif"
+            exit 1
+          fi
       - name: Upload actual + diff PNGs on failure
         if: failure()
         uses: actions/upload-artifact@v4

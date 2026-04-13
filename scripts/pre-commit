@@ -39,4 +39,26 @@ if [ $stale -ne 0 ]; then
     exit 1
 fi
 
+# Only rebuild docs/platformer.gif when platformer.nes or the gif
+# recorder itself changed — the gif regeneration takes ~20s due to
+# puppeteer's cold start, so we don't want to pay it on every commit.
+# Skipped entirely if node_modules isn't installed in the emulator
+# harness; the CI `emulator` job is the authoritative check.
+changed_files=$(git diff --cached --name-only)
+if echo "$changed_files" | grep -qE '^(examples/platformer\.(ne|nes)|tests/emulator/record_gif\.mjs|tests/emulator/harness\.html)$'; then
+    if [ -d tests/emulator/node_modules ]; then
+        echo "  Rebuilding docs/platformer.gif (platformer.nes or recorder changed)..."
+        (cd tests/emulator && node record_gif.mjs platformer 360 2 /tmp/platformer-precheck.gif >/dev/null)
+        if ! cmp -s docs/platformer.gif /tmp/platformer-precheck.gif; then
+            echo "    STALE: docs/platformer.gif"
+            echo "           rerun: node tests/emulator/record_gif.mjs platformer 360 2 docs/platformer.gif"
+            rm -f /tmp/platformer-precheck.gif
+            exit 1
+        fi
+        rm -f /tmp/platformer-precheck.gif
+    else
+        echo "  (skipping gif freshness check — tests/emulator/node_modules not installed)"
+    fi
+fi
+
 echo "All pre-commit checks passed."
