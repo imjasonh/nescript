@@ -868,3 +868,103 @@ fn analyze_undefined_variable_emits_e0502() {
         diag.help
     );
 }
+
+// ── Audio name validation ──
+
+#[test]
+fn analyze_accepts_builtin_sfx() {
+    // `play coin` is always valid because `coin` is a builtin
+    // even without a user `sfx Coin { ... }` declaration.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        on frame { play coin }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_accepts_user_declared_sfx() {
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        sfx Chime {
+            pitch: [0x20, 0x22, 0x24, 0x26]
+            volume: [15, 12, 8, 4]
+        }
+        on frame { play Chime }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_rejects_unknown_sfx_name() {
+    // `play Nonexistent` with no matching user decl or builtin
+    // should emit E0505.
+    let codes = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        on frame { play Nonexistent }
+        start Main
+    "#,
+    );
+    assert!(
+        codes.contains(&ErrorCode::E0505),
+        "expected E0505 for unknown sfx, got {codes:?}"
+    );
+}
+
+#[test]
+fn analyze_accepts_builtin_music() {
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        on frame { start_music theme }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_accepts_user_declared_music() {
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        music Boss {
+            notes: [37, 8, 41, 8, 44, 8, 49, 8]
+        }
+        on frame { start_music Boss }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_rejects_unknown_music_name() {
+    let codes = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        on frame { start_music Nonexistent }
+        start Main
+    "#,
+    );
+    assert!(
+        codes.contains(&ErrorCode::E0505),
+        "expected E0505 for unknown music, got {codes:?}"
+    );
+}
+
+#[test]
+fn analyze_stop_music_needs_no_name_and_is_always_valid() {
+    // `stop_music` takes no argument, so there's nothing to
+    // validate — it should always analyze cleanly.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        on frame { stop_music }
+        start Main
+    "#,
+    );
+}

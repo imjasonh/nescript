@@ -33,13 +33,17 @@ fn compile(source: &str) -> Vec<u8> {
 
     let sprites = assets::resolve_sprites(&program, Path::new("."))
         .expect("sprite resolution should succeed");
+    let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
+    let music = assets::resolve_music(&program).expect("music resolution should succeed");
 
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program).with_sprites(&sprites);
+    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
     let mut instructions = codegen.generate(&ir_program);
     nescript::codegen::peephole::optimize(&mut instructions);
 
     let linker = Linker::new(program.game.mirroring);
-    linker.link_with_assets(&instructions, &sprites)
+    linker.link_with_all_assets(&instructions, &sprites, &sfx, &music)
 }
 
 // ── M1 Tests ──
@@ -608,10 +612,10 @@ fn program_with_u16_arithmetic_and_compare() {
 
 #[test]
 fn program_with_audio_driver() {
-    // Exercises the minimal audio driver: play, start_music,
-    // stop_music all lowering into APU register writes plus the
-    // NMI audio tick splice. The linker must include the driver
-    // body and wire up the JSR from NMI.
+    // Exercises the audio driver end-to-end with builtin sfx/music
+    // names: play, start_music, stop_music all lower into the
+    // data-driven driver, the linker splices the tick/period-table/
+    // data blobs, and the resulting ROM is valid iNES.
     let source = r#"
         game "Audio" { mapper: NROM }
         on frame {
@@ -623,6 +627,175 @@ fn program_with_audio_driver() {
     "#;
     let rom_data = compile(source);
     rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_user_declared_sfx_and_music() {
+    // Full user-declared audio pipeline: `sfx` and `music` blocks,
+    // references via `play`/`start_music`, full ROM emission. The
+    // resolved envelope and note-stream bytes should land in PRG
+    // under stable labels so the IR codegen's SymbolLo/SymbolHi
+    // references resolve.
+    let source = r#"
+        game "Audio Assets" { mapper: NROM }
+
+        sfx Zap {
+            duty: 2
+            pitch: [0x20, 0x22, 0x24, 0x26, 0x28, 0x2A]
+            volume: [15, 13, 11, 9, 6, 3]
+        }
+
+        music Loop {
+            duty: 2
+            volume: 10
+            repeat: true
+            notes: [37, 8, 41, 8, 44, 8, 49, 8]
+        }
+
+        var t: u8 = 0
+
+        on frame {
+            t += 1
+            if t == 30 { play Zap }
+            if t == 60 {
+                t = 0
+                start_music Loop
+            }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    let info = rom::validate_ines(&rom_data).expect("should be valid iNES");
+    assert_eq!(info.mapper, 0);
+
+    // Verify the user-declared envelope appears in PRG. The
+    // resolver encodes `Zap` as
+    //     duty << 6 | 0x30 | volume
+    // per frame, terminated by a zero sentinel.
+    let prg = &rom_data[16..16 + 16384];
+    let env = |v: u8| (2u8 << 6) | 0x30u8 | v;
+    let zap_env: [u8; 7] = [env(15), env(13), env(11), env(9), env(6), env(3), 0x00];
+    assert!(
+        prg.windows(zap_env.len()).any(|w| w == zap_env),
+        "Zap envelope bytes should be in PRG ROM"
+    );
+
+    // Verify the music stream is in PRG: (37, 8, 41, 8, 44, 8, 49, 8, 0xFF, 0xFF)
+    let loop_stream: [u8; 10] = [37, 8, 41, 8, 44, 8, 49, 8, 0xFF, 0xFF];
+    assert!(
+        prg.windows(loop_stream.len()).any(|w| w == loop_stream),
+        "Loop music note stream should be in PRG ROM"
+    );
+}
+
+#[test]
+fn program_without_audio_has_no_audio_driver_in_prg() {
+    // Programs that never touch audio should pay zero ROM cost:
+    // no period table, no driver body, no data blobs. We verify
+    // indirectly by checking that the `__audio_tick` entry point
+    // wouldn't have anything to JSR to (because the NMI splice
+    // is gated on the `__audio_used` marker which never exists).
+    //
+    // The cheapest observable signal: a period-table fingerprint.
+    // The period table always starts with a distinct 2-byte
+    // sequence that appears at C1's period; if we don't see it in
+    // PRG, the audio subsystem wasn't linked in.
+    let source = r#"
+        game "Silent" { mapper: NROM }
+        var x: u8 = 0
+        on frame { x += 1 }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    // Pull the period table for C1 and make sure it's NOT in PRG.
+    // C1 ≈ 32.7 Hz → period ≈ 3421 → but that's too big for 11
+    // bits, so it clamps. Instead, use the distinctive combined
+    // LDA #imm / LDA #imm pattern from the audio tick itself that
+    // would only appear if the driver body was linked in.
+    //
+    // A robust fingerprint: the `JSR __audio_tick` opcode byte
+    // ($20) followed by any 2 bytes only appears in the NMI
+    // handler when audio was used. We test the absence of the
+    // label instead via an indirect method: count the total
+    // number of STA $4004 writes (pulse-2 register). When audio
+    // is unused, there should be none. When audio is used, there
+    // would be several in the driver.
+    let prg = &rom_data[16..16 + 16384];
+    // `STA $4006` ($8D $06 $40) is written exclusively by the
+    // music tick's period-lookup path. The init code pre-silences
+    // $4004 but never touches $4006, so its presence is a reliable
+    // "the audio driver was linked in" signal.
+    let pattern: [u8; 3] = [0x8D, 0x06, 0x40];
+    let count = prg.windows(pattern.len()).filter(|w| *w == pattern).count();
+    assert_eq!(
+        count, 0,
+        "silent program should not contain the music tick's $4006 write"
+    );
+}
+
+#[test]
+fn unknown_sfx_name_is_a_hard_error() {
+    // The analyzer must reject `play NoSuchSfx` (neither a user
+    // decl nor a builtin) with E0505. Regression test for the
+    // old behavior, which silently accepted any name.
+    let source = r#"
+        game "T" { mapper: NROM }
+        on frame { play NoSuchSfx }
+        start Main
+    "#;
+    let (program, _) = nescript::parser::parse(source);
+    let analysis = analyzer::analyze(&program.unwrap());
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(nescript::errors::Diagnostic::is_error),
+        "unknown sfx should produce an error"
+    );
+}
+
+#[test]
+fn audio_pipeline_drops_period_table_cost_when_unused() {
+    // Regression test for the "no-cost elision" invariant: a
+    // program with no audio statements should produce a ROM
+    // smaller than one that uses audio. The exact byte count
+    // varies with codegen changes, so we test the *ordering* of
+    // sizes: a silent program < an audio program.
+    let silent = compile(
+        r#"
+        game "Silent" { mapper: NROM }
+        var x: u8 = 0
+        on frame { x += 1 }
+        start Main
+    "#,
+    );
+    // Both ROMs are the same file size (16 header + 16 KB PRG + 8
+    // KB CHR = 24592), but the silent program's PRG fills with
+    // $FF padding past the code; an audio program's PRG has the
+    // driver and tables eating into that padding space. So we
+    // count $FF bytes in PRG: the silent version must have more.
+    let audio = compile(
+        r#"
+        game "Audio" { mapper: NROM }
+        on frame { play coin }
+        start Main
+    "#,
+    );
+    let silent_prg = &silent[16..16 + 16384];
+    let audio_prg = &audio[16..16 + 16384];
+    // Count padding bytes ($FF = PRG fill) in each ROM. Using a
+    // raw filter().count() is clippy-noisy ("naive_bytecount"),
+    // but pulling in the `bytecount` crate for a one-line test
+    // helper isn't worth it — the test runs once per build.
+    #[allow(clippy::naive_bytecount)]
+    let silent_ff = silent_prg.iter().filter(|&&b| b == 0xFF).count();
+    #[allow(clippy::naive_bytecount)]
+    let audio_ff = audio_prg.iter().filter(|&&b| b == 0xFF).count();
+    assert!(
+        silent_ff > audio_ff,
+        "silent program should have more $FF padding than an audio program \
+         (silent={silent_ff}, audio={audio_ff})"
+    );
 }
 
 // ── M3 Tests ──
@@ -689,13 +862,17 @@ fn compile_with_mapper(source: &str) -> Vec<u8> {
 
     let sprites = assets::resolve_sprites(&program, Path::new("."))
         .expect("sprite resolution should succeed");
+    let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
+    let music = assets::resolve_music(&program).expect("music resolution should succeed");
 
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program).with_sprites(&sprites);
+    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
     let mut instructions = codegen.generate(&ir_program);
     nescript::codegen::peephole::optimize(&mut instructions);
 
     let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
-    linker.link_with_assets(&instructions, &sprites)
+    linker.link_with_all_assets(&instructions, &sprites, &sfx, &music)
 }
 
 #[test]

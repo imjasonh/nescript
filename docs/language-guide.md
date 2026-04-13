@@ -715,6 +715,107 @@ Three ways to provide asset data:
 
 ---
 
+## Audio
+
+NEScript ships with a full data-driven audio subsystem. Sound effects run on pulse channel 1 and music runs on pulse channel 2, both driven by an NMI-time tick that walks per-track data tables compiled into PRG ROM. Programs that never touch audio pay zero ROM or cycle cost — the driver and its period table are only linked in when user code contains at least one `play`, `start_music`, or `stop_music` statement.
+
+### Statements
+
+```
+play SfxName          // trigger a one-shot sound effect
+start_music TrackName // begin looping background music
+stop_music            // silence the music channel
+```
+
+Each statement looks up the name in the program's user declarations first, then falls back to the builtin table. Unknown names are a hard error (E0505).
+
+### SFX Declarations
+
+An `sfx` block is a frame-accurate envelope for pulse 1. `pitch` latches the pulse period on trigger; `volume` runs one entry per frame, so the envelope length controls the effect duration.
+
+```
+sfx Pickup {
+    duty: 2                                   // 0-3, 2 = 50% square (default)
+    pitch: [0x50, 0x50, 0x50, 0x50, 0x50]     // period for each frame
+    volume: [15, 12, 9, 6, 3]                  // 0-15, one per frame
+}
+```
+
+Rules:
+- `pitch` and `volume` must have the same length (the frame count).
+- `volume` values are 0-15 (4-bit pulse volume).
+- `duty` is 0-3 and defaults to 2.
+- Maximum 120 frames (2 seconds at 60 fps).
+
+### Music Declarations
+
+A `music` block is a flat list of `(pitch, duration)` note pairs played on pulse 2. Pitch 0 is a rest; pitches 1-60 are indices into the builtin 60-note period table (C1 through B5, with middle C at index 37). Duration is in frames (so at 60 fps, `30` is half a second).
+
+```
+music Theme {
+    duty: 2                                   // 0-3 (default 2)
+    volume: 10                                // 0-15 (default 10)
+    repeat: true                              // loop when track ends (default true)
+    notes: [
+        37, 20,    // C4 for 20 frames
+        41, 20,    // E4
+        44, 20,    // G4
+        49, 20,    // C5
+        0, 10,     // rest for 10 frames
+    ]
+}
+```
+
+Rules:
+- `notes` must contain an even number of bytes (pitch + duration pairs).
+- Pitches are 0 (rest) or 1-60 (period table index).
+- Duration must be ≥ 1 frame.
+- Maximum 256 notes per track.
+
+### Builtin Names
+
+For programs that want classic game audio without writing data tables, NEScript provides a handful of builtin effects and tracks that can be used directly:
+
+**Builtin SFX**
+
+| Name | Description |
+|------|-------------|
+| `coin`, `pickup`, `collect` | Ascending high blip |
+| `jump`, `hop` | Descending arc |
+| `hit`, `damage`, `explode` | Low blast |
+| `click`, `select`, `confirm` | Sharp beep |
+| `cancel`, `back`, `error` | Low longer tone |
+| `shoot`, `laser`, `fire` | Very high pulse |
+| `step`, `footstep` | Short low thud |
+
+**Builtin Music**
+
+| Name | Description |
+|------|-------------|
+| `title`, `theme`, `main` | Major arpeggio (looping) |
+| `battle`, `boss` | Driving pulse (looping) |
+| `win`, `victory`, `fanfare` | Ascending burst (one-shot) |
+| `gameover`, `lose`, `fail` | Descending dirge (looping) |
+
+A user-declared `sfx` or `music` block takes priority over a builtin with the same name, so `sfx coin { ... }` will shadow the default coin effect.
+
+### How It Works
+
+Compile time:
+
+1. The resolver compiles each `sfx` into `(period_lo, period_hi, envelope[])` and each `music` into `(header, (pitch, duration)[])`, appending builtins for any referenced name that isn't user-declared.
+2. The IR codegen emits `play Name` as: write trigger bytes to `$4002`/`$4003`, load envelope pointer into `$0C/$0D`, set the sfx counter. `start_music Name` stamps a state byte into `$07`, loads the stream pointer into `$0E/$0F` (and the loop base into `$05/$06`), and primes the duration counter.
+3. The linker splices the audio tick, the 60-entry period table, and every compiled sfx/music blob into PRG ROM, all guarded on a `__audio_used` marker label so silent programs never pay the cost.
+
+Runtime (every NMI, if audio is in use):
+
+1. **SFX**: if the counter is nonzero, read one envelope byte through `(ZP_SFX_PTR),Y` and write it to `$4000`. A zero sentinel mutes pulse 1 and stops the tick.
+2. **Music**: if active and the note counter hits zero, read the next pitch byte. 0 = rest (mute pulse 2). 1-60 = look up the period in the table and write to `$4006`/`$4007`. `0xFF` = loop back to the base pointer (or mute if `repeat: false`). Then read the duration byte and reload the counter.
+
+Total memory cost: 8 bytes of zero page, ~200 bytes for the driver body, 120 bytes for the period table, plus the data for each user-declared sfx/music.
+
+---
+
 ## Mappers
 
 The mapper determines cartridge hardware and available ROM size.

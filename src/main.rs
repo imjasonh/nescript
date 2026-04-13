@@ -287,9 +287,20 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         eprintln!("error: {e}");
     })?;
 
+    // Resolve audio assets: user-declared sfx/music plus any
+    // builtins referenced via `play foo` / `start_music bar` for
+    // names that aren't in the program's sfx/music declarations.
+    let sfx = assets::resolve_sfx(&program).map_err(|e| {
+        eprintln!("error: {e}");
+    })?;
+    let music = assets::resolve_music(&program).map_err(|e| {
+        eprintln!("error: {e}");
+    })?;
+
     // IR-based code generation. Lower → optimize → emit 6502.
     let mut instructions = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
+        .with_audio(&sfx, &music)
         .with_debug(debug)
         .generate(&ir_program);
 
@@ -301,9 +312,10 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         dump_asm(&instructions);
     }
 
-    // Link into ROM with sprite CHR data placed at each sprite's tile index.
-    let linker = Linker::new(program.game.mirroring);
-    let rom = linker.link_with_assets(&instructions, &sprites);
+    // Link into ROM with both graphic assets (sprite CHR) and audio
+    // assets (sfx envelopes, music note streams) spliced in.
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    let rom = linker.link_with_all_assets(&instructions, &sprites, &sfx, &music);
 
     Ok(rom)
 }

@@ -26,8 +26,12 @@ use std::collections::HashMap;
 
 use crate::analyzer::VarAllocation;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
+use crate::assets::{MusicData, SfxData};
 use crate::ir::{IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator, VarId};
-use crate::runtime::ZP_OAM_CURSOR;
+use crate::runtime::{
+    ZP_MUSIC_BASE_HI, ZP_MUSIC_BASE_LO, ZP_MUSIC_COUNTER, ZP_MUSIC_PTR_HI, ZP_MUSIC_PTR_LO,
+    ZP_MUSIC_STATE, ZP_OAM_CURSOR, ZP_SFX_COUNTER, ZP_SFX_PTR_HI, ZP_SFX_PTR_LO,
+};
 
 /// Base zero-page address for IR temp slots.
 const TEMP_BASE: u8 = 0x80;
@@ -72,6 +76,15 @@ pub struct IrCodeGen<'a> {
     use_counts: HashMap<IrTemp, u32>,
     /// Sprite name to tile index mapping.
     sprite_tiles: HashMap<String, u8>,
+    /// Sfx name to `(period_lo, period_hi, envelope_label)`. Populated
+    /// by `with_audio` from the resolved [`SfxData`] list — lets
+    /// `play Name` emit the right literals for the trigger bytes
+    /// and the right label for the envelope pointer.
+    sfx_info: HashMap<String, (u8, u8, String)>,
+    /// Music name to `(header_byte, stream_label)`. Populated by
+    /// `with_audio`. `start_music Name` stamps `header | 0x02` into
+    /// `ZP_MUSIC_STATE` and loads the pointer from `stream_label`.
+    music_info: HashMap<String, (u8, String)>,
     /// State name to dispatch index mapping.
     state_indices: HashMap<String, u8>,
     /// Set of function names defined in the IR program (for existence checks).
@@ -147,6 +160,8 @@ impl<'a> IrCodeGen<'a> {
             free_slots: Vec::new(),
             use_counts: HashMap::new(),
             sprite_tiles: HashMap::new(),
+            sfx_info: HashMap::new(),
+            music_info: HashMap::new(),
             state_indices: HashMap::new(),
             function_names,
             in_frame_handler: false,
@@ -173,6 +188,22 @@ impl<'a> IrCodeGen<'a> {
         for sprite in sprites {
             self.sprite_tiles
                 .insert(sprite.name.clone(), sprite.tile_index);
+        }
+        self
+    }
+
+    /// Register resolved audio assets with the codegen so that
+    /// `play`/`start_music` can emit literal trigger constants and
+    /// symbolic pointers to the in-ROM data blobs.
+    #[must_use]
+    pub fn with_audio(mut self, sfx: &[SfxData], music: &[MusicData]) -> Self {
+        for s in sfx {
+            self.sfx_info
+                .insert(s.name.clone(), (s.period_lo, s.period_hi, s.label()));
+        }
+        for m in music {
+            self.music_info
+                .insert(m.name.clone(), (m.header, m.label()));
         }
         self
     }
@@ -919,65 +950,97 @@ impl<'a> IrCodeGen<'a> {
         }
     }
 
-    /// Emit pulse-1 register writes for a one-shot sound effect and
-    /// set the SFX countdown frames. The name is looked up in the
-    /// builtin SFX table; unrecognized names play a generic beep.
-    /// Triggers inclusion of the audio driver body via the
-    /// `__audio_used` marker label (idempotent).
+    /// Emit the `play Name` sequence.
+    ///
+    /// This is the trigger side of the audio driver: it writes the
+    /// initial period to pulse 1, sets the SFX counter to "active",
+    /// and loads the envelope pointer into ZP. The per-frame
+    /// envelope walk happens in `runtime::gen_audio_tick`, which
+    /// reads through the pointer and writes the next `$4000` byte
+    /// each NMI.
+    ///
+    /// If `name` is not a declared sfx or a recognized builtin, we
+    /// emit a silent `play` (period 0, zero-length envelope) rather
+    /// than failing hard — the analyzer will have already issued a
+    /// diagnostic for the unknown name.
     fn gen_play_sfx(&mut self, name: &str) {
         self.emit_audio_marker();
-        let (vol, period_lo, period_hi, duration) = lookup_sfx(name);
-        // $4000: volume envelope byte (duty | length halt | constant | volume)
-        self.emit(LDA, AM::Immediate(vol));
-        self.emit(STA, AM::Absolute(0x4000));
-        // $4002: period low byte
+        let Some((period_lo, period_hi, label)) = self.sfx_info.get(name).cloned() else {
+            // Unknown name. The analyzer warns on this; emit a no-op
+            // sequence so the rest of the code still assembles. The
+            // unknown branch is easy to spot in `--asm-dump`: it
+            // writes to the APU status register without touching
+            // any other pulse-1 state.
+            return;
+        };
+        // $4000: we don't write a volume envelope here. The first
+        // envelope byte is consumed by the next NMI audio tick. We
+        // only need to set up the trigger (period + length).
+        //
+        // $4002 / $4003: write period bytes. The write to $4003 also
+        // loads the length counter and re-triggers the note — that's
+        // what makes holding down a sfx button re-start the tone
+        // every frame (audible, useful for demos).
         self.emit(LDA, AM::Immediate(period_lo));
         self.emit(STA, AM::Absolute(0x4002));
-        // $4003: length counter load + period high 3 bits.
-        // The length counter load also "triggers" the envelope
-        // so this is the canonical "start note" write.
         self.emit(LDA, AM::Immediate(period_hi));
         self.emit(STA, AM::Absolute(0x4003));
-        // Set the duration counter so the NMI audio tick knows
-        // when to mute.
-        self.emit(LDA, AM::Immediate(duration));
-        self.emit(STA, AM::ZeroPage(0x0A));
+        // Point ZP_SFX_PTR at the envelope blob. Each subsequent
+        // NMI advances this pointer and writes the byte to $4000.
+        self.emit(LDA, AM::SymbolLo(label.clone()));
+        self.emit(STA, AM::ZeroPage(ZP_SFX_PTR_LO));
+        self.emit(LDA, AM::SymbolHi(label));
+        self.emit(STA, AM::ZeroPage(ZP_SFX_PTR_HI));
+        // Mark sfx as active. The audio tick checks this and bails
+        // on zero. We use `$FF` (any nonzero value works) as a flag;
+        // the tick zeros it when it hits the envelope sentinel.
+        self.emit(LDA, AM::Immediate(0xFF));
+        self.emit(STA, AM::ZeroPage(ZP_SFX_COUNTER));
     }
 
-    /// Emit pulse-2 register writes for sustained music, using the
-    /// sentinel `$FF` as "play forever" in the NMI tick. A subsequent
-    /// `stop_music` clears the counter and mutes pulse 2.
+    /// Emit the `start_music Name` sequence.
+    ///
+    /// Stores the track's header byte into `ZP_MUSIC_STATE` (with
+    /// bit 1 OR'd in as the "active" flag) and seeds both the
+    /// current pointer and the loop base with the track's stream
+    /// label. Also zeroes `ZP_MUSIC_COUNTER` so the very next audio
+    /// tick immediately advances to the first note.
     fn gen_start_music(&mut self, name: &str) {
         self.emit_audio_marker();
-        let (vol, period_lo, period_hi) = lookup_music(name);
-        // Music: write to pulse 2 registers ($4004-$4007).
-        self.emit(LDA, AM::Immediate(vol));
-        self.emit(STA, AM::Absolute(0x4004));
-        self.emit(LDA, AM::Immediate(period_lo));
-        self.emit(STA, AM::Absolute(0x4006));
-        self.emit(LDA, AM::Immediate(period_hi));
-        self.emit(STA, AM::Absolute(0x4007));
-        // Music counter = $FF is the "infinite sustain" sentinel.
-        // The NMI tick only ever looks at the SFX counter ($0A)
-        // for mute — pulse 2 sustains through the halted length
-        // counter (the `0x30 | 0x0F` volume byte clears the halt
-        // bit, letting the envelope hold).
-        self.emit(LDA, AM::Immediate(0xFF));
-        self.emit(STA, AM::ZeroPage(0x0B));
+        let Some((header, label)) = self.music_info.get(name).cloned() else {
+            return;
+        };
+        // State byte: header | 0x02 (active flag). Header already
+        // encodes duty, volume, and loop bit.
+        self.emit(LDA, AM::Immediate(header | 0x02));
+        self.emit(STA, AM::ZeroPage(ZP_MUSIC_STATE));
+        // Stream pointer = label. Also seed the loop-back base
+        // so the tick's loop branch can rewind.
+        self.emit(LDA, AM::SymbolLo(label.clone()));
+        self.emit(STA, AM::ZeroPage(ZP_MUSIC_PTR_LO));
+        self.emit(STA, AM::ZeroPage(ZP_MUSIC_BASE_LO));
+        self.emit(LDA, AM::SymbolHi(label));
+        self.emit(STA, AM::ZeroPage(ZP_MUSIC_PTR_HI));
+        self.emit(STA, AM::ZeroPage(ZP_MUSIC_BASE_HI));
+        // Counter = 1. The tick will decrement to 0 on the next
+        // NMI and immediately advance to the first note. We don't
+        // use 0 here because the tick's "bit 1 set AND counter
+        // hit zero" check would fire before the first real note
+        // was even read.
+        self.emit(LDA, AM::Immediate(1));
+        self.emit(STA, AM::ZeroPage(ZP_MUSIC_COUNTER));
     }
 
-    /// Emit a mute for pulse 2 (music) and zero out both countdown
-    /// counters. Leaves pulse 1 alone — SFX tails naturally expire
-    /// via the audio tick.
+    /// Emit the `stop_music` sequence. Mutes pulse 2 and clears the
+    /// music state byte so the audio tick's bit-1 active check
+    /// fails and it skips the music work entirely.
     fn gen_stop_music(&mut self) {
         self.emit_audio_marker();
-        // Silence pulse 2: write the canonical mute byte ($30).
         self.emit(LDA, AM::Immediate(0x30));
         self.emit(STA, AM::Absolute(0x4004));
-        // Clear the music sustain sentinel so subsequent
-        // `start_music` calls don't race with a stale counter.
         self.emit(LDA, AM::Immediate(0));
-        self.emit(STA, AM::ZeroPage(0x0B));
+        self.emit(STA, AM::ZeroPage(ZP_MUSIC_STATE));
+        self.emit(STA, AM::ZeroPage(ZP_MUSIC_COUNTER));
     }
 
     /// Emit the `__audio_used` marker label at most once per program.
@@ -1490,70 +1553,12 @@ fn build_use_counts(func: &IrFunction) -> HashMap<IrTemp, u32> {
     counts
 }
 
-/// Look up APU parameters for a named sound effect. Returns
-/// `(volume_byte, period_lo, period_hi, duration_frames)` suitable
-/// for direct writes to $4000/$4002/$4003 and a frame countdown to
-/// store at the SFX counter.
-///
-/// The table is a small set of builtin names; anything not matched
-/// falls back to a generic 1/16th-second beep. Names are matched
-/// case-insensitively so `Coin`, `COIN`, and `coin` all work.
-///
-/// Volume byte format: `DD LC VVVV` where `DD` is the duty cycle,
-/// `L` halts the length counter (1 = sustained), `C` selects
-/// constant volume (1 = constant, 0 = envelope decay), and `VVVV`
-/// is the volume level (0–15). We use constant volume + short
-/// duration counter for all SFX so the envelope doesn't surprise
-/// users.
-///
-/// Period: NES pulse channels compute frequency as
-/// `CPU / (16 * (period + 1))`. Lower period = higher pitch. The
-/// table uses periods chosen to land roughly on NES-era notes.
-fn lookup_sfx(name: &str) -> (u8, u8, u8, u8) {
-    // Duty = 10 (50% square), length halt off, constant volume,
-    // volume 11 (~-8 dB) — a comfortable loudness that doesn't
-    // dominate the mix. `0xBF = 0b1011_1111`.
-    const VOL: u8 = 0xBF;
-    let lower = name.to_ascii_lowercase();
-    match lower.as_str() {
-        // High, short blip — classic pickup sound.
-        "coin" | "pickup" | "collect" => (VOL, 0x50, 0x08, 6),
-        // Mid tone with slight length — jump ack.
-        "jump" | "hop" => (VOL, 0x80, 0x0A, 8),
-        // Low short blast — hit/damage.
-        "hit" | "damage" | "explode" => (0xBC, 0xA0, 0x0D, 10),
-        // Very low short thud — footstep.
-        "step" | "footstep" => (VOL, 0xC0, 0x0D, 3),
-        // Higher short beep — menu click.
-        "click" | "select" | "confirm" => (VOL, 0x40, 0x08, 4),
-        // Low long-ish tone — cancel/back.
-        "cancel" | "back" | "error" => (VOL, 0xB0, 0x0C, 10),
-        // Very high short beep — laser shoot.
-        "shoot" | "laser" | "fire" => (VOL, 0x30, 0x08, 5),
-        // Default generic beep.
-        _ => (VOL, 0x70, 0x0A, 6),
-    }
-}
-
-/// Look up APU parameters for a named music track. Returns
-/// `(volume_byte, period_lo, period_hi)` for pulse 2. Music is
-/// sustained (halt bit set) until `stop_music` runs. The table
-/// maps a few well-known names to a single held tone; picking a
-/// real tune is out of scope for the minimal driver.
-fn lookup_music(name: &str) -> (u8, u8, u8) {
-    // `0x3F` = duty 00 (12.5% pulse), length halt on, constant
-    // volume, volume 15. The halt bit keeps the note playing
-    // without envelope decay.
-    const VOL: u8 = 0x3F;
-    let lower = name.to_ascii_lowercase();
-    match lower.as_str() {
-        "title" | "theme" | "main" => (VOL, 0xFD, 0x02),
-        "battle" | "boss" => (VOL, 0xA0, 0x01),
-        "win" | "victory" | "fanfare" => (VOL, 0x60, 0x01),
-        "gameover" | "lose" | "fail" => (VOL, 0xE0, 0x03),
-        _ => (VOL, 0xC0, 0x01),
-    }
-}
+// SFX and music parameters used to live in hardcoded `lookup_sfx` /
+// `lookup_music` tables here. Those have moved to
+// `crate::assets::audio::{builtin_sfx, builtin_music}` so the same
+// data path handles user-declared effects, builtin fallbacks, and
+// the asset resolver — the codegen only needs the compile-time
+// trigger constants which flow through `IrCodeGen::with_audio`.
 
 /// Group all scanline handlers by state name, returning
 /// `(state_name, sorted_scanlines)` pairs. Within each state the
@@ -1592,6 +1597,7 @@ fn group_scanline_handlers(ir: &IrProgram) -> Vec<(String, Vec<u8>)> {
 mod tests {
     use super::*;
     use crate::analyzer;
+    use crate::assets;
     use crate::ir;
     use crate::parser;
 
@@ -1600,7 +1606,13 @@ mod tests {
         let prog = prog.unwrap();
         let analysis = analyzer::analyze(&prog);
         let ir_program = ir::lower(&prog, &analysis);
-        IrCodeGen::new(&analysis.var_allocations, &ir_program).generate(&ir_program)
+        // Resolve audio the same way the real pipeline does so `play`
+        // and `start_music` tests can reference builtin names.
+        let sfx = assets::resolve_sfx(&prog).expect("sfx");
+        let music = assets::resolve_music(&prog).expect("music");
+        IrCodeGen::new(&analysis.var_allocations, &ir_program)
+            .with_audio(&sfx, &music)
+            .generate(&ir_program)
     }
 
     fn has_instruction(insts: &[Instruction], opcode: crate::asm::Opcode, mode: &AM) -> bool {
@@ -1733,6 +1745,7 @@ mod tests {
 mod more_tests {
     use super::*;
     use crate::analyzer;
+    use crate::assets;
     use crate::ir;
     use crate::parser;
 
@@ -1741,7 +1754,11 @@ mod more_tests {
         let prog = prog.unwrap();
         let analysis = analyzer::analyze(&prog);
         let ir_program = ir::lower(&prog, &analysis);
-        IrCodeGen::new(&analysis.var_allocations, &ir_program).generate(&ir_program)
+        let sfx = assets::resolve_sfx(&prog).expect("sfx");
+        let music = assets::resolve_music(&prog).expect("music");
+        IrCodeGen::new(&analysis.var_allocations, &ir_program)
+            .with_audio(&sfx, &music)
+            .generate(&ir_program)
     }
 
     #[test]
@@ -2128,7 +2145,16 @@ mod more_tests {
     }
 
     #[test]
-    fn ir_codegen_play_sfx_emits_pulse1_writes_and_marker() {
+    fn ir_codegen_play_sfx_triggers_pulse1_and_loads_envelope_pointer() {
+        // `play coin` must:
+        //   1. Write the period trigger bytes to $4002 and $4003
+        //      (starting the note on pulse 1).
+        //   2. Load the envelope blob pointer into ZP_SFX_PTR_LO/HI
+        //      via SymbolLo/SymbolHi of the `__sfx_coin` label.
+        //   3. Set ZP_SFX_COUNTER nonzero so the audio tick starts
+        //      walking the envelope.
+        //   4. Emit the `__audio_used` marker label so the linker
+        //      splices in the driver and period table.
         let insts = lower_and_gen(
             r#"
             game "T" { mapper: NROM }
@@ -2136,12 +2162,7 @@ mod more_tests {
             start Main
         "#,
         );
-        // `play` must emit writes to $4000 (volume), $4002 (period
-        // low) and $4003 (length + period high).
-        assert!(
-            has_inst(&insts, STA, &AM::Absolute(0x4000)),
-            "play should write pulse-1 volume register $4000"
-        );
+        // Trigger bytes on pulse 1.
         assert!(
             has_inst(&insts, STA, &AM::Absolute(0x4002)),
             "play should write pulse-1 period-lo register $4002"
@@ -2150,14 +2171,21 @@ mod more_tests {
             has_inst(&insts, STA, &AM::Absolute(0x4003)),
             "play should write pulse-1 length+period-hi register $4003"
         );
-        // The SFX countdown counter at $0A must be set so the NMI
-        // audio tick knows how long to sustain the tone.
+        // Envelope pointer loaded via SymbolLo/SymbolHi of sfx label.
+        let has_ptr_lo = insts
+            .iter()
+            .any(|i| i.opcode == LDA && matches!(&i.mode, AM::SymbolLo(n) if n == "__sfx_coin"));
+        let has_ptr_hi = insts
+            .iter()
+            .any(|i| i.opcode == LDA && matches!(&i.mode, AM::SymbolHi(n) if n == "__sfx_coin"));
+        assert!(has_ptr_lo, "play should load envelope pointer low byte");
+        assert!(has_ptr_hi, "play should load envelope pointer high byte");
+        // ZP_SFX_COUNTER (0x0A) set to a nonzero "active" marker.
         assert!(
             has_inst(&insts, STA, &AM::ZeroPage(0x0A)),
-            "play should set the SFX counter at $0A"
+            "play should set ZP_SFX_COUNTER to flag the sfx as active"
         );
-        // The `__audio_used` marker label must be present so the
-        // linker knows to splice the audio tick into NMI.
+        // __audio_used marker.
         let has_marker = insts
             .iter()
             .any(|i| matches!(&i.mode, AM::Label(l) if l == "__audio_used"));
@@ -2165,7 +2193,14 @@ mod more_tests {
     }
 
     #[test]
-    fn ir_codegen_start_music_writes_pulse2() {
+    fn ir_codegen_start_music_sets_state_and_stream_pointer() {
+        // `start_music theme` must:
+        //   1. Load a state byte (header OR'd with 0x02 = active)
+        //      into ZP_MUSIC_STATE (0x07).
+        //   2. Load the music stream pointer into ZP_MUSIC_PTR and
+        //      ZP_MUSIC_BASE (so the loop branch can rewind).
+        //   3. Seed ZP_MUSIC_COUNTER with 1 so the next tick
+        //      immediately advances to the first note.
         let insts = lower_and_gen(
             r#"
             game "T" { mapper: NROM }
@@ -2173,23 +2208,42 @@ mod more_tests {
             start Main
         "#,
         );
-        // Music uses pulse 2 ($4004-$4007).
+        // State byte stored at 0x07.
         assert!(
-            has_inst(&insts, STA, &AM::Absolute(0x4004)),
-            "start_music should write pulse-2 volume register $4004"
+            has_inst(&insts, STA, &AM::ZeroPage(0x07)),
+            "start_music should store the state byte at ZP_MUSIC_STATE ($07)"
+        );
+        // Pointer load via SymbolLo of __music_theme.
+        let has_ptr_lo = insts
+            .iter()
+            .any(|i| i.opcode == LDA && matches!(&i.mode, AM::SymbolLo(n) if n == "__music_theme"));
+        let has_ptr_hi = insts
+            .iter()
+            .any(|i| i.opcode == LDA && matches!(&i.mode, AM::SymbolHi(n) if n == "__music_theme"));
+        assert!(has_ptr_lo, "start_music should load stream ptr low");
+        assert!(has_ptr_hi, "start_music should load stream ptr high");
+        // Both PTR and BASE should be written (4 stores total for
+        // the pointer pair: PTR_LO, BASE_LO, PTR_HI, BASE_HI).
+        assert!(
+            has_inst(&insts, STA, &AM::ZeroPage(0x0E)),
+            "start_music should store ZP_MUSIC_PTR_LO ($0E)"
         );
         assert!(
-            has_inst(&insts, STA, &AM::Absolute(0x4006)),
-            "start_music should write pulse-2 period-lo register $4006"
+            has_inst(&insts, STA, &AM::ZeroPage(0x05)),
+            "start_music should store ZP_MUSIC_BASE_LO ($05) for loop-back"
         );
         assert!(
-            has_inst(&insts, STA, &AM::Absolute(0x4007)),
-            "start_music should write pulse-2 length+period-hi register $4007"
+            has_inst(&insts, STA, &AM::ZeroPage(0x0F)),
+            "start_music should store ZP_MUSIC_PTR_HI ($0F)"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::ZeroPage(0x06)),
+            "start_music should store ZP_MUSIC_BASE_HI ($06) for loop-back"
         );
     }
 
     #[test]
-    fn ir_codegen_stop_music_mutes_pulse2() {
+    fn ir_codegen_stop_music_mutes_pulse2_and_clears_state() {
         let insts = lower_and_gen(
             r#"
             game "T" { mapper: NROM }
@@ -2197,7 +2251,7 @@ mod more_tests {
             start Main
         "#,
         );
-        // Stop must write the mute byte ($30) to $4004.
+        // Mute $4004 and clear ZP_MUSIC_STATE ($07).
         assert!(
             has_inst(&insts, LDA, &AM::Immediate(0x30)),
             "stop_music should load the mute byte $30"
@@ -2205,6 +2259,10 @@ mod more_tests {
         assert!(
             has_inst(&insts, STA, &AM::Absolute(0x4004)),
             "stop_music should store to pulse-2 volume register $4004"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::ZeroPage(0x07)),
+            "stop_music should clear ZP_MUSIC_STATE ($07)"
         );
     }
 

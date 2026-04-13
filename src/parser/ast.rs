@@ -12,6 +12,8 @@ pub struct Program {
     pub sprites: Vec<SpriteDecl>,
     pub palettes: Vec<PaletteDecl>,
     pub backgrounds: Vec<BackgroundDecl>,
+    pub sfx: Vec<SfxDecl>,
+    pub music: Vec<MusicDecl>,
     pub banks: Vec<BankDecl>,
     pub start_state: String,
     pub span: Span,
@@ -65,6 +67,58 @@ pub struct BackgroundDecl {
     pub name: String,
     pub chr_source: AssetSource,
     pub span: Span,
+}
+
+/// `sfx Name { ... }` — a sound effect played on pulse 1. SFX are
+/// frame-accurate envelopes: `pitch[i]` and `volume[i]` describe the
+/// $4002/$4000 register state for frame `i`, advancing one entry per
+/// NMI tick. `duty` selects the pulse duty cycle (0-3) for the whole
+/// effect. The two arrays must have the same length; the runtime
+/// drops pulse 1's volume to 0 one frame after the last entry.
+#[derive(Debug, Clone)]
+pub struct SfxDecl {
+    pub name: String,
+    /// Duty cycle bits (0-3). Each bit pattern picks a different
+    /// pulse waveform; 2 (50%) sounds like a square wave.
+    pub duty: u8,
+    /// One period byte per frame, written to $4002. The $4003 high
+    /// nibble is always zero (keeps notes in the audible range).
+    pub pitch: Vec<u8>,
+    /// One volume byte per frame (0-15), combined with the duty bits
+    /// and written to $4000.
+    pub volume: Vec<u8>,
+    pub span: Span,
+}
+
+/// `music Name { ... }` — a background music track played on pulse 2.
+/// Music is encoded as a list of `(note_index, duration_frames)`
+/// pairs. Note index 0 is a rest; indexes 1..=60 look up a period in
+/// the builtin period table (C1 through B5). The track loops by
+/// default when it reaches the end.
+#[derive(Debug, Clone)]
+pub struct MusicDecl {
+    pub name: String,
+    /// Pulse-2 duty cycle (0-3).
+    pub duty: u8,
+    /// Constant volume (0-15) for pulse 2.
+    pub volume: u8,
+    /// True: the track loops when it reaches the end.
+    /// False: the track mutes itself on completion.
+    pub loops: bool,
+    /// List of `(note_index, duration_frames)` pairs. A `note_index`
+    /// of 0 is a rest; otherwise it's an index into the builtin
+    /// period table (see `runtime::gen_period_table`).
+    pub notes: Vec<MusicNote>,
+    pub span: Span,
+}
+
+/// A single note in a music track: pitch + duration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MusicNote {
+    /// 0 = rest; 1-60 = period table index; other values are invalid.
+    pub pitch: u8,
+    /// Number of frames to hold this note (1-255). 0 is invalid.
+    pub duration: u8,
 }
 
 #[derive(Debug, Clone)]

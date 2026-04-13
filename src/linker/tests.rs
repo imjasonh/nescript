@@ -164,6 +164,138 @@ fn link_omits_audio_tick_when_no_marker() {
 }
 
 #[test]
+fn link_with_audio_data_places_sfx_blobs_in_prg() {
+    // When user code has the `__audio_used` marker AND we pass in
+    // sfx data, the linker must:
+    //   1. Splice in the audio tick (driver body)
+    //   2. Splice in the period table
+    //   3. Splice in the envelope blob under its label
+    //   4. Resolve SymbolLo/SymbolHi references from user code to
+    //      the blob's address (second pass of the assembler)
+    let linker = Linker::new(Mirroring::Horizontal);
+    // User code: `LDA #<__sfx_test`, `STA $0C`, `LDA #>__sfx_test`,
+    // `STA $0D` — simulates what IR codegen's gen_play_sfx emits.
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__audio_used".into())),
+        Instruction::new(LDA, AM::SymbolLo("__sfx_test".into())),
+        Instruction::new(STA, AM::ZeroPage(0x0C)),
+        Instruction::new(LDA, AM::SymbolHi("__sfx_test".into())),
+        Instruction::new(STA, AM::ZeroPage(0x0D)),
+    ];
+    let sfx = vec![SfxData {
+        name: "test".into(),
+        period_lo: 0x50,
+        period_hi: 0x08,
+        envelope: vec![0xBF, 0xB8, 0xB4, 0xB0, 0x00],
+    }];
+    let rom = linker.link_with_all_assets(&user_code, &[], &sfx, &[]);
+    let info = rom::validate_ines(&rom).unwrap();
+    assert_eq!(info.prg_banks, 1);
+    // The envelope bytes must appear somewhere in PRG. Find them.
+    let prg = &rom[16..16 + 16384];
+    let needle = [0xBF, 0xB8, 0xB4, 0xB0, 0x00];
+    let found = prg.windows(needle.len()).any(|w| w == needle);
+    assert!(found, "sfx envelope bytes should be spliced into PRG ROM");
+}
+
+#[test]
+fn link_with_audio_data_places_music_stream_in_prg() {
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__audio_used".into())),
+        Instruction::new(LDA, AM::SymbolLo("__music_test".into())),
+        Instruction::new(STA, AM::ZeroPage(0x0E)),
+        Instruction::new(LDA, AM::SymbolHi("__music_test".into())),
+        Instruction::new(STA, AM::ZeroPage(0x0F)),
+    ];
+    let music = vec![MusicData {
+        name: "test".into(),
+        header: 0xA9,
+        stream: vec![37, 8, 41, 8, 44, 8, 0xFF, 0xFF],
+    }];
+    let rom = linker.link_with_all_assets(&user_code, &[], &[], &music);
+    let prg = &rom[16..16 + 16384];
+    let needle = [37, 8, 41, 8, 44, 8, 0xFF, 0xFF];
+    let found = prg.windows(needle.len()).any(|w| w == needle);
+    assert!(found, "music note stream should be spliced into PRG ROM");
+}
+
+#[test]
+fn link_with_audio_resolves_sfx_pointer_references() {
+    // The SymbolLo/SymbolHi references in user code must get
+    // fixed up to the *actual* PRG address of the envelope blob.
+    // We can verify this by reading back the user code bytes and
+    // checking that the LDA immediates point somewhere in the
+    // valid PRG range ($C000-$FFFF).
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__audio_used".into())),
+        Instruction::new(LDA, AM::SymbolLo("__sfx_test".into())),
+        Instruction::new(LDA, AM::SymbolHi("__sfx_test".into())),
+    ];
+    let sfx = vec![SfxData {
+        name: "test".into(),
+        period_lo: 0x50,
+        period_hi: 0x08,
+        envelope: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00],
+    }];
+    let rom = linker.link_with_all_assets(&user_code, &[], &sfx, &[]);
+    // The user code starts at RESET ($C000) after init+palette_load.
+    // Rather than compute the exact offset, verify the envelope
+    // bytes appear at a byte that matches what the LDA immediate
+    // pair would produce. We find the immediate pair by searching
+    // for `A9 xx A9 yy` and checking `$xxyy` points at the needle.
+    let prg = &rom[16..16 + 16384];
+    let needle = [0xDE, 0xAD, 0xBE, 0xEF, 0x00];
+    // Find where the envelope lives in ROM.
+    let env_offset = prg
+        .windows(needle.len())
+        .position(|w| w == needle)
+        .expect("envelope should be in PRG");
+    let env_addr = 0xC000u16 + env_offset as u16;
+    // Find any LDA-immediate pair that matches the envelope address.
+    let lo = (env_addr & 0xFF) as u8;
+    let hi = (env_addr >> 8) as u8;
+    let pattern = [0xA9u8, lo, 0xA9, hi];
+    let matched = prg.windows(pattern.len()).any(|w| w == pattern);
+    assert!(
+        matched,
+        "should find `LDA #<env_addr; LDA #>env_addr` in PRG ($A9 ${lo:02X} $A9 ${hi:02X})"
+    );
+}
+
+#[test]
+fn link_without_audio_marker_does_not_emit_period_table() {
+    // Programs that never use audio must not pay the cost of the
+    // period table, driver body, or any blobs. We verify this
+    // indirectly: the `__period_table` label should NOT appear at
+    // a distinct ROM address from the main body.
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![Instruction::implied(NOP)];
+    let rom = linker.link_with_all_assets(
+        &user_code,
+        &[],
+        &[SfxData {
+            name: "unused".into(),
+            period_lo: 0,
+            period_hi: 0,
+            envelope: vec![0xAA, 0xBB, 0x00],
+        }],
+        &[],
+    );
+    // The envelope bytes `AA BB 00` must NOT appear in PRG — the
+    // linker should have elided the whole audio section because
+    // the marker is absent.
+    let prg = &rom[16..16 + 16384];
+    let needle = [0xAAu8, 0xBB, 0x00];
+    let found = prg.windows(needle.len()).any(|w| w == needle);
+    assert!(
+        !found,
+        "unused sfx data should not be spliced when __audio_used is absent"
+    );
+}
+
+#[test]
 fn palette_load_writes_to_ppu() {
     let linker = Linker::new(Mirroring::Horizontal);
     let palette_insts = linker.gen_palette_load();

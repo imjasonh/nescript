@@ -79,6 +79,15 @@ impl Assembler {
 
     fn emit_instruction(&mut self, inst: &Instruction) {
         match &inst.mode {
+            AddressingMode::Bytes(payload) if inst.opcode == Opcode::NOP => {
+                // Raw-data pseudo-instruction: splice the payload
+                // into the output stream verbatim. No opcode byte
+                // is emitted — this is how we embed audio tables
+                // and other data blobs inside a code section while
+                // still letting the two-pass label resolver see
+                // adjacent labels at the right addresses.
+                self.output.extend_from_slice(payload);
+            }
             AddressingMode::Label(name) => {
                 // A `NOP` with a `Label` mode is the label-definition
                 // pseudo-instruction: it records the current address and
