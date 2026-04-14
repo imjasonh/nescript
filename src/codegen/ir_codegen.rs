@@ -452,13 +452,17 @@ impl<'a> IrCodeGen<'a> {
         if size == 0 {
             return;
         }
-        // Anything >= 256 would overflow the u8 immediate; skip
-        // the check rather than emit a bogus compare. A proper
-        // 16-bit bounds check would need a two-byte compare
-        // against the high byte too.
-        let Ok(size_u8) = u8::try_from(size) else {
+        // Sizes > 256 skip the bounds check because the X register
+        // is 8 bits — any index the codegen can actually produce is
+        // already in-bounds for a byte count that large. The
+        // analyzer's W0108 warning fires at declaration time so the
+        // user knows those elements are unreachable. Size == 256
+        // fits in a `CMP #$00` (trivially true), so we clamp to
+        // 255 — the tightest useful check — and treat 256+ the same.
+        let size_u8 = u8::try_from(size.min(255)).unwrap_or(255);
+        if size_u8 == 0 {
             return;
-        };
+        }
         // Use a short BCC over an unconditional JMP instead of a
         // plain `BCS __debug_halt`. A single BCS can only span 127
         // bytes, and `__debug_halt` is emitted at the very end of

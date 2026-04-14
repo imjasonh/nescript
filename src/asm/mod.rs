@@ -182,6 +182,24 @@ impl Assembler {
                     self.output.push(0); // placeholder
                 }
             }
+            AddressingMode::LabelAbsoluteX(name) => {
+                // `STA label,X` style indexed store with a label-
+                // resolved base address. Encodes like `absolute,X`
+                // but the 16-bit address is patched in by the
+                // fixup pass, same as plain `Label` fixups.
+                if let Some(op) = opcodes::encode(inst.opcode, &AddressingMode::AbsoluteX(0)) {
+                    self.output.push(op);
+                    self.fixups.push(Fixup {
+                        offset: self.output.len(),
+                        label: name.clone(),
+                        kind: FixupKind::Absolute,
+                    });
+                    self.output.push(0); // placeholder low byte
+                    self.output.push(0); // placeholder high byte
+                } else {
+                    panic!("opcode {:?} cannot target an absolute,X label", inst.opcode);
+                }
+            }
             AddressingMode::SymbolLo(name) => {
                 if let Some(op) = opcodes::encode(inst.opcode, &AddressingMode::Immediate(0)) {
                     self.output.push(op);

@@ -1455,11 +1455,28 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
             out.push(Instruction::implied(RTS));
         }
         Mapper::UxROM => {
-            // UxROM: write bank number to any address in $8000-$FFFF.
-            // We use $FFF0 so the write lands in the fixed bank's
-            // tail area where the linker can back it with a matching
-            // bank-table byte to avoid bus conflicts.
-            out.push(Instruction::new(STA, AM::Absolute(0xFFF0)));
+            // UxROM: write the bank number to any address in
+            // $8000-$FFFF. On boards with bus conflicts the CPU's
+            // write and the ROM byte at that address are ANDed on
+            // the data bus, so we must write to an address whose
+            // ROM byte already equals the bank number. The linker
+            // splices a 256-byte table (`__bank_select_table`,
+            // bytes 0..255) into the fixed bank, and we index into
+            // it with X = bank number: `STA __bank_select_table, X`
+            // stores A (= bank number) at
+            // `__bank_select_table + X`, whose ROM byte is exactly
+            // X, so bus = A = X = ROM — no conflict.
+            //
+            // Previously this wrote to a fixed `$FFF0`, which
+            // happens to work on emulators that don't simulate bus
+            // conflicts (jsnes, Mesen permissive) but would glitch
+            // on real hardware because a single ROM byte can't
+            // match every possible bank number.
+            out.push(Instruction::implied(TAX));
+            out.push(Instruction::new(
+                STA,
+                AM::LabelAbsoluteX("__bank_select_table".into()),
+            ));
             out.push(Instruction::implied(RTS));
         }
         Mapper::MMC3 => {

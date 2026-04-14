@@ -1661,3 +1661,77 @@ fn analyze_fast_var_underscore_exempt() {
         result.diagnostics
     );
 }
+
+#[test]
+fn analyze_oversized_array_warns_w0108() {
+    // A u8 array with 300 elements has byte size 300 > 256. The
+    // codegen lowers `arr[i]` to `LDA base,X` with X 8-bit, so
+    // elements 256..299 are unreachable. W0108 should fire.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var big: u8[300]
+        on frame {
+            big[0] = 0
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0108),
+        "oversized u8 array should emit W0108, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_boundary_size_256_array_ok() {
+    // A u8[256] exactly fills the 8-bit X register — every element
+    // is reachable. No W0108.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var big: u8[256]
+        on frame {
+            big[0] = 0
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0108),
+        "u8[256] should not emit W0108, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_small_array_never_warns_w0108() {
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var small: u8[16]
+        on frame {
+            small[0] = 0
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0108),
+        "small array should not emit W0108, got: {:?}",
+        result.diagnostics
+    );
+}

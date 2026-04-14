@@ -42,6 +42,7 @@ pub enum ErrorCode {
     W0105, // palette sub-palette universal mismatch (mirror collision)
     W0106, // implicit drop of non-void function return value
     W0107, // `fast` variable rarely accessed (wastes zero-page slot)
+    W0108, // array elements past byte 255 unreachable via 8-bit X index
 }
 
 impl fmt::Display for ErrorCode {
@@ -68,6 +69,7 @@ impl fmt::Display for ErrorCode {
             Self::W0105 => "W0105",
             Self::W0106 => "W0106",
             Self::W0107 => "W0107",
+            Self::W0108 => "W0108",
         };
         write!(f, "{code}")
     }
@@ -82,7 +84,8 @@ impl ErrorCode {
             | Self::W0104
             | Self::W0105
             | Self::W0106
-            | Self::W0107 => Level::Warning,
+            | Self::W0107
+            | Self::W0108 => Level::Warning,
             _ => Level::Error,
         }
     }

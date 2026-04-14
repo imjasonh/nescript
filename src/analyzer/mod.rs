@@ -915,6 +915,34 @@ impl Analyzer {
             .map(|(n, l)| (n.clone(), l.size))
             .collect();
         let size = type_size_with(&var.var_type, &struct_sizes);
+
+        // Warn on arrays whose byte size exceeds 256: the codegen
+        // lowers `arr[i]` to `LDA base,X` (or `ZeroPageX`), and the
+        // 6502's X register is 8 bits, so elements whose byte
+        // offset is >= 256 are unreachable. For a `u8` array the
+        // safe max count is 256; for a `u16` array it's 128
+        // (since the codegen doesn't scale the index by element
+        // width — see the note in `emit_bounds_check`). This
+        // diagnostic replaces the previous silent-skip in the
+        // debug-mode bounds checker.
+        if let NesType::Array(_, _) = &var.var_type {
+            if size > 256 {
+                self.diagnostics.push(
+                    Diagnostic::warning(
+                        ErrorCode::W0108,
+                        format!(
+                            "array '{}' has byte size {size}, but the 6502's 8-bit X index can only reach the first 256 bytes — elements past that are unreachable",
+                            var.name
+                        ),
+                        var.span,
+                    )
+                    .with_help(
+                        "shrink the array, split it across multiple smaller arrays, or use separate fields for each element".to_string(),
+                    ),
+                );
+            }
+        }
+
         let Some(address) = self.allocate_ram(size, var.span) else {
             // Allocation failed (E0301 already emitted) — still add the
             // symbol so that later references don't cascade into E0502,

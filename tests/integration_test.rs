@@ -2261,6 +2261,155 @@ start Main
 }
 
 #[test]
+fn source_map_survives_aggressive_peephole_folding() {
+    // Regression guard for the concern raised in code review:
+    // `__src_<N>` markers are emitted as label pseudo-ops, and
+    // peephole uses labels as block boundaries. If peephole ever
+    // started pruning unreferenced labels the source map would
+    // silently lose entries. Compile a program that trips the
+    // peephole store-then-load and redundant-load folds on every
+    // single line, then assert every `__src_` label the codegen
+    // recorded is still in the linker's label table post-peephole.
+    let source = r#"
+        game "PeepholeFolds" { mapper: NROM }
+        var t0: u8 = 0
+        var t1: u8 = 0
+        var t2: u8 = 0
+        var t3: u8 = 0
+        var t4: u8 = 0
+        on frame {
+            t0 = 1
+            t1 = t0
+            t2 = t1
+            t3 = t2
+            t4 = t3
+            t0 = t4
+            wait_frame
+        }
+        start Main
+    "#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let palettes = assets::resolve_palettes(&program, Path::new(".")).unwrap();
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new(".")).unwrap();
+
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music)
+        .with_source_map(true);
+    let mut instructions = codegen.generate(&ir_program);
+
+    // Snapshot the __src_ labels the codegen recorded BEFORE
+    // peephole runs.
+    let pre_peephole: std::collections::HashSet<String> = codegen
+        .source_locs()
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert!(
+        pre_peephole.len() >= 6,
+        "codegen should have recorded at least one source loc per statement, got {} from {pre_peephole:?}",
+        pre_peephole.len()
+    );
+
+    // Run peephole. This is the pass that the reviewer worried
+    // might drop labels.
+    nescript::codegen::peephole::optimize(&mut instructions);
+
+    // Link and inspect the resolved label table.
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    let switchable_banks: Vec<PrgBank> = program
+        .banks
+        .iter()
+        .filter(|b| b.bank_type == BankType::Prg)
+        .map(|b| PrgBank::empty(&b.name))
+        .collect();
+    let link_result = linker.link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &switchable_banks,
+    );
+
+    // Every pre-peephole __src_ label must survive into the final
+    // linker label table. If peephole ever deletes a label this
+    // loop fails with the exact label that vanished.
+    for name in &pre_peephole {
+        assert!(
+            link_result.labels.contains_key(name),
+            "peephole dropped source marker {name}; this breaks source maps"
+        );
+    }
+}
+
+#[test]
+fn debug_frame_overrun_counter_reads_back_from_user_code() {
+    // End-to-end contract test for the frame-overrun counter:
+    // when compiled with `--debug`, the NMI handler increments
+    // `$07FF` whenever the main loop didn't reach `wait_frame`
+    // in time, and user code is expected to read that counter
+    // with `peek(0x07FF)`. This test verifies three things that
+    // together make the feature usable:
+    //
+    //   1. The NMI handler's INC $07FF is still present.
+    //   2. A user `peek(0x07FF)` lowers to a matching LDA $07FF.
+    //   3. The analyzer's RAM allocator doesn't hand out $07FF
+    //      to a user variable, so the peek reads the counter
+    //      and not some unrelated byte.
+    let source = r#"
+        game "Overrun" { mapper: NROM }
+        var last_overruns: u8 = 0
+        on frame {
+            last_overruns = peek(0x07FF)
+            wait_frame
+        }
+        start Main
+    "#;
+    let (rom, _mlb, _map) = compile_with_debug_artifacts(source, true);
+    let prg = &rom[16..16 + 16384];
+
+    // (1) NMI bumps the counter — look for `INC $07FF`
+    // (opcode EE, lo FF, hi 07).
+    let inc_07ff: [u8; 3] = [0xEE, 0xFF, 0x07];
+    assert!(
+        prg.windows(inc_07ff.len()).any(|w| w == inc_07ff),
+        "debug NMI handler should INC $07FF"
+    );
+
+    // (2) User peek lowers to an `LDA $07FF` somewhere in the
+    // frame handler (opcode AD, lo FF, hi 07).
+    let lda_07ff: [u8; 3] = [0xAD, 0xFF, 0x07];
+    assert!(
+        prg.windows(lda_07ff.len()).any(|w| w == lda_07ff),
+        "user `peek(0x07FF)` should lower to LDA $07FF"
+    );
+
+    // (3) No user variable should be allocated at $07FF — verify
+    // by re-parsing + re-analyzing and walking the allocations.
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.var_allocations.iter().all(|a| {
+            // Last allocated byte is address + size - 1.
+            let last = a.address + a.size - 1;
+            last < 0x07FF
+        }),
+        "user variable must not land on the debug overrun counter at $07FF: {:?}",
+        analysis.var_allocations
+    );
+}
+
+#[test]
 fn debug_build_emits_bounds_check_halt_routine() {
     // When compiled with `--debug`, a program that indexes an
     // array should include the shared `__debug_halt` trip routine

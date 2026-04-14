@@ -674,14 +674,32 @@ fn bank_select_mmc1_serializes_five_bits_to_e000() {
 }
 
 #[test]
-fn bank_select_uxrom_writes_fff0() {
-    // UxROM bank-select writes A to $FFF0, which lives in the
-    // fixed bank's bus-conflict-safe table.
+fn bank_select_uxrom_uses_bus_conflict_table() {
+    // UxROM bank-select has to write to a ROM address whose byte
+    // already equals the bank being selected. The routine does
+    // `TAX; STA __bank_select_table, X` so the store goes to
+    // `table + bank_num`, whose ROM byte is `bank_num` — making
+    // the bus write match the ROM byte regardless of which bank
+    // is being requested. We assert both pieces here so a
+    // regression back to the broken `STA $FFF0` form fails
+    // loudly.
     let sel = gen_bank_select(Mapper::UxROM);
-    let has_write = sel
+    let has_tax = sel.iter().any(|i| i.opcode == TAX && i.mode == AM::Implied);
+    assert!(has_tax, "UxROM bank-select must TAX before the store");
+    let has_indexed_store = sel.iter().any(|i| {
+        i.opcode == STA && matches!(&i.mode, AM::LabelAbsoluteX(n) if n == "__bank_select_table")
+    });
+    assert!(
+        has_indexed_store,
+        "UxROM bank-select must `STA __bank_select_table,X`"
+    );
+    let writes_fff0 = sel
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0xFFF0));
-    assert!(has_write, "UxROM bank-select must write to $FFF0");
+    assert!(
+        !writes_fff0,
+        "UxROM bank-select must not fall back to the bus-conflict-unsafe STA $FFF0 form"
+    );
     assert_eq!(sel.last().unwrap().opcode, RTS);
 }
 
@@ -723,7 +741,15 @@ fn bank_select_stashes_bank_number_in_zp() {
 #[test]
 fn bank_select_assembles_for_every_mapper() {
     for m in [Mapper::NROM, Mapper::MMC1, Mapper::UxROM, Mapper::MMC3] {
-        let sel = gen_bank_select(m);
+        let mut sel = gen_bank_select(m);
+        // UxROM `gen_bank_select` references `__bank_select_table`
+        // via `AM::LabelAbsoluteX`; give the assembler something
+        // to resolve against in this standalone unit test. Real
+        // linking appends the table in the linker pass, so the
+        // label always resolves there.
+        if m == Mapper::UxROM {
+            sel.extend(super::gen_uxrom_bank_table());
+        }
         let result = asm::assemble(&sel, 0xC000);
         assert!(
             !result.bytes.is_empty(),
