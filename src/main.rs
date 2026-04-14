@@ -42,6 +42,13 @@ enum Cli {
         /// Dump a call graph showing which functions call which.
         #[arg(long)]
         call_graph: bool,
+
+        /// Skip the IR optimizer pass. Useful for bisecting
+        /// optimizer-introduced miscompiles: if a program misbehaves
+        /// with the optimizer on but works with `--no-opt`, the bug
+        /// lives in `src/optimizer/`.
+        #[arg(long)]
+        no_opt: bool,
     },
     /// Type-check a source file without building
     Check {
@@ -62,6 +69,7 @@ fn main() {
             dump_ir,
             memory_map,
             call_graph,
+            no_opt,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
             match compile(
@@ -72,6 +80,7 @@ fn main() {
                     dump_ir,
                     memory_map,
                     call_graph,
+                    no_opt,
                 },
             ) {
                 Ok(rom) => {
@@ -220,6 +229,7 @@ struct CompileOptions {
     dump_ir: bool,
     memory_map: bool,
     call_graph: bool,
+    no_opt: bool,
 }
 
 fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
@@ -228,6 +238,7 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     let dump_ir = opts.dump_ir;
     let memory_map = opts.memory_map;
     let call_graph = opts.call_graph;
+    let no_opt = opts.no_opt;
     let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
     })?;
@@ -265,9 +276,13 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         return Err(());
     }
 
-    // IR lowering and optimization
+    // IR lowering and (optionally) optimization. `--no-opt` skips
+    // the IR optimizer pass entirely so optimizer-introduced
+    // miscompiles can be bisected against the unoptimized output.
     let mut ir_program = ir::lower(&program, &analysis);
-    optimizer::optimize(&mut ir_program);
+    if !no_opt {
+        optimizer::optimize(&mut ir_program);
+    }
 
     if dump_ir {
         print!("{}", ir_program.pretty());

@@ -1722,3 +1722,109 @@ fn e2e_banked_chr_rom_is_preserved() {
     // Default smiley is non-zero in its first 16 bytes.
     assert_ne!(&rom[chr_start..chr_start + 16], &[0u8; 16]);
 }
+
+/// Same as `compile_banked` but lets the caller toggle whether the IR
+/// optimizer runs. Used to cover the `--no-opt` CLI flag: compiling
+/// with the optimizer disabled must still produce a valid iNES ROM.
+fn compile_banked_with_opts(source: &str, optimize: bool) -> Vec<u8> {
+    let (program, diags) = nescript::parser::parse(source);
+    assert!(
+        diags.is_empty(),
+        "unexpected parse errors: {diags:?}\nsource:\n{source}"
+    );
+    let program = program.expect("parse should succeed");
+
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.diagnostics.iter().all(|d| !d.is_error()),
+        "unexpected analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut ir_program = ir::lower(&program, &analysis);
+    if optimize {
+        nescript::optimizer::optimize(&mut ir_program);
+    }
+
+    let sprites = assets::resolve_sprites(&program, Path::new("."))
+        .expect("sprite resolution should succeed");
+    let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
+    let music = assets::resolve_music(&program).expect("music resolution should succeed");
+    let palettes = assets::resolve_palettes(&program);
+    let backgrounds = assets::resolve_backgrounds(&program);
+
+    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    let switchable_banks: Vec<PrgBank> = program
+        .banks
+        .iter()
+        .filter(|b| b.bank_type == BankType::Prg)
+        .map(|b| PrgBank::empty(&b.name))
+        .collect();
+    linker.link_banked_with_ppu(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &switchable_banks,
+    )
+}
+
+#[test]
+fn no_opt_still_produces_valid_rom() {
+    // Acceptance test for the `--no-opt` CLI flag. Skipping the IR
+    // optimizer must still produce a byte-valid iNES ROM that links
+    // against the runtime, uses the declared mapper, and carries a
+    // plausible vector table. This guards the compile path the flag
+    // opens up so optimizer bisection remains a usable workflow.
+    let source = r#"
+        game "NoOpt" { mapper: NROM }
+
+        var counter: u8 = 0
+        var doubled: u8 = 0
+
+        fun double(x: u8) -> u8 {
+            return x + x
+        }
+
+        on frame {
+            counter += 1
+            doubled = double(counter)
+            if button.a {
+                counter = 0
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+
+    let rom_opt = compile_banked_with_opts(source, true);
+    let rom_noopt = compile_banked_with_opts(source, false);
+
+    // Both outputs must be valid iNES ROMs with matching headers —
+    // the optimizer only affects PRG codegen, not the CHR/header
+    // layout the linker produces.
+    let info_opt = rom::validate_ines(&rom_opt).expect("opt ROM should be valid iNES");
+    let info_noopt = rom::validate_ines(&rom_noopt).expect("noopt ROM should be valid iNES");
+    assert_eq!(info_opt.mapper, 0);
+    assert_eq!(info_noopt.mapper, 0);
+    assert_eq!(info_opt.prg_banks, info_noopt.prg_banks);
+    assert_eq!(info_opt.chr_banks, info_noopt.chr_banks);
+    assert_eq!(rom_opt.len(), rom_noopt.len());
+
+    // The reset vector should still point into the fixed PRG bank
+    // in both builds — the optimizer has no say in where the reset
+    // handler lands.
+    let prg_end = 16 + 16384;
+    let reset_opt = u16::from_le_bytes([rom_opt[prg_end - 4], rom_opt[prg_end - 3]]);
+    let reset_noopt = u16::from_le_bytes([rom_noopt[prg_end - 4], rom_noopt[prg_end - 3]]);
+    assert_eq!(reset_opt, 0xC000);
+    assert_eq!(reset_noopt, 0xC000);
+}
