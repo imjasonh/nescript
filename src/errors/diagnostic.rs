@@ -39,6 +39,9 @@ pub enum ErrorCode {
     W0102, // loop without break or wait_frame
     W0103, // unused variable
     W0104, // unreachable code after terminator, or unreachable state
+    W0105, // palette sub-palette universal mismatch (mirror collision)
+    W0106, // implicit drop of non-void function return value
+    W0107, // `fast` variable rarely accessed (wastes zero-page slot)
 }
 
 impl fmt::Display for ErrorCode {
@@ -62,6 +65,9 @@ impl fmt::Display for ErrorCode {
             Self::W0102 => "W0102",
             Self::W0103 => "W0103",
             Self::W0104 => "W0104",
+            Self::W0105 => "W0105",
+            Self::W0106 => "W0106",
+            Self::W0107 => "W0107",
         };
         write!(f, "{code}")
     }
@@ -70,7 +76,13 @@ impl fmt::Display for ErrorCode {
 impl ErrorCode {
     pub fn level(self) -> Level {
         match self {
-            Self::W0101 | Self::W0102 | Self::W0103 | Self::W0104 => Level::Warning,
+            Self::W0101
+            | Self::W0102
+            | Self::W0103
+            | Self::W0104
+            | Self::W0105
+            | Self::W0106
+            | Self::W0107 => Level::Warning,
             _ => Level::Error,
         }
     }
