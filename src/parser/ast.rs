@@ -69,6 +69,12 @@ pub struct SpriteDecl {
 pub struct PaletteDecl {
     pub name: String,
     pub colors: Vec<u8>,
+    /// Optional PNG source — when set, the analyzer leaves `colors`
+    /// empty and the asset resolver decodes the PNG into a 32-byte
+    /// palette blob at compile time. Mutually exclusive with
+    /// `colors` being non-empty in practice (the parser never fills
+    /// both).
+    pub png_source: Option<String>,
     pub span: Span,
 }
 
@@ -87,6 +93,11 @@ pub struct BackgroundDecl {
     pub name: String,
     pub tiles: Vec<u8>,
     pub attributes: Vec<u8>,
+    /// Optional PNG source for `background Name @nametable("file.png")`.
+    /// When set, the asset resolver decodes the PNG into tile + attribute
+    /// tables at compile time. Mutually exclusive with inline
+    /// `tiles` / `attributes` (the parser never fills both).
+    pub png_source: Option<String>,
     pub span: Span,
 }
 

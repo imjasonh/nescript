@@ -582,6 +582,63 @@ fn parse_background_decl_with_attributes() {
 }
 
 #[test]
+fn parse_palette_decl_from_png_source() {
+    // Shortcut form: `palette Name @palette("file.png")` sets
+    // `png_source` and leaves `colors` empty. The asset resolver
+    // decodes the actual bytes at compile time.
+    let src = r#"
+        game "Test" { mapper: NROM }
+        palette Main @palette("art/main.png")
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.palettes.len(), 1);
+    assert_eq!(prog.palettes[0].name, "Main");
+    assert!(prog.palettes[0].colors.is_empty());
+    assert_eq!(prog.palettes[0].png_source.as_deref(), Some("art/main.png"));
+}
+
+#[test]
+fn parse_palette_decl_rejects_wrong_directive() {
+    // The shortcut form insists the directive be `@palette`, not
+    // some other `@foo`. We want a clear error the first time
+    // someone confuses `@chr` / `@palette` / `@nametable`.
+    let src = r#"
+        game "Test" { mapper: NROM }
+        palette Main @chr("art/main.png")
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (_, diags) = parse(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d: &crate::errors::Diagnostic| d.message.contains("@palette")),
+        "expected diagnostic about @palette, got: {diags:?}"
+    );
+}
+
+#[test]
+fn parse_background_decl_from_png_source() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        background Main @nametable("levels/stage1.png")
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.backgrounds.len(), 1);
+    assert_eq!(prog.backgrounds[0].name, "Main");
+    assert!(prog.backgrounds[0].tiles.is_empty());
+    assert!(prog.backgrounds[0].attributes.is_empty());
+    assert_eq!(
+        prog.backgrounds[0].png_source.as_deref(),
+        Some("levels/stage1.png")
+    );
+}
+
+#[test]
 fn parse_background_decl_without_attributes() {
     let src = r#"
         game "Test" { mapper: NROM }

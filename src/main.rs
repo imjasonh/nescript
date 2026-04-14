@@ -1,12 +1,14 @@
 use clap::Parser;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use nescript::analyzer;
 use nescript::assets;
+use nescript::assets::{BackgroundData, PaletteData};
 use nescript::codegen::IrCodeGen;
 use nescript::errors::render_diagnostics;
 use nescript::ir;
-use nescript::linker::{render_mlb, render_source_map, Linker, PrgBank};
+use nescript::linker::{render_mlb, render_source_map, LinkedRom, Linker, PrgBank};
 use nescript::optimizer;
 use nescript::parser::ast::BankType;
 
@@ -125,45 +127,64 @@ fn main() {
     }
 }
 
-/// Print a human-readable memory map of variable allocations.
-/// Entries are sorted by address and labelled with their scope
-/// (zero-page vs RAM).
-fn print_memory_map(analysis: &nescript::analyzer::AnalysisResult) {
+/// Write a human-readable memory map of variable allocations to
+/// `w`. Entries are sorted by address and labelled with their scope
+/// (zero-page vs RAM). When `link_result` is `Some(_)`, a PRG ROM
+/// section listing each palette and background data blob's CPU
+/// address + size is appended — the CLI passes the linker result
+/// whenever it's available, which is always unless the caller is
+/// unit-testing the variable-only path.
+///
+/// This function is factored out of the direct `println!` path so
+/// tests can drive it against an in-memory buffer and assert on the
+/// rendered output.
+fn write_memory_map(
+    w: &mut impl std::io::Write,
+    analysis: &nescript::analyzer::AnalysisResult,
+    link_result: Option<&LinkedRom>,
+    palettes: &[PaletteData],
+    backgrounds: &[BackgroundData],
+) -> std::io::Result<()> {
     let mut allocs: Vec<_> = analysis.var_allocations.iter().collect();
     allocs.sort_by_key(|a| a.address);
 
-    println!("=== NEScript Memory Map ===");
-    println!("Zero Page ($00-$FF):");
-    println!("  $00-$0F  [SYSTEM]  reserved (frame flag, input, state, params, scratch)");
+    writeln!(w, "=== NEScript Memory Map ===")?;
+    writeln!(w, "Zero Page ($00-$FF):")?;
+    writeln!(
+        w,
+        "  $00-$0F  [SYSTEM]  reserved (frame flag, input, state, params, scratch)"
+    )?;
     for a in allocs.iter().filter(|a| a.address < 0x100) {
         if a.size == 1 {
-            println!("  ${:04X}    [USER]    {} (u8)", a.address, a.name);
+            writeln!(w, "  ${:04X}    [USER]    {} (u8)", a.address, a.name)?;
         } else {
-            println!(
+            writeln!(
+                w,
                 "  ${:04X}-${:04X}  [USER]  {} ({} bytes)",
                 a.address,
                 a.address + a.size - 1,
                 a.name,
                 a.size
-            );
+            )?;
         }
     }
 
     let ram_allocs: Vec<_> = allocs.iter().filter(|a| a.address >= 0x100).collect();
     if !ram_allocs.is_empty() {
-        println!("\nRAM ($0200-$07FF):");
-        println!("  $0200-$02FF  [SYSTEM]  OAM shadow buffer");
+        writeln!(w, "\nRAM ($0200-$07FF):")?;
+        writeln!(w, "  $0200-$02FF  [SYSTEM]  OAM shadow buffer")?;
         for a in &ram_allocs {
             if a.size == 1 {
-                println!("  ${:04X}        [USER]    {} (u8)", a.address, a.name);
+                writeln!(w, "  ${:04X}        [USER]    {} (u8)", a.address, a.name)?;
             } else {
-                println!(
+                writeln!(
+                    w,
                     "  ${:04X}-${:04X}  [USER]  {} ({} bytes)",
                     a.address,
                     a.address + a.size - 1,
                     a.name,
                     a.size
-                );
+                )?;
             }
         }
     }
@@ -179,9 +200,74 @@ fn print_memory_map(analysis: &nescript::analyzer::AnalysisResult) {
         .filter(|a| a.address >= 0x300)
         .map(|a| a.size)
         .sum();
-    println!();
-    println!("Zero Page: {zp_used}/128 bytes used");
-    println!("Main RAM:  {ram_used}/1280 bytes used");
+    writeln!(w)?;
+    writeln!(w, "Zero Page: {zp_used}/128 bytes used")?;
+    writeln!(w, "Main RAM:  {ram_used}/1280 bytes used")?;
+
+    // PRG ROM: palette (32 B each) and background (960 + 64 B each)
+    // data blobs. The linker emits each one under a well-known
+    // label — `__palette_<name>`, `__bg_tiles_<name>`,
+    // `__bg_attrs_<name>` — so we look those up in the label table
+    // and render the CPU address + byte count.
+    if let Some(link) = link_result {
+        if !palettes.is_empty() || !backgrounds.is_empty() {
+            writeln!(w, "\nPRG ROM data blobs:")?;
+            let mut total: u32 = 0;
+            for pal in palettes {
+                let label = pal.label();
+                match link.labels.get(&label).copied() {
+                    Some(addr) => {
+                        writeln!(w, "  ${addr:04X}        [PALETTE] {} (32 bytes)", pal.name)?;
+                    }
+                    None => {
+                        writeln!(w, "  (unlinked)   [PALETTE] {} (32 bytes)", pal.name)?;
+                    }
+                }
+                total += 32;
+            }
+            for bg in backgrounds {
+                let tiles_label = bg.tiles_label();
+                let attrs_label = bg.attrs_label();
+                match link.labels.get(&tiles_label).copied() {
+                    Some(addr) => {
+                        writeln!(w, "  ${addr:04X}        [BG-TILES] {} (960 bytes)", bg.name)?;
+                    }
+                    None => {
+                        writeln!(w, "  (unlinked)   [BG-TILES] {} (960 bytes)", bg.name)?;
+                    }
+                }
+                match link.labels.get(&attrs_label).copied() {
+                    Some(addr) => {
+                        writeln!(w, "  ${addr:04X}        [BG-ATTRS] {} (64 bytes)", bg.name)?;
+                    }
+                    None => {
+                        writeln!(w, "  (unlinked)   [BG-ATTRS] {} (64 bytes)", bg.name)?;
+                    }
+                }
+                total += 960 + 64;
+            }
+            writeln!(w, "\nPRG ROM data total: {total} bytes")?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Print a human-readable memory map of variable allocations. Thin
+/// wrapper around [`write_memory_map`] that drives stdout; tests
+/// call `write_memory_map` directly against a `Vec<u8>`.
+fn print_memory_map(
+    analysis: &nescript::analyzer::AnalysisResult,
+    link_result: Option<&LinkedRom>,
+    palettes: &[PaletteData],
+    backgrounds: &[BackgroundData],
+) {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    // Infallible: stdout writes only return Err on broken pipes,
+    // which is the caller's problem.
+    let _ = write_memory_map(&mut handle, analysis, link_result, palettes, backgrounds);
+    let _ = handle.flush();
 }
 
 /// Print a human-readable call graph of the analyzed program.
@@ -312,10 +398,6 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         print!("{}", ir_program.pretty());
     }
 
-    if memory_map {
-        print_memory_map(&analysis);
-    }
-
     if call_graph {
         print_call_graph(&analysis);
     }
@@ -338,11 +420,16 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     })?;
 
     // Resolve palette and background declarations into fixed-size
-    // ROM data blobs. These are purely compile-time — the byte
-    // arrays came from the parser and all the analyzer validation
-    // has already run.
-    let palettes = assets::resolve_palettes(&program);
-    let backgrounds = assets::resolve_backgrounds(&program);
+    // ROM data blobs. These are purely compile-time — either the
+    // parser handed us an inline byte array, or the declaration
+    // named a PNG to decode relative to the source file's directory
+    // (`@palette("art/main.png")` / `@nametable("levels/1.png")`).
+    let palettes = assets::resolve_palettes(&program, source_dir).map_err(|e| {
+        eprintln!("error: {e}");
+    })?;
+    let backgrounds = assets::resolve_backgrounds(&program, source_dir).map_err(|e| {
+        eprintln!("error: {e}");
+    })?;
 
     // IR-based code generation. Lower → optimize → emit 6502.
     //
@@ -403,6 +490,12 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         &switchable_banks,
     );
 
+    // Memory map is reported after linking so the palette /
+    // background PRG ROM addresses are available in `link_result.labels`.
+    if memory_map {
+        print_memory_map(&analysis, Some(&link_result), &palettes, &backgrounds);
+    }
+
     if let Some(path) = symbols_path {
         let mlb = render_mlb(&link_result, &analysis.var_allocations);
         std::fs::write(path, mlb).map_err(|e| {
@@ -455,4 +548,106 @@ fn check(input: &PathBuf) -> Result<(), ()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nescript::analyzer::AnalysisResult;
+    use nescript::linker::LinkedRom;
+    use std::collections::HashMap;
+
+    fn empty_analysis() -> AnalysisResult {
+        AnalysisResult {
+            symbols: HashMap::new(),
+            var_allocations: Vec::new(),
+            diagnostics: Vec::new(),
+            call_graph: HashMap::new(),
+            max_depths: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn write_memory_map_without_link_result_covers_variable_path() {
+        // Without a link result (e.g. the unit-test path that
+        // only wants to inspect the variable allocator) the output
+        // should still render the Zero Page / RAM sections and the
+        // summary lines. No PRG ROM section appears because there
+        // are no linked labels to point at.
+        let analysis = empty_analysis();
+        let mut buf = Vec::new();
+        write_memory_map(&mut buf, &analysis, None, &[], &[]).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("=== NEScript Memory Map ==="));
+        assert!(s.contains("Zero Page"));
+        assert!(s.contains("0/128 bytes used"));
+        assert!(!s.contains("PRG ROM data blobs"));
+    }
+
+    #[test]
+    fn write_memory_map_reports_palette_and_background_rom_addresses() {
+        // With palettes and backgrounds plus a faked LinkedRom
+        // carrying matching labels, the PRG ROM section should
+        // render each blob's CPU address + size and a grand total.
+        let analysis = empty_analysis();
+        let palettes = vec![PaletteData {
+            name: "Main".to_string(),
+            colors: [0u8; 32],
+        }];
+        let backgrounds = vec![BackgroundData {
+            name: "Stage".to_string(),
+            tiles: [0u8; 960],
+            attrs: [0u8; 64],
+        }];
+        let mut labels = HashMap::new();
+        labels.insert("__palette_Main".to_string(), 0xC100);
+        labels.insert("__bg_tiles_Stage".to_string(), 0xC200);
+        labels.insert("__bg_attrs_Stage".to_string(), 0xC5C0);
+        let link = LinkedRom {
+            rom: Vec::new(),
+            labels,
+            fixed_bank_file_offset: 16,
+        };
+        let mut buf = Vec::new();
+        write_memory_map(&mut buf, &analysis, Some(&link), &palettes, &backgrounds).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("PRG ROM data blobs:"));
+        assert!(
+            s.contains("$C100") && s.contains("[PALETTE] Main"),
+            "missing palette line in: {s}"
+        );
+        assert!(
+            s.contains("$C200") && s.contains("[BG-TILES] Stage"),
+            "missing bg-tiles line in: {s}"
+        );
+        assert!(
+            s.contains("$C5C0") && s.contains("[BG-ATTRS] Stage"),
+            "missing bg-attrs line in: {s}"
+        );
+        // 32 (palette) + 960 + 64 (background) = 1056.
+        assert!(s.contains("1056 bytes"), "missing total in: {s}");
+    }
+
+    #[test]
+    fn write_memory_map_marks_unlinked_blobs() {
+        // If a palette's label isn't in `link.labels` (e.g. the
+        // linker skipped it for some reason), we still emit the
+        // line but mark it "(unlinked)" so the user knows the
+        // address isn't available.
+        let analysis = empty_analysis();
+        let palettes = vec![PaletteData {
+            name: "Ghost".to_string(),
+            colors: [0u8; 32],
+        }];
+        let link = LinkedRom {
+            rom: Vec::new(),
+            labels: HashMap::new(),
+            fixed_bank_file_offset: 16,
+        };
+        let mut buf = Vec::new();
+        write_memory_map(&mut buf, &analysis, Some(&link), &palettes, &[]).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("(unlinked)"), "missing unlinked marker in: {s}");
+        assert!(s.contains("[PALETTE] Ghost"));
+    }
 }

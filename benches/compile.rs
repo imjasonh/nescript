@@ -108,8 +108,10 @@ fn compile_pipeline(source: &str, source_dir: &Path) -> Vec<u8> {
     let sprites = assets::resolve_sprites(&program, source_dir).expect("sprite resolution failed");
     let sfx = assets::resolve_sfx(&program).expect("sfx resolution failed");
     let music = assets::resolve_music(&program).expect("music resolution failed");
-    let palettes = assets::resolve_palettes(&program);
-    let backgrounds = assets::resolve_backgrounds(&program);
+    let palettes =
+        assets::resolve_palettes(&program, source_dir).expect("palette resolution failed");
+    let backgrounds =
+        assets::resolve_backgrounds(&program, source_dir).expect("background resolution failed");
 
     let mut instructions = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)

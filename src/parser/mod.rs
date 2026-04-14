@@ -946,6 +946,22 @@ impl Parser {
         let start = self.current_span();
         self.expect(&TokenKind::KwPalette)?;
         let (name, _) = self.expect_ident()?;
+
+        // Shortcut form: `palette Name @palette("file.png")` — the PNG
+        // is decoded at asset-resolve time into a 32-byte blob. No
+        // `{ ... }` body follows. The in-source `@palette(...)` token
+        // is distinct from the `palette` block keyword (they're
+        // different TokenKinds); don't confuse them.
+        if *self.peek() == TokenKind::At {
+            let png_path = self.parse_named_asset_path("palette")?;
+            return Ok(PaletteDecl {
+                name,
+                colors: Vec::new(),
+                png_source: Some(png_path),
+                span: Span::new(start.file_id, start.start, self.current_span().end),
+            });
+        }
+
         self.expect(&TokenKind::LBrace)?;
 
         // Flat-form output.
@@ -1078,8 +1094,70 @@ impl Parser {
         Ok(PaletteDecl {
             name,
             colors,
+            png_source: None,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
+    }
+
+    /// Parse a `@kind("path")` asset directive when the caller has
+    /// already matched `@` at `self.peek()`. Verifies that `kind` is
+    /// the expected identifier (e.g. `palette` or `nametable`) and
+    /// returns the string literal inside the parentheses.
+    ///
+    /// Note: `palette` and `background` are reserved keywords in the
+    /// lexer so `@palette` tokenises as `At` + `KwPalette` rather
+    /// than `At` + `Ident("palette")`. We match both shapes so the
+    /// directive kind can collide with a keyword without the user
+    /// having to worry about it. `nametable` isn't a keyword today
+    /// so it comes through as an `Ident`; if it ever becomes one,
+    /// this branch will still work.
+    fn parse_named_asset_path(&mut self, expected: &str) -> Result<String, Diagnostic> {
+        self.expect(&TokenKind::At)?;
+        let kind_span = self.current_span();
+        let kind = match self.peek().clone() {
+            TokenKind::Ident(name) => {
+                self.advance();
+                name
+            }
+            TokenKind::KwPalette => {
+                self.advance();
+                "palette".to_string()
+            }
+            TokenKind::KwBackground => {
+                self.advance();
+                "background".to_string()
+            }
+            other => {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!("expected '@{expected}(\"...\")', found '@{other}'"),
+                    kind_span,
+                ));
+            }
+        };
+        if kind != expected {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!("expected '@{expected}(\"...\")', found '@{kind}'"),
+                kind_span,
+            ));
+        }
+        self.expect(&TokenKind::LParen)?;
+        let path = if let TokenKind::StringLiteral(s) = self.peek().clone() {
+            self.advance();
+            s
+        } else {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!(
+                    "expected string path in '@{expected}(...)', found '{}'",
+                    self.peek()
+                ),
+                self.current_span(),
+            ));
+        };
+        self.expect(&TokenKind::RParen)?;
+        Ok(path)
     }
 
     /// Parse a single NES colour value: either a `u8` integer literal or
@@ -1189,6 +1267,22 @@ impl Parser {
         let start = self.current_span();
         self.expect(&TokenKind::KwBackground)?;
         let (name, _) = self.expect_ident()?;
+
+        // Shortcut form: `background Name @nametable("file.png")` —
+        // the PNG is decoded at asset-resolve time into a 32×30 tile
+        // map plus a 64-byte attribute table. No `{ ... }` body
+        // follows.
+        if *self.peek() == TokenKind::At {
+            let png_path = self.parse_named_asset_path("nametable")?;
+            return Ok(BackgroundDecl {
+                name,
+                tiles: Vec::new(),
+                attributes: Vec::new(),
+                png_source: Some(png_path),
+                span: Span::new(start.file_id, start.start, self.current_span().end),
+            });
+        }
+
         self.expect(&TokenKind::LBrace)?;
 
         // Raw-form scratch.
@@ -1359,6 +1453,7 @@ impl Parser {
             name,
             tiles,
             attributes,
+            png_source: None,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }

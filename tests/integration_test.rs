@@ -1104,8 +1104,10 @@ fn compile_banked(source: &str) -> Vec<u8> {
         .expect("sprite resolution should succeed");
     let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
     let music = assets::resolve_music(&program).expect("music resolution should succeed");
-    let palettes = assets::resolve_palettes(&program);
-    let backgrounds = assets::resolve_backgrounds(&program);
+    let palettes = assets::resolve_palettes(&program, Path::new("."))
+        .expect("palette resolution should succeed");
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."))
+        .expect("background resolution should succeed");
 
     let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
@@ -1847,6 +1849,98 @@ fn e2e_banked_chr_rom_is_preserved() {
     assert_ne!(&rom[chr_start..chr_start + 16], &[0u8; 16]);
 }
 
+#[test]
+fn e2e_png_palette_source_compiles_and_splices_bytes_into_prg() {
+    // Full pipeline: parse `palette Main @palette("fixture.png")`,
+    // resolve the PNG into a 32-byte blob via the asset resolver,
+    // and verify the resulting bytes land in PRG ROM. We write a
+    // 2×1 test fixture (pure black + pure red) to a tempdir so
+    // the test is self-contained and deterministic.
+    use image::{Rgb, RgbImage};
+    use nescript::codegen::IrCodeGen;
+    use nescript::linker::LinkedRom;
+
+    let dir = std::env::temp_dir();
+    let png_path = dir.join("nescript_e2e_palette.png");
+    let mut img = RgbImage::new(2, 1);
+    img.put_pixel(0, 0, Rgb([0, 0, 0]));
+    img.put_pixel(1, 0, Rgb([248, 0, 0]));
+    img.save(&png_path).unwrap();
+
+    let source = r#"
+        game "PngPalette" { mapper: NROM }
+        palette Main @palette("nescript_e2e_palette.png")
+        on frame { wait_frame }
+        start Main
+    "#;
+
+    let (program, diags) = nescript::parser::parse(source);
+    assert!(diags.is_empty(), "unexpected parse errors: {diags:?}");
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(analysis.diagnostics.iter().all(|d| !d.is_error()));
+
+    // Resolve with the tempdir as the source dir so the
+    // relative PNG path lands on the fixture we just wrote.
+    let palettes =
+        assets::resolve_palettes(&program, &dir).expect("palette resolution should succeed");
+    let backgrounds = assets::resolve_backgrounds(&program, &dir).expect("bg ok");
+    assert_eq!(palettes.len(), 1);
+    assert_eq!(palettes[0].name, "Main");
+    // First two bytes should map via `nearest_nes_color` to black
+    // and a red-ish index. We re-run the mapper so the test
+    // doesn't hard-code the NES palette table.
+    let e_black = assets::nearest_nes_color(0, 0, 0);
+    let e_red = assets::nearest_nes_color(248, 0, 0);
+    assert_eq!(palettes[0].colors[0], e_black);
+    assert_eq!(palettes[0].colors[1], e_red);
+    // Every sub-palette first byte equals the universal.
+    for slot in 0..8 {
+        assert_eq!(palettes[0].colors[slot * 4], e_black);
+    }
+
+    // Link the program and verify the 32-byte blob shows up in PRG
+    // ROM at the linker-assigned label.
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut ir_program = nescript::ir::lower(&program, &analysis);
+    nescript::optimizer::optimize(&mut ir_program);
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    let link: LinkedRom = linker.link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &[],
+    );
+    let pal_label = palettes[0].label();
+    let pal_addr = link
+        .labels
+        .get(&pal_label)
+        .copied()
+        .expect("palette label should be emitted");
+    // Translate the CPU address into a byte offset inside the
+    // fixed bank. NROM: the fixed bank starts at file offset 16
+    // (past the iNES header) and maps to CPU $C000-$FFFF.
+    let rom_offset = link.fixed_bank_file_offset + (pal_addr as usize - 0xC000);
+    let prg_bytes = &link.rom[rom_offset..rom_offset + 32];
+    assert_eq!(
+        prg_bytes, &palettes[0].colors,
+        "PRG ROM should contain the decoded palette blob verbatim"
+    );
+
+    let _ = std::fs::remove_file(&png_path);
+}
+
 /// Same as `compile_banked` but lets the caller toggle whether the IR
 /// optimizer runs. Used to cover the `--no-opt` CLI flag: compiling
 /// with the optimizer disabled must still produce a valid iNES ROM.
@@ -1874,8 +1968,10 @@ fn compile_banked_with_opts(source: &str, optimize: bool) -> Vec<u8> {
         .expect("sprite resolution should succeed");
     let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
     let music = assets::resolve_music(&program).expect("music resolution should succeed");
-    let palettes = assets::resolve_palettes(&program);
-    let backgrounds = assets::resolve_backgrounds(&program);
+    let palettes = assets::resolve_palettes(&program, Path::new("."))
+        .expect("palette resolution should succeed");
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."))
+        .expect("background resolution should succeed");
 
     let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
@@ -1979,8 +2075,10 @@ fn compile_with_debug_artifacts(source: &str, debug: bool) -> (Vec<u8>, String, 
         .expect("sprite resolution should succeed");
     let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
     let music = assets::resolve_music(&program).expect("music resolution should succeed");
-    let palettes = assets::resolve_palettes(&program);
-    let backgrounds = assets::resolve_backgrounds(&program);
+    let palettes = assets::resolve_palettes(&program, Path::new("."))
+        .expect("palette resolution should succeed");
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."))
+        .expect("background resolution should succeed");
 
     let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
@@ -2141,8 +2239,10 @@ fn debug_build_emits_bounds_check_halt_routine() {
     let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
     let sfx = assets::resolve_sfx(&program).unwrap();
     let music = assets::resolve_music(&program).unwrap();
-    let palettes = assets::resolve_palettes(&program);
-    let backgrounds = assets::resolve_backgrounds(&program);
+    let palettes = assets::resolve_palettes(&program, Path::new("."))
+        .expect("palette resolution should succeed");
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."))
+        .expect("background resolution should succeed");
 
     let mut cg_debug = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)

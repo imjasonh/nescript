@@ -113,34 +113,65 @@ pub fn resolve_sprites(program: &Program, source_dir: &Path) -> Result<Vec<Sprit
 
 /// Resolve all `palette Name { ... }` declarations in `program` into
 /// 32-byte fixed-size blobs suitable for splicing into PRG ROM.
-/// Declarations with fewer than 32 colors are zero-padded.
-#[must_use]
-pub fn resolve_palettes(program: &Program) -> Vec<PaletteData> {
-    program
-        .palettes
-        .iter()
-        .map(|p| {
+///
+/// Each declaration can take one of three shapes:
+/// - `colors: [...]` flat byte array — shorter than 32 is zero-padded.
+/// - grouped `universal / bg0..sp3` form — already assembled into
+///   `colors` by the parser.
+/// - `@palette("file.png")` — decoded on the fly via
+///   [`crate::assets::png_to_palette`], which maps RGB pixels to
+///   nearest NES master-palette indices and enforces the universal
+///   first-byte convention.
+///
+/// `source_dir` is the base for PNG-relative paths — callers typically
+/// pass the source file's parent directory so `@palette("art/main.png")`
+/// resolves next to the `.ne` file, the same convention the sprite
+/// resolver uses.
+pub fn resolve_palettes(program: &Program, source_dir: &Path) -> Result<Vec<PaletteData>, String> {
+    let mut out = Vec::with_capacity(program.palettes.len());
+    for p in &program.palettes {
+        let colors = if let Some(png_path) = &p.png_source {
+            let full_path = source_dir.join(png_path);
+            crate::assets::png_to_palette(&full_path)
+                .map_err(|e| format!("palette '{}' PNG source: {e}", p.name))?
+        } else {
             let mut colors = [0u8; 32];
             for (i, c) in p.colors.iter().enumerate().take(32) {
                 colors[i] = *c;
             }
-            PaletteData {
-                name: p.name.clone(),
-                colors,
-            }
-        })
-        .collect()
+            colors
+        };
+        out.push(PaletteData {
+            name: p.name.clone(),
+            colors,
+        });
+    }
+    Ok(out)
 }
 
 /// Resolve all `background Name { ... }` declarations in `program`
 /// into fixed-size 960-byte tile maps and 64-byte attribute tables.
 /// Declarations shorter than the maximum are zero-padded.
-#[must_use]
-pub fn resolve_backgrounds(program: &Program) -> Vec<BackgroundData> {
-    program
-        .backgrounds
-        .iter()
-        .map(|b| {
+///
+/// When a declaration uses the PNG shortcut form
+/// (`@nametable("file.png")`), the image is decoded via
+/// [`crate::assets::png_to_nametable`] into a 960-byte tile index
+/// table + 64-byte attribute table. The CHR data itself is **not**
+/// generated automatically — callers are expected to provide matching
+/// CHR via a sprite / `@chr(...)` declaration in the same order the
+/// deduplicator walks the PNG (row-major unique-first). This
+/// limitation is tracked in `docs/future-work.md`.
+pub fn resolve_backgrounds(
+    program: &Program,
+    source_dir: &Path,
+) -> Result<Vec<BackgroundData>, String> {
+    let mut out = Vec::with_capacity(program.backgrounds.len());
+    for b in &program.backgrounds {
+        let (tiles, attrs) = if let Some(png_path) = &b.png_source {
+            let full_path = source_dir.join(png_path);
+            crate::assets::png_to_nametable(&full_path)
+                .map_err(|e| format!("background '{}' PNG source: {e}", b.name))?
+        } else {
             let mut tiles = [0u8; 960];
             for (i, t) in b.tiles.iter().enumerate().take(960) {
                 tiles[i] = *t;
@@ -149,13 +180,15 @@ pub fn resolve_backgrounds(program: &Program) -> Vec<BackgroundData> {
             for (i, a) in b.attributes.iter().enumerate().take(64) {
                 attrs[i] = *a;
             }
-            BackgroundData {
-                name: b.name.clone(),
-                tiles,
-                attrs,
-            }
-        })
-        .collect()
+            (tiles, attrs)
+        };
+        out.push(BackgroundData {
+            name: b.name.clone(),
+            tiles,
+            attrs,
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -274,9 +307,10 @@ mod tests {
         program.palettes.push(PaletteDecl {
             name: "Cool".to_string(),
             colors: vec![0x0F, 0x01, 0x11, 0x21],
+            png_source: None,
             span: Span::dummy(),
         });
-        let resolved = resolve_palettes(&program);
+        let resolved = resolve_palettes(&program, Path::new(".")).unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "Cool");
         assert_eq!(resolved[0].colors.len(), 32);
@@ -296,12 +330,64 @@ mod tests {
         program.palettes.push(PaletteDecl {
             name: "Big".to_string(),
             colors: (0u8..40).collect(),
+            png_source: None,
             span: Span::dummy(),
         });
-        let resolved = resolve_palettes(&program);
+        let resolved = resolve_palettes(&program, Path::new(".")).unwrap();
         assert_eq!(resolved[0].colors.len(), 32);
         assert_eq!(resolved[0].colors[0], 0);
         assert_eq!(resolved[0].colors[31], 31);
+    }
+
+    #[test]
+    fn resolve_palette_from_png() {
+        // A 2×1 PNG with pure black and pure red goes through the
+        // PNG-sourced path. We write the fixture to a tempdir, point
+        // the resolver at it, and verify the universal-byte rule
+        // (every sub-palette's first byte = first unique colour).
+        use image::{Rgb, RgbImage};
+
+        let dir = std::env::temp_dir();
+        let png_path = dir.join("nescript_resolve_palette_png.png");
+        let mut img = RgbImage::new(2, 1);
+        img.put_pixel(0, 0, Rgb([0, 0, 0]));
+        img.put_pixel(1, 0, Rgb([248, 0, 0]));
+        img.save(&png_path).unwrap();
+
+        let mut program = blank_program();
+        program.palettes.push(PaletteDecl {
+            name: "Fromimg".to_string(),
+            colors: Vec::new(),
+            png_source: Some(png_path.file_name().unwrap().to_string_lossy().to_string()),
+            span: Span::dummy(),
+        });
+        let resolved = resolve_palettes(&program, &dir).unwrap();
+        let _ = std::fs::remove_file(&png_path);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].colors.len(), 32);
+        // Every sub-palette slot's first byte is the universal.
+        let universal = resolved[0].colors[0];
+        for slot in 0..8 {
+            assert_eq!(resolved[0].colors[slot * 4], universal);
+        }
+    }
+
+    #[test]
+    fn resolve_palette_missing_png_is_error() {
+        // Unlike the sprite resolver (which silently skips missing
+        // `@binary` / `@chr` files to keep documentation-only
+        // declarations cheap), a missing PNG palette is a hard
+        // failure — the declaration has no fallback bytes to fall
+        // back on. The error bubbles up with the palette's name.
+        let mut program = blank_program();
+        program.palettes.push(PaletteDecl {
+            name: "Missing".to_string(),
+            colors: Vec::new(),
+            png_source: Some("nonexistent_palette.png".to_string()),
+            span: Span::dummy(),
+        });
+        let err = resolve_palettes(&program, Path::new(".")).unwrap_err();
+        assert!(err.contains("palette 'Missing' PNG source"));
     }
 
     #[test]
@@ -311,9 +397,10 @@ mod tests {
             name: "Stage".to_string(),
             tiles: vec![1, 2, 3],
             attributes: vec![0xFF],
+            png_source: None,
             span: Span::dummy(),
         });
-        let resolved = resolve_backgrounds(&program);
+        let resolved = resolve_backgrounds(&program, Path::new(".")).unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "Stage");
         assert_eq!(resolved[0].tiles.len(), 960);
@@ -325,5 +412,82 @@ mod tests {
         assert!(resolved[0].attrs[1..].iter().all(|&b| b == 0));
         assert_eq!(resolved[0].tiles_label(), "__bg_tiles_Stage");
         assert_eq!(resolved[0].attrs_label(), "__bg_attrs_Stage");
+    }
+
+    #[test]
+    fn resolve_background_from_png() {
+        // A 256×240 PNG with a simple horizontal-stripe pattern so
+        // the tile deduplicator produces a predictable number of
+        // tiles. We flag the tile count rather than exact bytes
+        // because the hashing is implementation-defined.
+        use image::{Rgb, RgbImage};
+
+        let dir = std::env::temp_dir();
+        let png_path = dir.join("nescript_resolve_bg_png.png");
+        let mut img = RgbImage::new(256, 240);
+        for y in 0..240u32 {
+            let band = (y / 16) as u8;
+            for x in 0..256u32 {
+                let c = band.wrapping_mul(30);
+                img.put_pixel(x, y, Rgb([c, c, c]));
+            }
+        }
+        img.save(&png_path).unwrap();
+
+        let mut program = blank_program();
+        program.backgrounds.push(BackgroundDecl {
+            name: "Fromimg".to_string(),
+            tiles: Vec::new(),
+            attributes: Vec::new(),
+            png_source: Some(png_path.file_name().unwrap().to_string_lossy().to_string()),
+            span: Span::dummy(),
+        });
+        let resolved = resolve_backgrounds(&program, &dir).unwrap();
+        let _ = std::fs::remove_file(&png_path);
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].tiles.len(), 960);
+        assert_eq!(resolved[0].attrs.len(), 64);
+        // Horizontal bands mean every column's tile in a given row
+        // is the same — the 32 tiles of row 0 are all tile index 0.
+        assert!(
+            resolved[0].tiles[..32]
+                .iter()
+                .all(|&t| t == resolved[0].tiles[0]),
+            "row 0 should be a single repeating tile"
+        );
+    }
+
+    #[test]
+    fn resolve_background_wrong_size_png_is_error() {
+        // Nametable PNGs must be exactly 256×240. Any other size
+        // is a hard failure with the background's name attached.
+        use image::{Rgb, RgbImage};
+
+        let dir = std::env::temp_dir();
+        let png_path = dir.join("nescript_resolve_bg_wrong_size.png");
+        let mut img = RgbImage::new(128, 128);
+        for p in img.pixels_mut() {
+            *p = Rgb([0, 0, 0]);
+        }
+        img.save(&png_path).unwrap();
+
+        let mut program = blank_program();
+        program.backgrounds.push(BackgroundDecl {
+            name: "Oops".to_string(),
+            tiles: Vec::new(),
+            attributes: Vec::new(),
+            png_source: Some(png_path.file_name().unwrap().to_string_lossy().to_string()),
+            span: Span::dummy(),
+        });
+        let err = resolve_backgrounds(&program, &dir).unwrap_err();
+        let _ = std::fs::remove_file(&png_path);
+        assert!(
+            err.contains("background 'Oops' PNG source"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("256") || err.contains("240"),
+            "unexpected error: {err}"
+        );
     }
 }
