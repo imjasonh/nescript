@@ -92,7 +92,7 @@ pub fn png_to_nametable(path: &std::path::Path) -> Result<([u8; 960], [u8; 64]),
 
     // Attribute table: 8×8 bytes, each covering a 32×32 region made
     // up of four 16×16 quadrants. Each quadrant gets 2 bits
-    // (0..=3) packed into the byte as `TR<<6 | TL<<4 | BR<<2 | BL`
+    // (0..=3) packed into the byte as `BR<<6 | BL<<4 | TR<<2 | TL`
     // per the PPU's documented layout. The 15-row nametable only
     // half-fills the last attribute byte-row (rows 8..10 of the
     // bottom attribute byte are unused and stay at 0, matching the

@@ -1407,10 +1407,15 @@ impl<'a> IrCodeGen<'a> {
         self.emit(STA, AM::Absolute(0x400A));
         self.emit(LDA, AM::Immediate(period_hi));
         self.emit(STA, AM::Absolute(0x400B));
-        // Enable pulse-1 + pulse-2 + triangle in the APU status
-        // register. We don't bother reading $4015 first — overwriting
-        // with $07 keeps all currently-used channels enabled.
-        self.emit(LDA, AM::Immediate(0x07));
+        // Enable all four tone channels in the APU status register.
+        // We always write $0F (pulse1+pulse2+triangle+noise) instead
+        // of just the channel we're triggering, because per-play
+        // writes use immediate values and a later noise play with
+        // $0B would otherwise silence an in-progress triangle note
+        // by clearing bit 2. Channels with no active envelope stay
+        // silent via the runtime's per-channel counter gating, so
+        // enabling them blindly is harmless.
+        self.emit(LDA, AM::Immediate(0x0F));
         self.emit(STA, AM::Absolute(0x4015));
         // Main-RAM envelope pointer.
         self.emit(LDA, AM::SymbolLo(label.to_string()));
@@ -1439,8 +1444,9 @@ impl<'a> IrCodeGen<'a> {
         // $400F: length counter load.
         self.emit(LDA, AM::Immediate(period_hi));
         self.emit(STA, AM::Absolute(0x400F));
-        // Enable pulse-1 + pulse-2 + noise channels.
-        self.emit(LDA, AM::Immediate(0x0B));
+        // Enable all four tone channels — see the equivalent write
+        // in `emit_play_triangle` for why $0F rather than $0B.
+        self.emit(LDA, AM::Immediate(0x0F));
         self.emit(STA, AM::Absolute(0x4015));
         // Main-RAM envelope pointer.
         self.emit(LDA, AM::SymbolLo(label.to_string()));
