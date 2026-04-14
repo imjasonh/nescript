@@ -37,7 +37,7 @@ fn compile(source: &str) -> Vec<u8> {
     let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
     let music = assets::resolve_music(&program).expect("music resolution should succeed");
 
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
         .with_audio(&sfx, &music);
     let mut instructions = codegen.generate(&ir_program);
@@ -1107,7 +1107,7 @@ fn compile_banked(source: &str) -> Vec<u8> {
     let palettes = assets::resolve_palettes(&program);
     let backgrounds = assets::resolve_backgrounds(&program);
 
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
         .with_audio(&sfx, &music);
     let mut instructions = codegen.generate(&ir_program);
@@ -1341,7 +1341,7 @@ fn ir_codegen_array_literal_globals_emit_per_byte_init() {
         .expect("xs should be allocated")
         .address;
 
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
     let instructions = codegen.generate(&ir_program);
 
     // For each element, look for `LDA #val` followed shortly by
@@ -1410,7 +1410,7 @@ fn ir_codegen_locals_do_not_overlap_array_globals() {
     let xs_base = xs_alloc.address;
     let xs_end = xs_base + xs_alloc.size; // one past last element
 
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
     let instructions = codegen.generate(&ir_program);
 
     // Collect the (ordered) list of `STA absolute` targets and
@@ -1877,7 +1877,7 @@ fn compile_banked_with_opts(source: &str, optimize: bool) -> Vec<u8> {
     let palettes = assets::resolve_palettes(&program);
     let backgrounds = assets::resolve_backgrounds(&program);
 
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
         .with_audio(&sfx, &music);
     let mut instructions = codegen.generate(&ir_program);
@@ -1951,4 +1951,242 @@ fn no_opt_still_produces_valid_rom() {
     let reset_noopt = u16::from_le_bytes([rom_noopt[prg_end - 4], rom_noopt[prg_end - 3]]);
     assert_eq!(reset_opt, 0xC000);
     assert_eq!(reset_noopt, 0xC000);
+}
+
+/// End-to-end pipeline that mirrors the CLI's `--debug`,
+/// `--symbols`, and `--source-map` paths. Returns the ROM bytes
+/// along with the rendered `.mlb` and source-map text so the
+/// integration tests can assert against the whole chain.
+fn compile_with_debug_artifacts(source: &str, debug: bool) -> (Vec<u8>, String, String) {
+    let (program, diags) = nescript::parser::parse(source);
+    assert!(
+        diags.is_empty(),
+        "unexpected parse errors: {diags:?}\nsource:\n{source}"
+    );
+    let program = program.expect("parse should succeed");
+
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.diagnostics.iter().all(|d| !d.is_error()),
+        "unexpected analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+
+    let sprites = assets::resolve_sprites(&program, Path::new("."))
+        .expect("sprite resolution should succeed");
+    let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
+    let music = assets::resolve_music(&program).expect("music resolution should succeed");
+    let palettes = assets::resolve_palettes(&program);
+    let backgrounds = assets::resolve_backgrounds(&program);
+
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music)
+        .with_debug(debug)
+        .with_source_map(true);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    let switchable_banks: Vec<PrgBank> = program
+        .banks
+        .iter()
+        .filter(|b| b.bank_type == BankType::Prg)
+        .map(|b| PrgBank::empty(&b.name))
+        .collect();
+    let link_result = linker.link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &switchable_banks,
+    );
+    let mlb = nescript::linker::render_mlb(&link_result, &analysis.var_allocations);
+    let map = nescript::linker::render_source_map(&link_result, codegen.source_locs(), source);
+    (link_result.rom, mlb, map)
+}
+
+#[test]
+fn symbol_export_lists_user_functions_states_and_vars() {
+    // Compile a small program that exercises the symbol-export
+    // path: a user function, a state handler, a global variable,
+    // and at least one array. The rendered `.mlb` should mention
+    // every one of those under its user-facing name (not the
+    // internal `__ir_fn_` prefix).
+    let source = r#"
+        game "Symbols" { mapper: NROM }
+        var score: u8 = 0
+        var enemies: u8[4] = [1, 2, 3, 4]
+        fun bump() -> u8 { return 1 }
+        state Main {
+            on frame {
+                score = bump()
+                wait_frame
+            }
+        }
+        start Main
+    "#;
+    let (_rom, mlb, _map) = compile_with_debug_artifacts(source, false);
+
+    // User functions appear with their bare name.
+    assert!(mlb.contains(":bump"), "bump() should be in .mlb:\n{mlb}");
+    assert!(
+        mlb.contains(":Main_frame"),
+        "state frame handler should be in .mlb:\n{mlb}"
+    );
+    // Well-known entry points.
+    assert!(mlb.contains(":reset"));
+    assert!(mlb.contains(":nmi"));
+    assert!(mlb.contains(":main_loop"));
+    // User variables with the `R:` prefix.
+    assert!(
+        mlb.contains(":score"),
+        "global var `score` should be in .mlb:\n{mlb}"
+    );
+    assert!(
+        mlb.contains(":enemies"),
+        "array var `enemies` should be in .mlb:\n{mlb}"
+    );
+    // Make sure internal-only labels did not leak.
+    assert!(
+        !mlb.contains("__ir_fn_"),
+        ".mlb should strip the __ir_fn_ prefix"
+    );
+    // P:-prefix entries should resolve to in-ROM offsets below
+    // the 16 KB fixed bank size.
+    for line in mlb.lines().filter(|l| l.starts_with("P:")) {
+        let hex = &line[2..6];
+        let offset = u32::from_str_radix(hex, 16).unwrap();
+        assert!(
+            offset < 0x4000,
+            "P: offset {offset:#06X} should be inside the 16 KB fixed bank"
+        );
+    }
+}
+
+#[test]
+fn source_map_covers_every_lowered_statement() {
+    let source = r#"
+game "SourceMap" { mapper: NROM }
+on frame {
+    var a: u8 = 1
+    var b: u8 = 2
+    var c: u8 = 3
+    wait_frame
+}
+start Main
+"#;
+    let (_rom, _mlb, map) = compile_with_debug_artifacts(source, false);
+    assert!(
+        !map.is_empty(),
+        "source map should be non-empty when --source-map is on"
+    );
+    // Each non-empty line has the form: `<offset> <file> <line> <col>`.
+    let lines: Vec<_> = map.lines().collect();
+    assert!(
+        lines.len() >= 4,
+        "should cover at least the four user statements; got {}",
+        lines.len()
+    );
+    // Lines should be sorted by ROM offset.
+    let offsets: Vec<u32> = lines
+        .iter()
+        .map(|l| u32::from_str_radix(l.split_whitespace().next().unwrap(), 16).unwrap())
+        .collect();
+    let mut sorted = offsets.clone();
+    sorted.sort_unstable();
+    assert_eq!(offsets, sorted, "source map must be sorted by ROM offset");
+    // At least one entry should point at line 4 (the `var a`
+    // declaration — line 1 is blank, line 2 is `game`, line 3 is
+    // `on frame {`, line 4 is the first body statement).
+    let has_line_4 = lines.iter().any(|l| {
+        let parts: Vec<_> = l.split_whitespace().collect();
+        parts.len() == 4 && parts[2] == "4"
+    });
+    assert!(
+        has_line_4,
+        "source map should include at least one entry for line 4:\n{map}"
+    );
+}
+
+#[test]
+fn debug_build_emits_bounds_check_halt_routine() {
+    // When compiled with `--debug`, a program that indexes an
+    // array should include the shared `__debug_halt` trip routine
+    // and at least one JMP targeting it. Release builds must not.
+    let source = r#"
+        game "BoundsCheck" { mapper: NROM }
+        var xs: u8[4] = [1, 2, 3, 4]
+        on frame {
+            var i: u8 = 0
+            var v: u8 = xs[i]
+            wait_frame
+        }
+        start Main
+    "#;
+    let (_rom, mlb_debug, _map) = compile_with_debug_artifacts(source, true);
+    // The halt routine is internal so it's filtered from the
+    // `.mlb` output, but we can verify by re-compiling the same
+    // program and scanning the linker's label table directly.
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let palettes = assets::resolve_palettes(&program);
+    let backgrounds = assets::resolve_backgrounds(&program);
+
+    let mut cg_debug = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music)
+        .with_debug(true);
+    let mut insts_debug = cg_debug.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut insts_debug);
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    let linked_debug = linker.link_banked_with_ppu_detailed(
+        &insts_debug,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &[],
+    );
+    assert!(
+        linked_debug.labels.contains_key("__debug_halt"),
+        "debug build should define the shared bounds-check halt label"
+    );
+
+    let mut cg_release = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut insts_release = cg_release.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut insts_release);
+    let linked_release = linker.link_banked_with_ppu_detailed(
+        &insts_release,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &[],
+    );
+    assert!(
+        !linked_release.labels.contains_key("__debug_halt"),
+        "release build must not emit __debug_halt"
+    );
+    // And the rendered `.mlb` for the debug build should not
+    // contain the internal halt label either (it's filtered out).
+    assert!(
+        !mlb_debug.contains("__debug_halt"),
+        "debug halt label is internal; should not leak into .mlb"
+    );
 }

@@ -590,3 +590,38 @@ fn palette_load_writes_to_ppu() {
         "should write all 32 palette bytes"
     );
 }
+
+#[test]
+fn link_banked_with_ppu_detailed_exposes_label_table() {
+    // The detailed variant carries the assembler's symbol table so
+    // the CLI can emit a `.mlb` file. Round-trip a minimal program
+    // through the linker and verify the classic runtime labels
+    // (`__reset`, `__nmi`, `__ir_main_loop`) show up with CPU
+    // addresses in the $C000-$FFFF fixed-bank window.
+    let lnk = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__ir_main_loop".into())),
+        Instruction::new(JMP, AM::Label("__ir_main_loop".into())),
+    ];
+    let result = lnk.link_banked_with_ppu_detailed(&user_code, &[], &[], &[], &[], &[], &[]);
+    assert!(
+        result.labels.contains_key("__reset"),
+        "LinkedRom should surface the reset label"
+    );
+    assert!(
+        result.labels.contains_key("__nmi"),
+        "LinkedRom should surface the nmi label"
+    );
+    assert!(
+        result.labels.contains_key("__ir_main_loop"),
+        "LinkedRom should surface user-code labels"
+    );
+    let main_addr = result.labels["__ir_main_loop"];
+    assert!(
+        (0xC000..=0xFFFF).contains(&main_addr),
+        "fixed-bank label should sit inside the $C000-$FFFF window, got {main_addr:#06X}"
+    );
+    // NROM has no switchable banks, so the fixed bank starts right
+    // after the 16-byte iNES header.
+    assert_eq!(result.fixed_bank_file_offset, 16);
+}

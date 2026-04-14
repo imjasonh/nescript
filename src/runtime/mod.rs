@@ -80,6 +80,22 @@ pub const ZP_PENDING_BG_TILES_HI: u8 = 0x15;
 pub const ZP_PENDING_BG_ATTRS_LO: u8 = 0x16;
 pub const ZP_PENDING_BG_ATTRS_HI: u8 = 0x17;
 
+// ── Debug instrumentation ──
+//
+// These slots are only touched by debug-mode ROMs. In release
+// builds the analyzer is free to allocate over them.
+
+/// Debug-mode frame-overrun counter. Incremented by the NMI
+/// handler whenever it fires while the previous frame's ready
+/// flag is still set — which means the main loop didn't consume
+/// it, so user code spent more than one vblank-to-vblank window
+/// processing the last frame. Read it with `peek(0x07FF)` in
+/// user code to see how many overruns have happened since reset,
+/// or watch the address in a Mesen memory viewer. Placed at the
+/// top of main RAM to minimise the chance of a collision with
+/// analyzer-allocated variables (which grow from $0300 upward).
+pub const DEBUG_FRAME_OVERRUN_ADDR: u16 = 0x07FF;
+
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
 pub fn gen_init() -> Vec<Instruction> {
@@ -209,8 +225,17 @@ pub fn gen_enable_rendering(show_background: bool) -> Vec<Instruction> {
 /// save/restore window used to silently clobber `ZP_CURRENT_STATE`
 /// whenever a music note was played (the tick's period-table
 /// lookup stashes the table's high byte into $03).
+///
+/// `debug_mode` enables frame-overrun detection: before touching
+/// the frame-ready flag, the handler checks whether it's already
+/// set — if it is, the previous frame's main-loop work never
+/// finished (i.e. the program ran over its vblank budget) and
+/// the handler bumps the counter at
+/// [`DEBUG_FRAME_OVERRUN_ADDR`]. Release-mode ROMs never call
+/// this with `debug_mode=true`, so the counter slot stays free
+/// for user allocation.
 #[must_use]
-pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool) -> Vec<Instruction> {
+pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool, debug_mode: bool) -> Vec<Instruction> {
     let mut out = Vec::new();
 
     // Save registers
@@ -274,6 +299,31 @@ pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool) -> Vec<Instruction> {
         BNE,
         AM::LabelRelative("__read_input".into()),
     ));
+
+    // Debug frame-overrun check. The frame flag is "set on NMI,
+    // cleared by wait_frame". If we see it set at the top of a
+    // new NMI, the main loop never reached its wait_frame since
+    // the previous vblank — i.e. the frame overran. Bump a
+    // counter at `DEBUG_FRAME_OVERRUN_ADDR` in that case so user
+    // code can `peek(0x07FF)` to see how many overruns have
+    // happened. The check is gated on `debug_mode` so release
+    // builds emit nothing here.
+    if debug_mode {
+        // Read the previous flag. If zero, skip the bump.
+        out.push(Instruction::new(LDA, AM::ZeroPage(ZP_FRAME_FLAG)));
+        out.push(Instruction::new(
+            BEQ,
+            AM::LabelRelative("__debug_no_overrun".into()),
+        ));
+        out.push(Instruction::new(
+            INC,
+            AM::Absolute(DEBUG_FRAME_OVERRUN_ADDR),
+        ));
+        out.push(Instruction::new(
+            NOP,
+            AM::Label("__debug_no_overrun".into()),
+        ));
+    }
 
     // Set frame-ready flag
     out.push(Instruction::new(LDA, AM::Immediate(0x01)));

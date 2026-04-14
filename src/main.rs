@@ -6,7 +6,7 @@ use nescript::assets;
 use nescript::codegen::IrCodeGen;
 use nescript::errors::render_diagnostics;
 use nescript::ir;
-use nescript::linker::{Linker, PrgBank};
+use nescript::linker::{render_mlb, render_source_map, Linker, PrgBank};
 use nescript::optimizer;
 use nescript::parser::ast::BankType;
 
@@ -49,6 +49,22 @@ enum Cli {
         /// lives in `src/optimizer/`.
         #[arg(long)]
         no_opt: bool,
+
+        /// Write a Mesen-compatible symbol file (`.mlb`) next to the
+        /// ROM. Contains one `<type>:<address>:<label>` entry per
+        /// function, state handler, and user variable. Enables
+        /// symbol-level debugging in Mesen / fceux without manual
+        /// address lookups.
+        #[arg(long, value_name = "PATH")]
+        symbols: Option<PathBuf>,
+
+        /// Write a plain-text source map (`.map`) next to the ROM.
+        /// Each line has the form `<rom_offset_hex> <file_id>
+        /// <line> <col>` and records the position of every IR-level
+        /// statement in the assembled fixed bank. Useful for
+        /// reverse-mapping a crash address back to the source.
+        #[arg(long, value_name = "PATH")]
+        source_map: Option<PathBuf>,
     },
     /// Type-check a source file without building
     Check {
@@ -70,6 +86,8 @@ fn main() {
             memory_map,
             call_graph,
             no_opt,
+            symbols,
+            source_map,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
             match compile(
@@ -81,6 +99,8 @@ fn main() {
                     memory_map,
                     call_graph,
                     no_opt,
+                    symbols: symbols.clone(),
+                    source_map: source_map.clone(),
                 },
             ) {
                 Ok(rom) => {
@@ -230,6 +250,8 @@ struct CompileOptions {
     memory_map: bool,
     call_graph: bool,
     no_opt: bool,
+    symbols: Option<PathBuf>,
+    source_map: Option<PathBuf>,
 }
 
 fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
@@ -239,6 +261,8 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     let memory_map = opts.memory_map;
     let call_graph = opts.call_graph;
     let no_opt = opts.no_opt;
+    let symbols_path = opts.symbols.as_ref();
+    let source_map_path = opts.source_map.as_ref();
     let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
     })?;
@@ -321,11 +345,23 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     let backgrounds = assets::resolve_backgrounds(&program);
 
     // IR-based code generation. Lower → optimize → emit 6502.
-    let mut instructions = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+    //
+    // We hold on to the codegen after `generate()` because it
+    // carries the source-location marker list — one entry per
+    // `SourceLoc` IR op — which the CLI reads to emit a source
+    // map. Dropping the codegen before then would throw that
+    // metadata away. Source-marker emission is opt-in (the label
+    // pseudo-ops shift peephole block boundaries, which would
+    // flip release-mode ROM bytes if it was always on) — so we
+    // only enable it when the user actually asked for a source
+    // map on the command line.
+    let emit_source_map = source_map_path.is_some();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
         .with_audio(&sfx, &music)
         .with_debug(debug)
-        .generate(&ir_program);
+        .with_source_map(emit_source_map);
+    let mut instructions = codegen.generate(&ir_program);
 
     // Peephole pass: cleans up the IR codegen's temp-heavy output —
     // dead stores, redundant loads, short-branch folds, etc.
@@ -357,7 +393,7 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         .filter(|b| b.bank_type == BankType::Prg)
         .map(|b| PrgBank::empty(&b.name))
         .collect();
-    let rom = linker.link_banked_with_ppu(
+    let link_result = linker.link_banked_with_ppu_detailed(
         &instructions,
         &sprites,
         &sfx,
@@ -367,7 +403,20 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         &switchable_banks,
     );
 
-    Ok(rom)
+    if let Some(path) = symbols_path {
+        let mlb = render_mlb(&link_result, &analysis.var_allocations);
+        std::fs::write(path, mlb).map_err(|e| {
+            eprintln!("error: failed to write symbol file {}: {e}", path.display());
+        })?;
+    }
+    if let Some(path) = source_map_path {
+        let map = render_source_map(&link_result, codegen.source_locs(), &source);
+        std::fs::write(path, map).map_err(|e| {
+            eprintln!("error: failed to write source map {}: {e}", path.display());
+        })?;
+    }
+
+    Ok(link_result.rom)
 }
 
 fn check(input: &PathBuf) -> Result<(), ()> {

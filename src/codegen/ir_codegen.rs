@@ -108,6 +108,38 @@ pub struct IrCodeGen<'a> {
     /// resulting `__ppu_update_used` marker label to decide whether
     /// to splice the in-NMI palette/nametable update helper.
     ppu_update_used: bool,
+    /// Source-location markers produced from [`IrOp::SourceLoc`].
+    /// Each entry is a `(label_name, span)` pair — the codegen
+    /// emits a unique label-definition pseudo-op at the current
+    /// instruction index, and the CLI later resolves each label's
+    /// CPU address through the linker's output map to produce a
+    /// `.map` file. Empty if the IR didn't contain any source
+    /// markers or if `emit_source_locs` is false.
+    source_locs: Vec<(String, crate::lexer::Span)>,
+    /// Next unused index for the monotonic `__src_<N>` label
+    /// counter. Bumped every time a new marker is emitted.
+    next_source_loc: u32,
+    /// When true, each [`IrOp::SourceLoc`] is lowered to a
+    /// label-definition pseudo-op and recorded in `source_locs`.
+    /// When false (the default), `SourceLoc` is silently dropped
+    /// so release-mode codegen output is byte-identical to the
+    /// pre-source-map behaviour — turning this on *does* affect
+    /// the peephole pass's block boundaries and shifts labels in
+    /// the final ROM. Enabled by the CLI when `--source-map` is
+    /// passed.
+    emit_source_locs: bool,
+    /// Byte size of each named global / local variable. Keyed by
+    /// IR `VarId`, mirrors [`Self::var_addrs`]. Used by the
+    /// debug-mode array bounds checker to emit an `idx >= size`
+    /// guard on every `ArrayLoad` / `ArrayStore`. Missing entries
+    /// mean "unknown size" and skip the check.
+    var_sizes: HashMap<VarId, u16>,
+    /// True once a bounds-check trip was emitted; the linker-side
+    /// helper (a `JMP $` infinite loop at `__debug_halt`) is
+    /// emitted once at the end of `generate()` so multiple
+    /// failing checks all land on the same debug marker. Skipped
+    /// entirely in release builds.
+    bounds_halt_used: bool,
     allocations: &'a [VarAllocation],
 }
 
@@ -117,9 +149,11 @@ impl<'a> IrCodeGen<'a> {
         // Globals in IR are in the same order as in the analyzer, so we
         // can align them by name.
         let mut var_addrs = HashMap::new();
+        let mut var_sizes = HashMap::new();
         for global in &ir.globals {
             if let Some(alloc) = allocations.iter().find(|a| a.name == global.name) {
                 var_addrs.insert(global.var_id, alloc.address);
+                var_sizes.insert(global.var_id, alloc.size);
             }
         }
         // Map each function's parameter VarIds to the zero-page
@@ -152,9 +186,11 @@ impl<'a> IrCodeGen<'a> {
                 if i < func.param_count {
                     if i < 4 {
                         var_addrs.insert(local.var_id, 0x04 + i as u16);
+                        var_sizes.insert(local.var_id, local.size);
                     }
                 } else {
                     var_addrs.insert(local.var_id, local_ram_next);
+                    var_sizes.insert(local.var_id, local.size);
                     local_ram_next += local.size.max(1);
                 }
             }
@@ -176,8 +212,35 @@ impl<'a> IrCodeGen<'a> {
             debug_mode: false,
             audio_used: false,
             ppu_update_used: false,
+            source_locs: Vec::new(),
+            next_source_loc: 0,
+            emit_source_locs: false,
+            var_sizes,
+            bounds_halt_used: false,
             allocations,
         }
+    }
+
+    /// Enable source-location marker emission. When set, each
+    /// [`IrOp::SourceLoc`] lowers to a uniquely-named
+    /// label-definition pseudo-op and is recorded in
+    /// [`Self::source_locs`]. Off by default so release builds
+    /// produce byte-identical ROMs regardless of the IR lowering
+    /// stage's marker output.
+    #[must_use]
+    pub fn with_source_map(mut self, enabled: bool) -> Self {
+        self.emit_source_locs = enabled;
+        self
+    }
+
+    /// Source-location markers emitted during codegen. Populated
+    /// once [`Self::generate`] has run; each entry pairs a
+    /// `__src_<N>` label name with the span it came from. The CLI
+    /// uses this plus the linker's label map to write a source-map
+    /// file under `--source-map`.
+    #[must_use]
+    pub fn source_locs(&self) -> &[(String, crate::lexer::Span)] {
+        &self.source_locs
     }
 
     /// Enable debug-mode code generation. When set, `debug.log` and
@@ -299,6 +362,52 @@ impl<'a> IrCodeGen<'a> {
         self.emit(STA, AM::ZeroPage(addr));
     }
 
+    /// Emit a debug-only array bounds check. Assumes A holds the
+    /// candidate index; emits `CMP #len; BCS __debug_halt` where
+    /// `len` is the declared byte size of the variable. For u8
+    /// arrays `size` is the element count (correct bound); for u16
+    /// arrays the codegen doesn't yet scale the index by element
+    /// width, so we use the raw byte size as the bound — that's
+    /// correct for the `ZeroPageX`/`AbsoluteX` lowering the current
+    /// codegen actually produces, and it's what a future lowering
+    /// fix would want the debug check to match anyway.
+    ///
+    /// Release builds emit nothing. Also a no-op when the size
+    /// isn't known (e.g. a local we couldn't match up against an
+    /// allocation); missing metadata degrades silently to the
+    /// old unchecked behaviour.
+    fn emit_bounds_check(&mut self, var: VarId) {
+        if !self.debug_mode {
+            return;
+        }
+        let Some(&size) = self.var_sizes.get(&var) else {
+            return;
+        };
+        if size == 0 {
+            return;
+        }
+        // Anything >= 256 would overflow the u8 immediate; skip
+        // the check rather than emit a bogus compare. A proper
+        // 16-bit bounds check would need a two-byte compare
+        // against the high byte too.
+        let Ok(size_u8) = u8::try_from(size) else {
+            return;
+        };
+        // Use a short BCC over an unconditional JMP instead of a
+        // plain `BCS __debug_halt`. A single BCS can only span 127
+        // bytes, and `__debug_halt` is emitted at the very end of
+        // the fixed bank — many check sites are far enough away
+        // that the short-branch fixup would panic at link time.
+        // BCC-over-JMP keeps the hot path at two branches (well
+        // under 8 cycles) and the failure path at a 3-byte JMP.
+        let skip_label = format!("__ir_bc_ok_{}", self.instructions.len());
+        self.emit(CMP, AM::Immediate(size_u8));
+        self.emit(BCC, AM::LabelRelative(skip_label.clone()));
+        self.emit(JMP, AM::Label("__debug_halt".to_string()));
+        self.emit_label(&skip_label);
+        self.bounds_halt_used = true;
+    }
+
     /// Emit a runtime-variable shift loop: loads `src` into A, then
     /// `amt` iterations of `shift_op` (`ASL` / `LSR`), storing into
     /// `dest`. An iteration count of zero is handled by a leading
@@ -336,10 +445,21 @@ impl<'a> IrCodeGen<'a> {
     /// 3. Main dispatch loop (wait vblank, then `JMP` to state's frame handler)
     /// 4. State frame handlers (each ends with `JMP` to main loop)
     /// 5. User function bodies (end with `RTS`)
-    pub fn generate(mut self, ir: &IrProgram) -> Vec<Instruction> {
+    pub fn generate(&mut self, ir: &IrProgram) -> Vec<Instruction> {
         // Populate state indices
         for (i, name) in ir.states.iter().enumerate() {
             self.state_indices.insert(name.clone(), i as u8);
+        }
+
+        // Emit a `__debug_mode` marker label whenever debug
+        // codegen is on. The linker looks for this label to decide
+        // whether to splice the debug variant of the NMI handler
+        // (which adds a frame-overrun counter). The label itself
+        // emits zero bytes — it's just a tripwire the linker can
+        // check by name, mirroring the `__audio_used` /
+        // `__ppu_update_used` marker pattern already in use.
+        if self.debug_mode {
+            self.emit_label("__debug_mode");
         }
 
         // 1. Variable initializers
@@ -488,7 +608,25 @@ impl<'a> IrCodeGen<'a> {
             self.gen_scanline_reload(&scanline_groups);
         }
 
-        self.instructions
+        // Debug-mode halt routine for failed array bounds checks.
+        // Every `emit_bounds_check` that ran writes a
+        // `BCS __debug_halt` which lands here on out-of-range
+        // indices. The routine is just `JMP __debug_halt` — an
+        // infinite loop that the debugger sees as a deterministic
+        // wedge on the offending address. Release builds never set
+        // `bounds_halt_used`, so this whole block compiles to zero
+        // bytes under `cargo run --release -- build`.
+        if self.bounds_halt_used {
+            self.emit_label("__debug_halt");
+            // Write a recognizable sentinel to the emulator debug
+            // port before wedging, so the log shows a bounds-check
+            // failure as a distinct event from a plain halt.
+            self.emit(LDA, AM::Immediate(0xBC));
+            self.emit(STA, AM::Absolute(DEBUG_PORT));
+            self.emit(JMP, AM::Label("__debug_halt".to_string()));
+        }
+
+        std::mem::take(&mut self.instructions)
     }
 
     fn gen_function(&mut self, func: &IrFunction) {
@@ -694,6 +832,7 @@ impl<'a> IrCodeGen<'a> {
             IrOp::ArrayLoad(dest, var, idx) => {
                 if let Some(&base_addr) = self.var_addrs.get(var) {
                     self.load_temp(*idx);
+                    self.emit_bounds_check(*var);
                     self.emit(TAX, AM::Implied);
                     if base_addr < 0x100 {
                         self.emit(LDA, AM::ZeroPageX(base_addr as u8));
@@ -706,6 +845,7 @@ impl<'a> IrCodeGen<'a> {
             IrOp::ArrayStore(var, idx, val) => {
                 if let Some(&base_addr) = self.var_addrs.get(var) {
                     self.load_temp(*idx);
+                    self.emit_bounds_check(*var);
                     self.emit(TAX, AM::Implied);
                     self.load_temp(*val);
                     if base_addr < 0x100 {
@@ -1012,8 +1152,20 @@ impl<'a> IrCodeGen<'a> {
                 b_lo,
                 b_hi,
             } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::GtEq),
-            IrOp::SourceLoc(_) => {
-                // No code for source location markers
+            IrOp::SourceLoc(span) => {
+                // Emit a uniquely-named label-definition pseudo-op
+                // at the current codegen position — but only when
+                // source-map emission is enabled. Labels introduce
+                // peephole block boundaries, so unconditionally
+                // emitting them would shift release-mode ROM bytes
+                // (and break the golden-diff contract). Off by
+                // default; the CLI flips it on under `--source-map`.
+                if self.emit_source_locs {
+                    let name = format!("__src_{}", self.next_source_loc);
+                    self.next_source_loc += 1;
+                    self.emit_label(&name);
+                    self.source_locs.push((name, *span));
+                }
             }
         }
     }
@@ -2620,6 +2772,149 @@ mod more_tests {
         assert_eq!(
             adc_count, 1,
             "u8 += should emit exactly one ADC; got {adc_count}"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_debug_mode_emits_marker_label() {
+        // The codegen drops a `__debug_mode` label whenever debug
+        // mode is on. The linker reads that label to decide
+        // whether to splice the frame-overrun-aware NMI handler,
+        // so the marker is load-bearing even though it carries no
+        // bytes itself.
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        let has_marker = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__debug_mode"));
+        assert!(has_marker, "debug mode should emit __debug_mode marker");
+    }
+
+    #[test]
+    fn ir_codegen_release_mode_has_no_debug_marker() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        let has_marker = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__debug_mode"));
+        assert!(
+            !has_marker,
+            "release mode must not emit __debug_mode; doing so would force the debug NMI"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_bounds_check_in_debug_mode_emits_halt_jump() {
+        // Debug-mode array access should emit a CMP + BCC + JMP
+        // __debug_halt guard, and the codegen should define
+        // `__debug_halt` as a terminal infinite loop. We only
+        // check for the presence of the halt label and a JMP
+        // targeting it; the actual CMP comes with an immediate
+        // whose value depends on the array length. Verified for
+        // `xs[i]` on a `u8[4]` array → the immediate should be 4.
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            var xs: u8[4] = [10, 20, 30, 40]
+            on frame {
+                var i: u8 = 2
+                var v: u8 = xs[i]
+                wait_frame
+            }
+            start Main
+        "#,
+        );
+        // Label defined at the halt site.
+        let has_halt_label = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__debug_halt") && i.opcode == NOP);
+        assert!(has_halt_label, "debug mode should emit __debug_halt label");
+        // JMP __debug_halt from the bounds-check fail path.
+        let has_jmp_halt = insts
+            .iter()
+            .any(|i| i.opcode == JMP && matches!(&i.mode, AM::Label(l) if l == "__debug_halt"));
+        assert!(
+            has_jmp_halt,
+            "debug-mode bounds check should JMP to __debug_halt on failure"
+        );
+        // The CMP #4 compares against the array length.
+        let has_cmp_four = insts
+            .iter()
+            .any(|i| i.opcode == CMP && i.mode == AM::Immediate(4));
+        assert!(
+            has_cmp_four,
+            "bounds check against a `u8[4]` array should CMP against 4"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_bounds_check_stripped_in_release() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var xs: u8[4] = [10, 20, 30, 40]
+            on frame {
+                var i: u8 = 2
+                var v: u8 = xs[i]
+                wait_frame
+            }
+            start Main
+        "#,
+        );
+        let has_halt_label = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__debug_halt"));
+        assert!(
+            !has_halt_label,
+            "release builds must not emit the bounds-check halt routine"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_source_map_opt_in_emits_src_labels() {
+        // With `with_source_map(true)` the codegen should emit
+        // a `__src_<N>` label and record the span for each
+        // lowered statement. Without the opt-in, release-mode
+        // ROMs must stay byte-identical (no `__src_` labels).
+        let (prog, _) = parser::parse(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        let prog = prog.unwrap();
+        let analysis = analyzer::analyze(&prog);
+        let ir_program = ir::lower(&prog, &analysis);
+        let mut codegen =
+            IrCodeGen::new(&analysis.var_allocations, &ir_program).with_source_map(true);
+        let insts = codegen.generate(&ir_program);
+        let src_labels: Vec<_> = insts
+            .iter()
+            .filter_map(|i| match &i.mode {
+                AM::Label(l) if l.starts_with("__src_") && i.opcode == NOP => Some(l.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !src_labels.is_empty(),
+            "source-map-enabled codegen should emit at least one __src_ label"
+        );
+        let recorded = codegen.source_locs();
+        assert_eq!(
+            src_labels.len(),
+            recorded.len(),
+            "every emitted __src_ label should have a matching source_locs entry"
         );
     }
 }

@@ -388,6 +388,14 @@ impl LoweringContext {
     }
 
     fn lower_statement(&mut self, stmt: &Statement) {
+        // Emit a source-location marker before every statement we
+        // lower. The codegen turns these into label-definition
+        // pseudo-ops (`__src_<file>_<byte>_<line>_<col>`), which
+        // the linker then reports back to the CLI so it can emit a
+        // source map. Release builds don't need the map, but we
+        // still leave the markers in — they lower to zero bytes in
+        // codegen, so there's no ROM cost.
+        self.emit(IrOp::SourceLoc(stmt.span()));
         match stmt {
             Statement::VarDecl(var) => {
                 let var_id = self.get_or_create_var(&var.name);

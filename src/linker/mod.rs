@@ -1,5 +1,10 @@
+mod debug_symbols;
 #[cfg(test)]
 mod tests;
+
+pub use debug_symbols::{render_mlb, render_source_map};
+
+use std::collections::HashMap;
 
 use crate::asm;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
@@ -7,6 +12,31 @@ use crate::assets::{BackgroundData, MusicData, PaletteData, SfxData};
 use crate::parser::ast::{HeaderFormat, Mapper, Mirroring};
 use crate::rom::RomBuilder;
 use crate::runtime;
+
+/// Detailed result of a link pass. In addition to the final iNES
+/// ROM bytes this carries the assembler's symbol table — each label
+/// defined anywhere in the assembled fixed bank mapped to its CPU
+/// address — and the byte offset at which the fixed bank starts
+/// inside the PRG ROM region of the file.
+///
+/// The CLI uses this metadata to emit Mesen-compatible `.mlb`
+/// symbol files and source-to-ROM maps (via the `--symbols` /
+/// `--source-map` flags). Callers that only care about the ROM
+/// bytes can read `.rom` and discard the rest.
+#[derive(Debug, Clone)]
+pub struct LinkedRom {
+    /// Final iNES ROM bytes (header + PRG banks + CHR).
+    pub rom: Vec<u8>,
+    /// Every label defined in the fixed bank, mapped to its CPU
+    /// address in the $C000-$FFFF window. Populated by the
+    /// 6502 assembler's label pass.
+    pub labels: HashMap<String, u16>,
+    /// Byte offset of the fixed bank's first byte inside `rom`.
+    /// For NROM this is `16` (just past the 16-byte iNES header).
+    /// For banked mappers each switchable bank shifts it by 16 KB,
+    /// so the fixed bank starts at `16 + 16_384 * switchable_bank_count`.
+    pub fixed_bank_file_offset: usize,
+}
 
 /// Link compiled code into a complete NES ROM.
 pub struct Linker {
@@ -213,6 +243,34 @@ impl Linker {
         backgrounds: &[BackgroundData],
         switchable_banks: &[PrgBank],
     ) -> Vec<u8> {
+        self.link_banked_with_ppu_detailed(
+            user_code,
+            sprites,
+            sfx,
+            music,
+            palettes,
+            backgrounds,
+            switchable_banks,
+        )
+        .rom
+    }
+
+    /// Like [`Linker::link_banked_with_ppu`] but returns the full
+    /// [`LinkedRom`] record, carrying the assembler label table and
+    /// the PRG offset of the fixed bank alongside the ROM bytes.
+    /// This is the entry point used by the CLI when emitting a
+    /// `.mlb` symbol file or a source-map file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn link_banked_with_ppu_detailed(
+        &self,
+        user_code: &[Instruction],
+        sprites: &[SpriteData],
+        sfx: &[SfxData],
+        music: &[MusicData],
+        palettes: &[PaletteData],
+        backgrounds: &[BackgroundData],
+        switchable_banks: &[PrgBank],
+    ) -> LinkedRom {
         assert!(
             switchable_banks.is_empty() || self.mapper != Mapper::NROM,
             "NROM does not support switchable PRG banks (got {} banks)",
@@ -239,7 +297,7 @@ impl Linker {
         palettes: &[PaletteData],
         backgrounds: &[BackgroundData],
         switchable_banks: &[PrgBank],
-    ) -> Vec<u8> {
+    ) -> LinkedRom {
         // ROM layout.
         //
         // NROM: a single 16 KB PRG bank mapped at $C000-$FFFF.
@@ -429,7 +487,11 @@ impl Linker {
         // The audio tick JSR is emitted by `gen_nmi` itself, after
         // the register and scratch-slot saves, so it can freely
         // clobber A/X/Y and $02/$03 without corrupting user state.
-        all_instructions.extend(runtime::gen_nmi(has_ppu_updates, has_audio));
+        // The codegen emits a `__debug_mode` marker whenever
+        // `--debug` is active; that tells the runtime to splice
+        // in the extra frame-overrun check at the top of NMI.
+        let debug_mode = has_label(user_code, "__debug_mode");
+        all_instructions.extend(runtime::gen_nmi(has_ppu_updates, has_audio, debug_mode));
 
         // IRQ handler
         all_instructions.push(Instruction::new(NOP, AM::Label("__irq".into())));
@@ -508,7 +570,17 @@ impl Linker {
         }
         builder.set_chr(chr);
 
-        builder.build()
+        let rom = builder.build();
+        // The fixed bank sits after the iNES header (16 bytes) and
+        // any switchable banks (16 KB each). Callers use this to
+        // translate CPU addresses from `labels` into ROM file
+        // offsets when emitting Mesen `.mlb` files.
+        let fixed_bank_file_offset = 16 + switchable_banks.len() * 16_384;
+        LinkedRom {
+            rom,
+            labels: result.labels,
+            fixed_bank_file_offset,
+        }
     }
 
     /// Generate instructions to load the default palette into the PPU.

@@ -70,7 +70,7 @@ fn init_assembles_without_error() {
 
 #[test]
 fn nmi_saves_and_restores_registers() {
-    let nmi = gen_nmi(false, false);
+    let nmi = gen_nmi(false, false, false);
     // First three instructions should push A, X, Y
     assert_eq!(nmi[0].opcode, PHA);
     assert_eq!(nmi[1].opcode, TXA);
@@ -86,7 +86,7 @@ fn nmi_saves_and_restores_registers() {
 
 #[test]
 fn nmi_triggers_oam_dma() {
-    let nmi = gen_nmi(false, false);
+    let nmi = gen_nmi(false, false, false);
     let has_dma = nmi
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4014));
@@ -95,7 +95,7 @@ fn nmi_triggers_oam_dma() {
 
 #[test]
 fn nmi_reads_controller() {
-    let nmi = gen_nmi(false, false);
+    let nmi = gen_nmi(false, false, false);
     // Should write strobe to $4016
     let has_strobe = nmi
         .iter()
@@ -105,7 +105,7 @@ fn nmi_reads_controller() {
 
 #[test]
 fn nmi_sets_frame_flag() {
-    let nmi = gen_nmi(false, false);
+    let nmi = gen_nmi(false, false, false);
     let has_flag = nmi
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(ZP_FRAME_FLAG));
@@ -114,13 +114,40 @@ fn nmi_sets_frame_flag() {
 
 #[test]
 fn nmi_assembles_without_error() {
-    let nmi = gen_nmi(false, false);
+    let nmi = gen_nmi(false, false, false);
     let result = asm::assemble(&nmi, 0xF000);
     assert!(!result.bytes.is_empty());
     assert!(
         result.bytes.len() < 150,
         "NMI handler is {} bytes, expected < 150",
         result.bytes.len()
+    );
+}
+
+#[test]
+fn nmi_debug_mode_bumps_overrun_counter() {
+    // With `debug_mode = true`, the NMI handler must include an
+    // `INC $07FF` (the frame-overrun counter at
+    // `DEBUG_FRAME_OVERRUN_ADDR`) guarded by a BEQ that skips the
+    // bump when the frame flag was clear. Without `debug_mode`,
+    // neither the `INC` nor the guard label appear so release
+    // builds keep the top byte of RAM free for user allocation.
+    let nmi = gen_nmi(false, false, true);
+    let has_inc = nmi.iter().any(|i| {
+        i.opcode == INC && matches!(i.mode, AM::Absolute(a) if a == DEBUG_FRAME_OVERRUN_ADDR)
+    });
+    assert!(
+        has_inc,
+        "debug-mode NMI should INC the overrun counter at $07FF"
+    );
+
+    let release_nmi = gen_nmi(false, false, false);
+    let has_inc_release = release_nmi.iter().any(|i| {
+        i.opcode == INC && matches!(i.mode, AM::Absolute(a) if a == DEBUG_FRAME_OVERRUN_ADDR)
+    });
+    assert!(
+        !has_inc_release,
+        "release NMI must not touch the debug overrun slot"
     );
 }
 
