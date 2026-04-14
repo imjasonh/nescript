@@ -21,7 +21,7 @@ use nescript::analyzer;
 use nescript::assets;
 use nescript::codegen::{peephole, IrCodeGen};
 use nescript::ir;
-use nescript::linker::{Linker, PrgBank};
+use nescript::linker::{BankTrampoline, Linker, PrgBank};
 use nescript::optimizer;
 use nescript::parser;
 use nescript::parser::ast::BankType;
@@ -113,18 +113,53 @@ fn compile_pipeline(source: &str, source_dir: &Path) -> Vec<u8> {
     let backgrounds =
         assets::resolve_backgrounds(&program, source_dir).expect("background resolution failed");
 
-    let mut instructions = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
-        .with_audio(&sfx, &music)
-        .generate(&ir_program);
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
     peephole::optimize(&mut instructions);
 
-    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    // Pull the per-bank instruction streams out of the codegen and
+    // reconstruct the trampoline requests for each banked function,
+    // mirroring the real CLI compile path in `src/main.rs`. A
+    // bench that left the switchable banks empty would panic in
+    // the assembler's fixup pass for any program that nests a
+    // function inside a `bank` block (e.g. `uxrom_user_banked`),
+    // because the `__tramp_<name>` label emitted by IR codegen
+    // would have nowhere to resolve to.
+    let mut banked_streams = codegen.banked_streams().clone();
+    for stream in banked_streams.values_mut() {
+        peephole::optimize(stream);
+    }
+    let mut bank_trampolines: std::collections::HashMap<String, Vec<BankTrampoline>> =
+        std::collections::HashMap::new();
+    for func in &ir_program.functions {
+        if let Some(bank_name) = &func.bank {
+            bank_trampolines
+                .entry(bank_name.clone())
+                .or_default()
+                .push(BankTrampoline {
+                    tramp_label: format!("__tramp_{}", func.name),
+                    entry_label: format!("__ir_fn_{}", func.name),
+                });
+        }
+    }
+
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper)
+        .with_header(program.game.header);
     let switchable_banks: Vec<PrgBank> = program
         .banks
         .iter()
         .filter(|b| b.bank_type == BankType::Prg)
-        .map(|b| PrgBank::empty(&b.name))
+        .map(|b| {
+            let stream = banked_streams.remove(&b.name).unwrap_or_default();
+            let tramps = bank_trampolines.remove(&b.name).unwrap_or_default();
+            if stream.is_empty() && tramps.is_empty() {
+                PrgBank::empty(&b.name)
+            } else {
+                PrgBank::with_instructions(&b.name, stream, tramps)
+            }
+        })
         .collect();
     linker.link_banked_with_ppu(
         &instructions,
