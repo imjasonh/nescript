@@ -70,7 +70,7 @@ fn init_assembles_without_error() {
 
 #[test]
 fn nmi_saves_and_restores_registers() {
-    let nmi = gen_nmi(false, false);
+    let nmi = gen_nmi(false, false, false);
     // First three instructions should push A, X, Y
     assert_eq!(nmi[0].opcode, PHA);
     assert_eq!(nmi[1].opcode, TXA);
@@ -86,7 +86,7 @@ fn nmi_saves_and_restores_registers() {
 
 #[test]
 fn nmi_triggers_oam_dma() {
-    let nmi = gen_nmi(false, false);
+    let nmi = gen_nmi(false, false, false);
     let has_dma = nmi
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4014));
@@ -95,7 +95,7 @@ fn nmi_triggers_oam_dma() {
 
 #[test]
 fn nmi_reads_controller() {
-    let nmi = gen_nmi(false, false);
+    let nmi = gen_nmi(false, false, false);
     // Should write strobe to $4016
     let has_strobe = nmi
         .iter()
@@ -105,7 +105,7 @@ fn nmi_reads_controller() {
 
 #[test]
 fn nmi_sets_frame_flag() {
-    let nmi = gen_nmi(false, false);
+    let nmi = gen_nmi(false, false, false);
     let has_flag = nmi
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(ZP_FRAME_FLAG));
@@ -114,13 +114,40 @@ fn nmi_sets_frame_flag() {
 
 #[test]
 fn nmi_assembles_without_error() {
-    let nmi = gen_nmi(false, false);
+    let nmi = gen_nmi(false, false, false);
     let result = asm::assemble(&nmi, 0xF000);
     assert!(!result.bytes.is_empty());
     assert!(
         result.bytes.len() < 150,
         "NMI handler is {} bytes, expected < 150",
         result.bytes.len()
+    );
+}
+
+#[test]
+fn nmi_debug_mode_bumps_overrun_counter() {
+    // With `debug_mode = true`, the NMI handler must include an
+    // `INC $07FF` (the frame-overrun counter at
+    // `DEBUG_FRAME_OVERRUN_ADDR`) guarded by a BEQ that skips the
+    // bump when the frame flag was clear. Without `debug_mode`,
+    // neither the `INC` nor the guard label appear so release
+    // builds keep the top byte of RAM free for user allocation.
+    let nmi = gen_nmi(false, false, true);
+    let has_inc = nmi.iter().any(|i| {
+        i.opcode == INC && matches!(i.mode, AM::Absolute(a) if a == DEBUG_FRAME_OVERRUN_ADDR)
+    });
+    assert!(
+        has_inc,
+        "debug-mode NMI should INC the overrun counter at $07FF"
+    );
+
+    let release_nmi = gen_nmi(false, false, false);
+    let has_inc_release = release_nmi.iter().any(|i| {
+        i.opcode == INC && matches!(i.mode, AM::Absolute(a) if a == DEBUG_FRAME_OVERRUN_ADDR)
+    });
+    assert!(
+        !has_inc_release,
+        "release NMI must not touch the debug overrun slot"
     );
 }
 
@@ -168,7 +195,7 @@ fn multiply_routine_assembles() {
 
 #[test]
 fn audio_tick_defines_required_labels() {
-    let tick = gen_audio_tick();
+    let tick = gen_audio_tick(false, false);
     // The IR codegen JSRs into `__audio_tick`; that's the entry.
     let has_entry = tick
         .iter()
@@ -188,7 +215,7 @@ fn audio_tick_defines_required_labels() {
 
 #[test]
 fn audio_tick_ends_with_rts() {
-    let tick = gen_audio_tick();
+    let tick = gen_audio_tick(false, false);
     assert_eq!(
         tick.last().unwrap().opcode,
         RTS,
@@ -201,7 +228,7 @@ fn audio_tick_reads_sfx_envelope_via_indirect_y() {
     // The sfx branch walks the envelope via (ZP_SFX_PTR_LO),Y with
     // Y=0 — each NMI reads one byte through the pointer and writes
     // it to $4000. Verify the indirect-indexed load is present.
-    let tick = gen_audio_tick();
+    let tick = gen_audio_tick(false, false);
     let has_load = tick
         .iter()
         .any(|i| i.opcode == LDA && i.mode == AM::IndirectY(ZP_SFX_PTR_LO));
@@ -214,11 +241,92 @@ fn audio_tick_reads_sfx_envelope_via_indirect_y() {
 #[test]
 fn audio_tick_writes_pulse1_envelope_register() {
     // After reading the envelope byte the tick writes it to $4000.
-    let tick = gen_audio_tick();
+    let tick = gen_audio_tick(false, false);
     let has_store = tick
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4000));
     assert!(has_store, "audio tick must write pulse-1 envelope to $4000");
+}
+
+#[test]
+fn audio_tick_noise_block_writes_400c_when_enabled() {
+    // With `has_noise = true` the tick gains a block that loads an
+    // envelope byte and writes it to the APU noise volume register
+    // at $400C. Verify both the marker label and the STA $400C are
+    // present.
+    let tick = gen_audio_tick(true, false);
+    let has_label = tick
+        .iter()
+        .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_noise_tick"));
+    assert!(has_label, "noise tick should define __audio_noise_tick");
+    let has_400c = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x400C));
+    assert!(has_400c, "noise tick should write to $400C");
+}
+
+#[test]
+fn audio_tick_noise_block_absent_when_disabled() {
+    // The pulse-only path must not emit any noise label, so
+    // programs that never declare a noise sfx get byte-identical
+    // code to the pre-feature version.
+    let tick = gen_audio_tick(false, false);
+    let has_label = tick
+        .iter()
+        .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_noise_tick"));
+    assert!(
+        !has_label,
+        "noise tick label must not appear when flag is off"
+    );
+    let has_400c = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x400C));
+    assert!(
+        !has_400c,
+        "noise $400C write must not appear when flag is off"
+    );
+}
+
+#[test]
+fn audio_tick_triangle_block_writes_4008_when_enabled() {
+    let tick = gen_audio_tick(false, true);
+    let has_label = tick
+        .iter()
+        .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_triangle_tick"));
+    assert!(
+        has_label,
+        "triangle tick should define __audio_triangle_tick"
+    );
+    let has_4008 = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4008));
+    assert!(has_4008, "triangle tick should write to $4008");
+}
+
+#[test]
+fn audio_tick_triangle_block_absent_when_disabled() {
+    let tick = gen_audio_tick(false, false);
+    let has_label = tick
+        .iter()
+        .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_triangle_tick"));
+    assert!(!has_label);
+    let has_4008 = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4008));
+    assert!(!has_4008);
+}
+
+#[test]
+fn audio_tick_both_channels_assemble() {
+    // With both new channels enabled, the tick + period table must
+    // still fit its internal branches (±127 bytes) and assemble
+    // successfully.
+    let mut combined = gen_audio_tick(true, true);
+    combined.extend(gen_period_table());
+    let result = asm::assemble(&combined, 0xC000);
+    assert!(!result.bytes.is_empty());
+    assert!(result.labels.contains_key("__audio_noise_tick"));
+    assert!(result.labels.contains_key("__audio_triangle_tick"));
 }
 
 #[test]
@@ -227,7 +335,7 @@ fn audio_tick_mutes_pulse2_on_non_looping_end_of_track() {
     // tick writes $30 to $4004 and clears ZP_MUSIC_STATE. We verify
     // the mute path exists by checking both writes exist somewhere
     // in the tick body.
-    let tick = gen_audio_tick();
+    let tick = gen_audio_tick(false, false);
     let has_mute = tick
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4004));
@@ -248,7 +356,7 @@ fn audio_tick_assembles_without_error() {
     // uses label-relative branches internally which need to fit
     // within ±127 bytes — if the body grows past that the branches
     // will panic at assemble time.
-    let mut combined = gen_audio_tick();
+    let mut combined = gen_audio_tick(false, false);
     combined.extend(gen_period_table());
     let result = asm::assemble(&combined, 0xC000);
     assert!(
@@ -566,14 +674,32 @@ fn bank_select_mmc1_serializes_five_bits_to_e000() {
 }
 
 #[test]
-fn bank_select_uxrom_writes_fff0() {
-    // UxROM bank-select writes A to $FFF0, which lives in the
-    // fixed bank's bus-conflict-safe table.
+fn bank_select_uxrom_uses_bus_conflict_table() {
+    // UxROM bank-select has to write to a ROM address whose byte
+    // already equals the bank being selected. The routine does
+    // `TAX; STA __bank_select_table, X` so the store goes to
+    // `table + bank_num`, whose ROM byte is `bank_num` — making
+    // the bus write match the ROM byte regardless of which bank
+    // is being requested. We assert both pieces here so a
+    // regression back to the broken `STA $FFF0` form fails
+    // loudly.
     let sel = gen_bank_select(Mapper::UxROM);
-    let has_write = sel
+    let has_tax = sel.iter().any(|i| i.opcode == TAX && i.mode == AM::Implied);
+    assert!(has_tax, "UxROM bank-select must TAX before the store");
+    let has_indexed_store = sel.iter().any(|i| {
+        i.opcode == STA && matches!(&i.mode, AM::LabelAbsoluteX(n) if n == "__bank_select_table")
+    });
+    assert!(
+        has_indexed_store,
+        "UxROM bank-select must `STA __bank_select_table,X`"
+    );
+    let writes_fff0 = sel
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0xFFF0));
-    assert!(has_write, "UxROM bank-select must write to $FFF0");
+    assert!(
+        !writes_fff0,
+        "UxROM bank-select must not fall back to the bus-conflict-unsafe STA $FFF0 form"
+    );
     assert_eq!(sel.last().unwrap().opcode, RTS);
 }
 
@@ -615,7 +741,15 @@ fn bank_select_stashes_bank_number_in_zp() {
 #[test]
 fn bank_select_assembles_for_every_mapper() {
     for m in [Mapper::NROM, Mapper::MMC1, Mapper::UxROM, Mapper::MMC3] {
-        let sel = gen_bank_select(m);
+        let mut sel = gen_bank_select(m);
+        // UxROM `gen_bank_select` references `__bank_select_table`
+        // via `AM::LabelAbsoluteX`; give the assembler something
+        // to resolve against in this standalone unit test. Real
+        // linking appends the table in the linker pass, so the
+        // label always resolves there.
+        if m == Mapper::UxROM {
+            sel.extend(super::gen_uxrom_bank_table());
+        }
         let result = asm::assemble(&sel, 0xC000);
         assert!(
             !result.bytes.is_empty(),
@@ -633,10 +767,12 @@ fn trampoline_switches_target_then_restores_fixed() {
     // A trampoline must JSR `__bank_select` twice: once with the
     // target bank's index, once with the fixed bank's index. The
     // two LDA immediates in the stub should match those two bank
-    // numbers in order.
-    let t = gen_bank_trampoline("Level1", "__bank_Level1_entry", 0, 3);
+    // numbers in order. The trampoline name is the label callers
+    // will JSR (one trampoline per banked function); the entry
+    // label is whatever lives in the switchable bank.
+    let t = gen_bank_trampoline("__tramp_helper", "__ir_fn_helper", 0, 3);
     // First instruction is the trampoline label.
-    assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_Level1"));
+    assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_helper"));
     // Extract the sequence of immediate loads.
     let imms: Vec<u8> = t
         .iter()
@@ -664,7 +800,7 @@ fn trampoline_switches_target_then_restores_fixed() {
         .collect();
     assert_eq!(
         jsrs,
-        vec!["__bank_select", "__bank_Level1_entry", "__bank_select"],
+        vec!["__bank_select", "__ir_fn_helper", "__bank_select"],
         "trampoline JSRs must dispatch in the correct order"
     );
     // Final instruction returns to caller.
@@ -672,11 +808,14 @@ fn trampoline_switches_target_then_restores_fixed() {
 }
 
 #[test]
-fn trampoline_label_derives_from_bank_name() {
-    // Trampoline labels are consistently named `__tramp_<bank>` so
-    // codegen can reference them without knowing bank indices.
-    let t = gen_bank_trampoline("MusicData", "__music_entry", 1, 3);
-    assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_MusicData"));
+fn trampoline_label_uses_caller_supplied_name() {
+    // The codegen picks the trampoline label (typically
+    // `__tramp_<fn_name>`) so it can JSR it from the call site
+    // without knowing bank indices. `gen_bank_trampoline` should
+    // emit that exact label as its leading pseudo-op so the
+    // assembler resolves the JSR.
+    let t = gen_bank_trampoline("__tramp_big_helper", "__ir_fn_big_helper", 1, 3);
+    assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_big_helper"));
 }
 
 #[test]

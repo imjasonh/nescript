@@ -70,6 +70,91 @@ pub const NES_COLORS: [(u8, u8, u8); 64] = [
     (0, 0, 0),       // 0x3F
 ];
 
+/// Decode a PNG file into a 32-byte NES palette blob.
+///
+/// Each pixel's RGB is mapped to the nearest NES master-palette
+/// index via [`nearest_nes_color`]. Pixels are walked in row-major
+/// order and deduplicated; the first `N` unique colours (up to 16)
+/// become the palette. The first unique colour is treated as the
+/// **universal** background colour and is written to every
+/// sub-palette's first byte (indices 0, 4, 8, 12, 16, 20, 24, 28)
+/// so the PPU's `$3F10/$3F14/$3F18/$3F1C` mirror doesn't silently
+/// clobber it — the same convention the grouped-form parser
+/// enforces.
+///
+/// The output is always exactly 32 bytes, even when fewer than
+/// 16 unique colours were found: remaining sub-palette slots are
+/// filled from the leading unique colours (so short PNGs round-
+/// trip cleanly into a valid `$3F00-$3F1F` blob). When more than
+/// 16 unique NES colours are present, an error is returned — the
+/// caller is expected to use a smaller image or the grouped
+/// authoring form.
+///
+/// Called from [`crate::assets::resolve::resolve_palettes`] when
+/// a `palette Name @palette("file.png")` declaration sets
+/// `PaletteDecl::png_source`.
+pub fn png_to_palette(path: &std::path::Path) -> Result<[u8; 32], String> {
+    let img = image::open(path).map_err(|e| format!("failed to open {}: {e}", path.display()))?;
+    let rgb = img.to_rgb8();
+
+    // Walk pixels in row-major order, mapping each to its nearest
+    // NES index and deduplicating. The first hit becomes the
+    // universal colour; subsequent unique hits fill the remaining
+    // 15 palette slots. The hard cap mirrors the PPU's own limit:
+    // 4 sub-palettes × 4 bytes − 3 shared universals = 13 usable
+    // slots for backgrounds and 13 for sprites, i.e. 16 including
+    // the shared universal byte. More than that can't fit into
+    // a single `$3F00-$3F1F` write.
+    let mut unique: Vec<u8> = Vec::with_capacity(16);
+    for pixel in rgb.pixels() {
+        let idx = nearest_nes_color(pixel[0], pixel[1], pixel[2]);
+        if !unique.contains(&idx) {
+            unique.push(idx);
+            if unique.len() > 16 {
+                return Err(format!(
+                    "palette PNG {} has more than 16 unique NES colours; \
+                     use a smaller image or switch to the grouped palette \
+                     authoring form",
+                    path.display()
+                ));
+            }
+        }
+    }
+
+    if unique.is_empty() {
+        return Err(format!(
+            "palette PNG {} has zero pixels; need at least one colour",
+            path.display()
+        ));
+    }
+
+    // Pad with the universal so every slot index is valid.
+    while unique.len() < 16 {
+        unique.push(unique[0]);
+    }
+
+    // Assemble the 32-byte blob. The first byte of every 4-byte
+    // sub-palette is forced to the shared universal (`unique[0]`)
+    // to avoid the PPU mirror bug described above.
+    let universal = unique[0];
+    let mut out = [0u8; 32];
+    for slot in 0..8 {
+        let base = slot * 4;
+        // The unique list is 16 bytes long but arranged as 4
+        // background sub-palettes of 4 bytes. We reuse the same
+        // 16-entry layout for sprites so a tiny PNG still produces
+        // a fully-filled 32-byte blob. The universal byte overrides
+        // whatever happened to land at index `base`.
+        let slot_idx = slot % 4; // 4 bg + 4 sp -> same 4 source slots
+        let src = slot_idx * 4;
+        out[base] = universal;
+        out[base + 1] = unique[src + 1];
+        out[base + 2] = unique[src + 2];
+        out[base + 3] = unique[src + 3];
+    }
+    Ok(out)
+}
+
 /// Find the nearest NES color index for an RGB value.
 pub fn nearest_nes_color(r: u8, g: u8, b: u8) -> u8 {
     let mut best_idx = 0u8;
@@ -240,6 +325,90 @@ mod tests {
     fn unknown_name_returns_none() {
         assert_eq!(color_name_to_index("mauve"), None);
         assert_eq!(color_name_to_index(""), None);
+    }
+
+    #[test]
+    fn png_to_palette_dedupes_and_pads() {
+        // Build a 4×1 PNG with four known NES colours, save it to
+        // a tempfile, and verify `png_to_palette` pulls them back
+        // out deterministically. We use pure primaries so the
+        // `nearest_nes_color` mapping is unambiguous.
+        use image::{Rgb, RgbImage};
+
+        let mut img = RgbImage::new(4, 1);
+        // $0F (black), $16 (red), $19 (green), $11 (blue) —
+        // picked to be the nearest master-palette entries for
+        // these pure primaries. `nearest_nes_color` does the
+        // actual lookup at read time so the test doesn't need
+        // to hard-code the exact RGB.
+        img.put_pixel(0, 0, Rgb([0, 0, 0]));
+        img.put_pixel(1, 0, Rgb([248, 0, 0]));
+        img.put_pixel(2, 0, Rgb([0, 168, 0]));
+        img.put_pixel(3, 0, Rgb([0, 0, 200]));
+
+        let dir = std::env::temp_dir();
+        let path = dir.join("nescript_png_to_palette_test.png");
+        img.save(&path).unwrap();
+
+        let blob = png_to_palette(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        // Expected colours recovered via the same mapper.
+        let e0 = nearest_nes_color(0, 0, 0);
+        let e1 = nearest_nes_color(248, 0, 0);
+        let e2 = nearest_nes_color(0, 168, 0);
+        let e3 = nearest_nes_color(0, 0, 200);
+
+        // Sub-palette 0 = [universal, red, green, blue].
+        assert_eq!(blob[0], e0);
+        assert_eq!(blob[1], e1);
+        assert_eq!(blob[2], e2);
+        assert_eq!(blob[3], e3);
+        // Every sub-palette's first byte is the shared universal
+        // so the PPU mirror doesn't wipe `$3F00` at runtime.
+        for slot in 0..8usize {
+            assert_eq!(blob[slot * 4], e0, "slot {slot} universal mismatch");
+        }
+    }
+
+    #[test]
+    fn png_to_palette_rejects_too_many_colours() {
+        // A PNG with 17+ distinct NES master-palette indices must
+        // be rejected: 16 is the hard cap. We pick pixels at the
+        // exact RGB values of 17 different NES master palette
+        // entries so the `nearest_nes_color` lookup produces 17
+        // distinct indices deterministically (rather than hoping
+        // a gradient happens to hit enough unique slots).
+        use image::{Rgb, RgbImage};
+
+        // Indices carefully chosen to be well-separated so none
+        // map to the same NES index as another. The NES master
+        // palette has several near-duplicate entries in row 3,
+        // so we stay in rows 0-2 where every entry is distinct.
+        let indices: [usize; 17] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x11,
+            0x16, 0x19, 0x21,
+        ];
+        let mut img = RgbImage::new(indices.len() as u32, 1);
+        for (x, &idx) in indices.iter().enumerate() {
+            let (r, g, b) = NES_COLORS[idx];
+            img.put_pixel(x as u32, 0, Rgb([r, g, b]));
+        }
+        let dir = std::env::temp_dir();
+        let path = dir.join("nescript_png_to_palette_toomany.png");
+        img.save(&path).unwrap();
+        let err = png_to_palette(&path).unwrap_err();
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            err.contains("more than 16 unique"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn png_to_palette_missing_file_errors() {
+        let err = png_to_palette(std::path::Path::new("/nope/does/not/exist.png")).unwrap_err();
+        assert!(err.contains("failed to open"));
     }
 
     #[test]

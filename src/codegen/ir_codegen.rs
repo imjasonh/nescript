@@ -28,11 +28,14 @@ use crate::analyzer::VarAllocation;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
 use crate::assets::{MusicData, SfxData};
 use crate::ir::{IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator, VarId};
+use crate::parser::ast::Channel;
 use crate::runtime::{
-    ZP_MUSIC_BASE_HI, ZP_MUSIC_BASE_LO, ZP_MUSIC_COUNTER, ZP_MUSIC_PTR_HI, ZP_MUSIC_PTR_LO,
-    ZP_MUSIC_STATE, ZP_OAM_CURSOR, ZP_PENDING_BG_ATTRS_HI, ZP_PENDING_BG_ATTRS_LO,
-    ZP_PENDING_BG_TILES_HI, ZP_PENDING_BG_TILES_LO, ZP_PENDING_PALETTE_HI, ZP_PENDING_PALETTE_LO,
-    ZP_PPU_UPDATE_FLAGS, ZP_SFX_COUNTER, ZP_SFX_PTR_HI, ZP_SFX_PTR_LO,
+    AUDIO_NOISE_COUNTER, AUDIO_NOISE_PTR_HI, AUDIO_NOISE_PTR_LO, AUDIO_TRIANGLE_COUNTER,
+    AUDIO_TRIANGLE_PTR_HI, AUDIO_TRIANGLE_PTR_LO, ZP_MUSIC_BASE_HI, ZP_MUSIC_BASE_LO,
+    ZP_MUSIC_COUNTER, ZP_MUSIC_PTR_HI, ZP_MUSIC_PTR_LO, ZP_MUSIC_STATE, ZP_OAM_CURSOR,
+    ZP_PENDING_BG_ATTRS_HI, ZP_PENDING_BG_ATTRS_LO, ZP_PENDING_BG_TILES_HI, ZP_PENDING_BG_TILES_LO,
+    ZP_PENDING_PALETTE_HI, ZP_PENDING_PALETTE_LO, ZP_PPU_UPDATE_FLAGS, ZP_SFX_COUNTER,
+    ZP_SFX_PTR_HI, ZP_SFX_PTR_LO,
 };
 
 /// Base zero-page address for IR temp slots.
@@ -79,11 +82,15 @@ pub struct IrCodeGen<'a> {
     use_counts: HashMap<IrTemp, u32>,
     /// Sprite name to tile index mapping.
     sprite_tiles: HashMap<String, u8>,
-    /// Sfx name to `(period_lo, period_hi, envelope_label)`. Populated
-    /// by `with_audio` from the resolved [`SfxData`] list — lets
-    /// `play Name` emit the right literals for the trigger bytes
-    /// and the right label for the envelope pointer.
-    sfx_info: HashMap<String, (u8, u8, String)>,
+    /// Sfx name to `(period_lo, period_hi, envelope_label, channel)`.
+    /// Populated by `with_audio` from the resolved [`SfxData`] list.
+    /// `play Name` consults this to pick:
+    /// - the right trigger register pair (pulse 1 = $4002/$4003,
+    ///   triangle = $400A/$400B, noise = $400E/$400F);
+    /// - the right per-channel envelope pointer slot (pulse 1 uses
+    ///   zero-page `ZP_SFX_PTR`, triangle/noise live in main RAM
+    ///   at the `AUDIO_*_PTR_*` addresses).
+    sfx_info: HashMap<String, (u8, u8, String, Channel)>,
     /// Music name to `(header_byte, stream_label)`. Populated by
     /// `with_audio`. `start_music Name` stamps `header | 0x02` into
     /// `ZP_MUSIC_STATE` and loads the pointer from `stream_label`.
@@ -103,11 +110,71 @@ pub struct IrCodeGen<'a> {
     /// marker label at most once per program so the linker can
     /// decide whether to splice the audio tick into NMI.
     audio_used: bool,
+    /// Set to true the first time a `play` op targets a noise sfx.
+    /// Emits the `__noise_used` marker label so the linker knows
+    /// to append the noise channel block to `gen_audio_tick` and
+    /// reserve the main-RAM state slots.
+    noise_used: bool,
+    /// Same as `noise_used`, but for triangle sfx. Drives the
+    /// `__triangle_used` marker label.
+    triangle_used: bool,
     /// Set to true the first time we emit any PPU update op
     /// (`set_palette` / `load_background`). The linker uses the
     /// resulting `__ppu_update_used` marker label to decide whether
     /// to splice the in-NMI palette/nametable update helper.
     ppu_update_used: bool,
+    /// Source-location markers produced from [`IrOp::SourceLoc`].
+    /// Each entry is a `(label_name, span)` pair — the codegen
+    /// emits a unique label-definition pseudo-op at the current
+    /// instruction index, and the CLI later resolves each label's
+    /// CPU address through the linker's output map to produce a
+    /// `.map` file. Empty if the IR didn't contain any source
+    /// markers or if `emit_source_locs` is false.
+    source_locs: Vec<(String, crate::lexer::Span)>,
+    /// Next unused index for the monotonic `__src_<N>` label
+    /// counter. Bumped every time a new marker is emitted.
+    next_source_loc: u32,
+    /// When true, each [`IrOp::SourceLoc`] is lowered to a
+    /// label-definition pseudo-op and recorded in `source_locs`.
+    /// When false (the default), `SourceLoc` is silently dropped
+    /// so release-mode codegen output is byte-identical to the
+    /// pre-source-map behaviour — turning this on *does* affect
+    /// the peephole pass's block boundaries and shifts labels in
+    /// the final ROM. Enabled by the CLI when `--source-map` is
+    /// passed.
+    emit_source_locs: bool,
+    /// Byte size of each named global / local variable. Keyed by
+    /// IR `VarId`, mirrors [`Self::var_addrs`]. Used by the
+    /// debug-mode array bounds checker to emit an `idx >= size`
+    /// guard on every `ArrayLoad` / `ArrayStore`. Missing entries
+    /// mean "unknown size" and skip the check.
+    var_sizes: HashMap<VarId, u16>,
+    /// True once a bounds-check trip was emitted; the linker-side
+    /// helper (a `JMP $` infinite loop at `__debug_halt`) is
+    /// emitted once at the end of `generate()` so multiple
+    /// failing checks all land on the same debug marker. Skipped
+    /// entirely in release builds.
+    bounds_halt_used: bool,
+    /// Per-banked-function instruction streams, populated by
+    /// [`Self::generate`] when a program declares one or more
+    /// `bank Foo { fun ... }` blocks. The key is the bank name; the
+    /// value is the assembled IR codegen output for every function
+    /// assigned to that bank, ready to be handed to the linker as a
+    /// `PrgBank::with_instructions` payload. Empty for programs
+    /// without any banked user code, which keeps the codegen output
+    /// byte-for-byte identical to the pre-banked behaviour.
+    banked_streams: HashMap<String, Vec<Instruction>>,
+    /// Function name → declared bank name, populated from the IR
+    /// functions' `bank` field. Used to decide whether a `Call` op
+    /// should JSR the direct `__ir_fn_<name>` label or the cross-bank
+    /// trampoline `__tramp_<name>` label.
+    function_banks: HashMap<String, String>,
+    /// While [`Self::generate`] is emitting code for a banked
+    /// function, this holds the bank name so cross-bank calls can be
+    /// disambiguated from in-bank calls. `None` means the codegen is
+    /// currently emitting fixed-bank code (handlers, runtime, the
+    /// dispatcher loop, top-level functions).
+    current_bank: Option<String>,
     allocations: &'a [VarAllocation],
 }
 
@@ -117,9 +184,11 @@ impl<'a> IrCodeGen<'a> {
         // Globals in IR are in the same order as in the analyzer, so we
         // can align them by name.
         let mut var_addrs = HashMap::new();
+        let mut var_sizes = HashMap::new();
         for global in &ir.globals {
             if let Some(alloc) = allocations.iter().find(|a| a.name == global.name) {
                 var_addrs.insert(global.var_id, alloc.address);
+                var_sizes.insert(global.var_id, alloc.size);
             }
         }
         // Map each function's parameter VarIds to the zero-page
@@ -152,14 +221,28 @@ impl<'a> IrCodeGen<'a> {
                 if i < func.param_count {
                     if i < 4 {
                         var_addrs.insert(local.var_id, 0x04 + i as u16);
+                        var_sizes.insert(local.var_id, local.size);
                     }
                 } else {
                     var_addrs.insert(local.var_id, local_ram_next);
+                    var_sizes.insert(local.var_id, local.size);
                     local_ram_next += local.size.max(1);
                 }
             }
         }
         let function_names = ir.functions.iter().map(|f| f.name.clone()).collect();
+        // Build the function-name → bank-name map from the IR. Most
+        // programs have an empty map (no `bank Foo { fun ... }`
+        // blocks); when populated, the codegen splits banked
+        // function bodies into per-bank instruction streams and
+        // rewrites `Call` ops to JSR a fixed-bank trampoline when
+        // they cross bank boundaries.
+        let mut function_banks: HashMap<String, String> = HashMap::new();
+        for func in &ir.functions {
+            if let Some(bank) = &func.bank {
+                function_banks.insert(func.name.clone(), bank.clone());
+            }
+        }
         Self {
             instructions: Vec::new(),
             var_addrs,
@@ -175,9 +258,53 @@ impl<'a> IrCodeGen<'a> {
             in_frame_handler: false,
             debug_mode: false,
             audio_used: false,
+            noise_used: false,
+            triangle_used: false,
             ppu_update_used: false,
+            source_locs: Vec::new(),
+            next_source_loc: 0,
+            emit_source_locs: false,
+            var_sizes,
+            bounds_halt_used: false,
+            banked_streams: HashMap::new(),
+            function_banks,
+            current_bank: None,
             allocations,
         }
+    }
+
+    /// Per-banked-function instruction streams produced by the most
+    /// recent [`Self::generate`] call. The map is keyed by bank name
+    /// (matching the program's `bank Foo { ... }` declarations) and
+    /// each value is ready to be handed to the linker as a
+    /// `PrgBank::with_instructions` payload. Empty for programs with
+    /// no banked code, in which case the linker treats every bank
+    /// as the legacy "reserved slot" mode.
+    #[must_use]
+    pub fn banked_streams(&self) -> &HashMap<String, Vec<Instruction>> {
+        &self.banked_streams
+    }
+
+    /// Enable source-location marker emission. When set, each
+    /// [`IrOp::SourceLoc`] lowers to a uniquely-named
+    /// label-definition pseudo-op and is recorded in
+    /// [`Self::source_locs`]. Off by default so release builds
+    /// produce byte-identical ROMs regardless of the IR lowering
+    /// stage's marker output.
+    #[must_use]
+    pub fn with_source_map(mut self, enabled: bool) -> Self {
+        self.emit_source_locs = enabled;
+        self
+    }
+
+    /// Source-location markers emitted during codegen. Populated
+    /// once [`Self::generate`] has run; each entry pairs a
+    /// `__src_<N>` label name with the span it came from. The CLI
+    /// uses this plus the linker's label map to write a source-map
+    /// file under `--source-map`.
+    #[must_use]
+    pub fn source_locs(&self) -> &[(String, crate::lexer::Span)] {
+        &self.source_locs
     }
 
     /// Enable debug-mode code generation. When set, `debug.log` and
@@ -207,8 +334,10 @@ impl<'a> IrCodeGen<'a> {
     #[must_use]
     pub fn with_audio(mut self, sfx: &[SfxData], music: &[MusicData]) -> Self {
         for s in sfx {
-            self.sfx_info
-                .insert(s.name.clone(), (s.period_lo, s.period_hi, s.label()));
+            self.sfx_info.insert(
+                s.name.clone(),
+                (s.period_lo, s.period_hi, s.label(), s.channel),
+            );
         }
         for m in music {
             self.music_info
@@ -299,6 +428,56 @@ impl<'a> IrCodeGen<'a> {
         self.emit(STA, AM::ZeroPage(addr));
     }
 
+    /// Emit a debug-only array bounds check. Assumes A holds the
+    /// candidate index; emits `CMP #len; BCS __debug_halt` where
+    /// `len` is the declared byte size of the variable. For u8
+    /// arrays `size` is the element count (correct bound); for u16
+    /// arrays the codegen doesn't yet scale the index by element
+    /// width, so we use the raw byte size as the bound — that's
+    /// correct for the `ZeroPageX`/`AbsoluteX` lowering the current
+    /// codegen actually produces, and it's what a future lowering
+    /// fix would want the debug check to match anyway.
+    ///
+    /// Release builds emit nothing. Also a no-op when the size
+    /// isn't known (e.g. a local we couldn't match up against an
+    /// allocation); missing metadata degrades silently to the
+    /// old unchecked behaviour.
+    fn emit_bounds_check(&mut self, var: VarId) {
+        if !self.debug_mode {
+            return;
+        }
+        let Some(&size) = self.var_sizes.get(&var) else {
+            return;
+        };
+        if size == 0 {
+            return;
+        }
+        // Sizes > 256 skip the bounds check because the X register
+        // is 8 bits — any index the codegen can actually produce is
+        // already in-bounds for a byte count that large. The
+        // analyzer's W0108 warning fires at declaration time so the
+        // user knows those elements are unreachable. Size == 256
+        // fits in a `CMP #$00` (trivially true), so we clamp to
+        // 255 — the tightest useful check — and treat 256+ the same.
+        let size_u8 = u8::try_from(size.min(255)).unwrap_or(255);
+        if size_u8 == 0 {
+            return;
+        }
+        // Use a short BCC over an unconditional JMP instead of a
+        // plain `BCS __debug_halt`. A single BCS can only span 127
+        // bytes, and `__debug_halt` is emitted at the very end of
+        // the fixed bank — many check sites are far enough away
+        // that the short-branch fixup would panic at link time.
+        // BCC-over-JMP keeps the hot path at two branches (well
+        // under 8 cycles) and the failure path at a 3-byte JMP.
+        let skip_label = format!("__ir_bc_ok_{}", self.instructions.len());
+        self.emit(CMP, AM::Immediate(size_u8));
+        self.emit(BCC, AM::LabelRelative(skip_label.clone()));
+        self.emit(JMP, AM::Label("__debug_halt".to_string()));
+        self.emit_label(&skip_label);
+        self.bounds_halt_used = true;
+    }
+
     /// Emit a runtime-variable shift loop: loads `src` into A, then
     /// `amt` iterations of `shift_op` (`ASL` / `LSR`), storing into
     /// `dest`. An iteration count of zero is handled by a leading
@@ -336,10 +515,21 @@ impl<'a> IrCodeGen<'a> {
     /// 3. Main dispatch loop (wait vblank, then `JMP` to state's frame handler)
     /// 4. State frame handlers (each ends with `JMP` to main loop)
     /// 5. User function bodies (end with `RTS`)
-    pub fn generate(mut self, ir: &IrProgram) -> Vec<Instruction> {
+    pub fn generate(&mut self, ir: &IrProgram) -> Vec<Instruction> {
         // Populate state indices
         for (i, name) in ir.states.iter().enumerate() {
             self.state_indices.insert(name.clone(), i as u8);
+        }
+
+        // Emit a `__debug_mode` marker label whenever debug
+        // codegen is on. The linker looks for this label to decide
+        // whether to splice the debug variant of the NMI handler
+        // (which adds a frame-overrun counter). The label itself
+        // emits zero bytes — it's just a tripwire the linker can
+        // check by name, mirroring the `__audio_used` /
+        // `__ppu_update_used` marker pattern already in use.
+        if self.debug_mode {
+            self.emit_label("__debug_mode");
         }
 
         // 1. Variable initializers
@@ -461,8 +651,15 @@ impl<'a> IrCodeGen<'a> {
         }
         self.emit(JMP, AM::Label(main_loop));
 
-        // 4. Emit each function body (state handlers + user functions)
+        // 4. Emit each fixed-bank function body (state handlers +
+        // top-level user functions). Functions tagged with `bank:
+        // Some(name)` belong to a switchable bank and are emitted
+        // separately into `self.banked_streams` after the fixed-bank
+        // pass finishes — see the loop further down.
         for func in &ir.functions {
+            if func.bank.is_some() {
+                continue;
+            }
             self.gen_function(func);
         }
 
@@ -488,7 +685,58 @@ impl<'a> IrCodeGen<'a> {
             self.gen_scanline_reload(&scanline_groups);
         }
 
-        self.instructions
+        // Debug-mode halt routine for failed array bounds checks.
+        // Every `emit_bounds_check` that ran writes a
+        // `BCS __debug_halt` which lands here on out-of-range
+        // indices. The routine is just `JMP __debug_halt` — an
+        // infinite loop that the debugger sees as a deterministic
+        // wedge on the offending address. Release builds never set
+        // `bounds_halt_used`, so this whole block compiles to zero
+        // bytes under `cargo run --release -- build`.
+        if self.bounds_halt_used {
+            self.emit_label("__debug_halt");
+            // Write a recognizable sentinel to the emulator debug
+            // port before wedging, so the log shows a bounds-check
+            // failure as a distinct event from a plain halt.
+            self.emit(LDA, AM::Immediate(0xBC));
+            self.emit(STA, AM::Absolute(DEBUG_PORT));
+            self.emit(JMP, AM::Label("__debug_halt".to_string()));
+        }
+
+        // Snapshot the fixed-bank instruction stream before we
+        // start emitting the banked function bodies into their own
+        // streams. Programs without any banked functions skip the
+        // banked-emission loop entirely so the codegen output is
+        // byte-for-byte identical to the pre-banked behaviour.
+        let fixed_instructions = std::mem::take(&mut self.instructions);
+
+        // 6. For each function tagged with a bank, redirect emission
+        // into a fresh per-bank instruction stream and call
+        // `gen_function`. The streams are keyed by bank name and
+        // collected into `self.banked_streams` for the linker to
+        // pick up via [`Self::banked_streams`].
+        for func in &ir.functions {
+            let Some(bank_name) = func.bank.clone() else {
+                continue;
+            };
+            // Pull the existing stream for this bank (if any) out
+            // of the map so subsequent functions in the same bank
+            // accumulate into one contiguous stream. The first
+            // function in a bank starts with an empty Vec.
+            let prev = self.banked_streams.remove(&bank_name).unwrap_or_default();
+            let prior_instrs = std::mem::replace(&mut self.instructions, prev);
+            self.current_bank = Some(bank_name.clone());
+            self.gen_function(func);
+            self.current_bank = None;
+            // Move the per-bank stream back into the map and
+            // restore whatever instruction buffer was active when
+            // we entered this iteration (always empty in the
+            // current pipeline, but we restore it for symmetry).
+            let bank_stream = std::mem::replace(&mut self.instructions, prior_instrs);
+            self.banked_streams.insert(bank_name, bank_stream);
+        }
+
+        fixed_instructions
     }
 
     fn gen_function(&mut self, func: &IrFunction) {
@@ -694,6 +942,7 @@ impl<'a> IrCodeGen<'a> {
             IrOp::ArrayLoad(dest, var, idx) => {
                 if let Some(&base_addr) = self.var_addrs.get(var) {
                     self.load_temp(*idx);
+                    self.emit_bounds_check(*var);
                     self.emit(TAX, AM::Implied);
                     if base_addr < 0x100 {
                         self.emit(LDA, AM::ZeroPageX(base_addr as u8));
@@ -706,6 +955,7 @@ impl<'a> IrCodeGen<'a> {
             IrOp::ArrayStore(var, idx, val) => {
                 if let Some(&base_addr) = self.var_addrs.get(var) {
                     self.load_temp(*idx);
+                    self.emit_bounds_check(*var);
                     self.emit(TAX, AM::Implied);
                     self.load_temp(*val);
                     if base_addr < 0x100 {
@@ -724,7 +974,46 @@ impl<'a> IrCodeGen<'a> {
                     self.load_temp(*arg);
                     self.emit(STA, AM::ZeroPage(0x04 + i as u8));
                 }
-                self.emit(JSR, AM::Label(format!("__ir_fn_{name}")));
+                // Pick the right JSR target. Three cases:
+                //   1. Callee is in the fixed bank (most common):
+                //      JSR `__ir_fn_<name>` — the original behaviour.
+                //   2. Callee is in a switchable bank and the caller
+                //      is in the fixed bank: JSR `__tramp_<name>`,
+                //      the linker-emitted trampoline that switches
+                //      banks, calls the body, then switches back.
+                //   3. Caller and callee live in the same switchable
+                //      bank: direct JSR to `__ir_fn_<name>` works
+                //      because both labels exist in the bank's own
+                //      assembler pass.
+                //
+                // Cross-bank calls between two different switchable
+                // banks aren't supported in the first pass — the
+                // codegen panics rather than silently miscompiling.
+                let callee_bank = self.function_banks.get(name).cloned();
+                let label = match (&self.current_bank, &callee_bank) {
+                    (None, None) => format!("__ir_fn_{name}"),
+                    (None, Some(_)) => format!("__tramp_{name}"),
+                    (Some(from_bank), Some(to_bank)) if from_bank == to_bank => {
+                        format!("__ir_fn_{name}")
+                    }
+                    (Some(from_bank), Some(to_bank)) => {
+                        panic!(
+                            "cross-bank call from bank '{from_bank}' to '{to_bank}' \
+                             is not supported (function '{name}'); only fixed-bank \
+                             callers can invoke banked functions in the v1 \
+                             user-banked codegen"
+                        );
+                    }
+                    (Some(_), None) => {
+                        // Banked function calls a fixed-bank function.
+                        // The fixed bank is always mapped at $C000-$FFFF
+                        // so a direct JSR works without a trampoline —
+                        // no bank-switching needed because we're already
+                        // calling into the always-mapped window.
+                        format!("__ir_fn_{name}")
+                    }
+                };
+                self.emit(JSR, AM::Label(label));
                 if let Some(d) = dest {
                     // Return value is in A
                     self.store_temp(*d);
@@ -1012,8 +1301,20 @@ impl<'a> IrCodeGen<'a> {
                 b_lo,
                 b_hi,
             } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::GtEq),
-            IrOp::SourceLoc(_) => {
-                // No code for source location markers
+            IrOp::SourceLoc(span) => {
+                // Emit a uniquely-named label-definition pseudo-op
+                // at the current codegen position — but only when
+                // source-map emission is enabled. Labels introduce
+                // peephole block boundaries, so unconditionally
+                // emitting them would shift release-mode ROM bytes
+                // (and break the golden-diff contract). Off by
+                // default; the CLI flips it on under `--source-map`.
+                if self.emit_source_locs {
+                    let name = format!("__src_{}", self.next_source_loc);
+                    self.next_source_loc += 1;
+                    self.emit_label(&name);
+                    self.source_locs.push((name, *span));
+                }
             }
         }
     }
@@ -1021,11 +1322,27 @@ impl<'a> IrCodeGen<'a> {
     /// Emit the `play Name` sequence.
     ///
     /// This is the trigger side of the audio driver: it writes the
-    /// initial period to pulse 1, sets the SFX counter to "active",
-    /// and loads the envelope pointer into ZP. The per-frame
-    /// envelope walk happens in `runtime::gen_audio_tick`, which
-    /// reads through the pointer and writes the next `$4000` byte
-    /// each NMI.
+    /// initial period to the destination channel's trigger
+    /// registers, sets the per-channel active counter, and loads
+    /// the envelope pointer. The per-frame envelope walk happens
+    /// in `runtime::gen_audio_tick`.
+    ///
+    /// The exact register set depends on the sfx's [`Channel`]:
+    /// - **Pulse 1**: `$4002/$4003` trigger, `ZP_SFX_PTR_*` envelope
+    ///   pointer, `$4000` runtime volume writes. This is the
+    ///   original path and is byte-identical to the pre-channels
+    ///   codegen.
+    /// - **Triangle**: `$400A/$400B` trigger, `$4015 |= $04` to
+    ///   enable the channel's length counter, main-RAM envelope
+    ///   pointer at [`AUDIO_TRIANGLE_PTR_*`], runtime writes to
+    ///   `$4008` (linear counter reload).
+    /// - **Noise**: `$400E/$400F` trigger, `$4015 |= $08` to
+    ///   enable, main-RAM pointer at [`AUDIO_NOISE_PTR_*`],
+    ///   runtime writes to `$400C` (noise volume).
+    ///
+    /// Programs that never reference triangle/noise sfx only emit
+    /// the pulse-1 path here, so their generated code — and their
+    /// ROM bytes — are unchanged from before the channel feature.
     ///
     /// If `name` is not a declared sfx or a recognized builtin, we
     /// emit a silent `play` (period 0, zero-length envelope) rather
@@ -1033,7 +1350,7 @@ impl<'a> IrCodeGen<'a> {
     /// diagnostic for the unknown name.
     fn gen_play_sfx(&mut self, name: &str) {
         self.emit_audio_marker();
-        let Some((period_lo, period_hi, label)) = self.sfx_info.get(name).cloned() else {
+        let Some((period_lo, period_hi, label, channel)) = self.sfx_info.get(name).cloned() else {
             // Unknown name. The analyzer warns on this; emit a no-op
             // sequence so the rest of the code still assembles. The
             // unknown branch is easy to spot in `--asm-dump`: it
@@ -1041,6 +1358,18 @@ impl<'a> IrCodeGen<'a> {
             // any other pulse-1 state.
             return;
         };
+        match channel {
+            Channel::Pulse1 | Channel::Pulse2 => self.emit_play_pulse(period_lo, period_hi, &label),
+            Channel::Triangle => self.emit_play_triangle(period_lo, period_hi, &label),
+            Channel::Noise => self.emit_play_noise(period_lo, period_hi, &label),
+        }
+    }
+
+    /// Original pulse-1 `play` sequence — unchanged from before the
+    /// channel feature. Kept as its own helper so the channel
+    /// dispatch above reads cleanly and the byte layout is trivial
+    /// to eyeball against the old code.
+    fn emit_play_pulse(&mut self, period_lo: u8, period_hi: u8, label: &str) {
         // $4000: we don't write a volume envelope here. The first
         // envelope byte is consumed by the next NMI audio tick. We
         // only need to set up the trigger (period + length).
@@ -1055,15 +1384,82 @@ impl<'a> IrCodeGen<'a> {
         self.emit(STA, AM::Absolute(0x4003));
         // Point ZP_SFX_PTR at the envelope blob. Each subsequent
         // NMI advances this pointer and writes the byte to $4000.
-        self.emit(LDA, AM::SymbolLo(label.clone()));
+        self.emit(LDA, AM::SymbolLo(label.to_string()));
         self.emit(STA, AM::ZeroPage(ZP_SFX_PTR_LO));
-        self.emit(LDA, AM::SymbolHi(label));
+        self.emit(LDA, AM::SymbolHi(label.to_string()));
         self.emit(STA, AM::ZeroPage(ZP_SFX_PTR_HI));
         // Mark sfx as active. The audio tick checks this and bails
         // on zero. We use `$FF` (any nonzero value works) as a flag;
         // the tick zeros it when it hits the envelope sentinel.
         self.emit(LDA, AM::Immediate(0xFF));
         self.emit(STA, AM::ZeroPage(ZP_SFX_COUNTER));
+    }
+
+    /// Triangle channel trigger sequence. Writes period bytes to
+    /// `$400A/$400B`, enables the triangle channel in `$4015`, and
+    /// seeds the main-RAM envelope pointer + active counter so the
+    /// tick's triangle block starts walking the blob next frame.
+    fn emit_play_triangle(&mut self, period_lo: u8, period_hi: u8, label: &str) {
+        self.emit_triangle_marker();
+        // $4008: linear counter control + reload. Set $FF (control
+        // bit + max reload) so the counter starts from a known
+        // non-muted state; the tick rewrites this every frame.
+        self.emit(LDA, AM::Immediate(0xFF));
+        self.emit(STA, AM::Absolute(0x4008));
+        // $400A / $400B: period lo / length + period hi.
+        self.emit(LDA, AM::Immediate(period_lo));
+        self.emit(STA, AM::Absolute(0x400A));
+        self.emit(LDA, AM::Immediate(period_hi));
+        self.emit(STA, AM::Absolute(0x400B));
+        // Enable all four tone channels in the APU status register.
+        // We always write $0F (pulse1+pulse2+triangle+noise) instead
+        // of just the channel we're triggering, because per-play
+        // writes use immediate values and a later noise play with
+        // $0B would otherwise silence an in-progress triangle note
+        // by clearing bit 2. Channels with no active envelope stay
+        // silent via the runtime's per-channel counter gating, so
+        // enabling them blindly is harmless.
+        self.emit(LDA, AM::Immediate(0x0F));
+        self.emit(STA, AM::Absolute(0x4015));
+        // Main-RAM envelope pointer.
+        self.emit(LDA, AM::SymbolLo(label.to_string()));
+        self.emit(STA, AM::Absolute(AUDIO_TRIANGLE_PTR_LO));
+        self.emit(LDA, AM::SymbolHi(label.to_string()));
+        self.emit(STA, AM::Absolute(AUDIO_TRIANGLE_PTR_HI));
+        // Counter nonzero = channel active.
+        self.emit(LDA, AM::Immediate(0xFF));
+        self.emit(STA, AM::Absolute(AUDIO_TRIANGLE_COUNTER));
+    }
+
+    /// Noise channel trigger sequence. Writes mode+period index to
+    /// `$400E`, length-counter load to `$400F`, enables the noise
+    /// channel in `$4015`, and seeds the main-RAM envelope pointer.
+    fn emit_play_noise(&mut self, period_lo: u8, period_hi: u8, label: &str) {
+        self.emit_noise_marker();
+        // $400C: volume register. Start at constant-volume 0 (muted)
+        // so the very first envelope byte (written by the tick one
+        // NMI later) audibly triggers the note without a stale
+        // value from a previous sfx leaking through.
+        self.emit(LDA, AM::Immediate(0x30));
+        self.emit(STA, AM::Absolute(0x400C));
+        // $400E: mode (bit 7) + period-table index (low 4 bits).
+        self.emit(LDA, AM::Immediate(period_lo));
+        self.emit(STA, AM::Absolute(0x400E));
+        // $400F: length counter load.
+        self.emit(LDA, AM::Immediate(period_hi));
+        self.emit(STA, AM::Absolute(0x400F));
+        // Enable all four tone channels — see the equivalent write
+        // in `emit_play_triangle` for why $0F rather than $0B.
+        self.emit(LDA, AM::Immediate(0x0F));
+        self.emit(STA, AM::Absolute(0x4015));
+        // Main-RAM envelope pointer.
+        self.emit(LDA, AM::SymbolLo(label.to_string()));
+        self.emit(STA, AM::Absolute(AUDIO_NOISE_PTR_LO));
+        self.emit(LDA, AM::SymbolHi(label.to_string()));
+        self.emit(STA, AM::Absolute(AUDIO_NOISE_PTR_HI));
+        // Counter nonzero = channel active.
+        self.emit(LDA, AM::Immediate(0xFF));
+        self.emit(STA, AM::Absolute(AUDIO_NOISE_COUNTER));
     }
 
     /// Emit the `start_music Name` sequence.
@@ -1118,6 +1514,25 @@ impl<'a> IrCodeGen<'a> {
         if !self.audio_used {
             self.emit_label("__audio_used");
             self.audio_used = true;
+        }
+    }
+
+    /// Emit the `__noise_used` marker label at most once per program.
+    /// The linker scans for this label to decide whether to append
+    /// the noise tick block to the audio tick.
+    fn emit_noise_marker(&mut self) {
+        if !self.noise_used {
+            self.emit_label("__noise_used");
+            self.noise_used = true;
+        }
+    }
+
+    /// Emit the `__triangle_used` marker label at most once per
+    /// program. Drives the triangle tick block in the audio driver.
+    fn emit_triangle_marker(&mut self) {
+        if !self.triangle_used {
+            self.emit_label("__triangle_used");
+            self.triangle_used = true;
         }
     }
 
@@ -2277,6 +2692,86 @@ mod more_tests {
     }
 
     #[test]
+    fn ir_codegen_play_noise_sfx_writes_400e_and_emits_noise_marker() {
+        // A noise sfx `play` should:
+        //   1. Write trigger bytes to $400E / $400F (noise
+        //      period + length).
+        //   2. Enable the noise channel in the APU status
+        //      register at $4015.
+        //   3. Emit the `__noise_used` marker so the linker
+        //      appends the noise block to the audio tick.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            sfx Zap {
+                channel: noise
+                pitch: 5
+                volume: [15, 8, 2]
+            }
+            on frame { play Zap }
+            start Main
+        "#,
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x400E)),
+            "noise play should write $400E (period)"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x400F)),
+            "noise play should write $400F (length counter)"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x4015)),
+            "noise play should write APU status ($4015)"
+        );
+        let has_marker = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__noise_used"));
+        assert!(has_marker, "noise play should emit __noise_used marker");
+        // And the pulse1 sfx path must not leak through — no
+        // $4002 write from this program.
+        assert!(
+            !has_inst(&insts, STA, &AM::Absolute(0x4002)),
+            "noise play should not touch pulse-1 trigger registers"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_play_triangle_sfx_writes_400a_and_emits_triangle_marker() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            sfx Bass {
+                channel: triangle
+                pitch: 60
+                volume: [1, 1, 1]
+            }
+            on frame { play Bass }
+            start Main
+        "#,
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x400A)),
+            "triangle play should write $400A (period)"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x400B)),
+            "triangle play should write $400B (length counter)"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x4008)),
+            "triangle play should write $4008 (linear counter)"
+        );
+        let has_marker = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__triangle_used"));
+        assert!(
+            has_marker,
+            "triangle play should emit __triangle_used marker"
+        );
+    }
+
+    #[test]
     fn ir_codegen_play_sfx_triggers_pulse1_and_loads_envelope_pointer() {
         // `play coin` must:
         //   1. Write the period trigger bytes to $4002 and $4003
@@ -2620,6 +3115,149 @@ mod more_tests {
         assert_eq!(
             adc_count, 1,
             "u8 += should emit exactly one ADC; got {adc_count}"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_debug_mode_emits_marker_label() {
+        // The codegen drops a `__debug_mode` label whenever debug
+        // mode is on. The linker reads that label to decide
+        // whether to splice the frame-overrun-aware NMI handler,
+        // so the marker is load-bearing even though it carries no
+        // bytes itself.
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        let has_marker = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__debug_mode"));
+        assert!(has_marker, "debug mode should emit __debug_mode marker");
+    }
+
+    #[test]
+    fn ir_codegen_release_mode_has_no_debug_marker() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        let has_marker = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__debug_mode"));
+        assert!(
+            !has_marker,
+            "release mode must not emit __debug_mode; doing so would force the debug NMI"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_bounds_check_in_debug_mode_emits_halt_jump() {
+        // Debug-mode array access should emit a CMP + BCC + JMP
+        // __debug_halt guard, and the codegen should define
+        // `__debug_halt` as a terminal infinite loop. We only
+        // check for the presence of the halt label and a JMP
+        // targeting it; the actual CMP comes with an immediate
+        // whose value depends on the array length. Verified for
+        // `xs[i]` on a `u8[4]` array → the immediate should be 4.
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            var xs: u8[4] = [10, 20, 30, 40]
+            on frame {
+                var i: u8 = 2
+                var v: u8 = xs[i]
+                wait_frame
+            }
+            start Main
+        "#,
+        );
+        // Label defined at the halt site.
+        let has_halt_label = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__debug_halt") && i.opcode == NOP);
+        assert!(has_halt_label, "debug mode should emit __debug_halt label");
+        // JMP __debug_halt from the bounds-check fail path.
+        let has_jmp_halt = insts
+            .iter()
+            .any(|i| i.opcode == JMP && matches!(&i.mode, AM::Label(l) if l == "__debug_halt"));
+        assert!(
+            has_jmp_halt,
+            "debug-mode bounds check should JMP to __debug_halt on failure"
+        );
+        // The CMP #4 compares against the array length.
+        let has_cmp_four = insts
+            .iter()
+            .any(|i| i.opcode == CMP && i.mode == AM::Immediate(4));
+        assert!(
+            has_cmp_four,
+            "bounds check against a `u8[4]` array should CMP against 4"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_bounds_check_stripped_in_release() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            var xs: u8[4] = [10, 20, 30, 40]
+            on frame {
+                var i: u8 = 2
+                var v: u8 = xs[i]
+                wait_frame
+            }
+            start Main
+        "#,
+        );
+        let has_halt_label = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__debug_halt"));
+        assert!(
+            !has_halt_label,
+            "release builds must not emit the bounds-check halt routine"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_source_map_opt_in_emits_src_labels() {
+        // With `with_source_map(true)` the codegen should emit
+        // a `__src_<N>` label and record the span for each
+        // lowered statement. Without the opt-in, release-mode
+        // ROMs must stay byte-identical (no `__src_` labels).
+        let (prog, _) = parser::parse(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        let prog = prog.unwrap();
+        let analysis = analyzer::analyze(&prog);
+        let ir_program = ir::lower(&prog, &analysis);
+        let mut codegen =
+            IrCodeGen::new(&analysis.var_allocations, &ir_program).with_source_map(true);
+        let insts = codegen.generate(&ir_program);
+        let src_labels: Vec<_> = insts
+            .iter()
+            .filter_map(|i| match &i.mode {
+                AM::Label(l) if l.starts_with("__src_") && i.opcode == NOP => Some(l.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !src_labels.is_empty(),
+            "source-map-enabled codegen should emit at least one __src_ label"
+        );
+        let recorded = codegen.source_locs();
+        assert_eq!(
+            src_labels.len(),
+            recorded.len(),
+            "every emitted __src_ label should have a matching source_locs entry"
         );
     }
 }

@@ -1,14 +1,12 @@
 use clap::Parser;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use nescript::analyzer;
-use nescript::assets;
-use nescript::codegen::IrCodeGen;
+use nescript::assets::{BackgroundData, PaletteData};
 use nescript::errors::render_diagnostics;
-use nescript::ir;
-use nescript::linker::{Linker, PrgBank};
-use nescript::optimizer;
-use nescript::parser::ast::BankType;
+use nescript::linker::{render_mlb, render_source_map, LinkedRom};
+use nescript::pipeline::{compile_source, CompileError, CompileOptions as PipelineOptions};
 
 #[derive(Parser)]
 #[command(name = "nescript", about = "NEScript compiler — NES game development")]
@@ -42,6 +40,29 @@ enum Cli {
         /// Dump a call graph showing which functions call which.
         #[arg(long)]
         call_graph: bool,
+
+        /// Skip the IR optimizer pass. Useful for bisecting
+        /// optimizer-introduced miscompiles: if a program misbehaves
+        /// with the optimizer on but works with `--no-opt`, the bug
+        /// lives in `src/optimizer/`.
+        #[arg(long)]
+        no_opt: bool,
+
+        /// Write a Mesen-compatible symbol file (`.mlb`) next to the
+        /// ROM. Contains one `<type>:<address>:<label>` entry per
+        /// function, state handler, and user variable. Enables
+        /// symbol-level debugging in Mesen / fceux without manual
+        /// address lookups.
+        #[arg(long, value_name = "PATH")]
+        symbols: Option<PathBuf>,
+
+        /// Write a plain-text source map (`.map`) next to the ROM.
+        /// Each line has the form `<rom_offset_hex> <file_id>
+        /// <line> <col>` and records the position of every IR-level
+        /// statement in the assembled fixed bank. Useful for
+        /// reverse-mapping a crash address back to the source.
+        #[arg(long, value_name = "PATH")]
+        source_map: Option<PathBuf>,
     },
     /// Type-check a source file without building
     Check {
@@ -62,6 +83,9 @@ fn main() {
             dump_ir,
             memory_map,
             call_graph,
+            no_opt,
+            symbols,
+            source_map,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
             match compile(
@@ -72,6 +96,9 @@ fn main() {
                     dump_ir,
                     memory_map,
                     call_graph,
+                    no_opt,
+                    symbols: symbols.clone(),
+                    source_map: source_map.clone(),
                 },
             ) {
                 Ok(rom) => {
@@ -96,45 +123,64 @@ fn main() {
     }
 }
 
-/// Print a human-readable memory map of variable allocations.
-/// Entries are sorted by address and labelled with their scope
-/// (zero-page vs RAM).
-fn print_memory_map(analysis: &nescript::analyzer::AnalysisResult) {
+/// Write a human-readable memory map of variable allocations to
+/// `w`. Entries are sorted by address and labelled with their scope
+/// (zero-page vs RAM). When `link_result` is `Some(_)`, a PRG ROM
+/// section listing each palette and background data blob's CPU
+/// address + size is appended — the CLI passes the linker result
+/// whenever it's available, which is always unless the caller is
+/// unit-testing the variable-only path.
+///
+/// This function is factored out of the direct `println!` path so
+/// tests can drive it against an in-memory buffer and assert on the
+/// rendered output.
+fn write_memory_map(
+    w: &mut impl std::io::Write,
+    analysis: &nescript::analyzer::AnalysisResult,
+    link_result: Option<&LinkedRom>,
+    palettes: &[PaletteData],
+    backgrounds: &[BackgroundData],
+) -> std::io::Result<()> {
     let mut allocs: Vec<_> = analysis.var_allocations.iter().collect();
     allocs.sort_by_key(|a| a.address);
 
-    println!("=== NEScript Memory Map ===");
-    println!("Zero Page ($00-$FF):");
-    println!("  $00-$0F  [SYSTEM]  reserved (frame flag, input, state, params, scratch)");
+    writeln!(w, "=== NEScript Memory Map ===")?;
+    writeln!(w, "Zero Page ($00-$FF):")?;
+    writeln!(
+        w,
+        "  $00-$0F  [SYSTEM]  reserved (frame flag, input, state, params, scratch)"
+    )?;
     for a in allocs.iter().filter(|a| a.address < 0x100) {
         if a.size == 1 {
-            println!("  ${:04X}    [USER]    {} (u8)", a.address, a.name);
+            writeln!(w, "  ${:04X}    [USER]    {} (u8)", a.address, a.name)?;
         } else {
-            println!(
+            writeln!(
+                w,
                 "  ${:04X}-${:04X}  [USER]  {} ({} bytes)",
                 a.address,
                 a.address + a.size - 1,
                 a.name,
                 a.size
-            );
+            )?;
         }
     }
 
     let ram_allocs: Vec<_> = allocs.iter().filter(|a| a.address >= 0x100).collect();
     if !ram_allocs.is_empty() {
-        println!("\nRAM ($0200-$07FF):");
-        println!("  $0200-$02FF  [SYSTEM]  OAM shadow buffer");
+        writeln!(w, "\nRAM ($0200-$07FF):")?;
+        writeln!(w, "  $0200-$02FF  [SYSTEM]  OAM shadow buffer")?;
         for a in &ram_allocs {
             if a.size == 1 {
-                println!("  ${:04X}        [USER]    {} (u8)", a.address, a.name);
+                writeln!(w, "  ${:04X}        [USER]    {} (u8)", a.address, a.name)?;
             } else {
-                println!(
+                writeln!(
+                    w,
                     "  ${:04X}-${:04X}  [USER]  {} ({} bytes)",
                     a.address,
                     a.address + a.size - 1,
                     a.name,
                     a.size
-                );
+                )?;
             }
         }
     }
@@ -150,9 +196,74 @@ fn print_memory_map(analysis: &nescript::analyzer::AnalysisResult) {
         .filter(|a| a.address >= 0x300)
         .map(|a| a.size)
         .sum();
-    println!();
-    println!("Zero Page: {zp_used}/128 bytes used");
-    println!("Main RAM:  {ram_used}/1280 bytes used");
+    writeln!(w)?;
+    writeln!(w, "Zero Page: {zp_used}/128 bytes used")?;
+    writeln!(w, "Main RAM:  {ram_used}/1280 bytes used")?;
+
+    // PRG ROM: palette (32 B each) and background (960 + 64 B each)
+    // data blobs. The linker emits each one under a well-known
+    // label — `__palette_<name>`, `__bg_tiles_<name>`,
+    // `__bg_attrs_<name>` — so we look those up in the label table
+    // and render the CPU address + byte count.
+    if let Some(link) = link_result {
+        if !palettes.is_empty() || !backgrounds.is_empty() {
+            writeln!(w, "\nPRG ROM data blobs:")?;
+            let mut total: u32 = 0;
+            for pal in palettes {
+                let label = pal.label();
+                match link.labels.get(&label).copied() {
+                    Some(addr) => {
+                        writeln!(w, "  ${addr:04X}        [PALETTE] {} (32 bytes)", pal.name)?;
+                    }
+                    None => {
+                        writeln!(w, "  (unlinked)   [PALETTE] {} (32 bytes)", pal.name)?;
+                    }
+                }
+                total += 32;
+            }
+            for bg in backgrounds {
+                let tiles_label = bg.tiles_label();
+                let attrs_label = bg.attrs_label();
+                match link.labels.get(&tiles_label).copied() {
+                    Some(addr) => {
+                        writeln!(w, "  ${addr:04X}        [BG-TILES] {} (960 bytes)", bg.name)?;
+                    }
+                    None => {
+                        writeln!(w, "  (unlinked)   [BG-TILES] {} (960 bytes)", bg.name)?;
+                    }
+                }
+                match link.labels.get(&attrs_label).copied() {
+                    Some(addr) => {
+                        writeln!(w, "  ${addr:04X}        [BG-ATTRS] {} (64 bytes)", bg.name)?;
+                    }
+                    None => {
+                        writeln!(w, "  (unlinked)   [BG-ATTRS] {} (64 bytes)", bg.name)?;
+                    }
+                }
+                total += 960 + 64;
+            }
+            writeln!(w, "\nPRG ROM data total: {total} bytes")?;
+        }
+    }
+
+    Ok(())
+}
+
+/// Print a human-readable memory map of variable allocations. Thin
+/// wrapper around [`write_memory_map`] that drives stdout; tests
+/// call `write_memory_map` directly against a `Vec<u8>`.
+fn print_memory_map(
+    analysis: &nescript::analyzer::AnalysisResult,
+    link_result: Option<&LinkedRom>,
+    palettes: &[PaletteData],
+    backgrounds: &[BackgroundData],
+) {
+    let stdout = std::io::stdout();
+    let mut handle = stdout.lock();
+    // Infallible: stdout writes only return Err on broken pipes,
+    // which is the caller's problem.
+    let _ = write_memory_map(&mut handle, analysis, link_result, palettes, backgrounds);
+    let _ = handle.flush();
 }
 
 /// Print a human-readable call graph of the analyzed program.
@@ -220,138 +331,90 @@ struct CompileOptions {
     dump_ir: bool,
     memory_map: bool,
     call_graph: bool,
+    no_opt: bool,
+    symbols: Option<PathBuf>,
+    source_map: Option<PathBuf>,
 }
 
 fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
-    let debug = opts.debug;
-    let asm_dump = opts.asm_dump;
-    let dump_ir = opts.dump_ir;
-    let memory_map = opts.memory_map;
-    let call_graph = opts.call_graph;
+    // File I/O + preprocessing lives here so the pipeline module
+    // itself doesn't need to touch `std::fs`. That keeps the
+    // pipeline usable from a future WASM host that routes asset
+    // reads through a trait.
     let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
     })?;
-
-    // Preprocess: inline include directives
     let source = nescript::parser::preprocess_source(&raw_source, Some(input)).map_err(|e| {
         eprintln!("error: {e}");
     })?;
-
     let filename = input.to_string_lossy();
-
-    // Parse
-    let (program, parse_diags) = nescript::parser::parse(&source);
-    if !parse_diags.is_empty() {
-        render_diagnostics(&source, &filename, &parse_diags);
-    }
-    if parse_diags
-        .iter()
-        .any(nescript::errors::Diagnostic::is_error)
-    {
-        return Err(());
-    }
-    let program = program.ok_or(())?;
-
-    // Analyze
-    let analysis = analyzer::analyze(&program);
-    if !analysis.diagnostics.is_empty() {
-        render_diagnostics(&source, &filename, &analysis.diagnostics);
-    }
-    if analysis
-        .diagnostics
-        .iter()
-        .any(nescript::errors::Diagnostic::is_error)
-    {
-        return Err(());
-    }
-
-    // IR lowering and optimization
-    let mut ir_program = ir::lower(&program, &analysis);
-    optimizer::optimize(&mut ir_program);
-
-    if dump_ir {
-        print!("{}", ir_program.pretty());
-    }
-
-    if memory_map {
-        print_memory_map(&analysis);
-    }
-
-    if call_graph {
-        print_call_graph(&analysis);
-    }
-
-    // Resolve sprite assets (CHR data + tile indices) relative to the
-    // source file's directory, so `@binary` / `@chr` paths work naturally.
     let source_dir = input.parent().unwrap_or_else(|| Path::new("."));
-    let sprites = assets::resolve_sprites(&program, source_dir).map_err(|e| {
-        eprintln!("error: {e}");
+
+    // Hand everything else off to the shared pipeline function
+    // so the CLI, the `compile` bench, and the integration-test
+    // helper all run the same compile path. When this block
+    // needs a new feature (new flag, new output, whatever), the
+    // change lands in `pipeline::compile_source` and every
+    // caller picks it up automatically.
+    let pipeline_opts = PipelineOptions {
+        debug: opts.debug,
+        no_opt: opts.no_opt,
+        emit_source_map: opts.source_map.is_some(),
+    };
+    let out = compile_source(&source, source_dir, &pipeline_opts).map_err(|e| match e {
+        CompileError::Parse(diags) => {
+            render_diagnostics(&source, &filename, &diags);
+        }
+        CompileError::ParseProducedNothing => {
+            // The parser returned `None` with no diagnostics.
+            // Extremely unusual (empty input or similar) and
+            // there's nothing for the user to act on beyond a
+            // generic message.
+            eprintln!("error: parser produced no program");
+        }
+        CompileError::Analyze(diags) => {
+            render_diagnostics(&source, &filename, &diags);
+        }
+        CompileError::AssetResolution(msg) => {
+            eprintln!("error: {msg}");
+        }
     })?;
 
-    // Resolve audio assets: user-declared sfx/music plus any
-    // builtins referenced via `play foo` / `start_music bar` for
-    // names that aren't in the program's sfx/music declarations.
-    let sfx = assets::resolve_sfx(&program).map_err(|e| {
-        eprintln!("error: {e}");
-    })?;
-    let music = assets::resolve_music(&program).map_err(|e| {
-        eprintln!("error: {e}");
-    })?;
-
-    // Resolve palette and background declarations into fixed-size
-    // ROM data blobs. These are purely compile-time — the byte
-    // arrays came from the parser and all the analyzer validation
-    // has already run.
-    let palettes = assets::resolve_palettes(&program);
-    let backgrounds = assets::resolve_backgrounds(&program);
-
-    // IR-based code generation. Lower → optimize → emit 6502.
-    let mut instructions = IrCodeGen::new(&analysis.var_allocations, &ir_program)
-        .with_sprites(&sprites)
-        .with_audio(&sfx, &music)
-        .with_debug(debug)
-        .generate(&ir_program);
-
-    // Peephole pass: cleans up the IR codegen's temp-heavy output —
-    // dead stores, redundant loads, short-branch folds, etc.
-    nescript::codegen::peephole::optimize(&mut instructions);
-
-    if asm_dump {
-        dump_asm(&instructions);
+    // Post-link CLI-only side effects: the various `--dump-*`
+    // flags and the two optional file outputs. These are not
+    // part of the pipeline because they're stdout / filesystem
+    // I/O, not compilation.
+    if opts.dump_ir {
+        print!("{}", out.ir_program.pretty());
+    }
+    if opts.call_graph {
+        print_call_graph(&out.analysis);
+    }
+    if opts.asm_dump {
+        dump_asm(&out.instructions);
+    }
+    if opts.memory_map {
+        print_memory_map(
+            &out.analysis,
+            Some(&out.link_result),
+            &out.palettes,
+            &out.backgrounds,
+        );
+    }
+    if let Some(path) = opts.symbols.as_ref() {
+        let mlb = render_mlb(&out.link_result, &out.analysis.var_allocations);
+        std::fs::write(path, mlb).map_err(|e| {
+            eprintln!("error: failed to write symbol file {}: {e}", path.display());
+        })?;
+    }
+    if let Some(path) = opts.source_map.as_ref() {
+        let map = render_source_map(&out.link_result, &out.source_locs, &source);
+        std::fs::write(path, map).map_err(|e| {
+            eprintln!("error: failed to write source map {}: {e}", path.display());
+        })?;
     }
 
-    // Link into ROM with both graphic assets (sprite CHR) and audio
-    // assets (sfx envelopes, music note streams) spliced in. We use
-    // `Linker::with_mapper` so the iNES header's mapper byte
-    // reflects the source's `mapper:` declaration — without this
-    // the CLI always shipped mapper 0 (NROM) regardless of whether
-    // the program actually needed MMC1/MMC3 bank switching.
-    //
-    // For banked mappers (MMC1, UxROM, MMC3) we collect the
-    // declared `bank X: prg` entries and turn each into an empty
-    // 16 KB switchable slot. User code currently still lives in
-    // the fixed bank — the declared banks exist so programs that
-    // outgrow 16 KB have real ROM space to grow into and so
-    // mapper-specific fixtures (vectors, trampolines, bank-select
-    // helpers) land in the right place.
-    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
-    let switchable_banks: Vec<PrgBank> = program
-        .banks
-        .iter()
-        .filter(|b| b.bank_type == BankType::Prg)
-        .map(|b| PrgBank::empty(&b.name))
-        .collect();
-    let rom = linker.link_banked_with_ppu(
-        &instructions,
-        &sprites,
-        &sfx,
-        &music,
-        &palettes,
-        &backgrounds,
-        &switchable_banks,
-    );
-
-    Ok(rom)
+    Ok(out.rom)
 }
 
 fn check(input: &PathBuf) -> Result<(), ()> {
@@ -390,4 +453,106 @@ fn check(input: &PathBuf) -> Result<(), ()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use nescript::analyzer::AnalysisResult;
+    use nescript::linker::LinkedRom;
+    use std::collections::HashMap;
+
+    fn empty_analysis() -> AnalysisResult {
+        AnalysisResult {
+            symbols: HashMap::new(),
+            var_allocations: Vec::new(),
+            diagnostics: Vec::new(),
+            call_graph: HashMap::new(),
+            max_depths: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn write_memory_map_without_link_result_covers_variable_path() {
+        // Without a link result (e.g. the unit-test path that
+        // only wants to inspect the variable allocator) the output
+        // should still render the Zero Page / RAM sections and the
+        // summary lines. No PRG ROM section appears because there
+        // are no linked labels to point at.
+        let analysis = empty_analysis();
+        let mut buf = Vec::new();
+        write_memory_map(&mut buf, &analysis, None, &[], &[]).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("=== NEScript Memory Map ==="));
+        assert!(s.contains("Zero Page"));
+        assert!(s.contains("0/128 bytes used"));
+        assert!(!s.contains("PRG ROM data blobs"));
+    }
+
+    #[test]
+    fn write_memory_map_reports_palette_and_background_rom_addresses() {
+        // With palettes and backgrounds plus a faked LinkedRom
+        // carrying matching labels, the PRG ROM section should
+        // render each blob's CPU address + size and a grand total.
+        let analysis = empty_analysis();
+        let palettes = vec![PaletteData {
+            name: "Main".to_string(),
+            colors: [0u8; 32],
+        }];
+        let backgrounds = vec![BackgroundData {
+            name: "Stage".to_string(),
+            tiles: [0u8; 960],
+            attrs: [0u8; 64],
+        }];
+        let mut labels = HashMap::new();
+        labels.insert("__palette_Main".to_string(), 0xC100);
+        labels.insert("__bg_tiles_Stage".to_string(), 0xC200);
+        labels.insert("__bg_attrs_Stage".to_string(), 0xC5C0);
+        let link = LinkedRom {
+            rom: Vec::new(),
+            labels,
+            fixed_bank_file_offset: 16,
+        };
+        let mut buf = Vec::new();
+        write_memory_map(&mut buf, &analysis, Some(&link), &palettes, &backgrounds).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("PRG ROM data blobs:"));
+        assert!(
+            s.contains("$C100") && s.contains("[PALETTE] Main"),
+            "missing palette line in: {s}"
+        );
+        assert!(
+            s.contains("$C200") && s.contains("[BG-TILES] Stage"),
+            "missing bg-tiles line in: {s}"
+        );
+        assert!(
+            s.contains("$C5C0") && s.contains("[BG-ATTRS] Stage"),
+            "missing bg-attrs line in: {s}"
+        );
+        // 32 (palette) + 960 + 64 (background) = 1056.
+        assert!(s.contains("1056 bytes"), "missing total in: {s}");
+    }
+
+    #[test]
+    fn write_memory_map_marks_unlinked_blobs() {
+        // If a palette's label isn't in `link.labels` (e.g. the
+        // linker skipped it for some reason), we still emit the
+        // line but mark it "(unlinked)" so the user knows the
+        // address isn't available.
+        let analysis = empty_analysis();
+        let palettes = vec![PaletteData {
+            name: "Ghost".to_string(),
+            colors: [0u8; 32],
+        }];
+        let link = LinkedRom {
+            rom: Vec::new(),
+            labels: HashMap::new(),
+            fixed_bank_file_offset: 16,
+        };
+        let mut buf = Vec::new();
+        write_memory_map(&mut buf, &analysis, Some(&link), &palettes, &[]).unwrap();
+        let s = String::from_utf8(buf).unwrap();
+        assert!(s.contains("(unlinked)"), "missing unlinked marker in: {s}");
+        assert!(s.contains("[PALETTE] Ghost"));
+    }
 }

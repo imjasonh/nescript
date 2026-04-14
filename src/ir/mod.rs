@@ -74,6 +74,16 @@ pub struct IrFunction {
     pub locals: Vec<IrLocal>,
     pub param_count: usize,
     pub has_return: bool,
+    /// When `Some(bank_name)`, this function was declared inside a
+    /// `bank Foo { fun ... }` block in the source and its compiled
+    /// bytes belong in the named switchable PRG bank instead of the
+    /// fixed bank. The codegen separates the per-bank instruction
+    /// streams during [`IrCodeGen::generate`] and the linker assembles
+    /// each bank into its own 16 KB slot. State handlers and any
+    /// top-level functions leave this `None` and live in the fixed
+    /// bank alongside the runtime — the only mode prior to user-banked
+    /// codegen.
+    pub bank: Option<String>,
     pub source_span: Span,
 }
 

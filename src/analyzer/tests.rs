@@ -328,6 +328,87 @@ fn analyze_struct_variable_allocates_fields() {
 }
 
 #[test]
+fn analyze_struct_u16_field_allocates_two_bytes() {
+    // A struct with a u16 field should lay out fields with
+    // byte-accurate offsets: a u8 followed by a u16 followed by a u8
+    // puts `b` at offset 1 and `c` at offset 3.
+    let result = analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Mixed { a: u8, b: u16, c: u8 }
+        var m: Mixed
+        on frame {
+            m.a = 1
+            m.b = 300
+            m.c = 7
+        }
+        start Main
+    "#,
+    );
+    let a = result
+        .var_allocations
+        .iter()
+        .find(|x| x.name == "m.a")
+        .expect("m.a should be allocated");
+    let b = result
+        .var_allocations
+        .iter()
+        .find(|x| x.name == "m.b")
+        .expect("m.b should be allocated");
+    let c = result
+        .var_allocations
+        .iter()
+        .find(|x| x.name == "m.c")
+        .expect("m.c should be allocated");
+    // Offsets from base: a=0, b=1, c=3 (b is two bytes wide).
+    assert_eq!(b.address, a.address + 1);
+    assert_eq!(c.address, a.address + 3);
+    // u16 field is recorded with size 2 so codegen bookkeeping
+    // knows how much space the field occupies.
+    assert_eq!(a.size, 1);
+    assert_eq!(b.size, 2);
+    assert_eq!(c.size, 1);
+}
+
+#[test]
+fn analyze_struct_with_array_field_is_rejected() {
+    // Array fields are still rejected — the analyzer only accepts
+    // u8/i8/u16/bool scalar fields in v1 structs.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Bag { xs: u8[4] }
+        var b: Bag
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "array struct field should emit E0201: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_struct_with_nested_struct_field_is_rejected() {
+    // Nested struct fields are still rejected — only scalar primitives.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Inner { a: u8 }
+        struct Outer { inner: Inner }
+        var o: Outer
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "nested struct field should emit E0201: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_struct_unknown_field_errors() {
     let errors = analyze_errors(
         r#"
@@ -917,6 +998,82 @@ fn analyze_rejects_unknown_sfx_name() {
 }
 
 #[test]
+fn analyze_accepts_noise_sfx() {
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        sfx Zap {
+            channel: noise
+            pitch: 5
+            volume: [15, 10, 5]
+        }
+        on frame { play Zap }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_accepts_triangle_sfx() {
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        sfx Bass {
+            channel: triangle
+            pitch: 60
+            volume: [1, 1, 1, 1, 1]
+        }
+        on frame { play Bass }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_rejects_pulse2_sfx() {
+    // pulse 2 is reserved for the music driver; declaring an sfx
+    // on it should be an error.
+    let codes = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        sfx Nope {
+            channel: pulse2
+            pitch: 5
+            volume: [8]
+        }
+        on frame { play Nope }
+        start Main
+    "#,
+    );
+    assert!(
+        codes.contains(&ErrorCode::E0201),
+        "expected E0201 for pulse2 sfx, got {codes:?}"
+    );
+}
+
+#[test]
+fn analyze_rejects_noise_sfx_with_out_of_range_pitch() {
+    // Noise pitch is a 4-bit period index + optional bit 7 mode.
+    // Setting bit 5 (0x20) is outside that envelope.
+    let codes = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        sfx Bad {
+            channel: noise
+            pitch: 0x20
+            volume: [8]
+        }
+        on frame { play Bad }
+        start Main
+    "#,
+    );
+    assert!(
+        codes.contains(&ErrorCode::E0201),
+        "expected E0201 for invalid noise pitch, got {codes:?}"
+    );
+}
+
+#[test]
 fn analyze_accepts_builtin_music() {
     analyze_ok(
         r#"
@@ -1147,4 +1304,434 @@ fn analyze_does_not_reserve_zero_page_without_palette_or_bg() {
         .find(|a| a.name == "x")
         .expect("x should be allocated");
     assert_eq!(x.address, 0x10);
+}
+
+// ── W0102 extended: `while true` + continue-only loops ──────
+
+#[test]
+fn analyze_while_true_without_exit_warns() {
+    // `while true { x = x + 1 }` — no break/return/wait_frame,
+    // so the same W0102 that fires on bare `loop { ... }` must
+    // also fire here.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            while true { x = x + 1 }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::W0102),
+        "`while true` with no exit should produce W0102, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_while_true_with_wait_frame_ok() {
+    // `while true { wait_frame }` yields control to the NMI each
+    // iteration, so the NES actually makes progress — no warning.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        on frame {
+            while true { wait_frame }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0102),
+        "`while true` + wait_frame should NOT warn, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_while_true_with_break_ok() {
+    // A reachable `break` satisfies W0102 just like it does for
+    // bare `loop`.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            while true {
+                x = x + 1
+                if x == 10 { break }
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0102),
+        "`while true` + break should NOT warn, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_loop_with_only_continue_still_warns() {
+    // `continue` is *not* an exit — the loop still spins forever.
+    // W0102 must still fire here.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        on frame {
+            loop {
+                if x == 0 { continue }
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::W0102),
+        "`loop` whose only exit is `continue` should still produce W0102, got: {errors:?}"
+    );
+}
+
+// ── W0105: palette universal-byte consistency ───────────────
+
+#[test]
+fn analyze_palette_consistent_universals_ok() {
+    // Flat-form palette where every sub-palette's first byte is
+    // the same universal colour ($0F = black). No W0105.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        palette Consistent {
+            colors: [
+                0x0F, 0x11, 0x12, 0x13,
+                0x0F, 0x21, 0x22, 0x23,
+                0x0F, 0x31, 0x32, 0x33,
+                0x0F, 0x01, 0x02, 0x03,
+                0x0F, 0x05, 0x06, 0x07,
+                0x0F, 0x15, 0x16, 0x17,
+                0x0F, 0x25, 0x26, 0x27,
+                0x0F, 0x35, 0x36, 0x37
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0105),
+        "consistent palette should NOT warn, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_palette_inconsistent_universals_warns() {
+    // Flat-form palette whose sub-palette first bytes disagree
+    // (index 0 = $0F, index 16 = $30, etc.) — the $3F10 mirror
+    // will overwrite the background universal colour at runtime.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        palette Broken {
+            colors: [
+                0x0F, 0x11, 0x12, 0x13,
+                0x0F, 0x21, 0x22, 0x23,
+                0x0F, 0x31, 0x32, 0x33,
+                0x0F, 0x01, 0x02, 0x03,
+                0x30, 0x05, 0x06, 0x07,
+                0x0F, 0x15, 0x16, 0x17,
+                0x0F, 0x25, 0x26, 0x27,
+                0x0F, 0x35, 0x36, 0x37
+            ]
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::W0105),
+        "inconsistent palette universals should produce W0105, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_grouped_palette_is_always_consistent() {
+    // The grouped form uses the `universal:` field to drive
+    // every sub-palette's first byte, so it can never trip
+    // W0105 — even when the sub-palette bodies differ wildly.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        palette Grouped {
+            universal: 0x0F
+            bg0: [0x11, 0x12, 0x13]
+            bg1: [0x21, 0x22, 0x23]
+            bg2: [0x31, 0x32, 0x33]
+            bg3: [0x01, 0x02, 0x03]
+            sp0: [0x05, 0x06, 0x07]
+            sp1: [0x15, 0x16, 0x17]
+            sp2: [0x25, 0x26, 0x27]
+            sp3: [0x35, 0x36, 0x37]
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0105),
+        "grouped palette should never trip W0105, got: {:?}",
+        result.diagnostics
+    );
+}
+
+// ── W0106: implicit drop of a function return value ─────────
+
+#[test]
+fn analyze_discarded_non_void_return_warns() {
+    // `double(x)` returns u8 but the caller drops the result.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        fun double(n: u8) -> u8 { return n + n }
+        on frame { double(x) }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::W0106),
+        "discarded non-void return should produce W0106, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_discarded_void_call_ok() {
+    // Void function at statement position is the happy path —
+    // no discarded value, no warning.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        fun bump() { x = x + 1 }
+        on frame { bump() }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0106),
+        "void call should NOT produce W0106, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_non_void_return_used_as_rhs_ok() {
+    // Same signature as the discarded case, but the return value
+    // is consumed by an assignment — no warning.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var x: u8 = 0
+        var y: u8 = 0
+        fun double(n: u8) -> u8 { return n + n }
+        on frame { y = double(x) }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0106),
+        "assigned return value should NOT produce W0106, got: {:?}",
+        result.diagnostics
+    );
+}
+
+// ── W0107: `fast` variable slot under-use ───────────────────
+
+#[test]
+fn analyze_fast_var_underused_warns() {
+    // `counter` is declared `fast` but only one read (in the
+    // `if` condition), so its access count is 1 — below the
+    // threshold of 3. W0107 should fire.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        fast var counter: u8 = 0
+        on frame {
+            if counter == 0 { wait_frame }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::W0107),
+        "under-used `fast` var should produce W0107, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_fast_var_heavy_use_ok() {
+    // Three-plus accesses (one init + one read + one write-back)
+    // is enough to justify the slot — no W0107.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        fast var counter: u8 = 0
+        on frame {
+            counter = counter + 1
+            if counter == 0 { wait_frame }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0107),
+        "hot `fast` var should NOT warn, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_non_fast_var_never_warns() {
+    // Only `fast` declarations are checked — a plain `var` with
+    // the same (light) access pattern must not fire W0107.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var counter: u8 = 0
+        on frame {
+            if counter == 0 { wait_frame }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0107),
+        "plain `var` should never trip W0107, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_fast_var_underscore_exempt() {
+    // Leading-underscore names are exempt from W0107, mirroring
+    // the W0103 convention for deliberately-unused variables.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        fast var _reserved: u8 = 0
+        on frame {
+            if _reserved == 0 { wait_frame }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0107),
+        "underscore-prefixed `fast` var should be exempt, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_oversized_array_warns_w0108() {
+    // A u8 array with 300 elements has byte size 300 > 256. The
+    // codegen lowers `arr[i]` to `LDA base,X` with X 8-bit, so
+    // elements 256..299 are unreachable. W0108 should fire.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var big: u8[300]
+        on frame {
+            big[0] = 0
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0108),
+        "oversized u8 array should emit W0108, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_boundary_size_256_array_ok() {
+    // A u8[256] exactly fills the 8-bit X register — every element
+    // is reachable. No W0108.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var big: u8[256]
+        on frame {
+            big[0] = 0
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0108),
+        "u8[256] should not emit W0108, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_small_array_never_warns_w0108() {
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var small: u8[16]
+        on frame {
+            small[0] = 0
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0108),
+        "small array should not emit W0108, got: {:?}",
+        result.diagnostics
+    );
 }

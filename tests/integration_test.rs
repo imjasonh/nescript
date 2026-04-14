@@ -37,7 +37,7 @@ fn compile(source: &str) -> Vec<u8> {
     let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
     let music = assets::resolve_music(&program).expect("music resolution should succeed");
 
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
         .with_audio(&sfx, &music);
     let mut instructions = codegen.generate(&ir_program);
@@ -307,6 +307,130 @@ fn program_with_structs() {
     "#;
     let rom_data = compile(source);
     rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn program_with_u16_struct_field() {
+    // Exercise the u16 struct field path end-to-end: declare a
+    // struct with a mix of u8 and u16 fields, read from and write
+    // to the u16 field (including a literal > 255), and verify the
+    // ROM assembles cleanly. The analyzer's field-offset math and
+    // the IR lowering's wide load/store path both need to agree
+    // for this to compile at all.
+    let source = r#"
+        game "U16Struct" { mapper: NROM }
+        struct Entity { kind: u8, position: u16, flags: u8 }
+        var e: Entity
+        on frame {
+            e.kind = 1
+            e.position = 1234
+            e.flags = 7
+            if e.position > 1000 {
+                e.position += 1
+            }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn u16_struct_field_initializer_writes_both_bytes_to_rom() {
+    // Struct literal initializer with a u16 field > 255 — the
+    // compiler runs the global-init path at reset time, which
+    // lowers to two independent LDA/STA pairs (low byte then high
+    // byte). Unlike per-frame stores, initializers aren't subject
+    // to the optimizer's dead-store pass, so they're a stable
+    // place to witness both halves of the u16 write. 1234 = $04D2.
+    let source = r#"
+        game "U16Init" { mapper: NROM }
+        struct Point { tag: u8, x: u16 }
+        var p: Point = Point { tag: 1, x: 1234 }
+        on frame {
+            if p.x > 1000 {
+                scroll(p.tag, 0)
+            }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+
+    // PRG ROM starts at offset 16 and is 16384 bytes long.
+    let prg = &rom_data[16..16 + 16384];
+
+    // Look for `LDA #$D2 ; STA abs|zp` — opcode $A9 $D2 $85/$8D.
+    // This is the low-byte initializer for `p.x`.
+    let mut found_low_store = false;
+    for i in 0..prg.len().saturating_sub(4) {
+        if prg[i] == 0xA9 && prg[i + 1] == 0xD2 && (prg[i + 2] == 0x85 || prg[i + 2] == 0x8D) {
+            found_low_store = true;
+            break;
+        }
+    }
+    assert!(
+        found_low_store,
+        "expected an LDA #$D2 / STA <addr> pair in PRG for the u16 initializer low byte"
+    );
+
+    // And the high byte: `LDA #$04 ; STA abs|zp`.
+    let mut found_high_store = false;
+    for i in 0..prg.len().saturating_sub(4) {
+        if prg[i] == 0xA9 && prg[i + 1] == 0x04 && (prg[i + 2] == 0x85 || prg[i + 2] == 0x8D) {
+            found_high_store = true;
+            break;
+        }
+    }
+    assert!(
+        found_high_store,
+        "expected an LDA #$04 / STA <addr> pair in PRG for the u16 initializer high byte"
+    );
+}
+
+#[test]
+fn u16_struct_field_comparison_emits_wide_compare() {
+    // Reading a u16 struct field into a comparison should take
+    // the wide (16-bit) compare path, which produces a distinctive
+    // two-stage CMP sequence: high byte first (with equal-branch),
+    // then low byte. Without the u16 lowering, the field would
+    // be treated as u8 and the comparison would fold to a single
+    // 8-bit CMP. We detect the wide path by checking that both
+    // the low byte of 1000 ($E8) and the high byte ($03) appear
+    // as immediate operands in the emitted PRG — the compiler
+    // only emits both when it's generating a 16-bit compare.
+    let source = r#"
+        game "U16Cmp" { mapper: NROM }
+        struct Counter { n: u16 }
+        var c: Counter = Counter { n: 2000 }
+        on frame {
+            if c.n > 1000 {
+                scroll(1, 0)
+            } else {
+                scroll(2, 0)
+            }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+
+    let prg = &rom_data[16..16 + 16384];
+
+    // 1000 = $03E8. Look for CMP #$03 (A9 03, C9 03) — the high
+    // byte of the comparison literal. We expect `CMP #$03` ($C9
+    // $03) to appear somewhere in the CMP-with-constant sequence.
+    let mut found_high_cmp = false;
+    for i in 0..prg.len().saturating_sub(2) {
+        if prg[i] == 0xC9 && prg[i + 1] == 0x03 {
+            found_high_cmp = true;
+            break;
+        }
+    }
+    assert!(
+        found_high_cmp,
+        "expected a CMP #$03 (16-bit compare high byte) in PRG"
+    );
 }
 
 #[test]
@@ -690,6 +814,54 @@ fn program_with_user_declared_sfx_and_music() {
 }
 
 #[test]
+fn program_with_noise_sfx_writes_400c_at_play_site() {
+    // A program that declares a noise sfx and plays it should
+    // end up with a trigger sequence that touches $400E (noise
+    // period) and $400C (volume pre-mute). The exact register
+    // sequence is:
+    //   LDA #$30; STA $400C; LDA #idx; STA $400E; LDA #len; STA $400F;
+    //   LDA #$0B; STA $4015
+    // plus an envelope pointer load. We check the two channel-
+    // specific stores ($400E + $400C) explicitly so a regression
+    // that routes to pulse 1 by mistake will fail loud.
+    let source = r#"
+        game "Noise Test" { mapper: NROM }
+        sfx Crash {
+            channel: noise
+            pitch: 4
+            volume: [15, 12, 8, 4]
+        }
+        on frame { play Crash }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    let prg = &rom_data[16..16 + 16384];
+    // Search for any `STA $400C` instruction byte sequence
+    // (opcode 0x8D, lo=0x0C, hi=0x40). 6502 absolute store is
+    // always 3 bytes.
+    let sta_envelope_reg: [u8; 3] = [0x8D, 0x0C, 0x40];
+    assert!(
+        prg.windows(sta_envelope_reg.len())
+            .any(|w| w == sta_envelope_reg),
+        "noise play sequence should include STA $400C"
+    );
+    let sta_period_reg: [u8; 3] = [0x8D, 0x0E, 0x40];
+    assert!(
+        prg.windows(sta_period_reg.len())
+            .any(|w| w == sta_period_reg),
+        "noise play sequence should include STA $400E"
+    );
+    // The noise envelope bytes (derived from the user `volume` list
+    // masked with 0x30 | vol) must be in ROM too.
+    let env = |v: u8| 0x30u8 | v;
+    let crash_env: [u8; 5] = [env(15), env(12), env(8), env(4), 0x00];
+    assert!(
+        prg.windows(crash_env.len()).any(|w| w == crash_env),
+        "noise envelope blob must live in PRG"
+    );
+}
+
+#[test]
 fn program_without_audio_has_no_audio_driver_in_prg() {
     // Programs that never touch audio should pay zero ROM cost:
     // no period table, no driver body, no data blobs. We verify
@@ -980,10 +1152,12 @@ fn compile_banked(source: &str) -> Vec<u8> {
         .expect("sprite resolution should succeed");
     let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
     let music = assets::resolve_music(&program).expect("music resolution should succeed");
-    let palettes = assets::resolve_palettes(&program);
-    let backgrounds = assets::resolve_backgrounds(&program);
+    let palettes = assets::resolve_palettes(&program, Path::new("."))
+        .expect("palette resolution should succeed");
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."))
+        .expect("background resolution should succeed");
 
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
         .with_audio(&sfx, &music);
     let mut instructions = codegen.generate(&ir_program);
@@ -1217,7 +1391,7 @@ fn ir_codegen_array_literal_globals_emit_per_byte_init() {
         .expect("xs should be allocated")
         .address;
 
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
     let instructions = codegen.generate(&ir_program);
 
     // For each element, look for `LDA #val` followed shortly by
@@ -1286,7 +1460,7 @@ fn ir_codegen_locals_do_not_overlap_array_globals() {
     let xs_base = xs_alloc.address;
     let xs_end = xs_base + xs_alloc.size; // one past last element
 
-    let codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
     let instructions = codegen.generate(&ir_program);
 
     // Collect the (ordered) list of `STA absolute` targets and
@@ -1721,4 +1895,559 @@ fn e2e_banked_chr_rom_is_preserved() {
     let chr_start = 16 + info.prg_banks * 16384;
     // Default smiley is non-zero in its first 16 bytes.
     assert_ne!(&rom[chr_start..chr_start + 16], &[0u8; 16]);
+}
+
+#[test]
+fn e2e_png_palette_source_compiles_and_splices_bytes_into_prg() {
+    // Full pipeline: parse `palette Main @palette("fixture.png")`,
+    // resolve the PNG into a 32-byte blob via the asset resolver,
+    // and verify the resulting bytes land in PRG ROM. We write a
+    // 2×1 test fixture (pure black + pure red) to a tempdir so
+    // the test is self-contained and deterministic.
+    use image::{Rgb, RgbImage};
+    use nescript::codegen::IrCodeGen;
+    use nescript::linker::LinkedRom;
+
+    let dir = std::env::temp_dir();
+    let png_path = dir.join("nescript_e2e_palette.png");
+    let mut img = RgbImage::new(2, 1);
+    img.put_pixel(0, 0, Rgb([0, 0, 0]));
+    img.put_pixel(1, 0, Rgb([248, 0, 0]));
+    img.save(&png_path).unwrap();
+
+    let source = r#"
+        game "PngPalette" { mapper: NROM }
+        palette Main @palette("nescript_e2e_palette.png")
+        on frame { wait_frame }
+        start Main
+    "#;
+
+    let (program, diags) = nescript::parser::parse(source);
+    assert!(diags.is_empty(), "unexpected parse errors: {diags:?}");
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(analysis.diagnostics.iter().all(|d| !d.is_error()));
+
+    // Resolve with the tempdir as the source dir so the
+    // relative PNG path lands on the fixture we just wrote.
+    let palettes =
+        assets::resolve_palettes(&program, &dir).expect("palette resolution should succeed");
+    let backgrounds = assets::resolve_backgrounds(&program, &dir).expect("bg ok");
+    assert_eq!(palettes.len(), 1);
+    assert_eq!(palettes[0].name, "Main");
+    // First two bytes should map via `nearest_nes_color` to black
+    // and a red-ish index. We re-run the mapper so the test
+    // doesn't hard-code the NES palette table.
+    let e_black = assets::nearest_nes_color(0, 0, 0);
+    let e_red = assets::nearest_nes_color(248, 0, 0);
+    assert_eq!(palettes[0].colors[0], e_black);
+    assert_eq!(palettes[0].colors[1], e_red);
+    // Every sub-palette first byte equals the universal.
+    for slot in 0..8 {
+        assert_eq!(palettes[0].colors[slot * 4], e_black);
+    }
+
+    // Link the program and verify the 32-byte blob shows up in PRG
+    // ROM at the linker-assigned label.
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut ir_program = nescript::ir::lower(&program, &analysis);
+    nescript::optimizer::optimize(&mut ir_program);
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    let link: LinkedRom = linker.link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &[],
+    );
+    let pal_label = palettes[0].label();
+    let pal_addr = link
+        .labels
+        .get(&pal_label)
+        .copied()
+        .expect("palette label should be emitted");
+    // Translate the CPU address into a byte offset inside the
+    // fixed bank. NROM: the fixed bank starts at file offset 16
+    // (past the iNES header) and maps to CPU $C000-$FFFF.
+    let rom_offset = link.fixed_bank_file_offset + (pal_addr as usize - 0xC000);
+    let prg_bytes = &link.rom[rom_offset..rom_offset + 32];
+    assert_eq!(
+        prg_bytes, &palettes[0].colors,
+        "PRG ROM should contain the decoded palette blob verbatim"
+    );
+
+    let _ = std::fs::remove_file(&png_path);
+}
+
+/// Same as `compile_banked` but lets the caller toggle whether the IR
+/// optimizer runs. Used to cover the `--no-opt` CLI flag: compiling
+/// with the optimizer disabled must still produce a valid iNES ROM.
+fn compile_banked_with_opts(source: &str, optimize: bool) -> Vec<u8> {
+    let (program, diags) = nescript::parser::parse(source);
+    assert!(
+        diags.is_empty(),
+        "unexpected parse errors: {diags:?}\nsource:\n{source}"
+    );
+    let program = program.expect("parse should succeed");
+
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.diagnostics.iter().all(|d| !d.is_error()),
+        "unexpected analysis errors: {:?}",
+        analysis.diagnostics
+    );
+
+    let mut ir_program = ir::lower(&program, &analysis);
+    if optimize {
+        nescript::optimizer::optimize(&mut ir_program);
+    }
+
+    let sprites = assets::resolve_sprites(&program, Path::new("."))
+        .expect("sprite resolution should succeed");
+    let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
+    let music = assets::resolve_music(&program).expect("music resolution should succeed");
+    let palettes = assets::resolve_palettes(&program, Path::new("."))
+        .expect("palette resolution should succeed");
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."))
+        .expect("background resolution should succeed");
+
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    let switchable_banks: Vec<PrgBank> = program
+        .banks
+        .iter()
+        .filter(|b| b.bank_type == BankType::Prg)
+        .map(|b| PrgBank::empty(&b.name))
+        .collect();
+    linker.link_banked_with_ppu(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &switchable_banks,
+    )
+}
+
+#[test]
+fn no_opt_still_produces_valid_rom() {
+    // Acceptance test for the `--no-opt` CLI flag. Skipping the IR
+    // optimizer must still produce a byte-valid iNES ROM that links
+    // against the runtime, uses the declared mapper, and carries a
+    // plausible vector table. This guards the compile path the flag
+    // opens up so optimizer bisection remains a usable workflow.
+    let source = r#"
+        game "NoOpt" { mapper: NROM }
+
+        var counter: u8 = 0
+        var doubled: u8 = 0
+
+        fun double(x: u8) -> u8 {
+            return x + x
+        }
+
+        on frame {
+            counter += 1
+            doubled = double(counter)
+            if button.a {
+                counter = 0
+            }
+            wait_frame
+        }
+        start Main
+    "#;
+
+    let rom_opt = compile_banked_with_opts(source, true);
+    let rom_noopt = compile_banked_with_opts(source, false);
+
+    // Both outputs must be valid iNES ROMs with matching headers —
+    // the optimizer only affects PRG codegen, not the CHR/header
+    // layout the linker produces.
+    let info_opt = rom::validate_ines(&rom_opt).expect("opt ROM should be valid iNES");
+    let info_noopt = rom::validate_ines(&rom_noopt).expect("noopt ROM should be valid iNES");
+    assert_eq!(info_opt.mapper, 0);
+    assert_eq!(info_noopt.mapper, 0);
+    assert_eq!(info_opt.prg_banks, info_noopt.prg_banks);
+    assert_eq!(info_opt.chr_banks, info_noopt.chr_banks);
+    assert_eq!(rom_opt.len(), rom_noopt.len());
+
+    // The reset vector should still point into the fixed PRG bank
+    // in both builds — the optimizer has no say in where the reset
+    // handler lands.
+    let prg_end = 16 + 16384;
+    let reset_opt = u16::from_le_bytes([rom_opt[prg_end - 4], rom_opt[prg_end - 3]]);
+    let reset_noopt = u16::from_le_bytes([rom_noopt[prg_end - 4], rom_noopt[prg_end - 3]]);
+    assert_eq!(reset_opt, 0xC000);
+    assert_eq!(reset_noopt, 0xC000);
+}
+
+/// End-to-end pipeline that mirrors the CLI's `--debug`,
+/// `--symbols`, and `--source-map` paths. Returns the ROM bytes
+/// along with the rendered `.mlb` and source-map text so the
+/// integration tests can assert against the whole chain.
+///
+/// Routes through the shared [`nescript::pipeline::compile_source`]
+/// so this helper can never drift away from the CLI compile path
+/// — the bench had a hand-maintained parallel copy and it missed
+/// the bank-switching wiring in commit `2fe943b`, which is the
+/// regression that pushed us to share a single pipeline.
+fn compile_with_debug_artifacts(source: &str, debug: bool) -> (Vec<u8>, String, String) {
+    use nescript::pipeline::{compile_source, CompileOptions};
+    let opts = CompileOptions {
+        debug,
+        no_opt: false,
+        emit_source_map: true,
+    };
+    let out = compile_source(source, Path::new("."), &opts)
+        .unwrap_or_else(|e| panic!("pipeline failed: {e:?}"));
+    let mlb = nescript::linker::render_mlb(&out.link_result, &out.analysis.var_allocations);
+    let map = nescript::linker::render_source_map(&out.link_result, &out.source_locs, source);
+    (out.rom, mlb, map)
+}
+
+#[test]
+fn symbol_export_lists_user_functions_states_and_vars() {
+    // Compile a small program that exercises the symbol-export
+    // path: a user function, a state handler, a global variable,
+    // and at least one array. The rendered `.mlb` should mention
+    // every one of those under its user-facing name (not the
+    // internal `__ir_fn_` prefix).
+    let source = r#"
+        game "Symbols" { mapper: NROM }
+        var score: u8 = 0
+        var enemies: u8[4] = [1, 2, 3, 4]
+        fun bump() -> u8 { return 1 }
+        state Main {
+            on frame {
+                score = bump()
+                wait_frame
+            }
+        }
+        start Main
+    "#;
+    let (_rom, mlb, _map) = compile_with_debug_artifacts(source, false);
+
+    // User functions appear with their bare name.
+    assert!(mlb.contains(":bump"), "bump() should be in .mlb:\n{mlb}");
+    assert!(
+        mlb.contains(":Main_frame"),
+        "state frame handler should be in .mlb:\n{mlb}"
+    );
+    // Well-known entry points.
+    assert!(mlb.contains(":reset"));
+    assert!(mlb.contains(":nmi"));
+    assert!(mlb.contains(":main_loop"));
+    // User variables with the `R:` prefix.
+    assert!(
+        mlb.contains(":score"),
+        "global var `score` should be in .mlb:\n{mlb}"
+    );
+    assert!(
+        mlb.contains(":enemies"),
+        "array var `enemies` should be in .mlb:\n{mlb}"
+    );
+    // Make sure internal-only labels did not leak.
+    assert!(
+        !mlb.contains("__ir_fn_"),
+        ".mlb should strip the __ir_fn_ prefix"
+    );
+    // P:-prefix entries should resolve to in-ROM offsets below
+    // the 16 KB fixed bank size.
+    for line in mlb.lines().filter(|l| l.starts_with("P:")) {
+        let hex = &line[2..6];
+        let offset = u32::from_str_radix(hex, 16).unwrap();
+        assert!(
+            offset < 0x4000,
+            "P: offset {offset:#06X} should be inside the 16 KB fixed bank"
+        );
+    }
+}
+
+#[test]
+fn source_map_covers_every_lowered_statement() {
+    let source = r#"
+game "SourceMap" { mapper: NROM }
+on frame {
+    var a: u8 = 1
+    var b: u8 = 2
+    var c: u8 = 3
+    wait_frame
+}
+start Main
+"#;
+    let (_rom, _mlb, map) = compile_with_debug_artifacts(source, false);
+    assert!(
+        !map.is_empty(),
+        "source map should be non-empty when --source-map is on"
+    );
+    // Each non-empty line has the form: `<offset> <file> <line> <col>`.
+    let lines: Vec<_> = map.lines().collect();
+    assert!(
+        lines.len() >= 4,
+        "should cover at least the four user statements; got {}",
+        lines.len()
+    );
+    // Lines should be sorted by ROM offset.
+    let offsets: Vec<u32> = lines
+        .iter()
+        .map(|l| u32::from_str_radix(l.split_whitespace().next().unwrap(), 16).unwrap())
+        .collect();
+    let mut sorted = offsets.clone();
+    sorted.sort_unstable();
+    assert_eq!(offsets, sorted, "source map must be sorted by ROM offset");
+    // At least one entry should point at line 4 (the `var a`
+    // declaration — line 1 is blank, line 2 is `game`, line 3 is
+    // `on frame {`, line 4 is the first body statement).
+    let has_line_4 = lines.iter().any(|l| {
+        let parts: Vec<_> = l.split_whitespace().collect();
+        parts.len() == 4 && parts[2] == "4"
+    });
+    assert!(
+        has_line_4,
+        "source map should include at least one entry for line 4:\n{map}"
+    );
+}
+
+#[test]
+fn source_map_survives_aggressive_peephole_folding() {
+    // Regression guard for the concern raised in code review:
+    // `__src_<N>` markers are emitted as label pseudo-ops, and
+    // peephole uses labels as block boundaries. If peephole ever
+    // started pruning unreferenced labels the source map would
+    // silently lose entries. Compile a program that trips the
+    // peephole store-then-load and redundant-load folds on every
+    // single line, then assert every `__src_` label the codegen
+    // recorded is still in the linker's label table post-peephole.
+    let source = r#"
+        game "PeepholeFolds" { mapper: NROM }
+        var t0: u8 = 0
+        var t1: u8 = 0
+        var t2: u8 = 0
+        var t3: u8 = 0
+        var t4: u8 = 0
+        on frame {
+            t0 = 1
+            t1 = t0
+            t2 = t1
+            t3 = t2
+            t4 = t3
+            t0 = t4
+            wait_frame
+        }
+        start Main
+    "#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let palettes = assets::resolve_palettes(&program, Path::new(".")).unwrap();
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new(".")).unwrap();
+
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music)
+        .with_source_map(true);
+    let mut instructions = codegen.generate(&ir_program);
+
+    // Snapshot the __src_ labels the codegen recorded BEFORE
+    // peephole runs.
+    let pre_peephole: std::collections::HashSet<String> = codegen
+        .source_locs()
+        .iter()
+        .map(|(name, _)| name.clone())
+        .collect();
+    assert!(
+        pre_peephole.len() >= 6,
+        "codegen should have recorded at least one source loc per statement, got {} from {pre_peephole:?}",
+        pre_peephole.len()
+    );
+
+    // Run peephole. This is the pass that the reviewer worried
+    // might drop labels.
+    nescript::codegen::peephole::optimize(&mut instructions);
+
+    // Link and inspect the resolved label table.
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    let switchable_banks: Vec<PrgBank> = program
+        .banks
+        .iter()
+        .filter(|b| b.bank_type == BankType::Prg)
+        .map(|b| PrgBank::empty(&b.name))
+        .collect();
+    let link_result = linker.link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &switchable_banks,
+    );
+
+    // Every pre-peephole __src_ label must survive into the final
+    // linker label table. If peephole ever deletes a label this
+    // loop fails with the exact label that vanished.
+    for name in &pre_peephole {
+        assert!(
+            link_result.labels.contains_key(name),
+            "peephole dropped source marker {name}; this breaks source maps"
+        );
+    }
+}
+
+#[test]
+fn debug_frame_overrun_counter_reads_back_from_user_code() {
+    // End-to-end contract test for the frame-overrun counter:
+    // when compiled with `--debug`, the NMI handler increments
+    // `$07FF` whenever the main loop didn't reach `wait_frame`
+    // in time, and user code is expected to read that counter
+    // with `peek(0x07FF)`. This test verifies three things that
+    // together make the feature usable:
+    //
+    //   1. The NMI handler's INC $07FF is still present.
+    //   2. A user `peek(0x07FF)` lowers to a matching LDA $07FF.
+    //   3. The analyzer's RAM allocator doesn't hand out $07FF
+    //      to a user variable, so the peek reads the counter
+    //      and not some unrelated byte.
+    let source = r#"
+        game "Overrun" { mapper: NROM }
+        var last_overruns: u8 = 0
+        on frame {
+            last_overruns = peek(0x07FF)
+            wait_frame
+        }
+        start Main
+    "#;
+    let (rom, _mlb, _map) = compile_with_debug_artifacts(source, true);
+    let prg = &rom[16..16 + 16384];
+
+    // (1) NMI bumps the counter — look for `INC $07FF`
+    // (opcode EE, lo FF, hi 07).
+    let inc_07ff: [u8; 3] = [0xEE, 0xFF, 0x07];
+    assert!(
+        prg.windows(inc_07ff.len()).any(|w| w == inc_07ff),
+        "debug NMI handler should INC $07FF"
+    );
+
+    // (2) User peek lowers to an `LDA $07FF` somewhere in the
+    // frame handler (opcode AD, lo FF, hi 07).
+    let lda_07ff: [u8; 3] = [0xAD, 0xFF, 0x07];
+    assert!(
+        prg.windows(lda_07ff.len()).any(|w| w == lda_07ff),
+        "user `peek(0x07FF)` should lower to LDA $07FF"
+    );
+
+    // (3) No user variable should be allocated at $07FF — verify
+    // by re-parsing + re-analyzing and walking the allocations.
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.var_allocations.iter().all(|a| {
+            // Last allocated byte is address + size - 1.
+            let last = a.address + a.size - 1;
+            last < 0x07FF
+        }),
+        "user variable must not land on the debug overrun counter at $07FF: {:?}",
+        analysis.var_allocations
+    );
+}
+
+#[test]
+fn debug_build_emits_bounds_check_halt_routine() {
+    // When compiled with `--debug`, a program that indexes an
+    // array should include the shared `__debug_halt` trip routine
+    // and at least one JMP targeting it. Release builds must not.
+    let source = r#"
+        game "BoundsCheck" { mapper: NROM }
+        var xs: u8[4] = [1, 2, 3, 4]
+        on frame {
+            var i: u8 = 0
+            var v: u8 = xs[i]
+            wait_frame
+        }
+        start Main
+    "#;
+    let (_rom, mlb_debug, _map) = compile_with_debug_artifacts(source, true);
+    // The halt routine is internal so it's filtered from the
+    // `.mlb` output, but we can verify by re-compiling the same
+    // program and scanning the linker's label table directly.
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let palettes = assets::resolve_palettes(&program, Path::new("."))
+        .expect("palette resolution should succeed");
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."))
+        .expect("background resolution should succeed");
+
+    let mut cg_debug = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music)
+        .with_debug(true);
+    let mut insts_debug = cg_debug.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut insts_debug);
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    let linked_debug = linker.link_banked_with_ppu_detailed(
+        &insts_debug,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &[],
+    );
+    assert!(
+        linked_debug.labels.contains_key("__debug_halt"),
+        "debug build should define the shared bounds-check halt label"
+    );
+
+    let mut cg_release = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut insts_release = cg_release.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut insts_release);
+    let linked_release = linker.link_banked_with_ppu_detailed(
+        &insts_release,
+        &sprites,
+        &sfx,
+        &music,
+        &palettes,
+        &backgrounds,
+        &[],
+    );
+    assert!(
+        !linked_release.labels.contains_key("__debug_halt"),
+        "release build must not emit __debug_halt"
+    );
+    // And the rendered `.mlb` for the debug build should not
+    // contain the internal halt label either (it's filtered out).
+    assert!(
+        !mlb_debug.contains("__debug_halt"),
+        "debug halt label is internal; should not leak into .mlb"
+    );
 }

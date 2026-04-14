@@ -23,6 +23,11 @@ image = { version = "0.25", default-features = false, features = ["png"] }
 
 [dev-dependencies]
 pretty_assertions = "1"
+criterion = "0.5"
+
+[[bench]]
+name = "compile"
+harness = false
 
 [profile.release]
 lto = true

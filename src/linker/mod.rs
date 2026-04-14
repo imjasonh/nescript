@@ -1,17 +1,48 @@
+mod debug_symbols;
 #[cfg(test)]
 mod tests;
+
+pub use debug_symbols::{render_mlb, render_source_map};
+
+use std::collections::HashMap;
 
 use crate::asm;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
 use crate::assets::{BackgroundData, MusicData, PaletteData, SfxData};
-use crate::parser::ast::{Mapper, Mirroring};
+use crate::parser::ast::{HeaderFormat, Mapper, Mirroring};
 use crate::rom::RomBuilder;
 use crate::runtime;
+
+/// Detailed result of a link pass. In addition to the final iNES
+/// ROM bytes this carries the assembler's symbol table — each label
+/// defined anywhere in the assembled fixed bank mapped to its CPU
+/// address — and the byte offset at which the fixed bank starts
+/// inside the PRG ROM region of the file.
+///
+/// The CLI uses this metadata to emit Mesen-compatible `.mlb`
+/// symbol files and source-to-ROM maps (via the `--symbols` /
+/// `--source-map` flags). Callers that only care about the ROM
+/// bytes can read `.rom` and discard the rest.
+#[derive(Debug, Clone)]
+pub struct LinkedRom {
+    /// Final iNES ROM bytes (header + PRG banks + CHR).
+    pub rom: Vec<u8>,
+    /// Every label defined in the fixed bank, mapped to its CPU
+    /// address in the $C000-$FFFF window. Populated by the
+    /// 6502 assembler's label pass.
+    pub labels: HashMap<String, u16>,
+    /// Byte offset of the fixed bank's first byte inside `rom`.
+    /// For NROM this is `16` (just past the 16-byte iNES header).
+    /// For banked mappers each switchable bank shifts it by 16 KB,
+    /// so the fixed bank starts at `16 + 16_384 * switchable_bank_count`.
+    pub fixed_bank_file_offset: usize,
+}
 
 /// Link compiled code into a complete NES ROM.
 pub struct Linker {
     mirroring: Mirroring,
     mapper: Mapper,
+    header_format: HeaderFormat,
 }
 
 /// CHR data for a sprite, placed at a specific tile index in CHR ROM.
@@ -29,38 +60,68 @@ pub struct SpriteData {
 /// places switchable banks in declaration order, followed by the
 /// fixed bank at the end.
 ///
-/// `entry_label` is the optional trampoline entry point inside this
-/// bank — when set, the linker emits a `__tramp_<name>` stub in the
-/// fixed bank that selects this bank and JSRs into the label.
-/// `data` is raw bytes to splice verbatim (the compiler currently
-/// only uses empty data and lets the linker pad with $FF).
+/// `instructions` is the assembly stream the IR codegen produced for
+/// any user functions assigned to this bank — the linker assembles
+/// it at base $8000, captures the resulting label addresses, and
+/// merges them into the fixed bank's symbol table so cross-bank
+/// trampolines can resolve their targets. An empty `instructions`
+/// list is the legacy "reserve a slot" mode where the bank is just
+/// padded with $FF.
+///
+/// `trampolines` lists each `(target_function, target_label)` pair
+/// that needs a trampoline emitted in the fixed bank: callers JSR
+/// the trampoline, the trampoline switches banks and JSRs the entry
+/// label, then switches back. The IR codegen populates this list
+/// from any function declared inside a `bank Foo { fun ... }` block
+/// that's actually called from outside its bank.
 #[derive(Debug, Clone)]
 pub struct PrgBank {
     pub name: String,
-    pub data: Vec<u8>,
-    pub entry_label: Option<String>,
+    pub instructions: Vec<Instruction>,
+    pub trampolines: Vec<BankTrampoline>,
+}
+
+/// A single cross-bank trampoline request. The linker emits one
+/// `__tramp_<fn_name>` stub in the fixed bank for every entry in
+/// this list — the stub pushes a fixed bank-select call, JSRs the
+/// real function in the switchable bank, then restores the fixed
+/// bank before returning.
+#[derive(Debug, Clone)]
+pub struct BankTrampoline {
+    /// Label callers will `JSR` (e.g. `__tramp_big_helper`).
+    pub tramp_label: String,
+    /// Label inside the switchable bank holding the function body.
+    /// Conventionally `__ir_fn_<fn_name>`.
+    pub entry_label: String,
 }
 
 impl PrgBank {
     /// Create an empty named bank. Convenience for the compiler,
-    /// which currently emits all user code into the fixed bank and
-    /// just wants switchable slots reserved for future use.
+    /// which uses this when a `bank Foo: prg` declaration has no
+    /// nested function bodies and exists only to reserve a 16 KB
+    /// switchable slot the linker pads with $FF.
     #[must_use]
     pub fn empty(name: impl Into<String>) -> Self {
         Self {
             name: name.into(),
-            data: Vec::new(),
-            entry_label: None,
+            instructions: Vec::new(),
+            trampolines: Vec::new(),
         }
     }
 
-    /// Create a bank with a raw byte payload and no trampoline entry.
+    /// Create a bank populated with the IR codegen's instruction
+    /// stream for any functions assigned to it, plus the trampoline
+    /// requests that should be emitted in the fixed bank.
     #[must_use]
-    pub fn with_data(name: impl Into<String>, data: Vec<u8>) -> Self {
+    pub fn with_instructions(
+        name: impl Into<String>,
+        instructions: Vec<Instruction>,
+        trampolines: Vec<BankTrampoline>,
+    ) -> Self {
         Self {
             name: name.into(),
-            data,
-            entry_label: None,
+            instructions,
+            trampolines,
         }
     }
 }
@@ -115,11 +176,25 @@ impl Linker {
         Self {
             mirroring,
             mapper: Mapper::NROM,
+            header_format: HeaderFormat::Ines1,
         }
     }
 
     pub fn with_mapper(mirroring: Mirroring, mapper: Mapper) -> Self {
-        Self { mirroring, mapper }
+        Self {
+            mirroring,
+            mapper,
+            header_format: HeaderFormat::Ines1,
+        }
+    }
+
+    /// Opt into the NES 2.0 header format for the emitted ROM.
+    /// Chainable builder method — returns `self` so callers can
+    /// write `Linker::with_mapper(m, p).with_header(HeaderFormat::Nes2)`.
+    #[must_use]
+    pub fn with_header(mut self, header: HeaderFormat) -> Self {
+        self.header_format = header;
+        self
     }
 
     /// Link all code sections into a .nes ROM.
@@ -198,6 +273,34 @@ impl Linker {
         backgrounds: &[BackgroundData],
         switchable_banks: &[PrgBank],
     ) -> Vec<u8> {
+        self.link_banked_with_ppu_detailed(
+            user_code,
+            sprites,
+            sfx,
+            music,
+            palettes,
+            backgrounds,
+            switchable_banks,
+        )
+        .rom
+    }
+
+    /// Like [`Linker::link_banked_with_ppu`] but returns the full
+    /// [`LinkedRom`] record, carrying the assembler label table and
+    /// the PRG offset of the fixed bank alongside the ROM bytes.
+    /// This is the entry point used by the CLI when emitting a
+    /// `.mlb` symbol file or a source-map file.
+    #[allow(clippy::too_many_arguments)]
+    pub fn link_banked_with_ppu_detailed(
+        &self,
+        user_code: &[Instruction],
+        sprites: &[SpriteData],
+        sfx: &[SfxData],
+        music: &[MusicData],
+        palettes: &[PaletteData],
+        backgrounds: &[BackgroundData],
+        switchable_banks: &[PrgBank],
+    ) -> LinkedRom {
         assert!(
             switchable_banks.is_empty() || self.mapper != Mapper::NROM,
             "NROM does not support switchable PRG banks (got {} banks)",
@@ -224,7 +327,7 @@ impl Linker {
         palettes: &[PaletteData],
         backgrounds: &[BackgroundData],
         switchable_banks: &[PrgBank],
-    ) -> Vec<u8> {
+    ) -> LinkedRom {
         // ROM layout.
         //
         // NROM: a single 16 KB PRG bank mapped at $C000-$FFFF.
@@ -239,6 +342,46 @@ impl Linker {
         // to $8000-$BFFF.
         let total_banks = switchable_banks.len() + 1;
         let fixed_bank_index = total_banks - 1;
+
+        // Discovery pass: assemble each switchable bank that has
+        // its own instruction stream so we know what labels live
+        // inside it and at what $8000-window address. The bytes
+        // produced here are discarded — any JSRs from the banked
+        // code into fixed-bank labels (math runtime, audio tick,
+        // other state handlers) will fail label resolution because
+        // the fixed bank hasn't been assembled yet. We catch the
+        // panic via a separate fixup-tolerant assembly variant
+        // below; for the discovery pass we just need the label
+        // addresses, so we seed the assembler with a placeholder
+        // mapping (every label resolves to $C000) that's enough to
+        // pass the second pass without panic.
+        //
+        // Banks with no instructions (the legacy "reserved slot"
+        // mode used by every existing banked example) skip this
+        // entirely and just contribute an empty payload below — the
+        // code path is byte-for-byte equivalent to the pre-banked
+        // codegen behaviour for those programs.
+        let mut cross_bank_labels: HashMap<String, u16> = HashMap::new();
+        for bank in switchable_banks {
+            if bank.instructions.is_empty() {
+                continue;
+            }
+            // Use placeholder seeding so unresolved references to
+            // fixed-bank labels don't panic during the discovery
+            // pass. The bytes are discarded; only the label table
+            // matters here.
+            let placeholder = HashMap::new();
+            let discovery = asm::assemble_discover_labels(&bank.instructions, 0x8000, &placeholder);
+            for (label, addr) in &discovery.labels {
+                if cross_bank_labels.contains_key(label) {
+                    panic!(
+                        "duplicate label '{label}' across switchable banks; \
+                         cannot resolve cross-bank reference"
+                    );
+                }
+                cross_bank_labels.insert(label.clone(), *addr);
+            }
+        }
 
         let mut all_instructions = Vec::new();
 
@@ -296,23 +439,26 @@ impl Linker {
         // User code (var init + main loop)
         all_instructions.extend(user_code.iter().cloned());
 
-        // Bank-select subroutine plus a trampoline per declared bank
-        // that has an entry label. Emitted only for banked mappers
-        // (NROM has no switchable banks by definition). The helpers
-        // live in the fixed bank so they're always reachable at
-        // $C000-$FFFF regardless of which switchable bank is
-        // currently mapped at $8000.
+        // Bank-select subroutine plus one trampoline per banked
+        // function that the IR codegen reported as cross-bank-called.
+        // Emitted only for banked mappers (NROM has no switchable
+        // banks by definition). The helpers live in the fixed bank
+        // so they're always reachable at $C000-$FFFF regardless of
+        // which switchable bank is currently mapped at $8000.
         if self.mapper != Mapper::NROM {
             all_instructions.extend(runtime::gen_bank_select(self.mapper));
             #[allow(clippy::cast_possible_truncation)]
             let fixed_bank_num = fixed_bank_index as u8;
             for (i, bank) in switchable_banks.iter().enumerate() {
-                if let Some(entry) = &bank.entry_label {
-                    #[allow(clippy::cast_possible_truncation)]
-                    let bank_num = i as u8;
+                if bank.trampolines.is_empty() {
+                    continue;
+                }
+                #[allow(clippy::cast_possible_truncation)]
+                let bank_num = i as u8;
+                for tramp in &bank.trampolines {
                     all_instructions.extend(runtime::gen_bank_trampoline(
-                        &bank.name,
-                        entry,
+                        &tramp.tramp_label,
+                        &tramp.entry_label,
                         bank_num,
                         fixed_bank_num,
                     ));
@@ -345,8 +491,10 @@ impl Linker {
         // `__audio_tick` — so we emit it alongside the math
         // routines, well before the NMI handler below.
         let has_audio = has_label(user_code, "__audio_used");
+        let has_noise = has_label(user_code, "__noise_used");
+        let has_triangle = has_label(user_code, "__triangle_used");
         if has_audio {
-            all_instructions.extend(runtime::gen_audio_tick());
+            all_instructions.extend(runtime::gen_audio_tick(has_noise, has_triangle));
             all_instructions.extend(runtime::gen_period_table());
             // Emit one data block per sfx blob: a label followed by
             // the envelope bytes. `play Name` codegen emits a
@@ -414,15 +562,29 @@ impl Linker {
         // The audio tick JSR is emitted by `gen_nmi` itself, after
         // the register and scratch-slot saves, so it can freely
         // clobber A/X/Y and $02/$03 without corrupting user state.
-        all_instructions.extend(runtime::gen_nmi(has_ppu_updates, has_audio));
+        // The codegen emits a `__debug_mode` marker whenever
+        // `--debug` is active; that tells the runtime to splice
+        // in the extra frame-overrun check at the top of NMI.
+        let debug_mode = has_label(user_code, "__debug_mode");
+        all_instructions.extend(runtime::gen_nmi(has_ppu_updates, has_audio, debug_mode));
 
         // IRQ handler
         all_instructions.push(Instruction::new(NOP, AM::Label("__irq".into())));
         all_instructions.extend(runtime::gen_irq());
 
-        // Assemble everything at $C000
+        // Assemble everything at $C000. The label-seed map is empty
+        // for programs without any banked user code, which keeps the
+        // result byte-identical to the pre-banked-codegen output for
+        // every existing example. Programs with banked functions get
+        // the per-bank label tables merged in here so cross-bank
+        // trampolines can resolve their `__ir_fn_<name>` targets in
+        // the second-pass fixup.
         let base_addr = 0xC000;
-        let result = asm::assemble(&all_instructions, base_addr);
+        let result = if cross_bank_labels.is_empty() {
+            asm::assemble(&all_instructions, base_addr)
+        } else {
+            asm::assemble_with_labels(&all_instructions, base_addr, &cross_bank_labels)
+        };
 
         // Build PRG ROM with vector table
         let mut prg = result.bytes;
@@ -454,24 +616,51 @@ impl Linker {
         // Build ROM
         let mut builder = RomBuilder::new(self.mirroring);
         builder.set_mapper(crate::rom::mapper_number(self.mapper));
+        if self.header_format == HeaderFormat::Nes2 {
+            builder.enable_nes2();
+        }
 
         // Multi-bank layout: each switchable bank is an independent
-        // 16 KB slot whose contents the linker takes verbatim from
-        // the caller, followed by the fixed bank (just assembled).
+        // 16 KB slot whose contents are either the assembled
+        // banked-instruction stream or empty padding (for "reserved
+        // slot" mode), followed by the fixed bank (just assembled).
         // For NROM (no switchable banks) this collapses to the
         // legacy single-bank path.
+        //
+        // For banks that hold their own instruction streams we run
+        // a second assembly pass here, this time seeding the
+        // assembler with both the cross-bank labels (other banks'
+        // discovery results) and the fixed bank's labels. This is
+        // the pass that resolves any fixups from banked code into
+        // the fixed bank — math runtime, audio tick, other state
+        // handlers, etc.
         if switchable_banks.is_empty() {
             builder.set_prg(prg);
         } else {
+            // Build the merged label table the bank assembler
+            // needs. Includes both the cross-bank labels gathered
+            // during the discovery pass and every label the fixed
+            // bank assembler just produced.
+            let mut merged_labels = cross_bank_labels.clone();
+            for (name, addr) in &result.labels {
+                merged_labels.insert(name.clone(), *addr);
+            }
             let mut banks: Vec<Vec<u8>> = Vec::with_capacity(total_banks);
             for bank in switchable_banks {
+                let payload = if bank.instructions.is_empty() {
+                    Vec::new()
+                } else {
+                    let final_pass =
+                        asm::assemble_with_labels(&bank.instructions, 0x8000, &merged_labels);
+                    final_pass.bytes
+                };
                 assert!(
-                    bank.data.len() <= 16384,
+                    payload.len() <= 16384,
                     "switchable bank '{}' exceeds 16 KB ({} bytes)",
                     bank.name,
-                    bank.data.len()
+                    payload.len()
                 );
-                banks.push(bank.data.clone());
+                banks.push(payload);
             }
             banks.push(prg);
             builder.set_prg_banks(banks);
@@ -490,7 +679,17 @@ impl Linker {
         }
         builder.set_chr(chr);
 
-        builder.build()
+        let rom = builder.build();
+        // The fixed bank sits after the iNES header (16 bytes) and
+        // any switchable banks (16 KB each). Callers use this to
+        // translate CPU addresses from `labels` into ROM file
+        // offsets when emitting Mesen `.mlb` files.
+        let fixed_bank_file_offset = 16 + switchable_banks.len() * 16_384;
+        LinkedRom {
+            rom,
+            labels: result.labels,
+            fixed_bank_file_offset,
+        }
     }
 
     /// Generate instructions to load the default palette into the PPU.

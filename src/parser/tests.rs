@@ -45,6 +45,38 @@ fn parse_game_with_mirroring() {
     assert_eq!(prog.game.mirroring, Mirroring::Vertical);
 }
 
+#[test]
+fn parse_game_default_header_is_ines1() {
+    // Programs that don't mention `header:` should default to
+    // iNES 1.0 — the current behaviour every example relies on.
+    let prog = parse_ok(MINIMAL_GAME);
+    assert_eq!(prog.game.header, HeaderFormat::Ines1);
+}
+
+#[test]
+fn parse_game_with_nes2_header() {
+    // Opting into NES 2.0 via `header: nes2`.
+    let src = r#"
+        game "Test" { mapper: NROM header: nes2 }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.game.header, HeaderFormat::Nes2);
+}
+
+#[test]
+fn parse_game_with_ines1_header_explicit() {
+    // Explicitly asking for iNES 1.0 (the default) also parses.
+    let src = r#"
+        game "Test" { mapper: NROM header: ines1 }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.game.header, HeaderFormat::Ines1);
+}
+
 // ── Variables ──
 
 #[test]
@@ -550,6 +582,63 @@ fn parse_background_decl_with_attributes() {
 }
 
 #[test]
+fn parse_palette_decl_from_png_source() {
+    // Shortcut form: `palette Name @palette("file.png")` sets
+    // `png_source` and leaves `colors` empty. The asset resolver
+    // decodes the actual bytes at compile time.
+    let src = r#"
+        game "Test" { mapper: NROM }
+        palette Main @palette("art/main.png")
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.palettes.len(), 1);
+    assert_eq!(prog.palettes[0].name, "Main");
+    assert!(prog.palettes[0].colors.is_empty());
+    assert_eq!(prog.palettes[0].png_source.as_deref(), Some("art/main.png"));
+}
+
+#[test]
+fn parse_palette_decl_rejects_wrong_directive() {
+    // The shortcut form insists the directive be `@palette`, not
+    // some other `@foo`. We want a clear error the first time
+    // someone confuses `@chr` / `@palette` / `@nametable`.
+    let src = r#"
+        game "Test" { mapper: NROM }
+        palette Main @chr("art/main.png")
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (_, diags) = parse(src);
+    assert!(
+        diags
+            .iter()
+            .any(|d: &crate::errors::Diagnostic| d.message.contains("@palette")),
+        "expected diagnostic about @palette, got: {diags:?}"
+    );
+}
+
+#[test]
+fn parse_background_decl_from_png_source() {
+    let src = r#"
+        game "Test" { mapper: NROM }
+        background Main @nametable("levels/stage1.png")
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.backgrounds.len(), 1);
+    assert_eq!(prog.backgrounds[0].name, "Main");
+    assert!(prog.backgrounds[0].tiles.is_empty());
+    assert!(prog.backgrounds[0].attributes.is_empty());
+    assert_eq!(
+        prog.backgrounds[0].png_source.as_deref(),
+        Some("levels/stage1.png")
+    );
+}
+
+#[test]
 fn parse_background_decl_without_attributes() {
     let src = r#"
         game "Test" { mapper: NROM }
@@ -697,6 +786,80 @@ fn parse_sfx_decl_rejects_duty_over_3() {
     assert!(
         diags.iter().any(crate::errors::Diagnostic::is_error),
         "duty > 3 should error"
+    );
+}
+
+#[test]
+fn parse_sfx_decl_defaults_channel_to_pulse1() {
+    // Existing declarations (which never set `channel:`) should
+    // default to `Channel::Pulse1` so their codegen path is
+    // unchanged.
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Pickup {
+            duty: 2
+            pitch: [0x50, 0x48]
+            volume: [15, 8]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sfx[0].channel, crate::parser::ast::Channel::Pulse1);
+}
+
+#[test]
+fn parse_sfx_decl_with_noise_channel() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Zap {
+            channel: noise
+            pitch: 5
+            volume: [15, 10, 5]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sfx.len(), 1);
+    assert_eq!(prog.sfx[0].channel, crate::parser::ast::Channel::Noise);
+    assert_eq!(prog.sfx[0].pitch, vec![5, 5, 5]);
+    assert_eq!(prog.sfx[0].volume, vec![15, 10, 5]);
+}
+
+#[test]
+fn parse_sfx_decl_with_triangle_channel() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Bass {
+            channel: triangle
+            pitch: 60
+            volume: [1, 1, 1, 1, 1]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sfx[0].channel, crate::parser::ast::Channel::Triangle);
+    assert_eq!(prog.sfx[0].pitch, vec![60; 5]);
+}
+
+#[test]
+fn parse_sfx_decl_rejects_unknown_channel() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Bad {
+            channel: bogus
+            pitch: 5
+            volume: [8]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (_, diags) = parse(src);
+    assert!(
+        diags.iter().any(crate::errors::Diagnostic::is_error),
+        "unknown channel name should error"
     );
 }
 

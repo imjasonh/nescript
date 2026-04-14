@@ -1,6 +1,6 @@
 use super::*;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
-use crate::parser::ast::{Mapper, Mirroring};
+use crate::parser::ast::{Channel, Mapper, Mirroring};
 use crate::rom;
 
 #[test]
@@ -187,6 +187,7 @@ fn link_with_audio_data_places_sfx_blobs_in_prg() {
         period_lo: 0x50,
         period_hi: 0x08,
         envelope: vec![0xBF, 0xB8, 0xB4, 0xB0, 0x00],
+        channel: Channel::Pulse1,
     }];
     let rom = linker.link_with_all_assets(&user_code, &[], &sfx, &[]);
     let info = rom::validate_ines(&rom).unwrap();
@@ -238,6 +239,7 @@ fn link_with_audio_resolves_sfx_pointer_references() {
         period_lo: 0x50,
         period_hi: 0x08,
         envelope: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00],
+        channel: Channel::Pulse1,
     }];
     let rom = linker.link_with_all_assets(&user_code, &[], &sfx, &[]);
     // The user code starts at RESET ($C000) after init+palette_load.
@@ -280,6 +282,7 @@ fn link_without_audio_marker_does_not_emit_period_table() {
             period_lo: 0,
             period_hi: 0,
             envelope: vec![0xAA, 0xBB, 0x00],
+            channel: Channel::Pulse1,
         }],
         &[],
     );
@@ -400,19 +403,30 @@ fn link_banked_switchable_banks_are_padded_with_ff() {
 }
 
 #[test]
-fn link_banked_preserves_switchable_bank_payload_bytes() {
-    // When a caller provides raw bytes for a switchable bank, the
-    // linker must splice them in verbatim at the start of that
-    // bank's slot. This is the hook the compiler uses to ship data
-    // tables without touching the fixed bank.
+fn link_banked_assembles_switchable_bank_instructions() {
+    // When a caller populates a switchable bank's instruction
+    // stream, the linker must assemble those instructions at the
+    // bank's $8000 base and splice the resulting bytes into the
+    // bank's slot. We use a label + a couple of NOPs so the byte
+    // pattern is unambiguous: NOP NOP NOP would be three $EA bytes
+    // at the very start of the bank.
     let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::UxROM);
     let user_code = vec![Instruction::implied(NOP)];
-    let data = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x42, 0x13];
-    let banks = vec![PrgBank::with_data("DataBank", data.clone())];
+    let bank_code = vec![
+        Instruction::new(NOP, AM::Label("__bank_payload".into())),
+        Instruction::implied(NOP),
+        Instruction::implied(NOP),
+        Instruction::implied(NOP),
+    ];
+    let banks = vec![PrgBank::with_instructions(
+        "DataBank",
+        bank_code,
+        Vec::new(),
+    )];
     let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
-    // Bank 0 starts at offset 16. Verify payload lands at the very
-    // start.
-    assert_eq!(&rom[16..16 + data.len()], &data[..]);
+    // Bank 0 starts at offset 16. Verify the three NOP bytes land
+    // at the very start (the label pseudo-op emits zero bytes).
+    assert_eq!(&rom[16..19], &[0xEA, 0xEA, 0xEA]);
 }
 
 #[test]
@@ -452,28 +466,30 @@ fn link_banked_fixed_bank_contains_bank_select_subroutine() {
 
 #[test]
 fn link_banked_fixed_bank_contains_trampolines_for_declared_banks() {
-    // When a bank declares an entry label, the linker must emit a
-    // matching `__tramp_<name>` stub in the fixed bank. We check
-    // by constructing a bank with an entry label and verifying the
-    // assembled labels map (via the indirect check: the ROM builds
-    // without panicking on unresolved labels, which means the
-    // trampoline's target label — here spliced via a dummy NOP
-    // label in the fixed bank — resolved).
+    // When a bank requests a trampoline, the linker must emit a
+    // matching `__tramp_<name>` stub in the fixed bank that JSRs
+    // the entry label inside the switchable bank. We check by
+    // constructing a bank with both an entry-label-defining
+    // instruction stream and a matching trampoline request, then
+    // verifying the linker doesn't panic on unresolved fixups (the
+    // banked-bank label seeding is what makes the JSR inside the
+    // trampoline resolve correctly).
     let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::MMC1);
-    // We splice a fake target label into the user code so the
-    // trampoline's internal JSR resolves. This simulates the path
-    // codegen will eventually take (emit the entry label alongside
-    // the banked user code; the linker resolves it via the banked
-    // assembler).
-    let user_code = vec![
-        Instruction::new(NOP, AM::Label("__fake_bank_entry".into())),
-        Instruction::implied(NOP),
+    let user_code = vec![Instruction::implied(NOP)];
+    // The switchable bank holds the entry label and a tiny RTS so
+    // there's something for the trampoline to JSR into.
+    let bank_code = vec![
+        Instruction::new(NOP, AM::Label("__ir_fn_helper".into())),
+        Instruction::implied(RTS),
     ];
-    let banks = vec![PrgBank {
-        name: "Level1".into(),
-        data: Vec::new(),
-        entry_label: Some("__fake_bank_entry".into()),
-    }];
+    let banks = vec![PrgBank::with_instructions(
+        "Level1",
+        bank_code,
+        vec![BankTrampoline {
+            tramp_label: "__tramp_helper".into(),
+            entry_label: "__ir_fn_helper".into(),
+        }],
+    )];
     // Should not panic — trampoline and entry label both present.
     let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
     let info = rom::validate_ines(&rom).unwrap();
@@ -589,4 +605,39 @@ fn palette_load_writes_to_ppu() {
         32,
         "should write all 32 palette bytes"
     );
+}
+
+#[test]
+fn link_banked_with_ppu_detailed_exposes_label_table() {
+    // The detailed variant carries the assembler's symbol table so
+    // the CLI can emit a `.mlb` file. Round-trip a minimal program
+    // through the linker and verify the classic runtime labels
+    // (`__reset`, `__nmi`, `__ir_main_loop`) show up with CPU
+    // addresses in the $C000-$FFFF fixed-bank window.
+    let lnk = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__ir_main_loop".into())),
+        Instruction::new(JMP, AM::Label("__ir_main_loop".into())),
+    ];
+    let result = lnk.link_banked_with_ppu_detailed(&user_code, &[], &[], &[], &[], &[], &[]);
+    assert!(
+        result.labels.contains_key("__reset"),
+        "LinkedRom should surface the reset label"
+    );
+    assert!(
+        result.labels.contains_key("__nmi"),
+        "LinkedRom should surface the nmi label"
+    );
+    assert!(
+        result.labels.contains_key("__ir_main_loop"),
+        "LinkedRom should surface user-code labels"
+    );
+    let main_addr = result.labels["__ir_main_loop"];
+    assert!(
+        (0xC000..=0xFFFF).contains(&main_addr),
+        "fixed-bank label should sit inside the $C000-$FFFF window, got {main_addr:#06X}"
+    );
+    // NROM has no switchable banks, so the fixed bank starts right
+    // after the 16-byte iNES header.
+    assert_eq!(result.fixed_bank_file_offset, 16);
 }

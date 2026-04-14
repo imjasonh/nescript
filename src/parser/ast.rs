@@ -69,6 +69,12 @@ pub struct SpriteDecl {
 pub struct PaletteDecl {
     pub name: String,
     pub colors: Vec<u8>,
+    /// Optional PNG source — when set, the analyzer leaves `colors`
+    /// empty and the asset resolver decodes the PNG into a 32-byte
+    /// palette blob at compile time. Mutually exclusive with
+    /// `colors` being non-empty in practice (the parser never fills
+    /// both).
+    pub png_source: Option<String>,
     pub span: Span,
 }
 
@@ -87,27 +93,59 @@ pub struct BackgroundDecl {
     pub name: String,
     pub tiles: Vec<u8>,
     pub attributes: Vec<u8>,
+    /// Optional PNG source for `background Name @nametable("file.png")`.
+    /// When set, the asset resolver decodes the PNG into tile + attribute
+    /// tables at compile time. Mutually exclusive with inline
+    /// `tiles` / `attributes` (the parser never fills both).
+    pub png_source: Option<String>,
     pub span: Span,
 }
 
-/// `sfx Name { ... }` — a sound effect played on pulse 1. SFX are
-/// frame-accurate envelopes: `pitch[i]` and `volume[i]` describe the
-/// $4002/$4000 register state for frame `i`, advancing one entry per
-/// NMI tick. `duty` selects the pulse duty cycle (0-3) for the whole
-/// effect. The two arrays must have the same length; the runtime
-/// drops pulse 1's volume to 0 one frame after the last entry.
+/// APU channel an sfx targets. Pulse1 is the historical default and
+/// the only one populated from older programs that omit `channel:`.
+/// Triangle and Noise were added as part of the "richer audio"
+/// work — Triangle has no volume envelope (the channel is fixed
+/// output), Noise uses a 16-entry period table rather than the
+/// pulse channel's 60-entry one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Pulse1,
+    Pulse2,
+    Triangle,
+    Noise,
+}
+
+/// `sfx Name { ... }` — a sound effect played on pulse 1 (by default).
+/// SFX are frame-accurate envelopes: `pitch[i]` and `volume[i]`
+/// describe the register state for frame `i`, advancing one entry
+/// per NMI tick. `duty` selects the pulse duty cycle (0-3) for the
+/// whole effect. The two arrays must have the same length; the runtime
+/// drops the channel volume to 0 one frame after the last entry.
+///
+/// The `channel:` property (new) lets a declaration target the
+/// triangle or noise channels instead of the default pulse 1. For
+/// triangle, `volume` is meaningless (fixed-level channel) and the
+/// per-frame "volume" byte is instead treated as a hold flag (nonzero
+/// = sustain, zero = release/stop). For noise, `pitch` values are
+/// interpreted as 0-15 indices into the APU's internal 16-entry
+/// noise period table rather than raw 11-bit pulse periods.
 #[derive(Debug, Clone)]
 pub struct SfxDecl {
     pub name: String,
     /// Duty cycle bits (0-3). Each bit pattern picks a different
-    /// pulse waveform; 2 (50%) sounds like a square wave.
+    /// pulse waveform; 2 (50%) sounds like a square wave. Not
+    /// meaningful for triangle or noise channels.
     pub duty: u8,
-    /// One period byte per frame, written to $4002. The $4003 high
-    /// nibble is always zero (keeps notes in the audible range).
+    /// One period byte per frame, written to $4002 (pulse 1) or
+    /// $400E (noise, low 4 bits only) on trigger.
     pub pitch: Vec<u8>,
     /// One volume byte per frame (0-15), combined with the duty bits
-    /// and written to $4000.
+    /// and written to $4000 (pulse 1) / $400C (noise) / $4008
+    /// (triangle; any nonzero value means "hold", zero means release).
     pub volume: Vec<u8>,
+    /// APU channel this sfx drives. Defaults to [`Channel::Pulse1`]
+    /// when the declaration omits the `channel:` property.
+    pub channel: Channel,
     pub span: Span,
 }
 
@@ -154,6 +192,9 @@ pub struct GameDecl {
     pub name: String,
     pub mapper: Mapper,
     pub mirroring: Mirroring,
+    /// iNES header flavor to emit. Defaults to [`HeaderFormat::Ines1`];
+    /// programs can opt into NES 2.0 via `game Foo { header: nes2 }`.
+    pub header: HeaderFormat,
     pub span: Span,
 }
 
@@ -169,6 +210,22 @@ pub enum Mapper {
 pub enum Mirroring {
     Horizontal,
     Vertical,
+}
+
+/// iNES header format to emit in the .nes file.
+///
+/// `Ines1` is the classic 16-byte iNES 1.0 header that every
+/// `NEScript` program has used to date. `Nes2` opts into the
+/// backwards-compatible NES 2.0 extension: the header is still
+/// 16 bytes, but byte 7 bits 2-3 are set to `10` and bytes 8-15
+/// carry extended metadata (submapper, PRG/CHR size MSBs, PRG RAM,
+/// CHR RAM, timing, etc.). NES 2.0 is strictly additive — any
+/// emulator that doesn't understand it falls back to reading the
+/// header as iNES 1.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderFormat {
+    Ines1,
+    Nes2,
 }
 
 #[derive(Debug, Clone)]
@@ -202,6 +259,16 @@ pub struct FunDecl {
     pub return_type: Option<NesType>,
     pub body: Block,
     pub is_inline: bool,
+    /// When `Some(bank_name)`, the function was declared inside a
+    /// `bank Foo { fun ... }` block and its compiled bytes live in
+    /// the named switchable PRG bank. Calls from the fixed bank to
+    /// this function go through a generated trampoline (see
+    /// `runtime::gen_bank_trampoline`); calls from inside the same
+    /// bank stay as direct JSRs. `None` means the function lives in
+    /// the fixed bank along with the runtime, NMI/IRQ handlers, and
+    /// every state handler — the only mode prior to the user-banked
+    /// codegen work.
+    pub bank: Option<String>,
     pub span: Span,
 }
 

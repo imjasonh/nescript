@@ -80,6 +80,47 @@ pub const ZP_PENDING_BG_TILES_HI: u8 = 0x15;
 pub const ZP_PENDING_BG_ATTRS_LO: u8 = 0x16;
 pub const ZP_PENDING_BG_ATTRS_HI: u8 = 0x17;
 
+// ── Debug instrumentation ──
+//
+// These slots are only touched by debug-mode ROMs. In release
+// builds the analyzer is free to allocate over them.
+
+/// Debug-mode frame-overrun counter. Incremented by the NMI
+/// handler whenever it fires while the previous frame's ready
+/// flag is still set — which means the main loop didn't consume
+/// it, so user code spent more than one vblank-to-vblank window
+/// processing the last frame. Read it with `peek(0x07FF)` in
+/// user code to see how many overruns have happened since reset,
+/// or watch the address in a Mesen memory viewer. Placed at the
+/// top of main RAM to minimise the chance of a collision with
+/// analyzer-allocated variables (which grow from $0300 upward).
+pub const DEBUG_FRAME_OVERRUN_ADDR: u16 = 0x07FF;
+
+// ── Extra channel state ──
+//
+// The pulse-1 sfx and pulse-2 music channels live in zero page
+// ($00-$0F) where every byte is precious. Adding new channel
+// state there would either push user variables back by 6 bytes
+// (breaking every existing example's ZP layout) or collide with
+// runtime scratch slots. Instead, we park triangle and noise
+// state at the very top of main RAM, just below the debug frame
+// overrun counter, where analyzer-allocated globals rarely reach
+// (they grow from $0300 upward). The few extra cycles per
+// absolute access are negligible for a once-per-NMI tick.
+//
+// The state is only *referenced* by the audio tick when the
+// corresponding `has_noise` / `has_triangle` flag is set — so
+// programs that don't declare any noise/triangle sfx touch
+// these addresses zero times, and the ROM bytes generated for
+// an existing audio example are byte-identical to what today's
+// compiler produces.
+pub const AUDIO_NOISE_PTR_LO: u16 = 0x07F0;
+pub const AUDIO_NOISE_PTR_HI: u16 = 0x07F1;
+pub const AUDIO_NOISE_COUNTER: u16 = 0x07F2;
+pub const AUDIO_TRIANGLE_PTR_LO: u16 = 0x07F3;
+pub const AUDIO_TRIANGLE_PTR_HI: u16 = 0x07F4;
+pub const AUDIO_TRIANGLE_COUNTER: u16 = 0x07F5;
+
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
 pub fn gen_init() -> Vec<Instruction> {
@@ -209,8 +250,17 @@ pub fn gen_enable_rendering(show_background: bool) -> Vec<Instruction> {
 /// save/restore window used to silently clobber `ZP_CURRENT_STATE`
 /// whenever a music note was played (the tick's period-table
 /// lookup stashes the table's high byte into $03).
+///
+/// `debug_mode` enables frame-overrun detection: before touching
+/// the frame-ready flag, the handler checks whether it's already
+/// set — if it is, the previous frame's main-loop work never
+/// finished (i.e. the program ran over its vblank budget) and
+/// the handler bumps the counter at
+/// [`DEBUG_FRAME_OVERRUN_ADDR`]. Release-mode ROMs never call
+/// this with `debug_mode=true`, so the counter slot stays free
+/// for user allocation.
 #[must_use]
-pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool) -> Vec<Instruction> {
+pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool, debug_mode: bool) -> Vec<Instruction> {
     let mut out = Vec::new();
 
     // Save registers
@@ -274,6 +324,31 @@ pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool) -> Vec<Instruction> {
         BNE,
         AM::LabelRelative("__read_input".into()),
     ));
+
+    // Debug frame-overrun check. The frame flag is "set on NMI,
+    // cleared by wait_frame". If we see it set at the top of a
+    // new NMI, the main loop never reached its wait_frame since
+    // the previous vblank — i.e. the frame overran. Bump a
+    // counter at `DEBUG_FRAME_OVERRUN_ADDR` in that case so user
+    // code can `peek(0x07FF)` to see how many overruns have
+    // happened. The check is gated on `debug_mode` so release
+    // builds emit nothing here.
+    if debug_mode {
+        // Read the previous flag. If zero, skip the bump.
+        out.push(Instruction::new(LDA, AM::ZeroPage(ZP_FRAME_FLAG)));
+        out.push(Instruction::new(
+            BEQ,
+            AM::LabelRelative("__debug_no_overrun".into()),
+        ));
+        out.push(Instruction::new(
+            INC,
+            AM::Absolute(DEBUG_FRAME_OVERRUN_ADDR),
+        ));
+        out.push(Instruction::new(
+            NOP,
+            AM::Label("__debug_no_overrun".into()),
+        ));
+    }
 
     // Set frame-ready flag
     out.push(Instruction::new(LDA, AM::Immediate(0x01)));
@@ -671,7 +746,18 @@ pub fn gen_multiply() -> Vec<Instruction> {
 ///
 /// A, X, Y. The NMI handler calls this from inside its own
 /// save/restore block so caller registers are safe.
-pub fn gen_audio_tick() -> Vec<Instruction> {
+///
+/// When `has_noise` / `has_triangle` are set, the driver gains an
+/// extra per-channel slot: noise routes envelope bytes to `$400C`
+/// and drives `$400E` / `$400F` on trigger; triangle writes linear-
+/// counter reload values to `$4008`. These blocks are appended to
+/// the tick after the music path so that programs which do not
+/// declare any noise or triangle sfx produce byte-identical ROM
+/// output — the old pulse-only path emits exactly the same
+/// instruction stream as before. The linker decides whether to
+/// enable each by scanning for the `__noise_used` and
+/// `__triangle_used` marker labels emitted by the IR codegen.
+pub fn gen_audio_tick(has_noise: bool, has_triangle: bool) -> Vec<Instruction> {
     let mut out = Vec::new();
 
     out.push(Instruction::new(NOP, AM::Label("__audio_tick".into())));
@@ -898,8 +984,165 @@ pub fn gen_audio_tick() -> Vec<Instruction> {
         NOP,
         AM::Label("__audio_music_done".into()),
     ));
+
+    // ── Noise channel tick (optional, gated on `has_noise`) ──
+    //
+    // Structurally identical to the pulse-1 sfx tick above: walk a
+    // per-frame envelope blob via an indirect-indexed load and
+    // write each byte to the APU noise volume register at $400C.
+    // The pointer lives in main RAM at [AUDIO_NOISE_PTR_LO,
+    // AUDIO_NOISE_PTR_HI]; the tick stashes it in ZP scratch $02/$03
+    // for the duration of the block because the 6502 has no
+    // (abs),Y addressing.
+    if has_noise {
+        out.extend(gen_noise_tick());
+    }
+
+    // ── Triangle channel tick (optional, gated on `has_triangle`) ──
+    //
+    // Same shape as the noise tick but writes to $4008 (the linear
+    // counter) instead of a volume register. Triangle has no volume,
+    // so the envelope blob just encodes "keep the linear counter
+    // loaded" (nonzero hold) or "silence" (the $80 sentinel).
+    if has_triangle {
+        out.extend(gen_triangle_tick());
+    }
+
     out.push(Instruction::implied(RTS));
 
+    out
+}
+
+/// Generate the noise-channel sfx tick. Appended to
+/// [`gen_audio_tick`] only when the program declares at least one
+/// noise sfx (`__noise_used` marker). Reads envelope bytes from the
+/// main-RAM pointer at [`AUDIO_NOISE_PTR_LO`] / [`AUDIO_NOISE_PTR_HI`]
+/// and writes them to the APU noise volume register at `$400C`.
+/// A zero envelope byte is the mute sentinel — on it the tick
+/// silences the channel and clears [`AUDIO_NOISE_COUNTER`].
+fn gen_noise_tick() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_noise_tick".into()),
+    ));
+    // If counter is zero, no noise sfx is playing; skip the block.
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_NOISE_COUNTER)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__audio_noise_done".into()),
+    ));
+    // Load the main-RAM pointer into ZP scratch $02/$03 so we can
+    // do an indirect-indexed read (6502 has no (abs),Y mode).
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_NOISE_PTR_LO)));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_NOISE_PTR_HI)));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+    // Read envelope byte through the scratch pointer.
+    out.push(Instruction::new(LDY, AM::Immediate(0)));
+    out.push(Instruction::new(LDA, AM::IndirectY(0x02)));
+    // Zero sentinel? branch to the write path if nonzero.
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_noise_write".into()),
+    ));
+    // Sentinel: mute pulse-noise ($4000-compatible encoding:
+    // length-halt + constant-volume + volume 0) and clear the
+    // counter so this block bails on subsequent NMIs.
+    out.push(Instruction::new(LDA, AM::Immediate(0x30)));
+    out.push(Instruction::new(STA, AM::Absolute(0x400C)));
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::Absolute(AUDIO_NOISE_COUNTER)));
+    out.push(Instruction::new(
+        JMP,
+        AM::Label("__audio_noise_done".into()),
+    ));
+    // Write envelope byte and advance the 16-bit pointer by 1.
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_noise_write".into()),
+    ));
+    out.push(Instruction::new(STA, AM::Absolute(0x400C)));
+    out.push(Instruction::new(INC, AM::Absolute(AUDIO_NOISE_PTR_LO)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_noise_ptr_ok".into()),
+    ));
+    out.push(Instruction::new(INC, AM::Absolute(AUDIO_NOISE_PTR_HI)));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_noise_ptr_ok".into()),
+    ));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_noise_done".into()),
+    ));
+    out
+}
+
+/// Generate the triangle-channel sfx tick. Same shape as
+/// [`gen_noise_tick`] but writes to `$4008` (the linear counter
+/// reload) instead of a volume register. Triangle has no volume —
+/// the envelope bytes are "keep holding" tokens that the runtime
+/// keeps writing every frame so the linear counter never underruns
+/// and the channel never auto-silences. A `0x80` byte is the mute
+/// sentinel (linear control bit set, reload = 0 → silence next
+/// frame).
+fn gen_triangle_tick() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_triangle_tick".into()),
+    ));
+    // If counter is zero, no triangle sfx is playing.
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_TRIANGLE_COUNTER)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__audio_triangle_done".into()),
+    ));
+    // Stash pointer to ZP scratch for indirect-indexed load.
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_TRIANGLE_PTR_LO)));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_TRIANGLE_PTR_HI)));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+    out.push(Instruction::new(LDY, AM::Immediate(0)));
+    out.push(Instruction::new(LDA, AM::IndirectY(0x02)));
+    // Write the envelope byte to $4008. For triangle, `$80` is the
+    // mute sentinel (linear counter reload = 0 with control bit
+    // set). We detect it by CMP + BEQ so the counter can be cleared.
+    out.push(Instruction::new(STA, AM::Absolute(0x4008)));
+    out.push(Instruction::new(CMP, AM::Immediate(0x80)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_triangle_advance".into()),
+    ));
+    // Sentinel: clear counter so we bail next frame. The $80 write
+    // above already mutes the triangle channel.
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::Absolute(AUDIO_TRIANGLE_COUNTER)));
+    out.push(Instruction::new(
+        JMP,
+        AM::Label("__audio_triangle_done".into()),
+    ));
+    // Advance the pointer by 1 for the next frame.
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_triangle_advance".into()),
+    ));
+    out.push(Instruction::new(INC, AM::Absolute(AUDIO_TRIANGLE_PTR_LO)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_triangle_ptr_ok".into()),
+    ));
+    out.push(Instruction::new(INC, AM::Absolute(AUDIO_TRIANGLE_PTR_HI)));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_triangle_ptr_ok".into()),
+    ));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_triangle_done".into()),
+    ));
     out
 }
 
@@ -1212,11 +1455,28 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
             out.push(Instruction::implied(RTS));
         }
         Mapper::UxROM => {
-            // UxROM: write bank number to any address in $8000-$FFFF.
-            // We use $FFF0 so the write lands in the fixed bank's
-            // tail area where the linker can back it with a matching
-            // bank-table byte to avoid bus conflicts.
-            out.push(Instruction::new(STA, AM::Absolute(0xFFF0)));
+            // UxROM: write the bank number to any address in
+            // $8000-$FFFF. On boards with bus conflicts the CPU's
+            // write and the ROM byte at that address are ANDed on
+            // the data bus, so we must write to an address whose
+            // ROM byte already equals the bank number. The linker
+            // splices a 256-byte table (`__bank_select_table`,
+            // bytes 0..255) into the fixed bank, and we index into
+            // it with X = bank number: `STA __bank_select_table, X`
+            // stores A (= bank number) at
+            // `__bank_select_table + X`, whose ROM byte is exactly
+            // X, so bus = A = X = ROM — no conflict.
+            //
+            // Previously this wrote to a fixed `$FFF0`, which
+            // happens to work on emulators that don't simulate bus
+            // conflicts (jsnes, Mesen permissive) but would glitch
+            // on real hardware because a single ROM byte can't
+            // match every possible bank number.
+            out.push(Instruction::implied(TAX));
+            out.push(Instruction::new(
+                STA,
+                AM::LabelAbsoluteX("__bank_select_table".into()),
+            ));
             out.push(Instruction::implied(RTS));
         }
         Mapper::MMC3 => {
@@ -1237,34 +1497,36 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
 
 /// Generate a cross-bank trampoline stub. Placed in the fixed bank
 /// and called by user code (also in the fixed bank) via
-/// `JSR __tramp_<bank_name>`. Behavior:
+/// `JSR <tramp_label>`. Behavior:
 ///
-///   1. Save the caller's bank number (always the fixed bank's index).
-///   2. Load the target bank number into A, JSR `__bank_select`.
-///   3. JSR the entry label in the target bank.
-///   4. Load the fixed bank number, JSR `__bank_select` to restore.
-///   5. RTS.
+///   1. Load the target bank number into A, JSR `__bank_select`.
+///   2. JSR the user-supplied entry label inside the target bank.
+///   3. Load the fixed bank number, JSR `__bank_select` to restore.
+///   4. RTS.
 ///
-/// `bank_name` is the user-declared bank name from the `.ne` source.
-/// `entry_label` is the label inside that bank the trampoline
-/// should call (conventionally `__bank_<name>_entry`). `bank_index`
-/// is the physical bank number. `fixed_bank_index` is the physical
-/// bank number of the fixed bank (always `total_banks - 1`).
+/// `tramp_label` is the label that callers will JSR (the IR codegen
+/// emits `JSR __tramp_<fn_name>` at every cross-bank call site).
+/// `entry_label` is the label inside the target bank that holds the
+/// callee's first instruction — conventionally `__ir_fn_<fn_name>`,
+/// the same label IR codegen would have emitted for an in-bank call.
+/// `bank_index` is the physical PRG bank number of the target bank.
+/// `fixed_bank_index` is the physical bank number of the fixed bank
+/// (always `total_banks - 1`).
 #[must_use]
 pub fn gen_bank_trampoline(
-    bank_name: &str,
+    tramp_label: &str,
     entry_label: &str,
     bank_index: u8,
     fixed_bank_index: u8,
 ) -> Vec<Instruction> {
     let mut out = Vec::new();
-    let tramp_label = format!("__tramp_{bank_name}");
-    out.push(Instruction::new(NOP, AM::Label(tramp_label)));
+    out.push(Instruction::new(NOP, AM::Label(tramp_label.to_string())));
     // Switch to target bank.
     out.push(Instruction::new(LDA, AM::Immediate(bank_index)));
     out.push(Instruction::new(JSR, AM::Label("__bank_select".into())));
     // Call the user's entry point in that bank. The label lives in
-    // the switchable bank and is resolved during banked assembly.
+    // the switchable bank and is resolved by the linker after the
+    // banked code is assembled.
     out.push(Instruction::new(JSR, AM::Label(entry_label.to_string())));
     // Restore the fixed bank.
     out.push(Instruction::new(LDA, AM::Immediate(fixed_bank_index)));

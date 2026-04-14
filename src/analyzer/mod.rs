@@ -45,6 +45,14 @@ const ZP_USER_CAP: u8 = 0x80;
 /// RAM at `$0000-$07FF`; the allocator uses up through `$07FF`.
 const RAM_END: u16 = 0x0800;
 
+/// W0107 threshold: a `fast` variable with fewer than this many
+/// observed accesses is flagged as wasting a zero-page slot. Writes
+/// and reads both count; the initializer of a `VarDecl` counts as a
+/// write. Three is a reasonable cutoff — anything below that barely
+/// justifies holding a scarce slot that codegen could use for a
+/// hotter variable.
+const W0107_MIN_ACCESSES: u32 = 3;
+
 /// Analyze a parsed program for semantic errors.
 pub fn analyze(program: &Program) -> AnalysisResult {
     // Pre-collect declared and builtin-matchable sfx/music names so
@@ -70,8 +78,27 @@ pub fn analyze(program: &Program) -> AnalysisResult {
     // (`$11` flags + 2 × 3 pointer slots). Bump the user zero-page
     // start past that region so var allocation doesn't collide with
     // the runtime slots.
+    //
+    // Programs that nest user functions inside a `bank Foo { ... }`
+    // block additionally need to reserve `$10` for `ZP_BANK_CURRENT`,
+    // the slot that `__bank_select` writes the requested bank index
+    // into at every cross-bank call. Without this bump, the bank's
+    // first user variable lands on top of the same slot that
+    // `__bank_select` clobbers, producing nonsense at runtime. The
+    // bump only fires when the program actually has banked
+    // functions; programs that declare empty bank slots (the
+    // existing mmc1_banked / uxrom_banked / mmc3_per_state_split
+    // examples) keep the legacy layout because their fixed-bank
+    // user code never invokes `__bank_select`.
     let needs_ppu_update_slots = !program.palettes.is_empty() || !program.backgrounds.is_empty();
-    let next_zp_addr = if needs_ppu_update_slots { 0x18 } else { 0x10 };
+    let needs_bank_current_slot = program.functions.iter().any(|f| f.bank.is_some());
+    let next_zp_addr = if needs_ppu_update_slots {
+        0x18
+    } else if needs_bank_current_slot {
+        0x11
+    } else {
+        0x10
+    };
     let mut analyzer = Analyzer {
         symbols: HashMap::new(),
         var_allocations: Vec::new(),
@@ -87,7 +114,9 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         stack_depth_limit: DEFAULT_STACK_DEPTH,
         in_loop: false,
         used_vars: HashSet::new(),
+        var_access_counts: HashMap::new(),
         function_signatures: HashMap::new(),
+        function_return_types: HashMap::new(),
         current_return_type: None,
         in_function_body: false,
         struct_layouts: HashMap::new(),
@@ -129,9 +158,19 @@ struct Analyzer {
     /// Names of variables that have been read somewhere in the program.
     /// Used for the W0103 unused-variable warning.
     used_vars: HashSet<String>,
+    /// Count of observed references (reads + writes) for each
+    /// variable. Used for the W0107 fast-variable-underuse warning
+    /// to detect `fast var` declarations that hog a zero-page slot
+    /// without justifying it.
+    var_access_counts: HashMap<String, u32>,
     /// Function name to parameter types (in order). Used to validate
     /// call arity and argument types.
     function_signatures: HashMap<String, Vec<NesType>>,
+    /// Function name to declared return type. `None` here means the
+    /// function has no declared return type (i.e. "void"); functions
+    /// with a declared return type appear with `Some(ty)`. Used by
+    /// W0106 to detect implicit-drop of a return value.
+    function_return_types: HashMap<String, Option<NesType>>,
     /// Return type of the function currently being analyzed, or None
     /// when the function has no declared return type. Only meaningful
     /// when `in_function_body` is true.
@@ -214,6 +253,49 @@ impl Analyzer {
                     ));
                 }
             }
+            // W0105: the NES mirrors $3F10/$3F14/$3F18/$3F1C onto
+            // $3F00/$3F04/$3F08/$3F0C, so the "first byte" of every
+            // sub-palette at indices 0, 4, 8, 12, 16, 20, 24, 28 is
+            // really a single shared universal background colour.
+            // Writing a 32-byte blob sequentially with inconsistent
+            // values at those offsets silently overwrites $3F00 with
+            // whatever the last sprite sub-palette's first byte is —
+            // a classic "my screen is suddenly black" bug. The
+            // grouped-form palette parser auto-fixes this via its
+            // `universal:` field, so only the flat-form `colors:`
+            // path can trip this warning in practice.
+            let universals: Vec<u8> = [0, 4, 8, 12, 16, 20, 24, 28]
+                .into_iter()
+                .filter_map(|i| palette.colors.get(i).copied())
+                .collect();
+            if universals.len() >= 2 {
+                let first = universals[0];
+                if universals.iter().any(|&b| b != first) {
+                    self.diagnostics.push(
+                        Diagnostic::warning(
+                            ErrorCode::W0105,
+                            format!(
+                                "palette '{}' has inconsistent universal-background bytes across \
+                                 its sub-palettes",
+                                palette.name,
+                            ),
+                            palette.span,
+                        )
+                        .with_note(
+                            "the NES PPU mirrors $3F10/$3F14/$3F18/$3F1C onto \
+                             $3F00/$3F04/$3F08/$3F0C, so a 32-byte sequential \
+                             palette write overwrites the background universal \
+                             colour with sub-palette sp3's first byte",
+                        )
+                        .with_help(
+                            "set every sub-palette's first byte (indices 0, 4, 8, 12, \
+                             16, 20, 24, 28) to the same universal colour, or switch \
+                             to the grouped form (`universal:` + `bg0..sp3`) which \
+                             fixes the mirror automatically",
+                        ),
+                    );
+                }
+            }
         }
         let mut seen_backgrounds = HashSet::new();
         for bg in &program.backgrounds {
@@ -245,6 +327,72 @@ impl Analyzer {
                     ),
                     bg.span,
                 ));
+            }
+        }
+
+        // Validate sfx declarations' channel-specific constraints.
+        // Triangle has no volume register so `volume:` is treated as
+        // a per-frame hold flag (nonzero = sustain, zero = release);
+        // duty bits are also meaningless for triangle and noise.
+        // Pulse 2 is rejected outright on sfx declarations because
+        // the pulse-2 channel is owned by the music driver.
+        for decl in &program.sfx {
+            match decl.channel {
+                Channel::Pulse1 => {}
+                Channel::Pulse2 => {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!(
+                            "sfx '{}' targets pulse2, which is reserved for the music driver",
+                            decl.name
+                        ),
+                        decl.span,
+                    ));
+                }
+                Channel::Triangle => {
+                    // Parser default `duty` is 2, so only flag
+                    // explicit non-default values. This keeps the
+                    // common `channel: triangle, pitch: N, volume: [..]`
+                    // form warning-free.
+                    if decl.duty != 2 {
+                        self.diagnostics.push(Diagnostic::warning(
+                            ErrorCode::W0107,
+                            format!(
+                                "sfx '{}' targets triangle; 'duty' has no effect on this channel",
+                                decl.name
+                            ),
+                            decl.span,
+                        ));
+                    }
+                }
+                Channel::Noise => {
+                    if decl.duty != 2 {
+                        self.diagnostics.push(Diagnostic::warning(
+                            ErrorCode::W0107,
+                            format!(
+                                "sfx '{}' targets noise; 'duty' has no effect on this channel",
+                                decl.name
+                            ),
+                            decl.span,
+                        ));
+                    }
+                    // Noise pitch is a 4-bit period-table index plus
+                    // an optional "mode" bit in position 7. Any other
+                    // bits set is a user mistake.
+                    for p in &decl.pitch {
+                        if *p & !0x8F != 0 {
+                            self.diagnostics.push(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!(
+                                    "sfx '{}' noise pitch {:#04x} has bits outside the valid range (low 4 bits index + optional bit 7 mode)",
+                                    decl.name, p
+                                ),
+                                decl.span,
+                            ));
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -359,13 +507,78 @@ impl Analyzer {
             }
         }
 
+        // Check for under-used `fast` variables (W0107). A `fast`
+        // declaration reserves one of the NES's scarce zero-page
+        // slots, so it should see frequent traffic; below the
+        // threshold the author is spending a precious slot on a
+        // cold variable. Globals and state-locals both count.
+        for var in &program.globals {
+            self.check_fast_var_usage(var);
+        }
+        for state in &program.states {
+            for var in &state.locals {
+                self.check_fast_var_usage(var);
+            }
+        }
+
         // Check for unreachable states (W0104).
         self.check_unreachable_states(program);
     }
 
     /// Mark a variable name as having been read somewhere in the program.
+    /// Also bumps the W0107 access counter.
     fn mark_var_used(&mut self, name: &str) {
         self.used_vars.insert(name.to_string());
+        self.bump_var_access(name);
+    }
+
+    /// Increment the observed access count for `name`. Called for
+    /// both reads (via [`Analyzer::mark_var_used`]) and writes (at
+    /// `Statement::Assign` handling). Used for W0107.
+    fn bump_var_access(&mut self, name: &str) {
+        *self.var_access_counts.entry(name.to_string()).or_insert(0) += 1;
+    }
+
+    /// Emit W0107 if `var` is declared `fast` but sees fewer than
+    /// [`W0107_MIN_ACCESSES`] observed reads + writes across the
+    /// whole program. Variables that are already unused (W0103
+    /// fires) are skipped to avoid double-reporting; leading-`_`
+    /// names are also exempt by the same convention that W0103 uses.
+    /// Array-typed `fast` variables are skipped because they never
+    /// end up in zero page anyway (allocation kicks them to main
+    /// RAM), so the slot argument doesn't apply.
+    fn check_fast_var_usage(&mut self, var: &VarDecl) {
+        if var.placement != Placement::Fast {
+            return;
+        }
+        if var.name.starts_with('_') {
+            return;
+        }
+        if !self.used_vars.contains(&var.name) {
+            return;
+        }
+        if matches!(var.var_type, NesType::Array(_, _)) {
+            return;
+        }
+        let count = self.var_access_counts.get(&var.name).copied().unwrap_or(0);
+        if count < W0107_MIN_ACCESSES {
+            self.diagnostics.push(
+                Diagnostic::warning(
+                    ErrorCode::W0107,
+                    format!(
+                        "`fast` variable '{}' is accessed {count} time{plural}; \
+                         it wastes a zero-page slot",
+                        var.name,
+                        plural = if count == 1 { "" } else { "s" },
+                    ),
+                    var.span,
+                )
+                .with_help(
+                    "drop the `fast` qualifier so the variable lives in main \
+                     RAM and the zero-page slot can go to a hotter variable",
+                ),
+            );
+        }
     }
 
     /// Emit W0103 if `var` is never read anywhere. Variables named
@@ -596,7 +809,9 @@ impl Analyzer {
     /// Register a struct declaration. Computes each field's byte
     /// offset from the base address (fields are laid out contiguously
     /// in declaration order with no padding), and records the total
-    /// size. v1 structs only support primitive fields (u8/i8/bool).
+    /// size. Fields may be u8, i8, bool, or u16. Nested structs and
+    /// array fields are still rejected — the IR-lowering path doesn't
+    /// model them yet.
     fn register_struct(&mut self, s: &StructDecl) {
         if self.struct_layouts.contains_key(&s.name) {
             self.diagnostics.push(Diagnostic::error(
@@ -609,14 +824,17 @@ impl Analyzer {
         let mut fields = Vec::new();
         let mut offset: u16 = 0;
         for field in &s.fields {
-            // Reject non-primitive field types for now.
+            // Reject non-primitive field types for now. u16 is
+            // allowed and takes two bytes; arrays and nested structs
+            // still error out with a clearer message than before.
             let size = match &field.field_type {
                 NesType::U8 | NesType::I8 | NesType::Bool => 1,
-                _ => {
+                NesType::U16 => 2,
+                NesType::Array(_, _) | NesType::Struct(_) => {
                     self.diagnostics.push(Diagnostic::error(
                         ErrorCode::E0201,
                         format!(
-                            "struct field '{}' has unsupported type '{}' (only u8/i8/bool allowed)",
+                            "struct field '{}' has unsupported type '{}' (struct fields must be u8, i8, u16, or bool)",
                             field.name, field.field_type
                         ),
                         field.span,
@@ -697,6 +915,34 @@ impl Analyzer {
             .map(|(n, l)| (n.clone(), l.size))
             .collect();
         let size = type_size_with(&var.var_type, &struct_sizes);
+
+        // Warn on arrays whose byte size exceeds 256: the codegen
+        // lowers `arr[i]` to `LDA base,X` (or `ZeroPageX`), and the
+        // 6502's X register is 8 bits, so elements whose byte
+        // offset is >= 256 are unreachable. For a `u8` array the
+        // safe max count is 256; for a `u16` array it's 128
+        // (since the codegen doesn't scale the index by element
+        // width — see the note in `emit_bounds_check`). This
+        // diagnostic replaces the previous silent-skip in the
+        // debug-mode bounds checker.
+        if let NesType::Array(_, _) = &var.var_type {
+            if size > 256 {
+                self.diagnostics.push(
+                    Diagnostic::warning(
+                        ErrorCode::W0108,
+                        format!(
+                            "array '{}' has byte size {size}, but the 6502's 8-bit X index can only reach the first 256 bytes — elements past that are unreachable",
+                            var.name
+                        ),
+                        var.span,
+                    )
+                    .with_help(
+                        "shrink the array, split it across multiple smaller arrays, or use separate fields for each element".to_string(),
+                    ),
+                );
+            }
+        }
+
         let Some(address) = self.allocate_ram(size, var.span) else {
             // Allocation failed (E0301 already emitted) — still add the
             // symbol so that later references don't cascade into E0502,
@@ -730,10 +976,18 @@ impl Analyzer {
                         span: var.span,
                     },
                 );
+                // u16 struct fields occupy two bytes — record that
+                // explicitly so the IR codegen's global-init pass and
+                // any size-aware bookkeeping treat the high byte as
+                // part of the same allocation.
+                let field_size = match field_type {
+                    NesType::U16 => 2,
+                    _ => 1,
+                };
                 self.var_allocations.push(VarAllocation {
                     name: full_name,
                     address: address + offset,
-                    size: 1,
+                    size: field_size,
                 });
             }
             // Also register the struct variable itself (as a symbol
@@ -789,6 +1043,8 @@ impl Analyzer {
         let param_types: Vec<NesType> = fun.params.iter().map(|p| p.param_type.clone()).collect();
         self.function_signatures
             .insert(fun.name.clone(), param_types);
+        self.function_return_types
+            .insert(fun.name.clone(), fun.return_type.clone());
     }
 
     /// Attempt to allocate `size` bytes of RAM for a variable declared
@@ -925,6 +1181,11 @@ impl Analyzer {
                 if let Some(init) = &var.init {
                     self.walk_expr_reads(init);
                     self.check_expr_type(init, &var.var_type);
+                    // The initializer is a write to the variable;
+                    // count it toward W0107's access tally without
+                    // marking the variable "read" (W0103 still wants
+                    // to fire on a declared-but-unread var).
+                    self.bump_var_access(&var.name);
                 }
             }
             Statement::Assign(lvalue, _, expr, span) => {
@@ -939,6 +1200,13 @@ impl Analyzer {
                                     *span,
                                 ));
                             }
+                            // A plain scalar write doesn't count as a
+                            // read for W0103 (an unused variable might
+                            // only be written to, never read), but it
+                            // is still an access of the variable's
+                            // storage for W0107's "is this `fast`
+                            // slot worth it?" check.
+                            self.bump_var_access(name);
                         } else {
                             // Assigning to an undeclared name is an
                             // error — the lowering would otherwise
@@ -1000,13 +1268,29 @@ impl Analyzer {
                     self.check_block(block, state_names);
                 }
             }
-            Statement::While(cond, body, _) => {
+            Statement::While(cond, body, span) => {
                 self.walk_expr_reads(cond);
                 self.check_expr_type(cond, &NesType::Bool);
                 let was_in_loop = self.in_loop;
                 self.in_loop = true;
                 self.check_block(body, state_names);
                 self.in_loop = was_in_loop;
+                // W0102: a `while true { ... }` (or the rarely-written
+                // `while 1 { ... }`) that never breaks, returns,
+                // transitions, or waits for a frame is an infinite
+                // spin — same hazard as the bare `loop { ... }` below.
+                if is_always_true(cond) && !block_can_exit_or_yield(body) {
+                    self.diagnostics.push(
+                        Diagnostic::warning(
+                            ErrorCode::W0102,
+                            "infinite loop with no break, return, transition, or wait_frame",
+                            *span,
+                        )
+                        .with_help(
+                            "add `wait_frame`, `break`, `return`, or `transition` somewhere in the body",
+                        ),
+                    );
+                }
             }
             Statement::For {
                 var,
@@ -1109,6 +1393,23 @@ impl Analyzer {
                     self.check_intrinsic_args(name, args, *span);
                 } else if self.symbols.contains_key(name) {
                     self.check_call_signature(name, args, *span);
+                    // W0106: a call at statement position whose
+                    // callee has a declared return type silently
+                    // drops the value. Flag it so the author at
+                    // least acknowledges the discard.
+                    if matches!(self.function_return_types.get(name), Some(Some(_))) {
+                        self.diagnostics.push(
+                            Diagnostic::warning(
+                                ErrorCode::W0106,
+                                format!("return value of '{name}' is discarded"),
+                                *span,
+                            )
+                            .with_help(
+                                "bind the result to a variable (e.g. `var _result: u8 = f()`), \
+                                 or remove the return type from the function if the value isn't useful",
+                            ),
+                        );
+                    }
                 } else {
                     self.diagnostics.push(Diagnostic::error(
                         ErrorCode::E0503,
@@ -1559,6 +1860,17 @@ fn stmt_is_terminator(stmt: &Statement) -> bool {
 
 fn block_can_exit_or_yield(block: &Block) -> bool {
     block.statements.iter().any(stmt_can_exit_or_yield)
+}
+
+/// True if `expr` is an always-true constant condition — i.e. the
+/// literal `true`, or a non-zero integer literal. Used by W0102 so
+/// `while true { ... }` gets the same treatment as bare `loop`.
+fn is_always_true(expr: &Expr) -> bool {
+    match expr {
+        Expr::BoolLiteral(true, _) => true,
+        Expr::IntLiteral(v, _) => *v != 0,
+        _ => false,
+    }
 }
 
 fn stmt_can_exit_or_yield(stmt: &Statement) -> bool {

@@ -44,12 +44,31 @@ re-derive the project conventions from scratch.
 ## Running the basics
 
 ```bash
-cargo build --release          # build the compiler
-cargo test                     # all Rust tests (lib + integration)
-cargo fmt                      # mandatory before committing
-cargo clippy --all-targets     # mandatory before committing; fix or #[allow]
+cargo build --release              # build the compiler
+cargo test --all-targets           # all Rust tests — MUST include --all-targets
+cargo fmt                          # mandatory before committing
+cargo clippy --all-targets -- -D warnings   # mandatory; fix or #[allow]
 ./target/release/nescript build examples/hello_sprite.ne   # build one ROM
 ```
+
+**Always pass `--all-targets` to `cargo test`.** CI runs `cargo test
+--all-targets`, which additionally compiles and smoke-runs the `compile`
+benchmark under `benches/compile.rs`. A plain `cargo test` skips that,
+so a bench that doesn't compile will pass locally and red-flag CI —
+this exact failure mode bit us once already (commit `889074a`).
+
+The repo ships a pre-commit hook at `scripts/pre-commit` that runs
+`cargo fmt --check`, `cargo clippy --all-targets -- -D warnings`,
+`cargo test --all-targets`, and the committed-ROM reproducibility diff.
+Install it once per worktree with:
+
+```bash
+cp scripts/pre-commit .git/hooks/pre-commit && chmod +x .git/hooks/pre-commit
+```
+
+Do this before your first commit in a new worktree. The hook catches
+stale ROMs, stale platformer gif, and divergent bench/compile pipelines
+before they hit CI.
 
 Compile every example at once:
 

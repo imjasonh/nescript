@@ -178,7 +178,15 @@ impl Parser {
                     music.push(self.parse_music_decl()?);
                 }
                 TokenKind::KwBank => {
-                    banks.push(self.parse_bank_decl()?);
+                    let (bank, nested_funs) = self.parse_bank_decl()?;
+                    banks.push(bank);
+                    // Functions declared inside a `bank Foo { ... }`
+                    // body land in the program's flat function list
+                    // tagged with `bank: Some("Foo")`. The analyzer
+                    // and the rest of the pipeline can then treat
+                    // them uniformly while still knowing which bank
+                    // each one belongs to.
+                    functions.extend(nested_funs);
                 }
                 TokenKind::KwOn => {
                     // Top-level `on frame` — implicit single state for M1
@@ -343,6 +351,7 @@ impl Parser {
 
         let mut mapper = Mapper::NROM;
         let mut mirroring = Mirroring::Horizontal;
+        let mut header = HeaderFormat::Ines1;
 
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             let (key, _) = self.expect_ident()?;
@@ -379,6 +388,21 @@ impl Parser {
                         }
                     };
                 }
+                "header" => {
+                    let (val, _) = self.expect_ident()?;
+                    header = match val.as_str() {
+                        "ines1" | "ines" => HeaderFormat::Ines1,
+                        "nes2" => HeaderFormat::Nes2,
+                        _ => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!("unknown header format '{val}'"),
+                                self.current_span(),
+                            )
+                            .with_help("supported header formats: ines1, nes2"));
+                        }
+                    };
+                }
                 _ => {
                     return Err(Diagnostic::error(
                         ErrorCode::E0201,
@@ -394,6 +418,7 @@ impl Parser {
             name,
             mapper,
             mirroring,
+            header,
             span: Span::new(
                 start_span.file_id,
                 start_span.start,
@@ -501,6 +526,11 @@ impl Parser {
             return_type,
             body,
             is_inline,
+            // Bank tagging happens after the function is parsed —
+            // top-level `fun` declarations leave it `None`, while
+            // nested `bank Foo { fun bar() ... }` bodies overwrite
+            // it to `Some("Foo")` on the way out of `parse_bank_decl`.
+            bank: None,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
@@ -593,29 +623,112 @@ impl Parser {
     }
 
     // ── Bank declaration ──
+    //
+    // Two forms are accepted:
+    //
+    //   bank Foo: prg
+    //   bank Foo: chr
+    //
+    //     The "type-only" form. Reserves a 16 KB switchable PRG slot
+    //     or claims a CHR bank. No body — used to declare named slots
+    //     that the linker pads with $FF and that user code can grow
+    //     into later.
+    //
+    //   bank Foo { fun bar() { ... } fun baz() { ... } }
+    //
+    //     The "nested-decls" form. The body holds zero or more
+    //     function declarations whose code lands inside the named
+    //     PRG bank instead of the fixed bank. Functions declared
+    //     here are pushed onto `Program.functions` like any other
+    //     function but tagged with `bank: Some("Foo")` so the
+    //     codegen + linker know where to put them.
+    //
+    //     The bank type is implicitly `prg` — there's no syntax for
+    //     CHR-bank function nesting because CHR is data, not code.
+    //     A bank declared this way can later be referenced from a
+    //     fixed-bank function via a normal call expression; the
+    //     codegen emits a trampoline in the fixed bank that switches
+    //     banks and JSRs into the target.
 
-    fn parse_bank_decl(&mut self) -> Result<BankDecl, Diagnostic> {
+    /// Parse one bank declaration. Returns the [`BankDecl`] and a
+    /// vector of any function declarations nested inside the bank
+    /// body (empty for the type-only form). The caller appends the
+    /// nested functions to the program's flat function list, tagging
+    /// each one with `bank: Some(name)` so the rest of the pipeline
+    /// can treat them like any other function.
+    fn parse_bank_decl(&mut self) -> Result<(BankDecl, Vec<FunDecl>), Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwBank)?;
         let (name, _) = self.expect_ident()?;
-        self.expect(&TokenKind::Colon)?;
-        let (type_str, _) = self.expect_ident()?;
-        let bank_type = match type_str.as_str() {
-            "prg" => BankType::Prg,
-            "chr" => BankType::Chr,
-            _ => {
-                return Err(Diagnostic::error(
-                    ErrorCode::E0201,
-                    format!("expected 'prg' or 'chr', found '{type_str}'"),
-                    self.current_span(),
-                ));
+        // Disambiguate between the two forms based on the next token.
+        // `:` introduces the bank type, `{` introduces a nested-decls
+        // body. Anything else is a parse error.
+        match self.peek() {
+            TokenKind::Colon => {
+                self.advance();
+                let (type_str, _) = self.expect_ident()?;
+                let bank_type = match type_str.as_str() {
+                    "prg" => BankType::Prg,
+                    "chr" => BankType::Chr,
+                    _ => {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!("expected 'prg' or 'chr', found '{type_str}'"),
+                            self.current_span(),
+                        ));
+                    }
+                };
+                Ok((
+                    BankDecl {
+                        name,
+                        bank_type,
+                        span: Span::new(start.file_id, start.start, self.current_span().end),
+                    },
+                    Vec::new(),
+                ))
             }
-        };
-        Ok(BankDecl {
-            name,
-            bank_type,
-            span: Span::new(start.file_id, start.start, self.current_span().end),
-        })
+            TokenKind::LBrace => {
+                self.advance();
+                let mut funs = Vec::new();
+                while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+                    match self.peek() {
+                        TokenKind::KwFun | TokenKind::KwInline => {
+                            let mut fun = self.parse_fun_decl()?;
+                            fun.bank = Some(name.clone());
+                            funs.push(fun);
+                        }
+                        _ => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!(
+                                    "unexpected token '{}' inside bank body; only function \
+                                     declarations are supported",
+                                    self.peek()
+                                ),
+                                self.current_span(),
+                            ));
+                        }
+                    }
+                }
+                self.expect(&TokenKind::RBrace)?;
+                Ok((
+                    BankDecl {
+                        name,
+                        bank_type: BankType::Prg,
+                        span: Span::new(start.file_id, start.start, self.current_span().end),
+                    },
+                    funs,
+                ))
+            }
+            _ => Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!(
+                    "expected ':' or '{{' after bank name, found '{}'",
+                    self.peek()
+                ),
+                self.current_span(),
+            )),
+        }
     }
 
     // ── Top-level on frame ──
@@ -929,6 +1042,22 @@ impl Parser {
         let start = self.current_span();
         self.expect(&TokenKind::KwPalette)?;
         let (name, _) = self.expect_ident()?;
+
+        // Shortcut form: `palette Name @palette("file.png")` — the PNG
+        // is decoded at asset-resolve time into a 32-byte blob. No
+        // `{ ... }` body follows. The in-source `@palette(...)` token
+        // is distinct from the `palette` block keyword (they're
+        // different TokenKinds); don't confuse them.
+        if *self.peek() == TokenKind::At {
+            let png_path = self.parse_named_asset_path("palette")?;
+            return Ok(PaletteDecl {
+                name,
+                colors: Vec::new(),
+                png_source: Some(png_path),
+                span: Span::new(start.file_id, start.start, self.current_span().end),
+            });
+        }
+
         self.expect(&TokenKind::LBrace)?;
 
         // Flat-form output.
@@ -1061,8 +1190,70 @@ impl Parser {
         Ok(PaletteDecl {
             name,
             colors,
+            png_source: None,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
+    }
+
+    /// Parse a `@kind("path")` asset directive when the caller has
+    /// already matched `@` at `self.peek()`. Verifies that `kind` is
+    /// the expected identifier (e.g. `palette` or `nametable`) and
+    /// returns the string literal inside the parentheses.
+    ///
+    /// Note: `palette` and `background` are reserved keywords in the
+    /// lexer so `@palette` tokenises as `At` + `KwPalette` rather
+    /// than `At` + `Ident("palette")`. We match both shapes so the
+    /// directive kind can collide with a keyword without the user
+    /// having to worry about it. `nametable` isn't a keyword today
+    /// so it comes through as an `Ident`; if it ever becomes one,
+    /// this branch will still work.
+    fn parse_named_asset_path(&mut self, expected: &str) -> Result<String, Diagnostic> {
+        self.expect(&TokenKind::At)?;
+        let kind_span = self.current_span();
+        let kind = match self.peek().clone() {
+            TokenKind::Ident(name) => {
+                self.advance();
+                name
+            }
+            TokenKind::KwPalette => {
+                self.advance();
+                "palette".to_string()
+            }
+            TokenKind::KwBackground => {
+                self.advance();
+                "background".to_string()
+            }
+            other => {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!("expected '@{expected}(\"...\")', found '@{other}'"),
+                    kind_span,
+                ));
+            }
+        };
+        if kind != expected {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!("expected '@{expected}(\"...\")', found '@{kind}'"),
+                kind_span,
+            ));
+        }
+        self.expect(&TokenKind::LParen)?;
+        let path = if let TokenKind::StringLiteral(s) = self.peek().clone() {
+            self.advance();
+            s
+        } else {
+            return Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!(
+                    "expected string path in '@{expected}(...)', found '{}'",
+                    self.peek()
+                ),
+                self.current_span(),
+            ));
+        };
+        self.expect(&TokenKind::RParen)?;
+        Ok(path)
     }
 
     /// Parse a single NES colour value: either a `u8` integer literal or
@@ -1172,6 +1363,22 @@ impl Parser {
         let start = self.current_span();
         self.expect(&TokenKind::KwBackground)?;
         let (name, _) = self.expect_ident()?;
+
+        // Shortcut form: `background Name @nametable("file.png")` —
+        // the PNG is decoded at asset-resolve time into a 32×30 tile
+        // map plus a 64-byte attribute table. No `{ ... }` body
+        // follows.
+        if *self.peek() == TokenKind::At {
+            let png_path = self.parse_named_asset_path("nametable")?;
+            return Ok(BackgroundDecl {
+                name,
+                tiles: Vec::new(),
+                attributes: Vec::new(),
+                png_source: Some(png_path),
+                span: Span::new(start.file_id, start.start, self.current_span().end),
+            });
+        }
+
         self.expect(&TokenKind::LBrace)?;
 
         // Raw-form scratch.
@@ -1342,6 +1549,7 @@ impl Parser {
             name,
             tiles,
             attributes,
+            png_source: None,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
@@ -1410,11 +1618,34 @@ impl Parser {
         let mut pitch_src: Option<PitchSrc> = None;
         let mut volume: Option<Vec<u8>> = None;
         let mut volume_key: &'static str = "volume";
+        let mut channel: Channel = Channel::Pulse1;
 
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             let (key, key_span) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             match key.as_str() {
+                "channel" => {
+                    // `channel: pulse1 | pulse2 | triangle | noise`.
+                    // Identifiers (not keywords) so the lexer passes
+                    // them through as `Ident`.
+                    let (ch_name, ch_span) = self.expect_ident()?;
+                    channel = match ch_name.as_str() {
+                        "pulse1" | "pulse" => Channel::Pulse1,
+                        "pulse2" => Channel::Pulse2,
+                        "triangle" => Channel::Triangle,
+                        "noise" => Channel::Noise,
+                        _ => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!(
+                                    "unknown sfx channel '{ch_name}' \
+                                     (expected pulse1, pulse2, triangle, or noise)"
+                                ),
+                                ch_span,
+                            ));
+                        }
+                    };
+                }
                 "duty" => {
                     duty = self.parse_u8_literal("duty")?;
                     if duty > 3 {
@@ -1528,6 +1759,7 @@ impl Parser {
             duty,
             pitch,
             volume,
+            channel,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }

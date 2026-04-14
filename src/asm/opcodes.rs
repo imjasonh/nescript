@@ -79,6 +79,13 @@ pub enum AddressingMode {
     // Pre-resolution symbolic forms
     Label(String),
     LabelRelative(String),
+    /// Absolute-X indexed form targeting a named label — resolves
+    /// to the 16-bit address of `label` at fix-up time, with the
+    /// instruction encoded as `absolute,X`. Used by `UxROM`'s
+    /// `__bank_select` to write into the bus-conflict table
+    /// (`STA __bank_select_table,X`) where the target address has
+    /// to be resolved by the linker.
+    LabelAbsoluteX(String),
     SymbolLo(String),
     SymbolHi(String),
 
@@ -103,7 +110,11 @@ impl AddressingMode {
             | Self::IndirectY(_)
             | Self::Relative(_) => 1,
             Self::Absolute(_) | Self::AbsoluteX(_) | Self::AbsoluteY(_) | Self::Indirect(_) => 2,
-            Self::Label(_) | Self::LabelRelative(_) | Self::SymbolLo(_) | Self::SymbolHi(_) => 0,
+            Self::Label(_)
+            | Self::LabelRelative(_)
+            | Self::LabelAbsoluteX(_)
+            | Self::SymbolLo(_)
+            | Self::SymbolHi(_) => 0,
             // `Bytes` is the full emitted payload — the assembler
             // skips the usual opcode byte for `NOP+Bytes` and writes
             // the raw vector, so the whole thing is operand.
@@ -125,7 +136,11 @@ impl AddressingMode {
             Self::Absolute(v) | Self::AbsoluteX(v) | Self::AbsoluteY(v) | Self::Indirect(v) => {
                 v.to_le_bytes().to_vec()
             }
-            Self::Label(_) | Self::LabelRelative(_) | Self::SymbolLo(_) | Self::SymbolHi(_) => {
+            Self::Label(_)
+            | Self::LabelRelative(_)
+            | Self::LabelAbsoluteX(_)
+            | Self::SymbolLo(_)
+            | Self::SymbolHi(_) => {
                 vec![]
             }
             Self::Bytes(v) => v.clone(),

@@ -15,6 +15,7 @@ fn make_program(ops: Vec<IrOp>, terminator: IrTerminator) -> IrProgram {
             locals: vec![],
             param_count: 0,
             has_return: false,
+            bank: None,
             source_span: Span::new(0, 0, 0),
         }],
         globals: vec![],
@@ -392,6 +393,7 @@ fn inline_removes_trivial() {
         locals: vec![],
         param_count: 0,
         has_return: false,
+        bank: None,
         source_span: Span::new(0, 0, 0),
     };
 
@@ -408,6 +410,7 @@ fn inline_removes_trivial() {
         locals: vec![],
         param_count: 0,
         has_return: true,
+        bank: None,
         source_span: Span::new(0, 0, 0),
     };
 
@@ -492,6 +495,7 @@ fn const_fold_preserves_loadimm_used_by_sibling_branch() {
             locals: vec![],
             param_count: 0,
             has_return: true,
+            bank: None,
             source_span: Span::new(0, 0, 0),
         }],
         globals: vec![],
