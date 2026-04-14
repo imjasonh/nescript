@@ -162,7 +162,7 @@ pub fn resolve_backgrounds(program: &Program) -> Vec<BackgroundData> {
 mod tests {
     use super::*;
     use crate::lexer::Span;
-    use crate::parser::ast::{GameDecl, Mapper, Mirroring, SpriteDecl};
+    use crate::parser::ast::{GameDecl, HeaderFormat, Mapper, Mirroring, SpriteDecl};
 
     fn make_program(sprite: SpriteDecl) -> Program {
         Program {
@@ -170,6 +170,7 @@ mod tests {
                 name: "Test".to_string(),
                 mapper: Mapper::NROM,
                 mirroring: Mirroring::Horizontal,
+                header: HeaderFormat::Ines1,
                 span: Span::dummy(),
             },
             globals: Vec::new(),
@@ -247,6 +248,7 @@ mod tests {
                 name: "Test".to_string(),
                 mapper: Mapper::NROM,
                 mirroring: Mirroring::Horizontal,
+                header: HeaderFormat::Ines1,
                 span: Span::dummy(),
             },
             globals: Vec::new(),

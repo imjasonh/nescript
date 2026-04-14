@@ -45,6 +45,38 @@ fn parse_game_with_mirroring() {
     assert_eq!(prog.game.mirroring, Mirroring::Vertical);
 }
 
+#[test]
+fn parse_game_default_header_is_ines1() {
+    // Programs that don't mention `header:` should default to
+    // iNES 1.0 — the current behaviour every example relies on.
+    let prog = parse_ok(MINIMAL_GAME);
+    assert_eq!(prog.game.header, HeaderFormat::Ines1);
+}
+
+#[test]
+fn parse_game_with_nes2_header() {
+    // Opting into NES 2.0 via `header: nes2`.
+    let src = r#"
+        game "Test" { mapper: NROM header: nes2 }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.game.header, HeaderFormat::Nes2);
+}
+
+#[test]
+fn parse_game_with_ines1_header_explicit() {
+    // Explicitly asking for iNES 1.0 (the default) also parses.
+    let src = r#"
+        game "Test" { mapper: NROM header: ines1 }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.game.header, HeaderFormat::Ines1);
+}
+
 // ── Variables ──
 
 #[test]

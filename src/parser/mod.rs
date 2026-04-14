@@ -343,6 +343,7 @@ impl Parser {
 
         let mut mapper = Mapper::NROM;
         let mut mirroring = Mirroring::Horizontal;
+        let mut header = HeaderFormat::Ines1;
 
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             let (key, _) = self.expect_ident()?;
@@ -379,6 +380,21 @@ impl Parser {
                         }
                     };
                 }
+                "header" => {
+                    let (val, _) = self.expect_ident()?;
+                    header = match val.as_str() {
+                        "ines1" | "ines" => HeaderFormat::Ines1,
+                        "nes2" => HeaderFormat::Nes2,
+                        _ => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!("unknown header format '{val}'"),
+                                self.current_span(),
+                            )
+                            .with_help("supported header formats: ines1, nes2"));
+                        }
+                    };
+                }
                 _ => {
                     return Err(Diagnostic::error(
                         ErrorCode::E0201,
@@ -394,6 +410,7 @@ impl Parser {
             name,
             mapper,
             mirroring,
+            header,
             span: Span::new(
                 start_span.file_id,
                 start_span.start,

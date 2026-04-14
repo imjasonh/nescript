@@ -724,7 +724,9 @@ impl Analyzer {
     /// Register a struct declaration. Computes each field's byte
     /// offset from the base address (fields are laid out contiguously
     /// in declaration order with no padding), and records the total
-    /// size. v1 structs only support primitive fields (u8/i8/bool).
+    /// size. Fields may be u8, i8, bool, or u16. Nested structs and
+    /// array fields are still rejected — the IR-lowering path doesn't
+    /// model them yet.
     fn register_struct(&mut self, s: &StructDecl) {
         if self.struct_layouts.contains_key(&s.name) {
             self.diagnostics.push(Diagnostic::error(
@@ -737,14 +739,17 @@ impl Analyzer {
         let mut fields = Vec::new();
         let mut offset: u16 = 0;
         for field in &s.fields {
-            // Reject non-primitive field types for now.
+            // Reject non-primitive field types for now. u16 is
+            // allowed and takes two bytes; arrays and nested structs
+            // still error out with a clearer message than before.
             let size = match &field.field_type {
                 NesType::U8 | NesType::I8 | NesType::Bool => 1,
-                _ => {
+                NesType::U16 => 2,
+                NesType::Array(_, _) | NesType::Struct(_) => {
                     self.diagnostics.push(Diagnostic::error(
                         ErrorCode::E0201,
                         format!(
-                            "struct field '{}' has unsupported type '{}' (only u8/i8/bool allowed)",
+                            "struct field '{}' has unsupported type '{}' (struct fields must be u8, i8, u16, or bool)",
                             field.name, field.field_type
                         ),
                         field.span,
@@ -858,10 +863,18 @@ impl Analyzer {
                         span: var.span,
                     },
                 );
+                // u16 struct fields occupy two bytes — record that
+                // explicitly so the IR codegen's global-init pass and
+                // any size-aware bookkeeping treat the high byte as
+                // part of the same allocation.
+                let field_size = match field_type {
+                    NesType::U16 => 2,
+                    _ => 1,
+                };
                 self.var_allocations.push(VarAllocation {
                     name: full_name,
                     address: address + offset,
-                    size: 1,
+                    size: field_size,
                 });
             }
             // Also register the struct variable itself (as a symbol

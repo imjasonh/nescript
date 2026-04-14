@@ -249,10 +249,18 @@ impl LoweringContext {
                     let full = format!("{}.{fname}", var.name);
                     let fvid = self.get_or_create_var(&full);
                     let fval = self.eval_const(fexpr);
+                    // Look up the field's type from the analyzer's
+                    // symbol table so u16 fields record a size of 2
+                    // and the IR codegen's initializer loop writes
+                    // both bytes.
+                    let field_size = match self.var_types.get(&full) {
+                        Some(NesType::U16) => 2,
+                        _ => 1,
+                    };
                     self.globals.push(IrGlobal {
                         var_id: fvid,
                         name: full,
-                        size: 1,
+                        size: field_size,
                         init_value: fval,
                         init_array: Vec::new(),
                     });
@@ -573,6 +581,13 @@ impl LoweringContext {
                 let field_var = self.get_or_create_var(&full);
                 let val = self.lower_expr(fexpr);
                 self.emit(IrOp::StoreVar(field_var, val));
+                // u16 fields need the high byte written too — the
+                // `widen` helper yields a zero-extended high temp
+                // when the RHS is narrow.
+                if matches!(self.var_types.get(&full), Some(NesType::U16)) {
+                    let (_, val_hi) = self.widen(val);
+                    self.emit(IrOp::StoreVarHi(field_var, val_hi));
+                }
             }
             return;
         }
@@ -670,22 +685,74 @@ impl LoweringContext {
                 // The analyzer synthesizes a variable named
                 // `"struct.field"` for each struct field, so we can
                 // treat field assignment as a regular variable
-                // assignment to that synthetic name.
+                // assignment to that synthetic name. u16 fields
+                // follow the same two-byte path as u16 globals.
                 let full_name = format!("{name}.{field}");
                 let var_id = self.get_or_create_var(&full_name);
+                let dest_is_u16 = matches!(self.var_types.get(&full_name), Some(NesType::U16));
                 match op {
                     AssignOp::Assign => {
                         let val = self.lower_expr(expr);
                         self.emit(IrOp::StoreVar(var_id, val));
+                        if dest_is_u16 {
+                            // Narrow value: zero-extend via widen
+                            // (which returns the original hi temp if
+                            // the value is already wide).
+                            let (_, val_hi) = self.widen(val);
+                            self.emit(IrOp::StoreVarHi(var_id, val_hi));
+                        }
                     }
                     _ => {
                         let current = self.fresh_temp();
                         self.emit(IrOp::LoadVar(current, var_id));
+                        if dest_is_u16 {
+                            let current_hi = self.fresh_temp();
+                            self.emit(IrOp::LoadVarHi(current_hi, var_id));
+                            self.make_wide(current, current_hi);
+                        }
                         let rhs = self.lower_expr(expr);
                         let result = self.fresh_temp();
-                        let ir_op = compound_assign_op(op, result, current, rhs, expr, self);
-                        self.emit(ir_op);
-                        self.emit(IrOp::StoreVar(var_id, result));
+                        let wide = dest_is_u16 || self.is_wide(current) || self.is_wide(rhs);
+                        if wide && matches!(op, AssignOp::PlusAssign | AssignOp::MinusAssign) {
+                            let (a_lo, a_hi) = self.widen(current);
+                            let (b_lo, b_hi) = self.widen(rhs);
+                            let d_hi = self.fresh_temp();
+                            match op {
+                                AssignOp::PlusAssign => self.emit(IrOp::Add16 {
+                                    d_lo: result,
+                                    d_hi,
+                                    a_lo,
+                                    a_hi,
+                                    b_lo,
+                                    b_hi,
+                                }),
+                                AssignOp::MinusAssign => self.emit(IrOp::Sub16 {
+                                    d_lo: result,
+                                    d_hi,
+                                    a_lo,
+                                    a_hi,
+                                    b_lo,
+                                    b_hi,
+                                }),
+                                _ => unreachable!(),
+                            }
+                            self.make_wide(result, d_hi);
+                            self.emit(IrOp::StoreVar(var_id, result));
+                            if dest_is_u16 {
+                                self.emit(IrOp::StoreVarHi(var_id, d_hi));
+                            }
+                        } else {
+                            let ir_op = compound_assign_op(op, result, current, rhs, expr, self);
+                            self.emit(ir_op);
+                            self.emit(IrOp::StoreVar(var_id, result));
+                            if dest_is_u16 {
+                                // High byte unchanged by 8-bit op;
+                                // keep the previously-loaded high
+                                // byte.
+                                let (_, cur_hi) = self.widen(current);
+                                self.emit(IrOp::StoreVarHi(var_id, cur_hi));
+                            }
+                        }
                     }
                 }
             }
@@ -927,11 +994,19 @@ impl LoweringContext {
             Expr::FieldAccess(name, field, _) => {
                 // Field access lowers to a plain load of the
                 // synthetic `"struct.field"` variable produced by the
-                // analyzer.
+                // analyzer. u16 fields follow the same two-byte path
+                // as u16 globals — load the low byte via `LoadVar`
+                // and the high byte via `LoadVarHi`, then register
+                // the pair as wide.
                 let full_name = format!("{name}.{field}");
                 let var_id = self.get_or_create_var(&full_name);
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadVar(t, var_id));
+                if matches!(self.var_types.get(&full_name), Some(NesType::U16)) {
+                    let hi = self.fresh_temp();
+                    self.emit(IrOp::LoadVarHi(hi, var_id));
+                    self.make_wide(t, hi);
+                }
                 t
             }
             Expr::BinaryOp(left, op, right, _) => self.lower_binop(left, *op, right),

@@ -4,7 +4,7 @@ mod tests;
 use crate::asm;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
 use crate::assets::{BackgroundData, MusicData, PaletteData, SfxData};
-use crate::parser::ast::{Mapper, Mirroring};
+use crate::parser::ast::{HeaderFormat, Mapper, Mirroring};
 use crate::rom::RomBuilder;
 use crate::runtime;
 
@@ -12,6 +12,7 @@ use crate::runtime;
 pub struct Linker {
     mirroring: Mirroring,
     mapper: Mapper,
+    header_format: HeaderFormat,
 }
 
 /// CHR data for a sprite, placed at a specific tile index in CHR ROM.
@@ -115,11 +116,25 @@ impl Linker {
         Self {
             mirroring,
             mapper: Mapper::NROM,
+            header_format: HeaderFormat::Ines1,
         }
     }
 
     pub fn with_mapper(mirroring: Mirroring, mapper: Mapper) -> Self {
-        Self { mirroring, mapper }
+        Self {
+            mirroring,
+            mapper,
+            header_format: HeaderFormat::Ines1,
+        }
+    }
+
+    /// Opt into the NES 2.0 header format for the emitted ROM.
+    /// Chainable builder method — returns `self` so callers can
+    /// write `Linker::with_mapper(m, p).with_header(HeaderFormat::Nes2)`.
+    #[must_use]
+    pub fn with_header(mut self, header: HeaderFormat) -> Self {
+        self.header_format = header;
+        self
     }
 
     /// Link all code sections into a .nes ROM.
@@ -454,6 +469,9 @@ impl Linker {
         // Build ROM
         let mut builder = RomBuilder::new(self.mirroring);
         builder.set_mapper(crate::rom::mapper_number(self.mapper));
+        if self.header_format == HeaderFormat::Nes2 {
+            builder.enable_nes2();
+        }
 
         // Multi-bank layout: each switchable bank is an independent
         // 16 KB slot whose contents the linker takes verbatim from

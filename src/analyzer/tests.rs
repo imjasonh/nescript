@@ -328,6 +328,87 @@ fn analyze_struct_variable_allocates_fields() {
 }
 
 #[test]
+fn analyze_struct_u16_field_allocates_two_bytes() {
+    // A struct with a u16 field should lay out fields with
+    // byte-accurate offsets: a u8 followed by a u16 followed by a u8
+    // puts `b` at offset 1 and `c` at offset 3.
+    let result = analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Mixed { a: u8, b: u16, c: u8 }
+        var m: Mixed
+        on frame {
+            m.a = 1
+            m.b = 300
+            m.c = 7
+        }
+        start Main
+    "#,
+    );
+    let a = result
+        .var_allocations
+        .iter()
+        .find(|x| x.name == "m.a")
+        .expect("m.a should be allocated");
+    let b = result
+        .var_allocations
+        .iter()
+        .find(|x| x.name == "m.b")
+        .expect("m.b should be allocated");
+    let c = result
+        .var_allocations
+        .iter()
+        .find(|x| x.name == "m.c")
+        .expect("m.c should be allocated");
+    // Offsets from base: a=0, b=1, c=3 (b is two bytes wide).
+    assert_eq!(b.address, a.address + 1);
+    assert_eq!(c.address, a.address + 3);
+    // u16 field is recorded with size 2 so codegen bookkeeping
+    // knows how much space the field occupies.
+    assert_eq!(a.size, 1);
+    assert_eq!(b.size, 2);
+    assert_eq!(c.size, 1);
+}
+
+#[test]
+fn analyze_struct_with_array_field_is_rejected() {
+    // Array fields are still rejected — the analyzer only accepts
+    // u8/i8/u16/bool scalar fields in v1 structs.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Bag { xs: u8[4] }
+        var b: Bag
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "array struct field should emit E0201: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_struct_with_nested_struct_field_is_rejected() {
+    // Nested struct fields are still rejected — only scalar primitives.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Inner { a: u8 }
+        struct Outer { inner: Inner }
+        var o: Outer
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "nested struct field should emit E0201: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_struct_unknown_field_errors() {
     let errors = analyze_errors(
         r#"

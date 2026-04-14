@@ -349,7 +349,8 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     // outgrow 16 KB have real ROM space to grow into and so
     // mapper-specific fixtures (vectors, trampolines, bank-select
     // helpers) land in the right place.
-    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
+    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper)
+        .with_header(program.game.header);
     let switchable_banks: Vec<PrgBank> = program
         .banks
         .iter()

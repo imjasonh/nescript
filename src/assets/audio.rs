@@ -556,6 +556,7 @@ mod tests {
                 name: "T".to_string(),
                 mapper: Mapper::NROM,
                 mirroring: Mirroring::Horizontal,
+                header: HeaderFormat::Ines1,
                 span: Span::dummy(),
             },
             globals: Vec::new(),

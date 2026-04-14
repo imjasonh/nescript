@@ -154,6 +154,9 @@ pub struct GameDecl {
     pub name: String,
     pub mapper: Mapper,
     pub mirroring: Mirroring,
+    /// iNES header flavor to emit. Defaults to [`HeaderFormat::Ines1`];
+    /// programs can opt into NES 2.0 via `game Foo { header: nes2 }`.
+    pub header: HeaderFormat,
     pub span: Span,
 }
 
@@ -169,6 +172,22 @@ pub enum Mapper {
 pub enum Mirroring {
     Horizontal,
     Vertical,
+}
+
+/// iNES header format to emit in the .nes file.
+///
+/// `Ines1` is the classic 16-byte iNES 1.0 header that every
+/// `NEScript` program has used to date. `Nes2` opts into the
+/// backwards-compatible NES 2.0 extension: the header is still
+/// 16 bytes, but byte 7 bits 2-3 are set to `10` and bytes 8-15
+/// carry extended metadata (submapper, PRG/CHR size MSBs, PRG RAM,
+/// CHR RAM, timing, etc.). NES 2.0 is strictly additive — any
+/// emulator that doesn't understand it falls back to reading the
+/// header as iNES 1.0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HeaderFormat {
+    Ines1,
+    Nes2,
 }
 
 #[derive(Debug, Clone)]

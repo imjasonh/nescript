@@ -1,5 +1,5 @@
 use super::*;
-use crate::parser::ast::Mirroring;
+use crate::parser::ast::{HeaderFormat, Mirroring};
 
 #[test]
 fn build_minimal_rom() {
@@ -217,4 +217,101 @@ fn empty_prg_banks_fallback_to_single_bank() {
     let rom = builder.build();
     assert_eq!(rom[4], 1, "default should be 1 PRG bank");
     assert_eq!(rom.len(), 16 + 16384);
+}
+
+// ─── NES 2.0 header support ────────────────────────────────────────
+
+#[test]
+fn ines1_default_has_clear_nes2_marker() {
+    // Default header format is iNES 1.0 — byte 7 bits 2-3 must be 00.
+    let builder = RomBuilder::new(Mirroring::Horizontal);
+    let rom = builder.build();
+    assert_eq!(
+        rom[7] & 0x0C,
+        0x00,
+        "iNES 1.0 default must not set byte 7 bits 2-3"
+    );
+    // Bytes 8-15 must all be zero padding in iNES 1.0.
+    assert_eq!(&rom[8..16], &[0u8; 8]);
+    assert_eq!(rom.len(), 16 + 16384);
+}
+
+#[test]
+fn nes2_header_sets_byte7_bits_2_3() {
+    // Opting into NES 2.0 must set byte 7 bits 2-3 to `10` (binary).
+    let mut builder = RomBuilder::new(Mirroring::Horizontal);
+    builder.enable_nes2();
+    let rom = builder.build();
+    assert_eq!(
+        rom[7] & 0x0C,
+        0x08,
+        "NES 2.0 header must set byte 7 bits 2-3 to 10"
+    );
+    // Header is still 16 bytes — NES 2.0 is not a longer header,
+    // it just reinterprets the existing bytes.
+    assert_eq!(rom.len(), 16 + 16384);
+}
+
+#[test]
+fn nes2_header_populates_bytes_8_through_15() {
+    // Bytes 8-15 should all be zero for our tiny ROMs — we don't
+    // use submappers, oversized PRG/CHR, CHR RAM, or non-NTSC
+    // timing — but they must still be present (not omitted).
+    let mut builder = RomBuilder::new(Mirroring::Horizontal);
+    builder.enable_nes2();
+    let rom = builder.build();
+    assert_eq!(&rom[8..16], &[0u8; 8]);
+}
+
+#[test]
+fn nes2_preserves_mapper_and_mirroring() {
+    // Opting into NES 2.0 should not disturb the mapper or
+    // mirroring fields in bytes 6-7.
+    let mut builder = RomBuilder::new(Mirroring::Vertical);
+    builder.set_mapper(crate::rom::mapper_number(crate::parser::ast::Mapper::MMC3));
+    builder.enable_nes2();
+    let rom = builder.build();
+    // Vertical mirroring keeps bit 0 of byte 6 set.
+    assert_eq!(rom[6] & 1, 1);
+    // Mapper 4 splits 0x40 across byte 6 high nibble and byte 7
+    // high nibble: 4 = 0b0100 → nibble 0 goes to byte 7.
+    let info = validate_ines(&rom).unwrap();
+    assert_eq!(info.mapper, 4);
+    assert_eq!(info.header_format, HeaderFormat::Nes2);
+    assert_eq!(info.mirroring, Mirroring::Vertical);
+}
+
+#[test]
+fn validate_accepts_both_header_formats() {
+    // iNES 1.0 ROM validates and is marked as `Ines1`.
+    let ines1 = RomBuilder::new(Mirroring::Horizontal).build();
+    let info1 = validate_ines(&ines1).unwrap();
+    assert_eq!(info1.header_format, HeaderFormat::Ines1);
+
+    // NES 2.0 ROM validates and is marked as `Nes2`.
+    let mut b = RomBuilder::new(Mirroring::Horizontal);
+    b.enable_nes2();
+    let nes2 = b.build();
+    let info2 = validate_ines(&nes2).unwrap();
+    assert_eq!(info2.header_format, HeaderFormat::Nes2);
+}
+
+#[test]
+fn nes2_mapper_high_nibble_in_byte_8_is_zero_for_small_mappers() {
+    // NEScript only supports u8 mapper numbers, so byte 8's low
+    // nibble (mapper bits 8-11) is always zero. Verify that
+    // explicitly so a future change that accidentally shifts bits
+    // into byte 8 is caught.
+    for mapper in [
+        crate::parser::ast::Mapper::NROM,
+        crate::parser::ast::Mapper::MMC1,
+        crate::parser::ast::Mapper::UxROM,
+        crate::parser::ast::Mapper::MMC3,
+    ] {
+        let mut builder = RomBuilder::new(Mirroring::Horizontal);
+        builder.set_mapper(crate::rom::mapper_number(mapper));
+        builder.enable_nes2();
+        let rom = builder.build();
+        assert_eq!(rom[8], 0, "byte 8 should be zero for {mapper:?}");
+    }
 }

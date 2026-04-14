@@ -310,6 +310,130 @@ fn program_with_structs() {
 }
 
 #[test]
+fn program_with_u16_struct_field() {
+    // Exercise the u16 struct field path end-to-end: declare a
+    // struct with a mix of u8 and u16 fields, read from and write
+    // to the u16 field (including a literal > 255), and verify the
+    // ROM assembles cleanly. The analyzer's field-offset math and
+    // the IR lowering's wide load/store path both need to agree
+    // for this to compile at all.
+    let source = r#"
+        game "U16Struct" { mapper: NROM }
+        struct Entity { kind: u8, position: u16, flags: u8 }
+        var e: Entity
+        on frame {
+            e.kind = 1
+            e.position = 1234
+            e.flags = 7
+            if e.position > 1000 {
+                e.position += 1
+            }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+}
+
+#[test]
+fn u16_struct_field_initializer_writes_both_bytes_to_rom() {
+    // Struct literal initializer with a u16 field > 255 — the
+    // compiler runs the global-init path at reset time, which
+    // lowers to two independent LDA/STA pairs (low byte then high
+    // byte). Unlike per-frame stores, initializers aren't subject
+    // to the optimizer's dead-store pass, so they're a stable
+    // place to witness both halves of the u16 write. 1234 = $04D2.
+    let source = r#"
+        game "U16Init" { mapper: NROM }
+        struct Point { tag: u8, x: u16 }
+        var p: Point = Point { tag: 1, x: 1234 }
+        on frame {
+            if p.x > 1000 {
+                scroll(p.tag, 0)
+            }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+
+    // PRG ROM starts at offset 16 and is 16384 bytes long.
+    let prg = &rom_data[16..16 + 16384];
+
+    // Look for `LDA #$D2 ; STA abs|zp` — opcode $A9 $D2 $85/$8D.
+    // This is the low-byte initializer for `p.x`.
+    let mut found_low_store = false;
+    for i in 0..prg.len().saturating_sub(4) {
+        if prg[i] == 0xA9 && prg[i + 1] == 0xD2 && (prg[i + 2] == 0x85 || prg[i + 2] == 0x8D) {
+            found_low_store = true;
+            break;
+        }
+    }
+    assert!(
+        found_low_store,
+        "expected an LDA #$D2 / STA <addr> pair in PRG for the u16 initializer low byte"
+    );
+
+    // And the high byte: `LDA #$04 ; STA abs|zp`.
+    let mut found_high_store = false;
+    for i in 0..prg.len().saturating_sub(4) {
+        if prg[i] == 0xA9 && prg[i + 1] == 0x04 && (prg[i + 2] == 0x85 || prg[i + 2] == 0x8D) {
+            found_high_store = true;
+            break;
+        }
+    }
+    assert!(
+        found_high_store,
+        "expected an LDA #$04 / STA <addr> pair in PRG for the u16 initializer high byte"
+    );
+}
+
+#[test]
+fn u16_struct_field_comparison_emits_wide_compare() {
+    // Reading a u16 struct field into a comparison should take
+    // the wide (16-bit) compare path, which produces a distinctive
+    // two-stage CMP sequence: high byte first (with equal-branch),
+    // then low byte. Without the u16 lowering, the field would
+    // be treated as u8 and the comparison would fold to a single
+    // 8-bit CMP. We detect the wide path by checking that both
+    // the low byte of 1000 ($E8) and the high byte ($03) appear
+    // as immediate operands in the emitted PRG — the compiler
+    // only emits both when it's generating a 16-bit compare.
+    let source = r#"
+        game "U16Cmp" { mapper: NROM }
+        struct Counter { n: u16 }
+        var c: Counter = Counter { n: 2000 }
+        on frame {
+            if c.n > 1000 {
+                scroll(1, 0)
+            } else {
+                scroll(2, 0)
+            }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("should be valid iNES");
+
+    let prg = &rom_data[16..16 + 16384];
+
+    // 1000 = $03E8. Look for CMP #$03 (A9 03, C9 03) — the high
+    // byte of the comparison literal. We expect `CMP #$03` ($C9
+    // $03) to appear somewhere in the CMP-with-constant sequence.
+    let mut found_high_cmp = false;
+    for i in 0..prg.len().saturating_sub(2) {
+        if prg[i] == 0xC9 && prg[i + 1] == 0x03 {
+            found_high_cmp = true;
+            break;
+        }
+    }
+    assert!(
+        found_high_cmp,
+        "expected a CMP #$03 (16-bit compare high byte) in PRG"
+    );
+}
+
+#[test]
 fn program_with_enums() {
     let source = r#"
         game "Enums" { mapper: NROM }
