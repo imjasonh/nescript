@@ -161,7 +161,45 @@ Items already tracked elsewhere in this doc (fixed-point, metasprites,
 multi-channel tracker music, DMC, banked→banked calls) are cross-referenced
 rather than duplicated.
 
+### Audience: which features are for humans vs for the decompiler
+
+Several of the features below exist **only** to give a machine-generated
+decompilation a way to express itself, not to give human authors new tools.
+When their language-guide entries land, `docs/language-guide.md` should
+split into two flavors of documentation for each feature — "how to use
+this when writing a game" vs "how to read this when reviewing decompiled
+output" — and the second flavor should actively discourage use in
+hand-written code. A lint (`W0109` "decompiler-only construct in
+hand-authored source") gated on a file-level `#![source: decompiled]`
+attribute is the natural enforcement knob: plain `.ne` programs get
+the warning, decompiler output asserts the attribute and is silent.
+
+| Feature                             | Audience       | Author use-case                                     |
+|-------------------------------------|----------------|------------------------------------------------------|
+| Address-pinned declarations (`@`)   | decompiler     | None in normal code. Read to understand pinned RAM / ROM slots in decompiled output. |
+| `raw_bank` pass-through             | decompiler     | None in normal code. Read to understand which banks are verbatim imports. |
+| `raw_vectors` / runtime opt-out     | decompiler     | None in normal code. Read to understand that the default runtime was replaced. |
+| `free_space` regions                | decompiler     | None. Pure hybrid-shim bookkeeping; only meaningful inside a `raw_bank`. |
+| `goto` / `label` escape hatch       | decompiler     | Never hand-written. Gated behind `#[allow(unstructured)]`; read to understand lifted hot routines. |
+| `chr_bank` (binary + PNG)           | **dual-use**   | Hand-authors drop in prebuilt 8 KB tilesheets from a pixel editor; decompilers dump original CHR verbatim. Same surface, both audiences. |
+| Fixed-point literals (`fixed8.8`)   | human          | First-class sub-pixel physics. Decompilers also use it, but the feature is worth landing on its own merits. |
+| Tracker-shaped multi-channel audio  | human          | Homebrew authors want multi-channel tracker music regardless of the decompiler workflow. |
+| Symbol map import                   | decompiler     | CLI-only. No language surface to teach. |
+
+The rule of thumb: if a feature's only coherent use is "make a decompiler's
+output legal `.ne`," it's decompiler-only. If there's a plausible reason
+a human would reach for it when writing a new game from scratch, it's
+human-facing or dual-use. The three dual-use items above (plus metasprites
+and tilemaps tracked elsewhere) happen to be the features where the
+decompiler workflow is a bonus on top of a feature humans already wanted.
+
+Each subsection below is labeled **[audience: X]** to match the table.
+
 ### Address-pinned declarations
+
+**[audience: decompiler]** — do not hand-write; humans should let the
+allocator pick addresses and rely on `fast` / `slow` hints (see
+`docs/language-guide.md` → Memory Placement Hints).
 
 Today `Placement` in `src/parser/ast.rs` is `Fast` / `Slow` / `Auto`. The
 compiler picks the final address. For the decompiler we need the author
@@ -192,6 +230,11 @@ Work:
 
 ### Raw PRG bank pass-through
 
+**[audience: decompiler]** — hand-authors write `.ne`, not binary blobs.
+The rare legitimate human use is shipping a third-party library as a
+prebuilt bank, which is advanced territory and should not be taught
+alongside the normal authoring flow.
+
 `linker::PrgBank::with_data` already carries a raw byte payload —
 switchable banks constructed via `PrgBank::with_data` get spliced into the
 ROM verbatim. What's missing is a language-surface declaration for it.
@@ -208,6 +251,12 @@ ROM verbatim. What's missing is a language-surface declaration for it.
   `binary: "…"` inline-asm asset source uses.
 
 ### Runtime opt-out and custom vectors
+
+**[audience: decompiler]** — the default runtime is one of the biggest
+productivity wins NEScript gives human authors (auto-init, NMI handler,
+OAM DMA, controller reads, audio tick, state dispatch). Opting out
+means reimplementing all of it in inline asm, which is a different
+programming model. Hand-authors should not use `raw_vectors`.
 
 Every `.ne` program today forcibly splices `runtime::gen_init`,
 `gen_nmi`, `gen_irq`, `gen_mapper_init`, `gen_audio_tick`, and the mapper
@@ -238,6 +287,13 @@ state dispatch.
 
 ### Raw and PNG-sourced CHR banks
 
+**[audience: dual-use]** — humans use this to drop in prebuilt 8 KB
+tilesheets they authored in an image editor without having to
+restructure them into `sprite`/`background` blocks. Decompilers use
+the binary variant to pass through the original game's CHR verbatim,
+and the PNG variant to let users edit it afterwards. Both audiences
+see the same surface syntax and it reads naturally for both.
+
 `chr_bank Name { source: "file.png" }` as a first-class top-level
 declaration — right now sprites and backgrounds are the only path to
 CHR ROM, and they're both tightly coupled to the sprite/nametable
@@ -260,6 +316,10 @@ to restructure it into `sprite` / `background` blocks.
 
 ### Fixed-point literals (already on the roadmap — pulled forward)
 
+**[audience: human]** — first-class feature for anyone writing a
+platformer with sub-pixel physics. The decompiler workflow is a
+coincidental beneficiary, not the justification.
+
 `fixed8.8` is listed in the Language feature gaps table. Finishing it
 is a prerequisite for editable physics constants: without a
 sub-pixel-capable numeric type, every decompiled physics constant is
@@ -270,6 +330,12 @@ what that row already tracks, but it should be scheduled alongside the
 decompiler rather than after.
 
 ### Tracker-shaped audio declarations
+
+**[audience: human]** — homebrew authors want multi-channel tracker
+music (triangle bass, noise drums, DPCM samples, envelopes, vibrato)
+regardless of whether they ever touch the decompiler. The
+decompiler's need for symmetric emission is an additional requirement
+layered on top of an already-justified feature.
 
 Already partially tracked under "Audio pipeline" (multi-channel tracker
 playback, DMC, `@music("file.ftm")` importers). The decompiler-specific
@@ -294,6 +360,15 @@ Work beyond the audio-pipeline row:
 
 ### Goto escape hatch for lifted code
 
+**[audience: decompiler]** — the canonical "exists so the decompiler
+can be correct on routines that don't structure cleanly." Hand-authors
+should never reach for `goto`; `.ne` already has `break` / `continue`
+/ `return` / early-exit patterns that cover the legitimate cases.
+Enforcement is via a file-level `#![source: decompiled]` attribute
+the decompiler emits, plus the `#[allow(unstructured)]` function
+attribute below. A plain `.ne` program using `goto` without either
+attribute triggers `W0109`.
+
 The hybrid shim is mostly data-driven, but we want the option to lift a
 specific hot routine (player update, collision, enemy AI) to readable
 `.ne` when it's worth the effort. 6502 control flow doesn't always fit
@@ -305,15 +380,21 @@ output than admitting defeat on a few edges.
 - Conditional `goto foo if <expr>` sugar, lowering to the normal
   branch-and-jump sequence.
 - Analyzer rules: labels are scoped to their enclosing function; no
-  cross-function gotos. Warning W0103 ("goto across a `var`
-  declaration") for the cases where the structured equivalent is
-  clearly better.
+  cross-function gotos. A separate style warning for the cases where
+  the structured equivalent is clearly better (e.g. goto jumping
+  across a `var` declaration) can be added later if the goto usage
+  in practice warrants it; skip until there's real decompiled output
+  to sample.
 - The goto facility is opt-in and off by default: plain `.ne` programs
   should not reach for it. Gate it behind a `#[allow(unstructured)]`
   attribute on the containing function so code review catches
   accidental use.
 
 ### Free-space-aware replacement
+
+**[audience: decompiler]** — pure hybrid-shim bookkeeping; the
+declaration only makes sense inside a `raw_bank`, which is itself
+decompiler-only. Hand-authors never touch this.
 
 When the user edits a pinned declaration and the recompiled blob no
 longer fits in the original slot, the linker needs somewhere to put
@@ -336,6 +417,10 @@ the original slot.
   fixed-size only — overflow is a hard error.
 
 ### Symbol map import
+
+**[audience: decompiler (CLI-only)]** — no language surface to teach.
+Hand-authors get `.mlb` output via `--symbols` on the build side;
+the decompiler gains a symmetric reader.
 
 Community disassemblies ship with `.sym` / `.mlb` files listing known
 RAM and ROM labels. Feeding one into the decompiler turns every

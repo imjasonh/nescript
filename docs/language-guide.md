@@ -227,6 +227,21 @@ var normal: u8              // compiler decides automatically
 
 If zero-page is exhausted and `fast` variables cannot be placed, the compiler emits error `E0301`.
 
+> **Note on decompiler-emitted placements.** A future release will add
+> `@ 0xADDR` address pinning for variables and data declarations. That
+> syntax exists to let a machine-generated decompilation of an existing
+> ROM express "this byte lives exactly here," and you will see it in
+> decompiled output from `nescript decompile`. **Do not use it in
+> hand-authored code.** The whole point of `fast` / `slow` / automatic
+> placement is that the allocator knows more about zero-page pressure
+> and liveness than you do. This guide follows a general rule: when a
+> feature is labeled **"decompiler-emitted,"** learn to read it so you
+> can review decompiled ROMs, but don't reach for it when writing a
+> new game. See the "ROM decompilation and hybrid-shim mods" section
+> in `docs/future-work.md` for the full list of decompiler-only
+> constructs and the `W0109` lint that flags them in hand-written
+> source.
+
 ### Scope
 
 | Scope    | Declared In    | Lifetime                                   |
