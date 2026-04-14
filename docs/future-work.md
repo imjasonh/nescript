@@ -6,50 +6,56 @@ tested is omitted — `git log` is the authoritative record of what shipped.
 
 ---
 
-## PNG-sourced palette and nametable assets
+## PNG-sourced assets
 
 **What ships today.** `palette Name { colors: [...] }` and
 `background Name { tiles: [...], attributes: [...] }` declarations with
-inline byte arrays. The first declared palette / background is loaded
-at reset time (before rendering enables), and both blocks get named
-data blobs in PRG ROM so `set_palette Name` / `load_background Name`
-can queue a vblank-safe swap via the NMI handler. See
-`examples/palette_and_background.ne`.
+inline byte arrays, plus `palette Name @palette("file.png")` and
+`background Name @nametable("file.png")` for PNG-sourced variants.
+The palette path maps each pixel to its nearest NES master-palette index
+(via `nearest_nes_color()` in `src/assets/palette.rs`), deduplicates, and
+emits the 32-byte blob; the nametable path slices a 256×240 PNG into the
+32×30 tile grid, deduplicates (max 256 unique tiles), and emits the 960+64
+byte nametable/attribute blobs. `--memory-map` reports per-blob PRG ROM
+addresses and a running total alongside the variable layout.
 
 **Still TODO.**
-- `@palette("file.png")` — analyze image colours and map to nearest
-  NES master-palette indices. `nearest_nes_color()` already lives in
-  `src/assets/palette.rs` but is not wired through the resolver.
-- `@nametable("file.png")` — convert a 256×240 image into a 960-byte
-  nametable plus 64-byte attribute table with automatic tile
-  deduplication (max 256 unique tiles per pattern table).
-- Per-state background rendering control — programs currently get a
-  single fixed nametable at reset; per-state swaps work but are
-  limited by the NMI-time write budget (~2273 cycles, enough for a
-  palette but not a full 1024-byte nametable).
-- `--memory-map` should report palette and background PRG ROM usage
-  alongside the variable layout.
+- **Automatic CHR generation from `@nametable` PNGs** — the nametable
+  resolver currently produces tile indices 0..N but does not write matching
+  CHR data, so users still need to supply CHR via `@chr(...)` with the same
+  tile ordering. Closing this gap requires coordinating the PNG tile
+  dedupe with the CHR allocator so both pipelines agree on indices.
+- **Per-state background rendering control** — programs currently load a
+  single nametable at reset. Per-state swaps work but are limited by the
+  NMI-time write budget (~2273 cycles, enough for a palette but not a
+  full 1024-byte nametable).
 
 ---
 
 ## User code distribution across switchable banks
 
-**Status.** `mapper: MMC1 / UxROM / MMC3` plus top-level `bank Name { prg }`
-declarations are honored by the iNES header and by the linker, which reserves
-each declared bank as a 16 KB switchable slot. However, the IR codegen puts
-every user function and state handler into the fixed bank at `$C000-$FFFF` —
-the declared banks exist only as empty space. Programs outgrowing the fixed
-16 KB have nowhere to put their code.
+**What ships today.** `bank Foo { fun bar() { ... } }` nesting places user
+functions into a specific switchable bank. The codegen emits per-bank
+instruction streams; the linker runs a two-pass assembly (discover labels
+per-bank, then resolve with the merged label table) so banked code can
+still reference fixed-bank symbols. Fixed → banked calls are rewritten to
+`JSR __tramp_<name>`, where each trampoline is a per-function stub in the
+fixed bank that saves the current bank, switches, calls the target,
+restores, and returns. `runtime/mod.rs::gen_bank_trampoline` is the
+per-mapper emitter. See `examples/uxrom_user_banked.ne`.
 
-**What's needed.**
-- A bank-assignment step (analyzer or a new pass) that maps each user function
-  / state handler to a target bank, either via explicit `bank Foo { fun bar()
-  ... }` nesting or by greedy size-packing.
-- Codegen support for emitting into non-fixed banks and for generating
-  cross-bank trampolines (the runtime helper scaffold already exists in
-  `runtime/mod.rs::gen_bank_trampoline`; it just isn't invoked).
-- Linker changes so that functions in a switchable bank are found by the
-  JSR fix-up logic when the call crosses bank boundaries.
+**Still TODO.**
+- **Banked → banked cross-bank calls.** The codegen panics if a function
+  in bank A tries to call a function in bank B. The fix is to generalize
+  the trampoline registry so the caller's bank restore logic works for
+  arbitrary target banks, not just calls originating in the fixed bank.
+- **Greedy size-packing.** Placement is explicit-only today — there is no
+  pass that takes a program with too much fixed-bank code and
+  automatically spills the biggest leaf functions to declared empty banks.
+- **MMC3 per-state-handler split** — the `mmc3_per_state_split.ne`
+  example still uses the legacy fixed-bank placement for its handlers.
+  Extending the banked-fun syntax to state handlers (plus trampoline
+  emission on handler dispatch) would unify the two paths.
 
 ---
 
@@ -64,15 +70,16 @@ From the spec's "Reserved for Future Versions" section:
 | **Metasprites**    | Multi-tile sprite groups with relative positioning.                   |
 | **Tilemaps**       | Declarative level data with built-in collision queries.              |
 | **SRAM / saves**   | Persistent storage declarations for battery-backed save data.        |
-| **NES 2.0 header** | Extended iNES header format for additional metadata.                  |
+
+NES 2.0 headers are now supported via `game Foo { header: nes2 }` — see
+`src/rom/mod.rs`.
 
 ### Struct / array field widths
 
-Struct and array element types are currently restricted to the single-byte
-primitives (`u8`, `i8`, `bool`). `u16`, nested struct fields, and array fields
-are rejected with `E0201`. The analyzer's field-layout machinery needs to
-grow multi-byte offsets, and IR lowering needs to treat wide fields as the
-existing wide-var path already does for `u16` globals.
+`u16` struct fields now compile. Nested struct fields and array fields are
+still rejected with `E0201`; the field-layout accumulator handles variable
+sizes correctly, but the IR-lowering side needs extending to recurse for
+nested structs and to multiply by element size for array fields.
 
 ---
 
@@ -81,16 +88,21 @@ existing wide-var path already does for `u16` globals.
 **What ships today.** Frame-walking pulse driver with `sfx Name { duty, pitch,
 volume }` and `music Name { duty, volume, repeat, notes }` blocks; builtin
 effects and tracks; a 60-entry period table; `__audio_used` marker that
-elides the whole subsystem when no program statement references it.
+elides the whole subsystem when no program statement references it. **Plus**
+`channel: triangle` and `channel: noise` on `sfx` blocks, which splice in
+per-channel slots that write to $4008-$400B (triangle) or $400C-$400F
+(noise) when a program declares them. Pulse-only programs still produce
+byte-identical driver code. See `examples/noise_triangle_sfx.ne`.
 
 **Still TODO for richer audio.**
-- Triangle / noise / DMC channels (today the driver only uses pulse 1 and
-  pulse 2).
-- Multi-channel tracker playback (one `notes` list per channel).
-- `@sfx("file.nsf")` / `@music("file.ftm")` asset directives — neither the
-  NSF nor the FamiTracker format is parsed yet.
-- Per-note pitch changes within a sfx (currently `pitch` latches once at
-  trigger time).
+- **DMC channel** — delta-modulation sample playback is not wired yet.
+- **Multi-channel tracker playback** — one `notes` list per channel on
+  `music` blocks (the triangle/noise SFX are one-shot envelopes, not a
+  tracker).
+- **`@sfx("file.nsf")` / `@music("file.ftm")`** — neither the NSF nor the
+  FamiTracker format is parsed yet.
+- **Per-note pitch changes within a sfx** — `pitch` latches once at
+  trigger time.
 
 ---
 
@@ -98,16 +110,23 @@ elides the whole subsystem when no program statement references it.
 
 **What ships today.** `debug.log(...)` and `debug.assert(...)` lower to $4800
 writes when `--debug` is passed, and are stripped entirely in release builds.
+`--symbols <path>` writes a Mesen-compatible `.mlb` file listing function,
+state-handler, and variable addresses (with PRG ROM offsets for code and
+CPU addresses for RAM). `--source-map <path>` consumes the `SourceLoc` IR
+op and writes a plain-text map of `<rom_offset> <file_id> <line> <col>`
+entries for every lowered statement. Debug builds emit array bounds checks
+(CMP against size, BCC past a `JMP __debug_halt` wedge) and bump an
+overrun counter at `$07FF` in the NMI handler when the main loop didn't
+reach `wait_frame` before the next vblank.
 
-**Not yet implemented.**
-- Mesen-compatible symbol export (`.mlb` / `.sym` files) — the CLI does not
-  emit them, and the previous `DebugSymbols` helper was removed as dead code
-  during cleanup.
-- Source maps relating ROM addresses to source lines — the `SourceLoc`
-  IR op exists but is not consumed by the linker or CLI.
-- Array bounds checking in debug mode.
-- Frame overrun detection (cycles-per-frame counting).
-- `debug.overlay(x, y, text)` — needs the text/HUD subsystem above.
+**Still TODO.**
+- **`debug.overlay(x, y, text)`** — needs the text/HUD subsystem (see
+  Language feature gaps).
+- **Richer frame overrun telemetry** — today a single counter is bumped.
+  A `debug.frame_overrun_count()` builtin that exposes the counter to user
+  code, plus a per-frame "did this frame overrun" bit for
+  `debug.assert!(no_overrun)`-style guards, would make the data more
+  actionable.
 
 ---
 
@@ -126,16 +145,6 @@ The slot recycler is function-local per-block. Temps that flow across block
 boundaries get a dedicated slot for the entire function, even if a later
 block could reuse the slot.
 
-### `--no-opt` flag
-
-There is no way to disable the optimizer from the CLI. Adding one would make
-optimizer-introduced bugs easier to bisect.
-
-### Compilation benchmarks
-
-Compilation is fast (<100 ms for every example today) but has no `cargo
-bench` harness, so regressions would slip through.
-
 ### WASM build target
 
 To build a browser IDE we would need to route file I/O through a trait so the
@@ -152,24 +161,6 @@ parser's preprocess pass and the asset resolver read files directly.
 were placeholder variants (`E0202` invalid cast, `E0403` unreachable state)
 marked `#[allow(dead_code)]`; those were removed during cleanup. If those
 semantics come back, add the codes at that point.
-
-### Missing diagnostics
-
-- No warning for implicit-drop of a function return value (`my_fun()` at
-  statement position when `my_fun` returns non-void).
-- `W0102` ("loop without yield") is only emitted for bare `loop`, not for
-  `while true` or `loop { if cond { continue } }`.
-- No warning for `fast` variables that never justify the zero-page slot
-  (could cross-reference access counts).
-- No warning when a `palette` declaration has inconsistent "index 0" bytes
-  across its eight sub-palettes. The NES hardware mirrors `$3F10/$3F14/
-  $3F18/$3F1C` onto `$3F00/$3F04/$3F08/$3F0C`, so writing the full 32-byte
-  blob sequentially causes the last four "sprite sub-palette 0" bytes to
-  overwrite the background universal colour; the fix is a user-side
-  convention (every sub-palette's first byte equals the chosen universal
-  colour) but the analyzer doesn't warn when a declaration violates it.
-  The mistake produced a solid-black screen in `examples/platformer.ne`
-  until it was chased down by hand.
 
 ---
 
