@@ -3,14 +3,10 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use nescript::analyzer;
-use nescript::assets;
 use nescript::assets::{BackgroundData, PaletteData};
-use nescript::codegen::IrCodeGen;
 use nescript::errors::render_diagnostics;
-use nescript::ir;
-use nescript::linker::{render_mlb, render_source_map, BankTrampoline, LinkedRom, Linker, PrgBank};
-use nescript::optimizer;
-use nescript::parser::ast::BankType;
+use nescript::linker::{render_mlb, render_source_map, LinkedRom};
+use nescript::pipeline::{compile_source, CompileError, CompileOptions as PipelineOptions};
 
 #[derive(Parser)]
 #[command(name = "nescript", about = "NEScript compiler — NES game development")]
@@ -341,216 +337,84 @@ struct CompileOptions {
 }
 
 fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
-    let debug = opts.debug;
-    let asm_dump = opts.asm_dump;
-    let dump_ir = opts.dump_ir;
-    let memory_map = opts.memory_map;
-    let call_graph = opts.call_graph;
-    let no_opt = opts.no_opt;
-    let symbols_path = opts.symbols.as_ref();
-    let source_map_path = opts.source_map.as_ref();
+    // File I/O + preprocessing lives here so the pipeline module
+    // itself doesn't need to touch `std::fs`. That keeps the
+    // pipeline usable from a future WASM host that routes asset
+    // reads through a trait.
     let raw_source = std::fs::read_to_string(input).map_err(|e| {
         eprintln!("error: failed to read {}: {e}", input.display());
     })?;
-
-    // Preprocess: inline include directives
     let source = nescript::parser::preprocess_source(&raw_source, Some(input)).map_err(|e| {
         eprintln!("error: {e}");
     })?;
-
     let filename = input.to_string_lossy();
-
-    // Parse
-    let (program, parse_diags) = nescript::parser::parse(&source);
-    if !parse_diags.is_empty() {
-        render_diagnostics(&source, &filename, &parse_diags);
-    }
-    if parse_diags
-        .iter()
-        .any(nescript::errors::Diagnostic::is_error)
-    {
-        return Err(());
-    }
-    let program = program.ok_or(())?;
-
-    // Analyze
-    let analysis = analyzer::analyze(&program);
-    if !analysis.diagnostics.is_empty() {
-        render_diagnostics(&source, &filename, &analysis.diagnostics);
-    }
-    if analysis
-        .diagnostics
-        .iter()
-        .any(nescript::errors::Diagnostic::is_error)
-    {
-        return Err(());
-    }
-
-    // IR lowering and (optionally) optimization. `--no-opt` skips
-    // the IR optimizer pass entirely so optimizer-introduced
-    // miscompiles can be bisected against the unoptimized output.
-    let mut ir_program = ir::lower(&program, &analysis);
-    if !no_opt {
-        optimizer::optimize(&mut ir_program);
-    }
-
-    if dump_ir {
-        print!("{}", ir_program.pretty());
-    }
-
-    if call_graph {
-        print_call_graph(&analysis);
-    }
-
-    // Resolve sprite assets (CHR data + tile indices) relative to the
-    // source file's directory, so `@binary` / `@chr` paths work naturally.
     let source_dir = input.parent().unwrap_or_else(|| Path::new("."));
-    let sprites = assets::resolve_sprites(&program, source_dir).map_err(|e| {
-        eprintln!("error: {e}");
-    })?;
 
-    // Resolve audio assets: user-declared sfx/music plus any
-    // builtins referenced via `play foo` / `start_music bar` for
-    // names that aren't in the program's sfx/music declarations.
-    let sfx = assets::resolve_sfx(&program).map_err(|e| {
-        eprintln!("error: {e}");
-    })?;
-    let music = assets::resolve_music(&program).map_err(|e| {
-        eprintln!("error: {e}");
-    })?;
-
-    // Resolve palette and background declarations into fixed-size
-    // ROM data blobs. These are purely compile-time — either the
-    // parser handed us an inline byte array, or the declaration
-    // named a PNG to decode relative to the source file's directory
-    // (`@palette("art/main.png")` / `@nametable("levels/1.png")`).
-    let palettes = assets::resolve_palettes(&program, source_dir).map_err(|e| {
-        eprintln!("error: {e}");
-    })?;
-    let backgrounds = assets::resolve_backgrounds(&program, source_dir).map_err(|e| {
-        eprintln!("error: {e}");
-    })?;
-
-    // IR-based code generation. Lower → optimize → emit 6502.
-    //
-    // We hold on to the codegen after `generate()` because it
-    // carries the source-location marker list — one entry per
-    // `SourceLoc` IR op — which the CLI reads to emit a source
-    // map. Dropping the codegen before then would throw that
-    // metadata away. Source-marker emission is opt-in (the label
-    // pseudo-ops shift peephole block boundaries, which would
-    // flip release-mode ROM bytes if it was always on) — so we
-    // only enable it when the user actually asked for a source
-    // map on the command line.
-    let emit_source_map = source_map_path.is_some();
-    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
-        .with_sprites(&sprites)
-        .with_audio(&sfx, &music)
-        .with_debug(debug)
-        .with_source_map(emit_source_map);
-    let mut instructions = codegen.generate(&ir_program);
-
-    // Peephole pass: cleans up the IR codegen's temp-heavy output —
-    // dead stores, redundant loads, short-branch folds, etc.
-    nescript::codegen::peephole::optimize(&mut instructions);
-
-    if asm_dump {
-        dump_asm(&instructions);
-    }
-
-    // Link into ROM with both graphic assets (sprite CHR) and audio
-    // assets (sfx envelopes, music note streams) spliced in. We use
-    // `Linker::with_mapper` so the iNES header's mapper byte
-    // reflects the source's `mapper:` declaration — without this
-    // the CLI always shipped mapper 0 (NROM) regardless of whether
-    // the program actually needed MMC1/MMC3 bank switching.
-    //
-    // For banked mappers (MMC1, UxROM, MMC3) we collect the
-    // declared `bank X: prg` entries and turn each into a 16 KB
-    // switchable slot. Programs that nest functions inside a
-    // `bank Foo { fun bar() { ... } }` block populate the matching
-    // slot with the IR codegen's per-bank instruction stream, plus
-    // a trampoline request for every nested function so the linker
-    // emits a `__tramp_<name>` stub in the fixed bank for each
-    // cross-bank call site. Programs without nested functions still
-    // produce empty slots, which keeps existing banked ROMs
-    // (mmc1_banked, uxrom_banked, mmc3_per_state_split) byte-for-byte
-    // identical to the pre-banked-codegen output.
-    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper)
-        .with_header(program.game.header);
-    // Run the peephole optimizer on each per-bank stream the same
-    // way we did for the fixed-bank stream. Mismatched optimization
-    // levels would only matter to programs with banked code (no
-    // existing example), but it's the right default.
-    let mut banked_streams: std::collections::HashMap<String, Vec<nescript::asm::Instruction>> =
-        codegen.banked_streams().clone();
-    for stream in banked_streams.values_mut() {
-        nescript::codegen::peephole::optimize(stream);
-    }
-    // For each declared bank, collect the trampoline requests from
-    // every banked function whose body lives in this bank. The
-    // codegen's `function_banks` map is the source of truth — but we
-    // don't expose it on the public API, so reconstruct the same
-    // mapping here by walking the IR. This keeps the linker
-    // independent of any codegen internal state beyond
-    // `banked_streams`.
-    let mut bank_trampolines: std::collections::HashMap<String, Vec<BankTrampoline>> =
-        std::collections::HashMap::new();
-    for func in &ir_program.functions {
-        if let Some(bank_name) = &func.bank {
-            bank_trampolines
-                .entry(bank_name.clone())
-                .or_default()
-                .push(BankTrampoline {
-                    tramp_label: format!("__tramp_{}", func.name),
-                    entry_label: format!("__ir_fn_{}", func.name),
-                });
+    // Hand everything else off to the shared pipeline function
+    // so the CLI, the `compile` bench, and the integration-test
+    // helper all run the same compile path. When this block
+    // needs a new feature (new flag, new output, whatever), the
+    // change lands in `pipeline::compile_source` and every
+    // caller picks it up automatically.
+    let pipeline_opts = PipelineOptions {
+        debug: opts.debug,
+        no_opt: opts.no_opt,
+        emit_source_map: opts.source_map.is_some(),
+    };
+    let out = compile_source(&source, source_dir, &pipeline_opts).map_err(|e| match e {
+        CompileError::Parse(diags) => {
+            render_diagnostics(&source, &filename, &diags);
         }
-    }
-    let switchable_banks: Vec<PrgBank> = program
-        .banks
-        .iter()
-        .filter(|b| b.bank_type == BankType::Prg)
-        .map(|b| {
-            let stream = banked_streams.remove(&b.name).unwrap_or_default();
-            let tramps = bank_trampolines.remove(&b.name).unwrap_or_default();
-            if stream.is_empty() && tramps.is_empty() {
-                PrgBank::empty(&b.name)
-            } else {
-                PrgBank::with_instructions(&b.name, stream, tramps)
-            }
-        })
-        .collect();
-    let link_result = linker.link_banked_with_ppu_detailed(
-        &instructions,
-        &sprites,
-        &sfx,
-        &music,
-        &palettes,
-        &backgrounds,
-        &switchable_banks,
-    );
+        CompileError::ParseProducedNothing => {
+            // The parser returned `None` with no diagnostics.
+            // Extremely unusual (empty input or similar) and
+            // there's nothing for the user to act on beyond a
+            // generic message.
+            eprintln!("error: parser produced no program");
+        }
+        CompileError::Analyze(diags) => {
+            render_diagnostics(&source, &filename, &diags);
+        }
+        CompileError::AssetResolution(msg) => {
+            eprintln!("error: {msg}");
+        }
+    })?;
 
-    // Memory map is reported after linking so the palette /
-    // background PRG ROM addresses are available in `link_result.labels`.
-    if memory_map {
-        print_memory_map(&analysis, Some(&link_result), &palettes, &backgrounds);
+    // Post-link CLI-only side effects: the various `--dump-*`
+    // flags and the two optional file outputs. These are not
+    // part of the pipeline because they're stdout / filesystem
+    // I/O, not compilation.
+    if opts.dump_ir {
+        print!("{}", out.ir_program.pretty());
     }
-
-    if let Some(path) = symbols_path {
-        let mlb = render_mlb(&link_result, &analysis.var_allocations);
+    if opts.call_graph {
+        print_call_graph(&out.analysis);
+    }
+    if opts.asm_dump {
+        dump_asm(&out.instructions);
+    }
+    if opts.memory_map {
+        print_memory_map(
+            &out.analysis,
+            Some(&out.link_result),
+            &out.palettes,
+            &out.backgrounds,
+        );
+    }
+    if let Some(path) = opts.symbols.as_ref() {
+        let mlb = render_mlb(&out.link_result, &out.analysis.var_allocations);
         std::fs::write(path, mlb).map_err(|e| {
             eprintln!("error: failed to write symbol file {}: {e}", path.display());
         })?;
     }
-    if let Some(path) = source_map_path {
-        let map = render_source_map(&link_result, codegen.source_locs(), &source);
+    if let Some(path) = opts.source_map.as_ref() {
+        let map = render_source_map(&out.link_result, &out.source_locs, &source);
         std::fs::write(path, map).map_err(|e| {
             eprintln!("error: failed to write source map {}: {e}", path.display());
         })?;
     }
 
-    Ok(link_result.rom)
+    Ok(out.rom)
 }
 
 fn check(input: &PathBuf) -> Result<(), ()> {

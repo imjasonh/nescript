@@ -1,30 +1,31 @@
 //! End-to-end compilation benchmarks.
 //!
 //! Each `examples/*.ne` file becomes its own Criterion group that
-//! times the full `parse → analyze → lower → optimize → codegen →
-//! peephole → link` pipeline the `nescript build` CLI runs. The goal
-//! is to catch compile-time regressions — today every example
-//! compiles in well under 100 ms, so a change that doubles that
-//! shows up as a large red bar in `cargo bench`'s output.
+//! times the full `preprocess → parse → analyze → lower →
+//! optimize → codegen → peephole → link` pipeline the `nescript
+//! build` CLI runs. The goal is to catch compile-time regressions
+//! — today every example compiles in well under 100 ms, so a
+//! change that doubles that shows up as a large red bar in
+//! `cargo bench`'s output.
 //!
 //! The harness pre-reads every source file into memory before any
 //! measurement starts. Criterion's sample iterations then run only
 //! the in-memory compile path, so disk I/O never shows up on the
 //! hot loop.
+//!
+//! The bench calls [`nescript::pipeline::compile_source`]
+//! directly so it's impossible for it to drift away from the CLI
+//! compile path — a 2026-04 regression where a hand-maintained
+//! parallel copy of the pipeline missed a new bank-switching step
+//! is exactly what this refactor prevents.
 
 use std::fs;
 use std::path::{Path, PathBuf};
 
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use nescript::analyzer;
-use nescript::assets;
-use nescript::codegen::{peephole, IrCodeGen};
-use nescript::ir;
-use nescript::linker::{BankTrampoline, Linker, PrgBank};
-use nescript::optimizer;
 use nescript::parser;
-use nescript::parser::ast::BankType;
+use nescript::pipeline::{compile_source, CompileOptions};
 
 /// Pre-loaded `.ne` source plus the directory it was read from. The
 /// directory matters because sprite `@binary` / `@chr` paths resolve
@@ -55,8 +56,12 @@ fn load_examples() -> Vec<Example> {
     entries
         .into_iter()
         .map(|path| {
-            let source = fs::read_to_string(&path)
+            let raw = fs::read_to_string(&path)
                 .unwrap_or_else(|e| panic!("failed to read {}: {e}", path.display()));
+            // Preprocess once up front (include inlining, etc.)
+            // so the hot loop never touches the filesystem.
+            let source = parser::preprocess_source(&raw, Some(&path))
+                .unwrap_or_else(|e| panic!("preprocess failed for {}: {e}", path.display()));
             let name = path
                 .file_stem()
                 .and_then(|s| s.to_str())
@@ -74,102 +79,14 @@ fn load_examples() -> Vec<Example> {
         .collect()
 }
 
-/// Run the full CLI compile pipeline on an in-memory source string.
-/// Mirrors `compile` in `src/main.rs`: parse → analyze → IR lower →
-/// optimize → IR codegen → peephole → link. Panics on any error so
-/// a regression that breaks the pipeline surfaces immediately instead
-/// of silently skewing the measurements.
+/// Run the full compile pipeline on an in-memory source string
+/// via the shared library entry point so the bench can't drift
+/// away from the CLI build path.
 fn compile_pipeline(source: &str, source_dir: &Path) -> Vec<u8> {
-    let preprocessed = parser::preprocess_source(source, None)
-        .unwrap_or_else(|e| panic!("preprocess failed: {e}"));
-
-    let (program, parse_diags) = parser::parse(&preprocessed);
-    assert!(
-        !parse_diags
-            .iter()
-            .any(nescript::errors::Diagnostic::is_error),
-        "parse errors: {parse_diags:?}"
-    );
-    let program = program.expect("parse produced no program");
-
-    let analysis = analyzer::analyze(&program);
-    assert!(
-        !analysis
-            .diagnostics
-            .iter()
-            .any(nescript::errors::Diagnostic::is_error),
-        "analysis errors: {:?}",
-        analysis.diagnostics
-    );
-
-    let mut ir_program = ir::lower(&program, &analysis);
-    optimizer::optimize(&mut ir_program);
-
-    let sprites = assets::resolve_sprites(&program, source_dir).expect("sprite resolution failed");
-    let sfx = assets::resolve_sfx(&program).expect("sfx resolution failed");
-    let music = assets::resolve_music(&program).expect("music resolution failed");
-    let palettes =
-        assets::resolve_palettes(&program, source_dir).expect("palette resolution failed");
-    let backgrounds =
-        assets::resolve_backgrounds(&program, source_dir).expect("background resolution failed");
-
-    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
-        .with_sprites(&sprites)
-        .with_audio(&sfx, &music);
-    let mut instructions = codegen.generate(&ir_program);
-    peephole::optimize(&mut instructions);
-
-    // Pull the per-bank instruction streams out of the codegen and
-    // reconstruct the trampoline requests for each banked function,
-    // mirroring the real CLI compile path in `src/main.rs`. A
-    // bench that left the switchable banks empty would panic in
-    // the assembler's fixup pass for any program that nests a
-    // function inside a `bank` block (e.g. `uxrom_user_banked`),
-    // because the `__tramp_<name>` label emitted by IR codegen
-    // would have nowhere to resolve to.
-    let mut banked_streams = codegen.banked_streams().clone();
-    for stream in banked_streams.values_mut() {
-        peephole::optimize(stream);
+    match compile_source(source, source_dir, &CompileOptions::default()) {
+        Ok(out) => out.rom,
+        Err(e) => panic!("pipeline failed: {e:?}"),
     }
-    let mut bank_trampolines: std::collections::HashMap<String, Vec<BankTrampoline>> =
-        std::collections::HashMap::new();
-    for func in &ir_program.functions {
-        if let Some(bank_name) = &func.bank {
-            bank_trampolines
-                .entry(bank_name.clone())
-                .or_default()
-                .push(BankTrampoline {
-                    tramp_label: format!("__tramp_{}", func.name),
-                    entry_label: format!("__ir_fn_{}", func.name),
-                });
-        }
-    }
-
-    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper)
-        .with_header(program.game.header);
-    let switchable_banks: Vec<PrgBank> = program
-        .banks
-        .iter()
-        .filter(|b| b.bank_type == BankType::Prg)
-        .map(|b| {
-            let stream = banked_streams.remove(&b.name).unwrap_or_default();
-            let tramps = bank_trampolines.remove(&b.name).unwrap_or_default();
-            if stream.is_empty() && tramps.is_empty() {
-                PrgBank::empty(&b.name)
-            } else {
-                PrgBank::with_instructions(&b.name, stream, tramps)
-            }
-        })
-        .collect();
-    linker.link_banked_with_ppu(
-        &instructions,
-        &sprites,
-        &sfx,
-        &music,
-        &palettes,
-        &backgrounds,
-        &switchable_banks,
-    )
 }
 
 /// Criterion entry point. One benchmark group per example so the

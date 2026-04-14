@@ -2101,60 +2101,24 @@ fn no_opt_still_produces_valid_rom() {
 /// `--symbols`, and `--source-map` paths. Returns the ROM bytes
 /// along with the rendered `.mlb` and source-map text so the
 /// integration tests can assert against the whole chain.
+///
+/// Routes through the shared [`nescript::pipeline::compile_source`]
+/// so this helper can never drift away from the CLI compile path
+/// — the bench had a hand-maintained parallel copy and it missed
+/// the bank-switching wiring in commit `2fe943b`, which is the
+/// regression that pushed us to share a single pipeline.
 fn compile_with_debug_artifacts(source: &str, debug: bool) -> (Vec<u8>, String, String) {
-    let (program, diags) = nescript::parser::parse(source);
-    assert!(
-        diags.is_empty(),
-        "unexpected parse errors: {diags:?}\nsource:\n{source}"
-    );
-    let program = program.expect("parse should succeed");
-
-    let analysis = analyzer::analyze(&program);
-    assert!(
-        analysis.diagnostics.iter().all(|d| !d.is_error()),
-        "unexpected analysis errors: {:?}",
-        analysis.diagnostics
-    );
-
-    let mut ir_program = ir::lower(&program, &analysis);
-    optimizer::optimize(&mut ir_program);
-
-    let sprites = assets::resolve_sprites(&program, Path::new("."))
-        .expect("sprite resolution should succeed");
-    let sfx = assets::resolve_sfx(&program).expect("sfx resolution should succeed");
-    let music = assets::resolve_music(&program).expect("music resolution should succeed");
-    let palettes = assets::resolve_palettes(&program, Path::new("."))
-        .expect("palette resolution should succeed");
-    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."))
-        .expect("background resolution should succeed");
-
-    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
-        .with_sprites(&sprites)
-        .with_audio(&sfx, &music)
-        .with_debug(debug)
-        .with_source_map(true);
-    let mut instructions = codegen.generate(&ir_program);
-    nescript::codegen::peephole::optimize(&mut instructions);
-
-    let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper);
-    let switchable_banks: Vec<PrgBank> = program
-        .banks
-        .iter()
-        .filter(|b| b.bank_type == BankType::Prg)
-        .map(|b| PrgBank::empty(&b.name))
-        .collect();
-    let link_result = linker.link_banked_with_ppu_detailed(
-        &instructions,
-        &sprites,
-        &sfx,
-        &music,
-        &palettes,
-        &backgrounds,
-        &switchable_banks,
-    );
-    let mlb = nescript::linker::render_mlb(&link_result, &analysis.var_allocations);
-    let map = nescript::linker::render_source_map(&link_result, codegen.source_locs(), source);
-    (link_result.rom, mlb, map)
+    use nescript::pipeline::{compile_source, CompileOptions};
+    let opts = CompileOptions {
+        debug,
+        no_opt: false,
+        emit_source_map: true,
+    };
+    let out = compile_source(source, Path::new("."), &opts)
+        .unwrap_or_else(|e| panic!("pipeline failed: {e:?}"));
+    let mlb = nescript::linker::render_mlb(&out.link_result, &out.analysis.var_allocations);
+    let map = nescript::linker::render_source_map(&out.link_result, &out.source_locs, source);
+    (out.rom, mlb, map)
 }
 
 #[test]

@@ -8,5 +8,6 @@ pub mod lexer;
 pub mod linker;
 pub mod optimizer;
 pub mod parser;
+pub mod pipeline;
 pub mod rom;
 pub mod runtime;
