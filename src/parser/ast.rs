@@ -259,6 +259,16 @@ pub struct FunDecl {
     pub return_type: Option<NesType>,
     pub body: Block,
     pub is_inline: bool,
+    /// When `Some(bank_name)`, the function was declared inside a
+    /// `bank Foo { fun ... }` block and its compiled bytes live in
+    /// the named switchable PRG bank. Calls from the fixed bank to
+    /// this function go through a generated trampoline (see
+    /// `runtime::gen_bank_trampoline`); calls from inside the same
+    /// bank stay as direct JSRs. `None` means the function lives in
+    /// the fixed bank along with the runtime, NMI/IRQ handlers, and
+    /// every state handler — the only mode prior to the user-banked
+    /// codegen work.
+    pub bank: Option<String>,
     pub span: Span,
 }
 

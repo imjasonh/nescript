@@ -78,8 +78,27 @@ pub fn analyze(program: &Program) -> AnalysisResult {
     // (`$11` flags + 2 × 3 pointer slots). Bump the user zero-page
     // start past that region so var allocation doesn't collide with
     // the runtime slots.
+    //
+    // Programs that nest user functions inside a `bank Foo { ... }`
+    // block additionally need to reserve `$10` for `ZP_BANK_CURRENT`,
+    // the slot that `__bank_select` writes the requested bank index
+    // into at every cross-bank call. Without this bump, the bank's
+    // first user variable lands on top of the same slot that
+    // `__bank_select` clobbers, producing nonsense at runtime. The
+    // bump only fires when the program actually has banked
+    // functions; programs that declare empty bank slots (the
+    // existing mmc1_banked / uxrom_banked / mmc3_per_state_split
+    // examples) keep the legacy layout because their fixed-bank
+    // user code never invokes `__bank_select`.
     let needs_ppu_update_slots = !program.palettes.is_empty() || !program.backgrounds.is_empty();
-    let next_zp_addr = if needs_ppu_update_slots { 0x18 } else { 0x10 };
+    let needs_bank_current_slot = program.functions.iter().any(|f| f.bank.is_some());
+    let next_zp_addr = if needs_ppu_update_slots {
+        0x18
+    } else if needs_bank_current_slot {
+        0x11
+    } else {
+        0x10
+    };
     let mut analyzer = Analyzer {
         symbols: HashMap::new(),
         var_allocations: Vec::new(),

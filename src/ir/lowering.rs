@@ -315,6 +315,7 @@ impl LoweringContext {
             locals: std::mem::take(&mut self.current_locals),
             param_count: fun.params.len(),
             has_return: fun.return_type.is_some(),
+            bank: fun.bank.clone(),
             source_span: fun.span,
         });
     }
@@ -377,6 +378,11 @@ impl LoweringContext {
             locals: std::mem::take(&mut self.current_locals),
             param_count: 0,
             has_return: false,
+            // State handlers always live in the fixed bank — the
+            // analyzer rejects state-handler nesting inside `bank`
+            // blocks because the NMI dispatcher and reset path JSR
+            // into them directly without going through a trampoline.
+            bank: None,
             source_span: state.span,
         });
     }

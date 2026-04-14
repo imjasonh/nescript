@@ -1480,34 +1480,36 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
 
 /// Generate a cross-bank trampoline stub. Placed in the fixed bank
 /// and called by user code (also in the fixed bank) via
-/// `JSR __tramp_<bank_name>`. Behavior:
+/// `JSR <tramp_label>`. Behavior:
 ///
-///   1. Save the caller's bank number (always the fixed bank's index).
-///   2. Load the target bank number into A, JSR `__bank_select`.
-///   3. JSR the entry label in the target bank.
-///   4. Load the fixed bank number, JSR `__bank_select` to restore.
-///   5. RTS.
+///   1. Load the target bank number into A, JSR `__bank_select`.
+///   2. JSR the user-supplied entry label inside the target bank.
+///   3. Load the fixed bank number, JSR `__bank_select` to restore.
+///   4. RTS.
 ///
-/// `bank_name` is the user-declared bank name from the `.ne` source.
-/// `entry_label` is the label inside that bank the trampoline
-/// should call (conventionally `__bank_<name>_entry`). `bank_index`
-/// is the physical bank number. `fixed_bank_index` is the physical
-/// bank number of the fixed bank (always `total_banks - 1`).
+/// `tramp_label` is the label that callers will JSR (the IR codegen
+/// emits `JSR __tramp_<fn_name>` at every cross-bank call site).
+/// `entry_label` is the label inside the target bank that holds the
+/// callee's first instruction — conventionally `__ir_fn_<fn_name>`,
+/// the same label IR codegen would have emitted for an in-bank call.
+/// `bank_index` is the physical PRG bank number of the target bank.
+/// `fixed_bank_index` is the physical bank number of the fixed bank
+/// (always `total_banks - 1`).
 #[must_use]
 pub fn gen_bank_trampoline(
-    bank_name: &str,
+    tramp_label: &str,
     entry_label: &str,
     bank_index: u8,
     fixed_bank_index: u8,
 ) -> Vec<Instruction> {
     let mut out = Vec::new();
-    let tramp_label = format!("__tramp_{bank_name}");
-    out.push(Instruction::new(NOP, AM::Label(tramp_label)));
+    out.push(Instruction::new(NOP, AM::Label(tramp_label.to_string())));
     // Switch to target bank.
     out.push(Instruction::new(LDA, AM::Immediate(bank_index)));
     out.push(Instruction::new(JSR, AM::Label("__bank_select".into())));
     // Call the user's entry point in that bank. The label lives in
-    // the switchable bank and is resolved during banked assembly.
+    // the switchable bank and is resolved by the linker after the
+    // banked code is assembled.
     out.push(Instruction::new(JSR, AM::Label(entry_label.to_string())));
     // Restore the fixed bank.
     out.push(Instruction::new(LDA, AM::Immediate(fixed_bank_index)));

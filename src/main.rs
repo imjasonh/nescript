@@ -8,7 +8,7 @@ use nescript::assets::{BackgroundData, PaletteData};
 use nescript::codegen::IrCodeGen;
 use nescript::errors::render_diagnostics;
 use nescript::ir;
-use nescript::linker::{render_mlb, render_source_map, LinkedRom, Linker, PrgBank};
+use nescript::linker::{render_mlb, render_source_map, BankTrampoline, LinkedRom, Linker, PrgBank};
 use nescript::optimizer;
 use nescript::parser::ast::BankType;
 
@@ -466,19 +466,60 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     // the program actually needed MMC1/MMC3 bank switching.
     //
     // For banked mappers (MMC1, UxROM, MMC3) we collect the
-    // declared `bank X: prg` entries and turn each into an empty
-    // 16 KB switchable slot. User code currently still lives in
-    // the fixed bank — the declared banks exist so programs that
-    // outgrow 16 KB have real ROM space to grow into and so
-    // mapper-specific fixtures (vectors, trampolines, bank-select
-    // helpers) land in the right place.
+    // declared `bank X: prg` entries and turn each into a 16 KB
+    // switchable slot. Programs that nest functions inside a
+    // `bank Foo { fun bar() { ... } }` block populate the matching
+    // slot with the IR codegen's per-bank instruction stream, plus
+    // a trampoline request for every nested function so the linker
+    // emits a `__tramp_<name>` stub in the fixed bank for each
+    // cross-bank call site. Programs without nested functions still
+    // produce empty slots, which keeps existing banked ROMs
+    // (mmc1_banked, uxrom_banked, mmc3_per_state_split) byte-for-byte
+    // identical to the pre-banked-codegen output.
     let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper)
         .with_header(program.game.header);
+    // Run the peephole optimizer on each per-bank stream the same
+    // way we did for the fixed-bank stream. Mismatched optimization
+    // levels would only matter to programs with banked code (no
+    // existing example), but it's the right default.
+    let mut banked_streams: std::collections::HashMap<String, Vec<nescript::asm::Instruction>> =
+        codegen.banked_streams().clone();
+    for stream in banked_streams.values_mut() {
+        nescript::codegen::peephole::optimize(stream);
+    }
+    // For each declared bank, collect the trampoline requests from
+    // every banked function whose body lives in this bank. The
+    // codegen's `function_banks` map is the source of truth — but we
+    // don't expose it on the public API, so reconstruct the same
+    // mapping here by walking the IR. This keeps the linker
+    // independent of any codegen internal state beyond
+    // `banked_streams`.
+    let mut bank_trampolines: std::collections::HashMap<String, Vec<BankTrampoline>> =
+        std::collections::HashMap::new();
+    for func in &ir_program.functions {
+        if let Some(bank_name) = &func.bank {
+            bank_trampolines
+                .entry(bank_name.clone())
+                .or_default()
+                .push(BankTrampoline {
+                    tramp_label: format!("__tramp_{}", func.name),
+                    entry_label: format!("__ir_fn_{}", func.name),
+                });
+        }
+    }
     let switchable_banks: Vec<PrgBank> = program
         .banks
         .iter()
         .filter(|b| b.bank_type == BankType::Prg)
-        .map(|b| PrgBank::empty(&b.name))
+        .map(|b| {
+            let stream = banked_streams.remove(&b.name).unwrap_or_default();
+            let tramps = bank_trampolines.remove(&b.name).unwrap_or_default();
+            if stream.is_empty() && tramps.is_empty() {
+                PrgBank::empty(&b.name)
+            } else {
+                PrgBank::with_instructions(&b.name, stream, tramps)
+            }
+        })
         .collect();
     let link_result = linker.link_banked_with_ppu_detailed(
         &instructions,

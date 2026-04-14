@@ -741,10 +741,12 @@ fn trampoline_switches_target_then_restores_fixed() {
     // A trampoline must JSR `__bank_select` twice: once with the
     // target bank's index, once with the fixed bank's index. The
     // two LDA immediates in the stub should match those two bank
-    // numbers in order.
-    let t = gen_bank_trampoline("Level1", "__bank_Level1_entry", 0, 3);
+    // numbers in order. The trampoline name is the label callers
+    // will JSR (one trampoline per banked function); the entry
+    // label is whatever lives in the switchable bank.
+    let t = gen_bank_trampoline("__tramp_helper", "__ir_fn_helper", 0, 3);
     // First instruction is the trampoline label.
-    assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_Level1"));
+    assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_helper"));
     // Extract the sequence of immediate loads.
     let imms: Vec<u8> = t
         .iter()
@@ -772,7 +774,7 @@ fn trampoline_switches_target_then_restores_fixed() {
         .collect();
     assert_eq!(
         jsrs,
-        vec!["__bank_select", "__bank_Level1_entry", "__bank_select"],
+        vec!["__bank_select", "__ir_fn_helper", "__bank_select"],
         "trampoline JSRs must dispatch in the correct order"
     );
     // Final instruction returns to caller.
@@ -780,11 +782,14 @@ fn trampoline_switches_target_then_restores_fixed() {
 }
 
 #[test]
-fn trampoline_label_derives_from_bank_name() {
-    // Trampoline labels are consistently named `__tramp_<bank>` so
-    // codegen can reference them without knowing bank indices.
-    let t = gen_bank_trampoline("MusicData", "__music_entry", 1, 3);
-    assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_MusicData"));
+fn trampoline_label_uses_caller_supplied_name() {
+    // The codegen picks the trampoline label (typically
+    // `__tramp_<fn_name>`) so it can JSR it from the call site
+    // without knowing bank indices. `gen_bank_trampoline` should
+    // emit that exact label as its leading pseudo-op so the
+    // assembler resolves the JSR.
+    let t = gen_bank_trampoline("__tramp_big_helper", "__ir_fn_big_helper", 1, 3);
+    assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_big_helper"));
 }
 
 #[test]

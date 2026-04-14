@@ -155,6 +155,26 @@ pub struct IrCodeGen<'a> {
     /// failing checks all land on the same debug marker. Skipped
     /// entirely in release builds.
     bounds_halt_used: bool,
+    /// Per-banked-function instruction streams, populated by
+    /// [`Self::generate`] when a program declares one or more
+    /// `bank Foo { fun ... }` blocks. The key is the bank name; the
+    /// value is the assembled IR codegen output for every function
+    /// assigned to that bank, ready to be handed to the linker as a
+    /// `PrgBank::with_instructions` payload. Empty for programs
+    /// without any banked user code, which keeps the codegen output
+    /// byte-for-byte identical to the pre-banked behaviour.
+    banked_streams: HashMap<String, Vec<Instruction>>,
+    /// Function name → declared bank name, populated from the IR
+    /// functions' `bank` field. Used to decide whether a `Call` op
+    /// should JSR the direct `__ir_fn_<name>` label or the cross-bank
+    /// trampoline `__tramp_<name>` label.
+    function_banks: HashMap<String, String>,
+    /// While [`Self::generate`] is emitting code for a banked
+    /// function, this holds the bank name so cross-bank calls can be
+    /// disambiguated from in-bank calls. `None` means the codegen is
+    /// currently emitting fixed-bank code (handlers, runtime, the
+    /// dispatcher loop, top-level functions).
+    current_bank: Option<String>,
     allocations: &'a [VarAllocation],
 }
 
@@ -211,6 +231,18 @@ impl<'a> IrCodeGen<'a> {
             }
         }
         let function_names = ir.functions.iter().map(|f| f.name.clone()).collect();
+        // Build the function-name → bank-name map from the IR. Most
+        // programs have an empty map (no `bank Foo { fun ... }`
+        // blocks); when populated, the codegen splits banked
+        // function bodies into per-bank instruction streams and
+        // rewrites `Call` ops to JSR a fixed-bank trampoline when
+        // they cross bank boundaries.
+        let mut function_banks: HashMap<String, String> = HashMap::new();
+        for func in &ir.functions {
+            if let Some(bank) = &func.bank {
+                function_banks.insert(func.name.clone(), bank.clone());
+            }
+        }
         Self {
             instructions: Vec::new(),
             var_addrs,
@@ -234,8 +266,23 @@ impl<'a> IrCodeGen<'a> {
             emit_source_locs: false,
             var_sizes,
             bounds_halt_used: false,
+            banked_streams: HashMap::new(),
+            function_banks,
+            current_bank: None,
             allocations,
         }
+    }
+
+    /// Per-banked-function instruction streams produced by the most
+    /// recent [`Self::generate`] call. The map is keyed by bank name
+    /// (matching the program's `bank Foo { ... }` declarations) and
+    /// each value is ready to be handed to the linker as a
+    /// `PrgBank::with_instructions` payload. Empty for programs with
+    /// no banked code, in which case the linker treats every bank
+    /// as the legacy "reserved slot" mode.
+    #[must_use]
+    pub fn banked_streams(&self) -> &HashMap<String, Vec<Instruction>> {
+        &self.banked_streams
     }
 
     /// Enable source-location marker emission. When set, each
@@ -600,8 +647,15 @@ impl<'a> IrCodeGen<'a> {
         }
         self.emit(JMP, AM::Label(main_loop));
 
-        // 4. Emit each function body (state handlers + user functions)
+        // 4. Emit each fixed-bank function body (state handlers +
+        // top-level user functions). Functions tagged with `bank:
+        // Some(name)` belong to a switchable bank and are emitted
+        // separately into `self.banked_streams` after the fixed-bank
+        // pass finishes — see the loop further down.
         for func in &ir.functions {
+            if func.bank.is_some() {
+                continue;
+            }
             self.gen_function(func);
         }
 
@@ -645,7 +699,40 @@ impl<'a> IrCodeGen<'a> {
             self.emit(JMP, AM::Label("__debug_halt".to_string()));
         }
 
-        std::mem::take(&mut self.instructions)
+        // Snapshot the fixed-bank instruction stream before we
+        // start emitting the banked function bodies into their own
+        // streams. Programs without any banked functions skip the
+        // banked-emission loop entirely so the codegen output is
+        // byte-for-byte identical to the pre-banked behaviour.
+        let fixed_instructions = std::mem::take(&mut self.instructions);
+
+        // 6. For each function tagged with a bank, redirect emission
+        // into a fresh per-bank instruction stream and call
+        // `gen_function`. The streams are keyed by bank name and
+        // collected into `self.banked_streams` for the linker to
+        // pick up via [`Self::banked_streams`].
+        for func in &ir.functions {
+            let Some(bank_name) = func.bank.clone() else {
+                continue;
+            };
+            // Pull the existing stream for this bank (if any) out
+            // of the map so subsequent functions in the same bank
+            // accumulate into one contiguous stream. The first
+            // function in a bank starts with an empty Vec.
+            let prev = self.banked_streams.remove(&bank_name).unwrap_or_default();
+            let prior_instrs = std::mem::replace(&mut self.instructions, prev);
+            self.current_bank = Some(bank_name.clone());
+            self.gen_function(func);
+            self.current_bank = None;
+            // Move the per-bank stream back into the map and
+            // restore whatever instruction buffer was active when
+            // we entered this iteration (always empty in the
+            // current pipeline, but we restore it for symmetry).
+            let bank_stream = std::mem::replace(&mut self.instructions, prior_instrs);
+            self.banked_streams.insert(bank_name, bank_stream);
+        }
+
+        fixed_instructions
     }
 
     fn gen_function(&mut self, func: &IrFunction) {
@@ -883,7 +970,46 @@ impl<'a> IrCodeGen<'a> {
                     self.load_temp(*arg);
                     self.emit(STA, AM::ZeroPage(0x04 + i as u8));
                 }
-                self.emit(JSR, AM::Label(format!("__ir_fn_{name}")));
+                // Pick the right JSR target. Three cases:
+                //   1. Callee is in the fixed bank (most common):
+                //      JSR `__ir_fn_<name>` — the original behaviour.
+                //   2. Callee is in a switchable bank and the caller
+                //      is in the fixed bank: JSR `__tramp_<name>`,
+                //      the linker-emitted trampoline that switches
+                //      banks, calls the body, then switches back.
+                //   3. Caller and callee live in the same switchable
+                //      bank: direct JSR to `__ir_fn_<name>` works
+                //      because both labels exist in the bank's own
+                //      assembler pass.
+                //
+                // Cross-bank calls between two different switchable
+                // banks aren't supported in the first pass — the
+                // codegen panics rather than silently miscompiling.
+                let callee_bank = self.function_banks.get(name).cloned();
+                let label = match (&self.current_bank, &callee_bank) {
+                    (None, None) => format!("__ir_fn_{name}"),
+                    (None, Some(_)) => format!("__tramp_{name}"),
+                    (Some(from_bank), Some(to_bank)) if from_bank == to_bank => {
+                        format!("__ir_fn_{name}")
+                    }
+                    (Some(from_bank), Some(to_bank)) => {
+                        panic!(
+                            "cross-bank call from bank '{from_bank}' to '{to_bank}' \
+                             is not supported (function '{name}'); only fixed-bank \
+                             callers can invoke banked functions in the v1 \
+                             user-banked codegen"
+                        );
+                    }
+                    (Some(_), None) => {
+                        // Banked function calls a fixed-bank function.
+                        // The fixed bank is always mapped at $C000-$FFFF
+                        // so a direct JSR works without a trampoline —
+                        // no bank-switching needed because we're already
+                        // calling into the always-mapped window.
+                        format!("__ir_fn_{name}")
+                    }
+                };
+                self.emit(JSR, AM::Label(label));
                 if let Some(d) = dest {
                     // Return value is in A
                     self.store_temp(*d);

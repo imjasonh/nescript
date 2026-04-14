@@ -178,7 +178,15 @@ impl Parser {
                     music.push(self.parse_music_decl()?);
                 }
                 TokenKind::KwBank => {
-                    banks.push(self.parse_bank_decl()?);
+                    let (bank, nested_funs) = self.parse_bank_decl()?;
+                    banks.push(bank);
+                    // Functions declared inside a `bank Foo { ... }`
+                    // body land in the program's flat function list
+                    // tagged with `bank: Some("Foo")`. The analyzer
+                    // and the rest of the pipeline can then treat
+                    // them uniformly while still knowing which bank
+                    // each one belongs to.
+                    functions.extend(nested_funs);
                 }
                 TokenKind::KwOn => {
                     // Top-level `on frame` — implicit single state for M1
@@ -518,6 +526,11 @@ impl Parser {
             return_type,
             body,
             is_inline,
+            // Bank tagging happens after the function is parsed —
+            // top-level `fun` declarations leave it `None`, while
+            // nested `bank Foo { fun bar() ... }` bodies overwrite
+            // it to `Some("Foo")` on the way out of `parse_bank_decl`.
+            bank: None,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
@@ -610,29 +623,112 @@ impl Parser {
     }
 
     // ── Bank declaration ──
+    //
+    // Two forms are accepted:
+    //
+    //   bank Foo: prg
+    //   bank Foo: chr
+    //
+    //     The "type-only" form. Reserves a 16 KB switchable PRG slot
+    //     or claims a CHR bank. No body — used to declare named slots
+    //     that the linker pads with $FF and that user code can grow
+    //     into later.
+    //
+    //   bank Foo { fun bar() { ... } fun baz() { ... } }
+    //
+    //     The "nested-decls" form. The body holds zero or more
+    //     function declarations whose code lands inside the named
+    //     PRG bank instead of the fixed bank. Functions declared
+    //     here are pushed onto `Program.functions` like any other
+    //     function but tagged with `bank: Some("Foo")` so the
+    //     codegen + linker know where to put them.
+    //
+    //     The bank type is implicitly `prg` — there's no syntax for
+    //     CHR-bank function nesting because CHR is data, not code.
+    //     A bank declared this way can later be referenced from a
+    //     fixed-bank function via a normal call expression; the
+    //     codegen emits a trampoline in the fixed bank that switches
+    //     banks and JSRs into the target.
 
-    fn parse_bank_decl(&mut self) -> Result<BankDecl, Diagnostic> {
+    /// Parse one bank declaration. Returns the [`BankDecl`] and a
+    /// vector of any function declarations nested inside the bank
+    /// body (empty for the type-only form). The caller appends the
+    /// nested functions to the program's flat function list, tagging
+    /// each one with `bank: Some(name)` so the rest of the pipeline
+    /// can treat them like any other function.
+    fn parse_bank_decl(&mut self) -> Result<(BankDecl, Vec<FunDecl>), Diagnostic> {
         let start = self.current_span();
         self.expect(&TokenKind::KwBank)?;
         let (name, _) = self.expect_ident()?;
-        self.expect(&TokenKind::Colon)?;
-        let (type_str, _) = self.expect_ident()?;
-        let bank_type = match type_str.as_str() {
-            "prg" => BankType::Prg,
-            "chr" => BankType::Chr,
-            _ => {
-                return Err(Diagnostic::error(
-                    ErrorCode::E0201,
-                    format!("expected 'prg' or 'chr', found '{type_str}'"),
-                    self.current_span(),
-                ));
+        // Disambiguate between the two forms based on the next token.
+        // `:` introduces the bank type, `{` introduces a nested-decls
+        // body. Anything else is a parse error.
+        match self.peek() {
+            TokenKind::Colon => {
+                self.advance();
+                let (type_str, _) = self.expect_ident()?;
+                let bank_type = match type_str.as_str() {
+                    "prg" => BankType::Prg,
+                    "chr" => BankType::Chr,
+                    _ => {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!("expected 'prg' or 'chr', found '{type_str}'"),
+                            self.current_span(),
+                        ));
+                    }
+                };
+                Ok((
+                    BankDecl {
+                        name,
+                        bank_type,
+                        span: Span::new(start.file_id, start.start, self.current_span().end),
+                    },
+                    Vec::new(),
+                ))
             }
-        };
-        Ok(BankDecl {
-            name,
-            bank_type,
-            span: Span::new(start.file_id, start.start, self.current_span().end),
-        })
+            TokenKind::LBrace => {
+                self.advance();
+                let mut funs = Vec::new();
+                while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+                    match self.peek() {
+                        TokenKind::KwFun | TokenKind::KwInline => {
+                            let mut fun = self.parse_fun_decl()?;
+                            fun.bank = Some(name.clone());
+                            funs.push(fun);
+                        }
+                        _ => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!(
+                                    "unexpected token '{}' inside bank body; only function \
+                                     declarations are supported",
+                                    self.peek()
+                                ),
+                                self.current_span(),
+                            ));
+                        }
+                    }
+                }
+                self.expect(&TokenKind::RBrace)?;
+                Ok((
+                    BankDecl {
+                        name,
+                        bank_type: BankType::Prg,
+                        span: Span::new(start.file_id, start.start, self.current_span().end),
+                    },
+                    funs,
+                ))
+            }
+            _ => Err(Diagnostic::error(
+                ErrorCode::E0201,
+                format!(
+                    "expected ':' or '{{' after bank name, found '{}'",
+                    self.peek()
+                ),
+                self.current_span(),
+            )),
+        }
     }
 
     // ── Top-level on frame ──

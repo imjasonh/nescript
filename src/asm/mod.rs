@@ -14,6 +14,61 @@ pub fn assemble(instructions: &[Instruction], base_address: u16) -> AssembleResu
     assembler.assemble(instructions)
 }
 
+/// Assemble like [`assemble`], but seed the assembler's label table
+/// with externally-resolved labels first. Labels passed in are visible
+/// to fixups in this assembly pass even though they're never defined
+/// inside `instructions` — useful for cross-bank linking, where the
+/// fixed bank's `JSR __ir_fn_foo` needs to resolve a label that lives
+/// in a separately-assembled switchable bank.
+///
+/// Definitions inside `instructions` shadow any seeded label of the
+/// same name. The returned `labels` map contains both the seeded
+/// entries and any labels defined in this pass — callers can use it
+/// as the merged symbol table for symbol-file emission.
+pub fn assemble_with_labels<S: std::hash::BuildHasher>(
+    instructions: &[Instruction],
+    base_address: u16,
+    seed_labels: &HashMap<String, u16, S>,
+) -> AssembleResult {
+    let mut assembler = Assembler::new(base_address);
+    for (name, addr) in seed_labels {
+        assembler.labels.insert(name.clone(), *addr);
+    }
+    assembler.assemble(instructions)
+}
+
+/// Discovery-only assembly pass for cross-bank linking. Walks
+/// `instructions` once, producing the label table (each label's
+/// address inside the `base_address`-aligned window) and the raw
+/// byte stream — but **skips fixup resolution entirely**. This lets
+/// the linker discover what labels live inside a switchable bank
+/// before the fixed bank has been assembled, without panicking on
+/// fixups that reference still-unknown fixed-bank labels.
+///
+/// Use [`assemble_with_labels`] for the final pass once the merged
+/// label table is available; the discovery output is throwaway.
+pub fn assemble_discover_labels<S: std::hash::BuildHasher>(
+    instructions: &[Instruction],
+    base_address: u16,
+    seed_labels: &HashMap<String, u16, S>,
+) -> AssembleResult {
+    let mut assembler = Assembler::new(base_address);
+    for (name, addr) in seed_labels {
+        assembler.labels.insert(name.clone(), *addr);
+    }
+    // First pass only — no fixup resolution. We still emit bytes so
+    // the per-instruction sizes are correct (label addresses are
+    // computed from the running output length), but unresolved
+    // label fixups stay as zero-byte placeholders.
+    for inst in instructions {
+        assembler.emit_instruction(inst);
+    }
+    AssembleResult {
+        bytes: assembler.output.clone(),
+        labels: assembler.labels.clone(),
+    }
+}
+
 /// Assemble a single instruction into bytes (no label resolution).
 pub fn assemble_instruction(opcode: Opcode, mode: &AddressingMode) -> Option<Vec<u8>> {
     let op = opcodes::encode(opcode, mode)?;
