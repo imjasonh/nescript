@@ -311,6 +311,72 @@ impl Analyzer {
             }
         }
 
+        // Validate sfx declarations' channel-specific constraints.
+        // Triangle has no volume register so `volume:` is treated as
+        // a per-frame hold flag (nonzero = sustain, zero = release);
+        // duty bits are also meaningless for triangle and noise.
+        // Pulse 2 is rejected outright on sfx declarations because
+        // the pulse-2 channel is owned by the music driver.
+        for decl in &program.sfx {
+            match decl.channel {
+                Channel::Pulse1 => {}
+                Channel::Pulse2 => {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!(
+                            "sfx '{}' targets pulse2, which is reserved for the music driver",
+                            decl.name
+                        ),
+                        decl.span,
+                    ));
+                }
+                Channel::Triangle => {
+                    // Parser default `duty` is 2, so only flag
+                    // explicit non-default values. This keeps the
+                    // common `channel: triangle, pitch: N, volume: [..]`
+                    // form warning-free.
+                    if decl.duty != 2 {
+                        self.diagnostics.push(Diagnostic::warning(
+                            ErrorCode::W0107,
+                            format!(
+                                "sfx '{}' targets triangle; 'duty' has no effect on this channel",
+                                decl.name
+                            ),
+                            decl.span,
+                        ));
+                    }
+                }
+                Channel::Noise => {
+                    if decl.duty != 2 {
+                        self.diagnostics.push(Diagnostic::warning(
+                            ErrorCode::W0107,
+                            format!(
+                                "sfx '{}' targets noise; 'duty' has no effect on this channel",
+                                decl.name
+                            ),
+                            decl.span,
+                        ));
+                    }
+                    // Noise pitch is a 4-bit period-table index plus
+                    // an optional "mode" bit in position 7. Any other
+                    // bits set is a user mistake.
+                    for p in &decl.pitch {
+                        if *p & !0x8F != 0 {
+                            self.diagnostics.push(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!(
+                                    "sfx '{}' noise pitch {:#04x} has bits outside the valid range (low 4 bits index + optional bit 7 mode)",
+                                    decl.name, p
+                                ),
+                                decl.span,
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         // Register functions as symbols
         for fun in &program.functions {
             self.register_fun(fun);

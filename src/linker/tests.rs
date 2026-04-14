@@ -1,6 +1,6 @@
 use super::*;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
-use crate::parser::ast::{Mapper, Mirroring};
+use crate::parser::ast::{Channel, Mapper, Mirroring};
 use crate::rom;
 
 #[test]
@@ -187,6 +187,7 @@ fn link_with_audio_data_places_sfx_blobs_in_prg() {
         period_lo: 0x50,
         period_hi: 0x08,
         envelope: vec![0xBF, 0xB8, 0xB4, 0xB0, 0x00],
+        channel: Channel::Pulse1,
     }];
     let rom = linker.link_with_all_assets(&user_code, &[], &sfx, &[]);
     let info = rom::validate_ines(&rom).unwrap();
@@ -238,6 +239,7 @@ fn link_with_audio_resolves_sfx_pointer_references() {
         period_lo: 0x50,
         period_hi: 0x08,
         envelope: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00],
+        channel: Channel::Pulse1,
     }];
     let rom = linker.link_with_all_assets(&user_code, &[], &sfx, &[]);
     // The user code starts at RESET ($C000) after init+palette_load.
@@ -280,6 +282,7 @@ fn link_without_audio_marker_does_not_emit_period_table() {
             period_lo: 0,
             period_hi: 0,
             envelope: vec![0xAA, 0xBB, 0x00],
+            channel: Channel::Pulse1,
         }],
         &[],
     );

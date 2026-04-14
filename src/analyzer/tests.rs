@@ -998,6 +998,82 @@ fn analyze_rejects_unknown_sfx_name() {
 }
 
 #[test]
+fn analyze_accepts_noise_sfx() {
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        sfx Zap {
+            channel: noise
+            pitch: 5
+            volume: [15, 10, 5]
+        }
+        on frame { play Zap }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_accepts_triangle_sfx() {
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        sfx Bass {
+            channel: triangle
+            pitch: 60
+            volume: [1, 1, 1, 1, 1]
+        }
+        on frame { play Bass }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_rejects_pulse2_sfx() {
+    // pulse 2 is reserved for the music driver; declaring an sfx
+    // on it should be an error.
+    let codes = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        sfx Nope {
+            channel: pulse2
+            pitch: 5
+            volume: [8]
+        }
+        on frame { play Nope }
+        start Main
+    "#,
+    );
+    assert!(
+        codes.contains(&ErrorCode::E0201),
+        "expected E0201 for pulse2 sfx, got {codes:?}"
+    );
+}
+
+#[test]
+fn analyze_rejects_noise_sfx_with_out_of_range_pitch() {
+    // Noise pitch is a 4-bit period index + optional bit 7 mode.
+    // Setting bit 5 (0x20) is outside that envelope.
+    let codes = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        sfx Bad {
+            channel: noise
+            pitch: 0x20
+            volume: [8]
+        }
+        on frame { play Bad }
+        start Main
+    "#,
+    );
+    assert!(
+        codes.contains(&ErrorCode::E0201),
+        "expected E0201 for invalid noise pitch, got {codes:?}"
+    );
+}
+
+#[test]
 fn analyze_accepts_builtin_music() {
     analyze_ok(
         r#"

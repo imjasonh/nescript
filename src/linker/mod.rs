@@ -418,8 +418,10 @@ impl Linker {
         // `__audio_tick` — so we emit it alongside the math
         // routines, well before the NMI handler below.
         let has_audio = has_label(user_code, "__audio_used");
+        let has_noise = has_label(user_code, "__noise_used");
+        let has_triangle = has_label(user_code, "__triangle_used");
         if has_audio {
-            all_instructions.extend(runtime::gen_audio_tick());
+            all_instructions.extend(runtime::gen_audio_tick(has_noise, has_triangle));
             all_instructions.extend(runtime::gen_period_table());
             // Emit one data block per sfx blob: a label followed by
             // the envelope bytes. `play Name` codegen emits a

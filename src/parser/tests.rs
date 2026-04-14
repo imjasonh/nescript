@@ -790,6 +790,80 @@ fn parse_sfx_decl_rejects_duty_over_3() {
 }
 
 #[test]
+fn parse_sfx_decl_defaults_channel_to_pulse1() {
+    // Existing declarations (which never set `channel:`) should
+    // default to `Channel::Pulse1` so their codegen path is
+    // unchanged.
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Pickup {
+            duty: 2
+            pitch: [0x50, 0x48]
+            volume: [15, 8]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sfx[0].channel, crate::parser::ast::Channel::Pulse1);
+}
+
+#[test]
+fn parse_sfx_decl_with_noise_channel() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Zap {
+            channel: noise
+            pitch: 5
+            volume: [15, 10, 5]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sfx.len(), 1);
+    assert_eq!(prog.sfx[0].channel, crate::parser::ast::Channel::Noise);
+    assert_eq!(prog.sfx[0].pitch, vec![5, 5, 5]);
+    assert_eq!(prog.sfx[0].volume, vec![15, 10, 5]);
+}
+
+#[test]
+fn parse_sfx_decl_with_triangle_channel() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Bass {
+            channel: triangle
+            pitch: 60
+            volume: [1, 1, 1, 1, 1]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.sfx[0].channel, crate::parser::ast::Channel::Triangle);
+    assert_eq!(prog.sfx[0].pitch, vec![60; 5]);
+}
+
+#[test]
+fn parse_sfx_decl_rejects_unknown_channel() {
+    let src = r#"
+        game "T" { mapper: NROM }
+        sfx Bad {
+            channel: bogus
+            pitch: 5
+            volume: [8]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let (_, diags) = parse(src);
+    assert!(
+        diags.iter().any(crate::errors::Diagnostic::is_error),
+        "unknown channel name should error"
+    );
+}
+
+#[test]
 fn parse_music_decl_minimal() {
     let src = r#"
         game "T" { mapper: NROM }

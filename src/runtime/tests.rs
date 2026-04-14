@@ -195,7 +195,7 @@ fn multiply_routine_assembles() {
 
 #[test]
 fn audio_tick_defines_required_labels() {
-    let tick = gen_audio_tick();
+    let tick = gen_audio_tick(false, false);
     // The IR codegen JSRs into `__audio_tick`; that's the entry.
     let has_entry = tick
         .iter()
@@ -215,7 +215,7 @@ fn audio_tick_defines_required_labels() {
 
 #[test]
 fn audio_tick_ends_with_rts() {
-    let tick = gen_audio_tick();
+    let tick = gen_audio_tick(false, false);
     assert_eq!(
         tick.last().unwrap().opcode,
         RTS,
@@ -228,7 +228,7 @@ fn audio_tick_reads_sfx_envelope_via_indirect_y() {
     // The sfx branch walks the envelope via (ZP_SFX_PTR_LO),Y with
     // Y=0 — each NMI reads one byte through the pointer and writes
     // it to $4000. Verify the indirect-indexed load is present.
-    let tick = gen_audio_tick();
+    let tick = gen_audio_tick(false, false);
     let has_load = tick
         .iter()
         .any(|i| i.opcode == LDA && i.mode == AM::IndirectY(ZP_SFX_PTR_LO));
@@ -241,11 +241,92 @@ fn audio_tick_reads_sfx_envelope_via_indirect_y() {
 #[test]
 fn audio_tick_writes_pulse1_envelope_register() {
     // After reading the envelope byte the tick writes it to $4000.
-    let tick = gen_audio_tick();
+    let tick = gen_audio_tick(false, false);
     let has_store = tick
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4000));
     assert!(has_store, "audio tick must write pulse-1 envelope to $4000");
+}
+
+#[test]
+fn audio_tick_noise_block_writes_400c_when_enabled() {
+    // With `has_noise = true` the tick gains a block that loads an
+    // envelope byte and writes it to the APU noise volume register
+    // at $400C. Verify both the marker label and the STA $400C are
+    // present.
+    let tick = gen_audio_tick(true, false);
+    let has_label = tick
+        .iter()
+        .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_noise_tick"));
+    assert!(has_label, "noise tick should define __audio_noise_tick");
+    let has_400c = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x400C));
+    assert!(has_400c, "noise tick should write to $400C");
+}
+
+#[test]
+fn audio_tick_noise_block_absent_when_disabled() {
+    // The pulse-only path must not emit any noise label, so
+    // programs that never declare a noise sfx get byte-identical
+    // code to the pre-feature version.
+    let tick = gen_audio_tick(false, false);
+    let has_label = tick
+        .iter()
+        .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_noise_tick"));
+    assert!(
+        !has_label,
+        "noise tick label must not appear when flag is off"
+    );
+    let has_400c = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x400C));
+    assert!(
+        !has_400c,
+        "noise $400C write must not appear when flag is off"
+    );
+}
+
+#[test]
+fn audio_tick_triangle_block_writes_4008_when_enabled() {
+    let tick = gen_audio_tick(false, true);
+    let has_label = tick
+        .iter()
+        .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_triangle_tick"));
+    assert!(
+        has_label,
+        "triangle tick should define __audio_triangle_tick"
+    );
+    let has_4008 = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4008));
+    assert!(has_4008, "triangle tick should write to $4008");
+}
+
+#[test]
+fn audio_tick_triangle_block_absent_when_disabled() {
+    let tick = gen_audio_tick(false, false);
+    let has_label = tick
+        .iter()
+        .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_triangle_tick"));
+    assert!(!has_label);
+    let has_4008 = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4008));
+    assert!(!has_4008);
+}
+
+#[test]
+fn audio_tick_both_channels_assemble() {
+    // With both new channels enabled, the tick + period table must
+    // still fit its internal branches (±127 bytes) and assemble
+    // successfully.
+    let mut combined = gen_audio_tick(true, true);
+    combined.extend(gen_period_table());
+    let result = asm::assemble(&combined, 0xC000);
+    assert!(!result.bytes.is_empty());
+    assert!(result.labels.contains_key("__audio_noise_tick"));
+    assert!(result.labels.contains_key("__audio_triangle_tick"));
 }
 
 #[test]
@@ -254,7 +335,7 @@ fn audio_tick_mutes_pulse2_on_non_looping_end_of_track() {
     // tick writes $30 to $4004 and clears ZP_MUSIC_STATE. We verify
     // the mute path exists by checking both writes exist somewhere
     // in the tick body.
-    let tick = gen_audio_tick();
+    let tick = gen_audio_tick(false, false);
     let has_mute = tick
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4004));
@@ -275,7 +356,7 @@ fn audio_tick_assembles_without_error() {
     // uses label-relative branches internally which need to fit
     // within ±127 bytes — if the body grows past that the branches
     // will panic at assemble time.
-    let mut combined = gen_audio_tick();
+    let mut combined = gen_audio_tick(false, false);
     combined.extend(gen_period_table());
     let result = asm::assemble(&combined, 0xC000);
     assert!(

@@ -33,21 +33,54 @@
 //!   label `__music_<name>`, terminated by `(0xFF, 0xFF)`. Pitch 0 is
 //!   a rest; pitches 1-60 are indices into the period table.
 
-use crate::parser::ast::{MusicDecl, MusicNote, Program, SfxDecl};
+use crate::parser::ast::{Channel, MusicDecl, MusicNote, Program, SfxDecl};
 
 /// Compiled sfx data.
+///
+/// Holds both the compile-time *trigger constants* written by the
+/// `play` sequence (these depend on the destination channel) and
+/// the per-frame *envelope blob* walked by the runtime audio tick
+/// on every NMI. The envelope byte meaning also depends on the
+/// channel:
+///
+/// - Pulse 1 / Pulse 2: each byte is a complete `$4000` / `$4004`
+///   write (`DDlcvvvv` where `DD` = duty, `lc` = length-halt +
+///   constant volume, `vvvv` = volume 0-15). A trailing `0x00` is
+///   the mute sentinel.
+/// - Noise: each byte is a complete `$400C` write using the exact
+///   same `lcvvvv` encoding as pulse (the noise register has no
+///   duty bits and ignores the top two). Trailing `0x00` is again
+///   the mute sentinel.
+/// - Triangle: triangle has no volume register, so each envelope
+///   byte is instead a "linear counter reload" value for `$4008`.
+///   The runtime writes it back on every tick so held notes don't
+///   decay when the length counter underruns. The mute sentinel
+///   (`0x80` — linear counter = 0 with the control bit set) tells
+///   the runtime to silence the channel by writing `$80` to
+///   `$4008` one last time.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SfxData {
     pub name: String,
-    /// Pulse-1 period low byte, written to `$4002` by `play` as an
-    /// immediate. Determines the tone of the effect.
+    /// Low byte of the trigger register written by `play`:
+    /// - Pulse 1 / 2: `$4002` / `$4006` period low.
+    /// - Triangle: `$400A` period low.
+    /// - Noise: `$400E` period — low 4 bits select the period-table
+    ///   index; we also stash a mode bit in bit 7 but default to 0
+    ///   for tonal (non-metallic) noise.
     pub period_lo: u8,
-    /// Pulse-1 length counter + period high byte, written to
-    /// `$4003`. Triggers a new note on write.
+    /// High byte of the trigger register written by `play`:
+    /// - Pulse: `$4003` / `$4007` length-counter + period-high.
+    /// - Triangle: `$400B` length-counter + period-high.
+    /// - Noise: `$400F` length-counter load byte (pitch goes via
+    ///   `$400E`, so this is just the length-counter reload).
     pub period_hi: u8,
-    /// Per-frame `$4000` envelope bytes terminated by `0x00`. Linked
-    /// into PRG ROM as a labelled data block.
+    /// Per-frame envelope bytes walked by the audio tick one byte
+    /// per NMI. Terminated by a channel-specific mute sentinel
+    /// (`0x00` for pulse/noise, `0x80` for triangle). Linked into
+    /// PRG ROM as a labelled data block.
     pub envelope: Vec<u8>,
+    /// APU channel this sfx drives.
+    pub channel: Channel,
 }
 
 /// Compiled music data.
@@ -271,12 +304,20 @@ pub fn resolve_music(program: &Program) -> Result<Vec<MusicData>, String> {
 ///
 /// The compile-time constants (period) are derived from the *first*
 /// pitch value in the array — v1 of the driver holds a fixed period
-/// for the whole envelope so the pulse channel doesn't retrigger.
-/// Pitch variation across frames is ignored in this version; a
-/// richer tracker-style format could interleave period and volume
-/// updates, but the simple envelope is plenty expressive for the
-/// classic set of game sounds.
+/// for the whole envelope so the channel doesn't retrigger mid-run.
+/// Pitch variation across frames is ignored in this version.
+///
+/// The exact bytes emitted depend on the destination channel — see
+/// [`SfxData`] for the per-channel format.
 fn compile_sfx(decl: &SfxDecl) -> SfxData {
+    match decl.channel {
+        Channel::Pulse1 | Channel::Pulse2 => compile_pulse_sfx(decl),
+        Channel::Triangle => compile_triangle_sfx(decl),
+        Channel::Noise => compile_noise_sfx(decl),
+    }
+}
+
+fn compile_pulse_sfx(decl: &SfxDecl) -> SfxData {
     let period_lo = decl.pitch.first().copied().unwrap_or(0);
     // length_hi: length counter load index 0 (254 frames), period hi = 0.
     // Bit 3 of $4003 = length counter enable; bits 0-2 = period high.
@@ -290,14 +331,92 @@ fn compile_sfx(decl: &SfxDecl) -> SfxData {
         let env = (duty << 6) | 0x30 | (vol & 0x0F);
         envelope.push(env);
     }
-    // Zero sentinel — the audio tick sees this, mutes pulse 1, and
-    // clears the sfx counter so subsequent NMIs don't keep walking.
+    // Zero sentinel — the audio tick sees this, mutes the channel,
+    // and clears the sfx counter so subsequent NMIs don't keep walking.
     envelope.push(0x00);
     SfxData {
         name: decl.name.clone(),
         period_lo,
         period_hi,
         envelope,
+        channel: decl.channel,
+    }
+}
+
+/// Triangle envelope: each byte is a linear-counter reload value
+/// written back to `$4008`. Nonzero means "continue holding the
+/// note"; the sentinel `0x80` (linear counter = 0 with control bit
+/// set to halt the length counter) tells the runtime to silence
+/// the channel and stop walking the blob.
+///
+/// We map each user `volume` value to the linear-counter reload
+/// value via `0x80 | 0x7F` = `0xFF` for the "hold" case — this
+/// gives the maximum sustain count of 127 per frame, which the
+/// runtime rewrites every tick anyway. Values of `0` in the user
+/// array collapse to the mute sentinel immediately.
+fn compile_triangle_sfx(decl: &SfxDecl) -> SfxData {
+    // $400A = period low, $400B = length + period high.
+    let period_lo = decl.pitch.first().copied().unwrap_or(0);
+    // Bit 3 of $400B = length counter enable; we set it along with
+    // period-high bits (always 0 at the user level).
+    let period_hi: u8 = 0x08;
+    let mut envelope = Vec::with_capacity(decl.volume.len() + 1);
+    for &vol in &decl.volume {
+        if vol == 0 {
+            // Early release: user wrote a zero in the hold array.
+            envelope.push(0x80);
+        } else {
+            // 0xFF = control bit set (halt length counter on 0) |
+            // 0x7F reload value (~2.1 seconds of sustain). The
+            // runtime rewrites this every tick so the channel
+            // never underruns the linear counter.
+            envelope.push(0xFF);
+        }
+    }
+    // Sentinel: linear-counter control + 0 reload = silence.
+    envelope.push(0x80);
+    SfxData {
+        name: decl.name.clone(),
+        period_lo,
+        period_hi,
+        envelope,
+        channel: decl.channel,
+    }
+}
+
+/// Noise envelope: each byte is a complete `$400C` write using the
+/// same `lcvvvv` encoding as the pulse channels (duty bits are
+/// unused by noise so we mask them out). The mute sentinel is
+/// `0x00`, same as the pulse channels — it resolves to "constant
+/// volume, volume = 0" which silences the channel.
+///
+/// The trigger byte (`period_lo`) is interpreted as a 4-bit index
+/// into the APU's internal 16-entry noise period table (`$400E`
+/// low nibble), plus an optional "mode" bit in position 7 that
+/// switches between the long and short feedback-shift-register
+/// patterns. We default to mode 0 (tonal).
+fn compile_noise_sfx(decl: &SfxDecl) -> SfxData {
+    // $400E = mode + period index. The user's `pitch` scalar is
+    // the low-nibble index 0-15. Mask to be safe.
+    let period_lo = decl.pitch.first().copied().unwrap_or(0) & 0x8F;
+    // $400F length counter load: same bit layout as pulse/triangle,
+    // load-index 1 = 254 frames. The length counter keeps the
+    // channel gated until our envelope sentinel mutes it.
+    let period_hi: u8 = 0x08;
+    let mut envelope = Vec::with_capacity(decl.volume.len() + 1);
+    for &vol in &decl.volume {
+        // $400C format: ..LC VVVV (top two bits unused).
+        // We set length-halt + constant-volume just like pulse.
+        let env = 0x30 | (vol & 0x0F);
+        envelope.push(env);
+    }
+    envelope.push(0x00);
+    SfxData {
+        name: decl.name.clone(),
+        period_lo,
+        period_hi,
+        envelope,
+        channel: decl.channel,
     }
 }
 
@@ -445,6 +564,7 @@ pub fn builtin_sfx(name: &str) -> Option<SfxDecl> {
         duty,
         pitch: vec![pitch_base; frames],
         volume,
+        channel: Channel::Pulse1,
         span: Span::dummy(),
     })
 }
@@ -583,6 +703,7 @@ mod tests {
             duty: 2,
             pitch: vec![0x50, 0x50, 0x50, 0x50],
             volume: vec![15, 10, 5, 0],
+            channel: Channel::Pulse1,
             span: Span::dummy(),
         };
         let data = compile_sfx(&decl);
@@ -606,11 +727,74 @@ mod tests {
             duty: 0,
             pitch: vec![0x20],
             volume: vec![8],
+            channel: Channel::Pulse1,
             span: Span::dummy(),
         };
         let data = compile_sfx(&decl);
         // env = 0 << 6 | 0x30 | 8 = 0x38
         assert_eq!(data.envelope[0], 0x38);
+    }
+
+    #[test]
+    fn compile_sfx_noise_channel_strips_duty_and_pitches() {
+        let decl = SfxDecl {
+            name: "Zap".to_string(),
+            duty: 3, // meaningless for noise; must not leak
+            pitch: vec![0x05, 0x05, 0x05],
+            volume: vec![15, 10, 5],
+            channel: Channel::Noise,
+            span: Span::dummy(),
+        };
+        let data = compile_sfx(&decl);
+        assert_eq!(data.channel, Channel::Noise);
+        // Trigger: period_lo = pitch & 0x8F.
+        assert_eq!(data.period_lo, 0x05);
+        // Envelope bytes: top two duty bits should be zero on noise.
+        // 0x30 | 15 = 0x3F, 0x30 | 10 = 0x3A, 0x30 | 5 = 0x35, + sentinel.
+        assert_eq!(data.envelope, vec![0x3F, 0x3A, 0x35, 0x00]);
+    }
+
+    #[test]
+    fn compile_sfx_triangle_channel_uses_hold_sentinel() {
+        let decl = SfxDecl {
+            name: "Bass".to_string(),
+            duty: 2,
+            pitch: vec![60, 60],
+            volume: vec![1, 0], // hold then release
+            channel: Channel::Triangle,
+            span: Span::dummy(),
+        };
+        let data = compile_sfx(&decl);
+        assert_eq!(data.channel, Channel::Triangle);
+        // Nonzero hold becomes 0xFF; zero release becomes 0x80.
+        // Terminal mute sentinel is also 0x80.
+        assert_eq!(data.envelope, vec![0xFF, 0x80, 0x80]);
+    }
+
+    #[test]
+    fn sfx_data_channel_roundtrips_through_resolve() {
+        let mut prog = empty_program();
+        prog.sfx.push(SfxDecl {
+            name: "Bang".to_string(),
+            duty: 2,
+            pitch: vec![3],
+            volume: vec![15, 8],
+            channel: Channel::Noise,
+            span: Span::dummy(),
+        });
+        prog.sfx.push(SfxDecl {
+            name: "Drone".to_string(),
+            duty: 2,
+            pitch: vec![60],
+            volume: vec![1, 1, 1],
+            channel: Channel::Triangle,
+            span: Span::dummy(),
+        });
+        let resolved = resolve_sfx(&prog).unwrap();
+        assert_eq!(resolved.len(), 2);
+        // The channel field survives the resolve/compile passes.
+        assert_eq!(resolved[0].channel, Channel::Noise);
+        assert_eq!(resolved[1].channel, Channel::Triangle);
     }
 
     #[test]
@@ -658,6 +842,7 @@ mod tests {
             duty: 2,
             pitch: vec![0x50],
             volume: vec![8],
+            channel: Channel::Pulse1,
             span: Span::dummy(),
         };
         let data = compile_sfx(&decl);
@@ -682,6 +867,7 @@ mod tests {
             duty: 2,
             pitch: vec![0x40, 0x40],
             volume: vec![15, 8],
+            channel: Channel::Pulse1,
             span: Span::dummy(),
         });
         let resolved = resolve_sfx(&prog).unwrap();
@@ -723,6 +909,7 @@ mod tests {
             duty: 0,
             pitch: vec![0xAA],
             volume: vec![1],
+            channel: Channel::Pulse1,
             span: Span::dummy(),
         });
         prog.states.push(StateDecl {
@@ -750,6 +937,7 @@ mod tests {
             duty: 2,
             pitch: vec![0x40],
             volume: vec![8],
+            channel: Channel::Pulse1,
             span: Span::dummy(),
         });
         prog.sfx.push(SfxDecl {
@@ -757,6 +945,7 @@ mod tests {
             duty: 2,
             pitch: vec![0x40],
             volume: vec![8],
+            channel: Channel::Pulse1,
             span: Span::dummy(),
         });
         assert!(resolve_sfx(&prog).is_err());
@@ -770,6 +959,7 @@ mod tests {
             duty: 2,
             pitch: vec![0; SFX_MAX_FRAMES + 1],
             volume: vec![8; SFX_MAX_FRAMES + 1],
+            channel: Channel::Pulse1,
             span: Span::dummy(),
         });
         assert!(resolve_sfx(&prog).is_err());

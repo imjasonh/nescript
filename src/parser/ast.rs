@@ -101,24 +101,51 @@ pub struct BackgroundDecl {
     pub span: Span,
 }
 
-/// `sfx Name { ... }` — a sound effect played on pulse 1. SFX are
-/// frame-accurate envelopes: `pitch[i]` and `volume[i]` describe the
-/// $4002/$4000 register state for frame `i`, advancing one entry per
-/// NMI tick. `duty` selects the pulse duty cycle (0-3) for the whole
-/// effect. The two arrays must have the same length; the runtime
-/// drops pulse 1's volume to 0 one frame after the last entry.
+/// APU channel an sfx targets. Pulse1 is the historical default and
+/// the only one populated from older programs that omit `channel:`.
+/// Triangle and Noise were added as part of the "richer audio"
+/// work — Triangle has no volume envelope (the channel is fixed
+/// output), Noise uses a 16-entry period table rather than the
+/// pulse channel's 60-entry one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Channel {
+    Pulse1,
+    Pulse2,
+    Triangle,
+    Noise,
+}
+
+/// `sfx Name { ... }` — a sound effect played on pulse 1 (by default).
+/// SFX are frame-accurate envelopes: `pitch[i]` and `volume[i]`
+/// describe the register state for frame `i`, advancing one entry
+/// per NMI tick. `duty` selects the pulse duty cycle (0-3) for the
+/// whole effect. The two arrays must have the same length; the runtime
+/// drops the channel volume to 0 one frame after the last entry.
+///
+/// The `channel:` property (new) lets a declaration target the
+/// triangle or noise channels instead of the default pulse 1. For
+/// triangle, `volume` is meaningless (fixed-level channel) and the
+/// per-frame "volume" byte is instead treated as a hold flag (nonzero
+/// = sustain, zero = release/stop). For noise, `pitch` values are
+/// interpreted as 0-15 indices into the APU's internal 16-entry
+/// noise period table rather than raw 11-bit pulse periods.
 #[derive(Debug, Clone)]
 pub struct SfxDecl {
     pub name: String,
     /// Duty cycle bits (0-3). Each bit pattern picks a different
-    /// pulse waveform; 2 (50%) sounds like a square wave.
+    /// pulse waveform; 2 (50%) sounds like a square wave. Not
+    /// meaningful for triangle or noise channels.
     pub duty: u8,
-    /// One period byte per frame, written to $4002. The $4003 high
-    /// nibble is always zero (keeps notes in the audible range).
+    /// One period byte per frame, written to $4002 (pulse 1) or
+    /// $400E (noise, low 4 bits only) on trigger.
     pub pitch: Vec<u8>,
     /// One volume byte per frame (0-15), combined with the duty bits
-    /// and written to $4000.
+    /// and written to $4000 (pulse 1) / $400C (noise) / $4008
+    /// (triangle; any nonzero value means "hold", zero means release).
     pub volume: Vec<u8>,
+    /// APU channel this sfx drives. Defaults to [`Channel::Pulse1`]
+    /// when the declaration omits the `channel:` property.
+    pub channel: Channel,
     pub span: Span,
 }
 

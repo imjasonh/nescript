@@ -814,6 +814,54 @@ fn program_with_user_declared_sfx_and_music() {
 }
 
 #[test]
+fn program_with_noise_sfx_writes_400c_at_play_site() {
+    // A program that declares a noise sfx and plays it should
+    // end up with a trigger sequence that touches $400E (noise
+    // period) and $400C (volume pre-mute). The exact register
+    // sequence is:
+    //   LDA #$30; STA $400C; LDA #idx; STA $400E; LDA #len; STA $400F;
+    //   LDA #$0B; STA $4015
+    // plus an envelope pointer load. We check the two channel-
+    // specific stores ($400E + $400C) explicitly so a regression
+    // that routes to pulse 1 by mistake will fail loud.
+    let source = r#"
+        game "Noise Test" { mapper: NROM }
+        sfx Crash {
+            channel: noise
+            pitch: 4
+            volume: [15, 12, 8, 4]
+        }
+        on frame { play Crash }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    let prg = &rom_data[16..16 + 16384];
+    // Search for any `STA $400C` instruction byte sequence
+    // (opcode 0x8D, lo=0x0C, hi=0x40). 6502 absolute store is
+    // always 3 bytes.
+    let sta_envelope_reg: [u8; 3] = [0x8D, 0x0C, 0x40];
+    assert!(
+        prg.windows(sta_envelope_reg.len())
+            .any(|w| w == sta_envelope_reg),
+        "noise play sequence should include STA $400C"
+    );
+    let sta_period_reg: [u8; 3] = [0x8D, 0x0E, 0x40];
+    assert!(
+        prg.windows(sta_period_reg.len())
+            .any(|w| w == sta_period_reg),
+        "noise play sequence should include STA $400E"
+    );
+    // The noise envelope bytes (derived from the user `volume` list
+    // masked with 0x30 | vol) must be in ROM too.
+    let env = |v: u8| 0x30u8 | v;
+    let crash_env: [u8; 5] = [env(15), env(12), env(8), env(4), 0x00];
+    assert!(
+        prg.windows(crash_env.len()).any(|w| w == crash_env),
+        "noise envelope blob must live in PRG"
+    );
+}
+
+#[test]
 fn program_without_audio_has_no_audio_driver_in_prg() {
     // Programs that never touch audio should pay zero ROM cost:
     // no period table, no driver body, no data blobs. We verify

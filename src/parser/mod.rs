@@ -1522,11 +1522,34 @@ impl Parser {
         let mut pitch_src: Option<PitchSrc> = None;
         let mut volume: Option<Vec<u8>> = None;
         let mut volume_key: &'static str = "volume";
+        let mut channel: Channel = Channel::Pulse1;
 
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             let (key, key_span) = self.expect_ident()?;
             self.expect(&TokenKind::Colon)?;
             match key.as_str() {
+                "channel" => {
+                    // `channel: pulse1 | pulse2 | triangle | noise`.
+                    // Identifiers (not keywords) so the lexer passes
+                    // them through as `Ident`.
+                    let (ch_name, ch_span) = self.expect_ident()?;
+                    channel = match ch_name.as_str() {
+                        "pulse1" | "pulse" => Channel::Pulse1,
+                        "pulse2" => Channel::Pulse2,
+                        "triangle" => Channel::Triangle,
+                        "noise" => Channel::Noise,
+                        _ => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!(
+                                    "unknown sfx channel '{ch_name}' \
+                                     (expected pulse1, pulse2, triangle, or noise)"
+                                ),
+                                ch_span,
+                            ));
+                        }
+                    };
+                }
                 "duty" => {
                     duty = self.parse_u8_literal("duty")?;
                     if duty > 3 {
@@ -1640,6 +1663,7 @@ impl Parser {
             duty,
             pitch,
             volume,
+            channel,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }

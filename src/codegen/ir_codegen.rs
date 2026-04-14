@@ -28,11 +28,14 @@ use crate::analyzer::VarAllocation;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
 use crate::assets::{MusicData, SfxData};
 use crate::ir::{IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator, VarId};
+use crate::parser::ast::Channel;
 use crate::runtime::{
-    ZP_MUSIC_BASE_HI, ZP_MUSIC_BASE_LO, ZP_MUSIC_COUNTER, ZP_MUSIC_PTR_HI, ZP_MUSIC_PTR_LO,
-    ZP_MUSIC_STATE, ZP_OAM_CURSOR, ZP_PENDING_BG_ATTRS_HI, ZP_PENDING_BG_ATTRS_LO,
-    ZP_PENDING_BG_TILES_HI, ZP_PENDING_BG_TILES_LO, ZP_PENDING_PALETTE_HI, ZP_PENDING_PALETTE_LO,
-    ZP_PPU_UPDATE_FLAGS, ZP_SFX_COUNTER, ZP_SFX_PTR_HI, ZP_SFX_PTR_LO,
+    AUDIO_NOISE_COUNTER, AUDIO_NOISE_PTR_HI, AUDIO_NOISE_PTR_LO, AUDIO_TRIANGLE_COUNTER,
+    AUDIO_TRIANGLE_PTR_HI, AUDIO_TRIANGLE_PTR_LO, ZP_MUSIC_BASE_HI, ZP_MUSIC_BASE_LO,
+    ZP_MUSIC_COUNTER, ZP_MUSIC_PTR_HI, ZP_MUSIC_PTR_LO, ZP_MUSIC_STATE, ZP_OAM_CURSOR,
+    ZP_PENDING_BG_ATTRS_HI, ZP_PENDING_BG_ATTRS_LO, ZP_PENDING_BG_TILES_HI, ZP_PENDING_BG_TILES_LO,
+    ZP_PENDING_PALETTE_HI, ZP_PENDING_PALETTE_LO, ZP_PPU_UPDATE_FLAGS, ZP_SFX_COUNTER,
+    ZP_SFX_PTR_HI, ZP_SFX_PTR_LO,
 };
 
 /// Base zero-page address for IR temp slots.
@@ -79,11 +82,15 @@ pub struct IrCodeGen<'a> {
     use_counts: HashMap<IrTemp, u32>,
     /// Sprite name to tile index mapping.
     sprite_tiles: HashMap<String, u8>,
-    /// Sfx name to `(period_lo, period_hi, envelope_label)`. Populated
-    /// by `with_audio` from the resolved [`SfxData`] list — lets
-    /// `play Name` emit the right literals for the trigger bytes
-    /// and the right label for the envelope pointer.
-    sfx_info: HashMap<String, (u8, u8, String)>,
+    /// Sfx name to `(period_lo, period_hi, envelope_label, channel)`.
+    /// Populated by `with_audio` from the resolved [`SfxData`] list.
+    /// `play Name` consults this to pick:
+    /// - the right trigger register pair (pulse 1 = $4002/$4003,
+    ///   triangle = $400A/$400B, noise = $400E/$400F);
+    /// - the right per-channel envelope pointer slot (pulse 1 uses
+    ///   zero-page `ZP_SFX_PTR`, triangle/noise live in main RAM
+    ///   at the `AUDIO_*_PTR_*` addresses).
+    sfx_info: HashMap<String, (u8, u8, String, Channel)>,
     /// Music name to `(header_byte, stream_label)`. Populated by
     /// `with_audio`. `start_music Name` stamps `header | 0x02` into
     /// `ZP_MUSIC_STATE` and loads the pointer from `stream_label`.
@@ -103,6 +110,14 @@ pub struct IrCodeGen<'a> {
     /// marker label at most once per program so the linker can
     /// decide whether to splice the audio tick into NMI.
     audio_used: bool,
+    /// Set to true the first time a `play` op targets a noise sfx.
+    /// Emits the `__noise_used` marker label so the linker knows
+    /// to append the noise channel block to `gen_audio_tick` and
+    /// reserve the main-RAM state slots.
+    noise_used: bool,
+    /// Same as `noise_used`, but for triangle sfx. Drives the
+    /// `__triangle_used` marker label.
+    triangle_used: bool,
     /// Set to true the first time we emit any PPU update op
     /// (`set_palette` / `load_background`). The linker uses the
     /// resulting `__ppu_update_used` marker label to decide whether
@@ -211,6 +226,8 @@ impl<'a> IrCodeGen<'a> {
             in_frame_handler: false,
             debug_mode: false,
             audio_used: false,
+            noise_used: false,
+            triangle_used: false,
             ppu_update_used: false,
             source_locs: Vec::new(),
             next_source_loc: 0,
@@ -270,8 +287,10 @@ impl<'a> IrCodeGen<'a> {
     #[must_use]
     pub fn with_audio(mut self, sfx: &[SfxData], music: &[MusicData]) -> Self {
         for s in sfx {
-            self.sfx_info
-                .insert(s.name.clone(), (s.period_lo, s.period_hi, s.label()));
+            self.sfx_info.insert(
+                s.name.clone(),
+                (s.period_lo, s.period_hi, s.label(), s.channel),
+            );
         }
         for m in music {
             self.music_info
@@ -1173,11 +1192,27 @@ impl<'a> IrCodeGen<'a> {
     /// Emit the `play Name` sequence.
     ///
     /// This is the trigger side of the audio driver: it writes the
-    /// initial period to pulse 1, sets the SFX counter to "active",
-    /// and loads the envelope pointer into ZP. The per-frame
-    /// envelope walk happens in `runtime::gen_audio_tick`, which
-    /// reads through the pointer and writes the next `$4000` byte
-    /// each NMI.
+    /// initial period to the destination channel's trigger
+    /// registers, sets the per-channel active counter, and loads
+    /// the envelope pointer. The per-frame envelope walk happens
+    /// in `runtime::gen_audio_tick`.
+    ///
+    /// The exact register set depends on the sfx's [`Channel`]:
+    /// - **Pulse 1**: `$4002/$4003` trigger, `ZP_SFX_PTR_*` envelope
+    ///   pointer, `$4000` runtime volume writes. This is the
+    ///   original path and is byte-identical to the pre-channels
+    ///   codegen.
+    /// - **Triangle**: `$400A/$400B` trigger, `$4015 |= $04` to
+    ///   enable the channel's length counter, main-RAM envelope
+    ///   pointer at [`AUDIO_TRIANGLE_PTR_*`], runtime writes to
+    ///   `$4008` (linear counter reload).
+    /// - **Noise**: `$400E/$400F` trigger, `$4015 |= $08` to
+    ///   enable, main-RAM pointer at [`AUDIO_NOISE_PTR_*`],
+    ///   runtime writes to `$400C` (noise volume).
+    ///
+    /// Programs that never reference triangle/noise sfx only emit
+    /// the pulse-1 path here, so their generated code — and their
+    /// ROM bytes — are unchanged from before the channel feature.
     ///
     /// If `name` is not a declared sfx or a recognized builtin, we
     /// emit a silent `play` (period 0, zero-length envelope) rather
@@ -1185,7 +1220,7 @@ impl<'a> IrCodeGen<'a> {
     /// diagnostic for the unknown name.
     fn gen_play_sfx(&mut self, name: &str) {
         self.emit_audio_marker();
-        let Some((period_lo, period_hi, label)) = self.sfx_info.get(name).cloned() else {
+        let Some((period_lo, period_hi, label, channel)) = self.sfx_info.get(name).cloned() else {
             // Unknown name. The analyzer warns on this; emit a no-op
             // sequence so the rest of the code still assembles. The
             // unknown branch is easy to spot in `--asm-dump`: it
@@ -1193,6 +1228,18 @@ impl<'a> IrCodeGen<'a> {
             // any other pulse-1 state.
             return;
         };
+        match channel {
+            Channel::Pulse1 | Channel::Pulse2 => self.emit_play_pulse(period_lo, period_hi, &label),
+            Channel::Triangle => self.emit_play_triangle(period_lo, period_hi, &label),
+            Channel::Noise => self.emit_play_noise(period_lo, period_hi, &label),
+        }
+    }
+
+    /// Original pulse-1 `play` sequence — unchanged from before the
+    /// channel feature. Kept as its own helper so the channel
+    /// dispatch above reads cleanly and the byte layout is trivial
+    /// to eyeball against the old code.
+    fn emit_play_pulse(&mut self, period_lo: u8, period_hi: u8, label: &str) {
         // $4000: we don't write a volume envelope here. The first
         // envelope byte is consumed by the next NMI audio tick. We
         // only need to set up the trigger (period + length).
@@ -1207,15 +1254,76 @@ impl<'a> IrCodeGen<'a> {
         self.emit(STA, AM::Absolute(0x4003));
         // Point ZP_SFX_PTR at the envelope blob. Each subsequent
         // NMI advances this pointer and writes the byte to $4000.
-        self.emit(LDA, AM::SymbolLo(label.clone()));
+        self.emit(LDA, AM::SymbolLo(label.to_string()));
         self.emit(STA, AM::ZeroPage(ZP_SFX_PTR_LO));
-        self.emit(LDA, AM::SymbolHi(label));
+        self.emit(LDA, AM::SymbolHi(label.to_string()));
         self.emit(STA, AM::ZeroPage(ZP_SFX_PTR_HI));
         // Mark sfx as active. The audio tick checks this and bails
         // on zero. We use `$FF` (any nonzero value works) as a flag;
         // the tick zeros it when it hits the envelope sentinel.
         self.emit(LDA, AM::Immediate(0xFF));
         self.emit(STA, AM::ZeroPage(ZP_SFX_COUNTER));
+    }
+
+    /// Triangle channel trigger sequence. Writes period bytes to
+    /// `$400A/$400B`, enables the triangle channel in `$4015`, and
+    /// seeds the main-RAM envelope pointer + active counter so the
+    /// tick's triangle block starts walking the blob next frame.
+    fn emit_play_triangle(&mut self, period_lo: u8, period_hi: u8, label: &str) {
+        self.emit_triangle_marker();
+        // $4008: linear counter control + reload. Set $FF (control
+        // bit + max reload) so the counter starts from a known
+        // non-muted state; the tick rewrites this every frame.
+        self.emit(LDA, AM::Immediate(0xFF));
+        self.emit(STA, AM::Absolute(0x4008));
+        // $400A / $400B: period lo / length + period hi.
+        self.emit(LDA, AM::Immediate(period_lo));
+        self.emit(STA, AM::Absolute(0x400A));
+        self.emit(LDA, AM::Immediate(period_hi));
+        self.emit(STA, AM::Absolute(0x400B));
+        // Enable pulse-1 + pulse-2 + triangle in the APU status
+        // register. We don't bother reading $4015 first — overwriting
+        // with $07 keeps all currently-used channels enabled.
+        self.emit(LDA, AM::Immediate(0x07));
+        self.emit(STA, AM::Absolute(0x4015));
+        // Main-RAM envelope pointer.
+        self.emit(LDA, AM::SymbolLo(label.to_string()));
+        self.emit(STA, AM::Absolute(AUDIO_TRIANGLE_PTR_LO));
+        self.emit(LDA, AM::SymbolHi(label.to_string()));
+        self.emit(STA, AM::Absolute(AUDIO_TRIANGLE_PTR_HI));
+        // Counter nonzero = channel active.
+        self.emit(LDA, AM::Immediate(0xFF));
+        self.emit(STA, AM::Absolute(AUDIO_TRIANGLE_COUNTER));
+    }
+
+    /// Noise channel trigger sequence. Writes mode+period index to
+    /// `$400E`, length-counter load to `$400F`, enables the noise
+    /// channel in `$4015`, and seeds the main-RAM envelope pointer.
+    fn emit_play_noise(&mut self, period_lo: u8, period_hi: u8, label: &str) {
+        self.emit_noise_marker();
+        // $400C: volume register. Start at constant-volume 0 (muted)
+        // so the very first envelope byte (written by the tick one
+        // NMI later) audibly triggers the note without a stale
+        // value from a previous sfx leaking through.
+        self.emit(LDA, AM::Immediate(0x30));
+        self.emit(STA, AM::Absolute(0x400C));
+        // $400E: mode (bit 7) + period-table index (low 4 bits).
+        self.emit(LDA, AM::Immediate(period_lo));
+        self.emit(STA, AM::Absolute(0x400E));
+        // $400F: length counter load.
+        self.emit(LDA, AM::Immediate(period_hi));
+        self.emit(STA, AM::Absolute(0x400F));
+        // Enable pulse-1 + pulse-2 + noise channels.
+        self.emit(LDA, AM::Immediate(0x0B));
+        self.emit(STA, AM::Absolute(0x4015));
+        // Main-RAM envelope pointer.
+        self.emit(LDA, AM::SymbolLo(label.to_string()));
+        self.emit(STA, AM::Absolute(AUDIO_NOISE_PTR_LO));
+        self.emit(LDA, AM::SymbolHi(label.to_string()));
+        self.emit(STA, AM::Absolute(AUDIO_NOISE_PTR_HI));
+        // Counter nonzero = channel active.
+        self.emit(LDA, AM::Immediate(0xFF));
+        self.emit(STA, AM::Absolute(AUDIO_NOISE_COUNTER));
     }
 
     /// Emit the `start_music Name` sequence.
@@ -1270,6 +1378,25 @@ impl<'a> IrCodeGen<'a> {
         if !self.audio_used {
             self.emit_label("__audio_used");
             self.audio_used = true;
+        }
+    }
+
+    /// Emit the `__noise_used` marker label at most once per program.
+    /// The linker scans for this label to decide whether to append
+    /// the noise tick block to the audio tick.
+    fn emit_noise_marker(&mut self) {
+        if !self.noise_used {
+            self.emit_label("__noise_used");
+            self.noise_used = true;
+        }
+    }
+
+    /// Emit the `__triangle_used` marker label at most once per
+    /// program. Drives the triangle tick block in the audio driver.
+    fn emit_triangle_marker(&mut self) {
+        if !self.triangle_used {
+            self.emit_label("__triangle_used");
+            self.triangle_used = true;
         }
     }
 
@@ -2426,6 +2553,86 @@ mod more_tests {
 
     fn has_inst(insts: &[Instruction], opcode: crate::asm::Opcode, mode: &AM) -> bool {
         insts.iter().any(|i| i.opcode == opcode && i.mode == *mode)
+    }
+
+    #[test]
+    fn ir_codegen_play_noise_sfx_writes_400e_and_emits_noise_marker() {
+        // A noise sfx `play` should:
+        //   1. Write trigger bytes to $400E / $400F (noise
+        //      period + length).
+        //   2. Enable the noise channel in the APU status
+        //      register at $4015.
+        //   3. Emit the `__noise_used` marker so the linker
+        //      appends the noise block to the audio tick.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            sfx Zap {
+                channel: noise
+                pitch: 5
+                volume: [15, 8, 2]
+            }
+            on frame { play Zap }
+            start Main
+        "#,
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x400E)),
+            "noise play should write $400E (period)"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x400F)),
+            "noise play should write $400F (length counter)"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x4015)),
+            "noise play should write APU status ($4015)"
+        );
+        let has_marker = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__noise_used"));
+        assert!(has_marker, "noise play should emit __noise_used marker");
+        // And the pulse1 sfx path must not leak through — no
+        // $4002 write from this program.
+        assert!(
+            !has_inst(&insts, STA, &AM::Absolute(0x4002)),
+            "noise play should not touch pulse-1 trigger registers"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_play_triangle_sfx_writes_400a_and_emits_triangle_marker() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            sfx Bass {
+                channel: triangle
+                pitch: 60
+                volume: [1, 1, 1]
+            }
+            on frame { play Bass }
+            start Main
+        "#,
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x400A)),
+            "triangle play should write $400A (period)"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x400B)),
+            "triangle play should write $400B (length counter)"
+        );
+        assert!(
+            has_inst(&insts, STA, &AM::Absolute(0x4008)),
+            "triangle play should write $4008 (linear counter)"
+        );
+        let has_marker = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__triangle_used"));
+        assert!(
+            has_marker,
+            "triangle play should emit __triangle_used marker"
+        );
     }
 
     #[test]

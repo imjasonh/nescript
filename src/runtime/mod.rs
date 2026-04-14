@@ -96,6 +96,31 @@ pub const ZP_PENDING_BG_ATTRS_HI: u8 = 0x17;
 /// analyzer-allocated variables (which grow from $0300 upward).
 pub const DEBUG_FRAME_OVERRUN_ADDR: u16 = 0x07FF;
 
+// ── Extra channel state ──
+//
+// The pulse-1 sfx and pulse-2 music channels live in zero page
+// ($00-$0F) where every byte is precious. Adding new channel
+// state there would either push user variables back by 6 bytes
+// (breaking every existing example's ZP layout) or collide with
+// runtime scratch slots. Instead, we park triangle and noise
+// state at the very top of main RAM, just below the debug frame
+// overrun counter, where analyzer-allocated globals rarely reach
+// (they grow from $0300 upward). The few extra cycles per
+// absolute access are negligible for a once-per-NMI tick.
+//
+// The state is only *referenced* by the audio tick when the
+// corresponding `has_noise` / `has_triangle` flag is set — so
+// programs that don't declare any noise/triangle sfx touch
+// these addresses zero times, and the ROM bytes generated for
+// an existing audio example are byte-identical to what today's
+// compiler produces.
+pub const AUDIO_NOISE_PTR_LO: u16 = 0x07F0;
+pub const AUDIO_NOISE_PTR_HI: u16 = 0x07F1;
+pub const AUDIO_NOISE_COUNTER: u16 = 0x07F2;
+pub const AUDIO_TRIANGLE_PTR_LO: u16 = 0x07F3;
+pub const AUDIO_TRIANGLE_PTR_HI: u16 = 0x07F4;
+pub const AUDIO_TRIANGLE_COUNTER: u16 = 0x07F5;
+
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
 pub fn gen_init() -> Vec<Instruction> {
@@ -721,7 +746,18 @@ pub fn gen_multiply() -> Vec<Instruction> {
 ///
 /// A, X, Y. The NMI handler calls this from inside its own
 /// save/restore block so caller registers are safe.
-pub fn gen_audio_tick() -> Vec<Instruction> {
+///
+/// When `has_noise` / `has_triangle` are set, the driver gains an
+/// extra per-channel slot: noise routes envelope bytes to `$400C`
+/// and drives `$400E` / `$400F` on trigger; triangle writes linear-
+/// counter reload values to `$4008`. These blocks are appended to
+/// the tick after the music path so that programs which do not
+/// declare any noise or triangle sfx produce byte-identical ROM
+/// output — the old pulse-only path emits exactly the same
+/// instruction stream as before. The linker decides whether to
+/// enable each by scanning for the `__noise_used` and
+/// `__triangle_used` marker labels emitted by the IR codegen.
+pub fn gen_audio_tick(has_noise: bool, has_triangle: bool) -> Vec<Instruction> {
     let mut out = Vec::new();
 
     out.push(Instruction::new(NOP, AM::Label("__audio_tick".into())));
@@ -948,8 +984,165 @@ pub fn gen_audio_tick() -> Vec<Instruction> {
         NOP,
         AM::Label("__audio_music_done".into()),
     ));
+
+    // ── Noise channel tick (optional, gated on `has_noise`) ──
+    //
+    // Structurally identical to the pulse-1 sfx tick above: walk a
+    // per-frame envelope blob via an indirect-indexed load and
+    // write each byte to the APU noise volume register at $400C.
+    // The pointer lives in main RAM at [AUDIO_NOISE_PTR_LO,
+    // AUDIO_NOISE_PTR_HI]; the tick stashes it in ZP scratch $02/$03
+    // for the duration of the block because the 6502 has no
+    // (abs),Y addressing.
+    if has_noise {
+        out.extend(gen_noise_tick());
+    }
+
+    // ── Triangle channel tick (optional, gated on `has_triangle`) ──
+    //
+    // Same shape as the noise tick but writes to $4008 (the linear
+    // counter) instead of a volume register. Triangle has no volume,
+    // so the envelope blob just encodes "keep the linear counter
+    // loaded" (nonzero hold) or "silence" (the $80 sentinel).
+    if has_triangle {
+        out.extend(gen_triangle_tick());
+    }
+
     out.push(Instruction::implied(RTS));
 
+    out
+}
+
+/// Generate the noise-channel sfx tick. Appended to
+/// [`gen_audio_tick`] only when the program declares at least one
+/// noise sfx (`__noise_used` marker). Reads envelope bytes from the
+/// main-RAM pointer at [`AUDIO_NOISE_PTR_LO`] / [`AUDIO_NOISE_PTR_HI`]
+/// and writes them to the APU noise volume register at `$400C`.
+/// A zero envelope byte is the mute sentinel — on it the tick
+/// silences the channel and clears [`AUDIO_NOISE_COUNTER`].
+fn gen_noise_tick() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_noise_tick".into()),
+    ));
+    // If counter is zero, no noise sfx is playing; skip the block.
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_NOISE_COUNTER)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__audio_noise_done".into()),
+    ));
+    // Load the main-RAM pointer into ZP scratch $02/$03 so we can
+    // do an indirect-indexed read (6502 has no (abs),Y mode).
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_NOISE_PTR_LO)));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_NOISE_PTR_HI)));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+    // Read envelope byte through the scratch pointer.
+    out.push(Instruction::new(LDY, AM::Immediate(0)));
+    out.push(Instruction::new(LDA, AM::IndirectY(0x02)));
+    // Zero sentinel? branch to the write path if nonzero.
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_noise_write".into()),
+    ));
+    // Sentinel: mute pulse-noise ($4000-compatible encoding:
+    // length-halt + constant-volume + volume 0) and clear the
+    // counter so this block bails on subsequent NMIs.
+    out.push(Instruction::new(LDA, AM::Immediate(0x30)));
+    out.push(Instruction::new(STA, AM::Absolute(0x400C)));
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::Absolute(AUDIO_NOISE_COUNTER)));
+    out.push(Instruction::new(
+        JMP,
+        AM::Label("__audio_noise_done".into()),
+    ));
+    // Write envelope byte and advance the 16-bit pointer by 1.
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_noise_write".into()),
+    ));
+    out.push(Instruction::new(STA, AM::Absolute(0x400C)));
+    out.push(Instruction::new(INC, AM::Absolute(AUDIO_NOISE_PTR_LO)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_noise_ptr_ok".into()),
+    ));
+    out.push(Instruction::new(INC, AM::Absolute(AUDIO_NOISE_PTR_HI)));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_noise_ptr_ok".into()),
+    ));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_noise_done".into()),
+    ));
+    out
+}
+
+/// Generate the triangle-channel sfx tick. Same shape as
+/// [`gen_noise_tick`] but writes to `$4008` (the linear counter
+/// reload) instead of a volume register. Triangle has no volume —
+/// the envelope bytes are "keep holding" tokens that the runtime
+/// keeps writing every frame so the linear counter never underruns
+/// and the channel never auto-silences. A `0x80` byte is the mute
+/// sentinel (linear control bit set, reload = 0 → silence next
+/// frame).
+fn gen_triangle_tick() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_triangle_tick".into()),
+    ));
+    // If counter is zero, no triangle sfx is playing.
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_TRIANGLE_COUNTER)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__audio_triangle_done".into()),
+    ));
+    // Stash pointer to ZP scratch for indirect-indexed load.
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_TRIANGLE_PTR_LO)));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+    out.push(Instruction::new(LDA, AM::Absolute(AUDIO_TRIANGLE_PTR_HI)));
+    out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+    out.push(Instruction::new(LDY, AM::Immediate(0)));
+    out.push(Instruction::new(LDA, AM::IndirectY(0x02)));
+    // Write the envelope byte to $4008. For triangle, `$80` is the
+    // mute sentinel (linear counter reload = 0 with control bit
+    // set). We detect it by CMP + BEQ so the counter can be cleared.
+    out.push(Instruction::new(STA, AM::Absolute(0x4008)));
+    out.push(Instruction::new(CMP, AM::Immediate(0x80)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_triangle_advance".into()),
+    ));
+    // Sentinel: clear counter so we bail next frame. The $80 write
+    // above already mutes the triangle channel.
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::Absolute(AUDIO_TRIANGLE_COUNTER)));
+    out.push(Instruction::new(
+        JMP,
+        AM::Label("__audio_triangle_done".into()),
+    ));
+    // Advance the pointer by 1 for the next frame.
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_triangle_advance".into()),
+    ));
+    out.push(Instruction::new(INC, AM::Absolute(AUDIO_TRIANGLE_PTR_LO)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__audio_triangle_ptr_ok".into()),
+    ));
+    out.push(Instruction::new(INC, AM::Absolute(AUDIO_TRIANGLE_PTR_HI)));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_triangle_ptr_ok".into()),
+    ));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__audio_triangle_done".into()),
+    ));
     out
 }
 
