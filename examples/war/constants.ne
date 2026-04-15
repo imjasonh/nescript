@@ -59,9 +59,16 @@ const TILE_RANK_BASE: u8 = 11      // 13 tiles: A, 2..10, J, Q, K
 // Small suit glyphs for the card corner, one per suit.
 const TILE_SUIT_SMALL_BASE: u8 = 24  // 4 tiles: ♠ ♥ ♦ ♣
 
-// Big centre-pip, authored as a 16×8 pair per suit (left half + right half).
-const TILE_PIP_L_BASE: u8 = 28       // 4 tiles
-const TILE_PIP_R_BASE: u8 = 32       // 4 tiles
+// Big centre-pip, authored as a 16×16 shape split into four 8×8
+// quadrants per suit. Each `_BASE + suit` picks the tile for that
+// suit's quadrant. The TL/TR quadrants are contiguous at 28-35;
+// the BL/BR quadrants live at 88-95 because they were added
+// after the alphabet / digit / BIG WAR tiles and putting them in
+// the middle would have shifted every later tile's index.
+const TILE_PIP_TL_BASE: u8 = 28      // spade/heart/diamond/club TL
+const TILE_PIP_TR_BASE: u8 = 32      // spade/heart/diamond/club TR
+const TILE_PIP_BL_BASE: u8 = 88      // spade/heart/diamond/club BL
+const TILE_PIP_BR_BASE: u8 = 92      // spade/heart/diamond/club BR
 
 // Alphanumerics (8×8) used for all on-screen text that lives on the
 // sprite layer. Letters A-Z then digits 0-9, contiguous.

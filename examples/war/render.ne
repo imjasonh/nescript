@@ -13,16 +13,19 @@
 
 // ── Card face ──────────────────────────────────────────────
 //
-// Draws the 6-sprite card face at (x, y) for the packed card
-// byte. Layout (each cell is 8×8):
+// Draws the 6-sprite face of a 16×24 card at (x, y) for the
+// packed `rank<<4 | suit` byte. Layout (each cell is 8×8):
 //
-//     [rank  ][small_suit]   row 0
-//     [pipL  ][pipR      ]   row 1
-//     [blankL][blankR    ]   row 2
+//     [ rank ][ssuit]    row 0: rank letter + small suit pip
+//     [pipTL ][pipTR]    row 1: top half of the big 16×16 pip
+//     [pipBL ][pipBR]    row 2: bottom half of the big pip
 //
-// Rank is the condensed glyph at TILE_RANK_BASE + (rank - 1);
-// small suit + big-pip halves are indexed directly off their
-// base constants.
+// Every tile in the card has a fully-opaque white background
+// (palette index 2) so the felt green behind the card does not
+// bleed through — see `assets.ne` for the art itself. The big
+// centre pip is a single 16×16 shape split across the bottom
+// two rows (4 tiles total); `rank` sits in the top-left corner
+// and `small_suit` in the top-right.
 fun draw_card_face(dcf_in_x: u8, dcf_in_y: u8, dcf_in_card: u8) {
     // Snapshot every parameter into a fresh local *before* any
     // nested function call. NEScript v0.1 passes parameters via
@@ -38,20 +41,22 @@ fun draw_card_face(dcf_in_x: u8, dcf_in_y: u8, dcf_in_card: u8) {
     var dcf_suit: u8 = card_suit(dcf_card)
     var dcf_rank_tile:  u8 = TILE_RANK_BASE + dcf_rank - 1
     var dcf_small_tile: u8 = TILE_SUIT_SMALL_BASE + dcf_suit
-    var dcf_pipl_tile:  u8 = TILE_PIP_L_BASE + dcf_suit
-    var dcf_pipr_tile:  u8 = TILE_PIP_R_BASE + dcf_suit
+    var dcf_pip_tl:     u8 = TILE_PIP_TL_BASE + dcf_suit
+    var dcf_pip_tr:     u8 = TILE_PIP_TR_BASE + dcf_suit
+    var dcf_pip_bl:     u8 = TILE_PIP_BL_BASE + dcf_suit
+    var dcf_pip_br:     u8 = TILE_PIP_BR_BASE + dcf_suit
     var dcf_x1: u8 = dcf_x + 8
     var dcf_y1: u8 = dcf_y + 8
     var dcf_y2: u8 = dcf_y + 16
     // Row 0 — rank corner + small suit
     draw Tileset at: (dcf_x,  dcf_y)  frame: dcf_rank_tile
     draw Tileset at: (dcf_x1, dcf_y)  frame: dcf_small_tile
-    // Row 1 — big centre pip (left + right halves)
-    draw Tileset at: (dcf_x,  dcf_y1) frame: dcf_pipl_tile
-    draw Tileset at: (dcf_x1, dcf_y1) frame: dcf_pipr_tile
-    // Row 2 — blank bottom so the card body is symmetric
-    draw Tileset at: (dcf_x,  dcf_y2) frame: TILE_FRAME_BLANK_L
-    draw Tileset at: (dcf_x1, dcf_y2) frame: TILE_FRAME_BLANK_R
+    // Row 1 — top half of the 16×16 big pip
+    draw Tileset at: (dcf_x,  dcf_y1) frame: dcf_pip_tl
+    draw Tileset at: (dcf_x1, dcf_y1) frame: dcf_pip_tr
+    // Row 2 — bottom half of the 16×16 big pip
+    draw Tileset at: (dcf_x,  dcf_y2) frame: dcf_pip_bl
+    draw Tileset at: (dcf_x1, dcf_y2) frame: dcf_pip_br
 }
 
 // Draw the card-back lattice at (x, y). 6 sprites again. Rows
