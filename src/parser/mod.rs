@@ -256,6 +256,7 @@ impl Parser {
             sfx,
             music,
             banks,
+            raw_banks: Vec::new(),  // TODO: parse raw_bank declarations
             start_state,
             span,
         })

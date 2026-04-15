@@ -15,6 +15,7 @@ pub struct Program {
     pub sfx: Vec<SfxDecl>,
     pub music: Vec<MusicDecl>,
     pub banks: Vec<BankDecl>,
+    pub raw_banks: Vec<RawBankDecl>,
     pub start_state: String,
     pub span: Span,
 }
@@ -239,6 +240,19 @@ pub struct BankDecl {
 pub enum BankType {
     Prg,
     Chr,
+}
+
+/// `raw_bank Name @ N { binary: "path.bin" }` — pass-through binary bank.
+/// Used by decompiler to emit opaque PRG/CHR code without parsing.
+/// The linker splices the binary file verbatim at bank offset N.
+#[derive(Debug, Clone)]
+pub struct RawBankDecl {
+    pub name: String,
+    /// Bank index (0, 1, 2, ... for PRG; or 0 for CHR)
+    pub index: u8,
+    /// Source file path
+    pub source: AssetSource,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]
