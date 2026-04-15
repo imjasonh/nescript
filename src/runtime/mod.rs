@@ -110,6 +110,59 @@ pub const DEBUG_FRAME_OVERRUN_ADDR: u16 = 0x07FF;
 /// two can be inspected together in a Mesen memory viewer.
 pub const DEBUG_FRAME_OVERRUN_FLAG_ADDR: u16 = 0x07FE;
 
+/// Debug-mode cumulative sprite-per-scanline overflow counter.
+/// Incremented by the NMI handler once per frame in which the
+/// PPU's sprite overflow flag ($2002 bit 5) was set, i.e. any
+/// scanline of the just-finished frame had more than 8 sprites
+/// on it and the PPU silently dropped the excess. Read with
+/// `peek(0x07FD)` or `debug.sprite_overflow_count()`.
+///
+/// The PPU hardware flag has two well-known quirks — it can
+/// occasionally miss the 9th sprite or flag when none actually
+/// overflowed — but it's right for the overwhelming majority of
+/// cases and is essentially free to sample (one `LDA $2002; AND
+/// #$20` at the top of NMI). Pairs with the compile-time W0109
+/// warning: W0109 catches layouts knowable at compile time (text,
+/// HUD, title screens) and this counter catches the dynamic
+/// cases (enemy formations, projectile clusters) during
+/// playtesting in debug builds. Release-mode ROMs never touch
+/// this slot, so the analyzer is free to allocate over it.
+pub const DEBUG_SPRITE_OVERFLOW_COUNT_ADDR: u16 = 0x07FD;
+
+/// Debug-mode "did the previous frame hit the 8-sprites-per-
+/// scanline limit" sticky bit. Set by the NMI handler together
+/// with [`DEBUG_SPRITE_OVERFLOW_COUNT_ADDR`], and cleared to 0
+/// by every `wait_frame` IR op (or the implicit main-loop
+/// clear) so user code sees a fresh value every frame.
+/// Exposed to user code as `debug.sprite_overflow()`, a
+/// per-frame boolean suited for
+/// `debug.assert(not debug.sprite_overflow())` guards during
+/// playtesting.
+pub const DEBUG_SPRITE_OVERFLOW_FLAG_ADDR: u16 = 0x07FC;
+
+/// Runtime sprite-cycling offset. When any program statement
+/// emits a `cycle_sprites` call the codegen drops the
+/// `__sprite_cycle_used` marker, and the linker builds the
+/// cycling variant of the NMI handler: instead of writing 0
+/// to `OAM_ADDR` before the OAM DMA, it writes the current value
+/// of this byte, which rotates the destination slot of the DMA
+/// copy around the 64-slot OAM buffer. `cycle_sprites` adds 4
+/// to this byte each call (naturally wrapping at 256 back to 0),
+/// moving the copy start by one OAM slot per tick.
+///
+/// The result is the classic NES "sprite flicker" pattern: a
+/// scene with >8 sprites on a scanline drops a different one
+/// each frame rather than the same one every frame, so users
+/// perceive flicker instead of permanent dropout — vastly
+/// better UX because the eye reconstructs the missing pixels
+/// from adjacent frames.
+///
+/// Programs that never use `cycle_sprites` leave this byte at
+/// 0 forever and the NMI handler emits the original `LDA #0;
+/// STA $2003` sequence, preserving byte-for-byte compatibility
+/// with every existing golden ROM.
+pub const SPRITE_CYCLE_ADDR: u16 = 0x07EF;
+
 // ── Extra channel state ──
 //
 // The pulse-1 sfx and pulse-2 music channels live in zero page
@@ -283,8 +336,41 @@ pub fn gen_enable_rendering(show_background: bool) -> Vec<Instruction> {
 /// [`DEBUG_FRAME_OVERRUN_ADDR`]. Release-mode ROMs never call
 /// this with `debug_mode=true`, so the counter slot stays free
 /// for user allocation.
+///
+/// `has_sprite_cycle` selects between two OAM DMA setup paths:
+/// when false the NMI writes a literal 0 to `$2003` before
+/// triggering the DMA (classic behaviour, byte-identical to
+/// every pre-cycling ROM), and when true it reads the rotating
+/// offset byte from [`SPRITE_CYCLE_ADDR`] so each frame's DMA
+/// lands in a different slot of the PPU's OAM buffer. The
+/// per-frame increment is emitted at the `cycle_sprites` call
+/// site, not here, so programs can choose to cycle every frame
+/// (one call in `on frame`) or every Nth frame.
+/// Compile-time switches that pick which NMI-handler variant
+/// the runtime emits. Each bool either inlines or skips a
+/// self-contained block inside [`gen_nmi`]; programs that don't
+/// opt into a feature pay zero ROM/cycle cost for it. Grouped
+/// into a struct rather than passed as individual parameters
+/// to avoid tripping the clippy `fn_params_excessive_bools`
+/// lint and to give future additions (another marker-label-
+/// triggered NMI block) an obvious extension point.
+#[allow(clippy::struct_excessive_bools)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NmiOptions {
+    pub has_ppu_updates: bool,
+    pub has_audio: bool,
+    pub debug_mode: bool,
+    pub has_sprite_cycle: bool,
+}
+
 #[must_use]
-pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool, debug_mode: bool) -> Vec<Instruction> {
+pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
+    let NmiOptions {
+        has_ppu_updates,
+        has_audio,
+        debug_mode,
+        has_sprite_cycle,
+    } = opts;
     let mut out = Vec::new();
 
     // Save registers
@@ -304,6 +390,52 @@ pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool, debug_mode: bool) -> Vec<
     out.push(Instruction::new(LDA, AM::ZeroPage(0x03)));
     out.push(Instruction::implied(PHA));
 
+    // Debug-mode sprite overflow sampling. The PPU sets bit 5 of
+    // $2002 when its sprite evaluation hits more than 8 in-range
+    // sprites on any scanline of the frame it just finished
+    // rendering. NMI fires at the start of vblank, right after
+    // that rendering ends, so this is the exact moment the flag
+    // is valid for "did the just-finished frame overflow". The
+    // flag is cleared by the PPU at dot 1 of the pre-render line
+    // (261), which is *before* the next NMI, so each NMI sees a
+    // flag that reflects only the frame it follows.
+    //
+    // Reading $2002 has the side effects of (a) clearing the
+    // vblank latch in bit 7 and (b) resetting the $2005/$2006
+    // write-toggle. Both are harmless here: NMI was already
+    // taken, and `gen_ppu_update_apply` below always opens its
+    // own $2006 address with a fresh pair of writes so the reset
+    // toggle doesn't confuse it.
+    //
+    // The counter/sticky pair mirrors the frame-overrun pattern
+    // at $07FE/$07FF. Release builds don't emit this block at
+    // all, so the two bytes at $07FC/$07FD stay free for the
+    // analyzer to allocate over.
+    if debug_mode {
+        out.push(Instruction::new(LDA, AM::Absolute(PPU_STATUS)));
+        out.push(Instruction::new(AND, AM::Immediate(0x20)));
+        out.push(Instruction::new(
+            BEQ,
+            AM::LabelRelative("__debug_no_sprite_ovf".into()),
+        ));
+        out.push(Instruction::new(
+            INC,
+            AM::Absolute(DEBUG_SPRITE_OVERFLOW_COUNT_ADDR),
+        ));
+        // Reuse A, which still holds 0x20. Nonzero is enough for
+        // the sticky bit; the exact value doesn't matter because
+        // user code reads it as a boolean via
+        // `debug.sprite_overflow()`.
+        out.push(Instruction::new(
+            STA,
+            AM::Absolute(DEBUG_SPRITE_OVERFLOW_FLAG_ADDR),
+        ));
+        out.push(Instruction::new(
+            NOP,
+            AM::Label("__debug_no_sprite_ovf".into()),
+        ));
+    }
+
     // Run the audio driver's per-frame tick *after* the saves so it
     // can freely reuse A/X/Y and the $02/$03 scratch slots without
     // corrupting anything the main loop cares about. Programs that
@@ -312,8 +444,16 @@ pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool, debug_mode: bool) -> Vec<
         out.push(Instruction::new(JSR, AM::Label("__audio_tick".into())));
     }
 
-    // OAM DMA — transfer sprite data from $0200
-    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    // OAM DMA — transfer sprite data from $0200. Programs that
+    // don't use `cycle_sprites` get the classic fixed-offset
+    // path (LDA #0); programs that opt in get the rotating
+    // offset read from SPRITE_CYCLE_ADDR. Both variants write
+    // the same low byte ($02) for the DMA source page.
+    if has_sprite_cycle {
+        out.push(Instruction::new(LDA, AM::Absolute(SPRITE_CYCLE_ADDR)));
+    } else {
+        out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    }
     out.push(Instruction::new(STA, AM::Absolute(OAM_ADDR)));
     out.push(Instruction::new(LDA, AM::Immediate(0x02)));
     out.push(Instruction::new(STA, AM::Absolute(OAM_DMA)));

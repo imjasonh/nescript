@@ -471,6 +471,99 @@ Five tests in `src/analyzer/tests.rs`:
   draws inside an `if` block still trip W0109 (conservative
   over-count).
 
+### Layer-2: runtime sprite cycling (`cycle_sprites`)
+
+W0109 only catches the literal-coordinate case — a game with
+>8 dynamically-positioned sprites (enemies, projectiles,
+animated NPCs) is invisible to it. The hardware will still
+drop the 9th+ sprite on every frame, and because draw order
+is stable frame-to-frame the *same* sprite goes missing every
+frame, which reads to the developer as a game bug rather
+than a hardware limit.
+
+The classic NES mitigation is sprite cycling: rotate the OAM
+DMA start offset each frame so different sprites land in the
+PPU's "first 8" on each successive frame. Over N frames (where
+N is the number of overlapping sprites) each sprite gets
+dropped exactly once, and the eye reconstructs the missing
+pixels from frame persistence. Permanent dropout becomes
+visible flicker — the failure mode every NES player
+recognises, and vastly better UX than "my bullet disappeared."
+
+NEScript ships this as the opt-in `cycle_sprites` statement:
+
+```nescript
+on frame {
+    draw Enemy0 at: (e0x, e0y)
+    draw Enemy1 at: (e1x, e1y)
+    // ...lots of enemies...
+    cycle_sprites   // bump the rotating offset one slot
+    wait_frame
+}
+```
+
+Each call adds 4 to a one-byte runtime counter at `$07EF`
+(natural u8 wrap at 256 → 0) and emits a `__sprite_cycle_used`
+marker label. The linker reads the marker and swaps the NMI
+handler over to a variant that writes the counter to `$2003`
+before triggering the OAM DMA, so each frame's DMA lands in
+a different slot of the PPU's OAM buffer. Over 64 frames the
+rotation completes a full cycle.
+
+Programs that don't call `cycle_sprites` emit no marker and
+get the original fixed-offset NMI path, so every existing
+golden ROM stays byte-identical. Opt-in by design — the
+tradeoff is "cosmetic HUD elements you pinned to slot 0 lose
+their pin" — so programs that manage OAM priority manually
+can keep doing so.
+
+The [`examples/sprite_flicker_demo.ne`](../sprite_flicker_demo.ne)
+example drives 12 sprites into a 4-pixel band to exercise
+both W0109 at compile time and `cycle_sprites` at runtime;
+the committed emulator golden captures a specific frame of
+the cycling pattern.
+
+### Layer-3: debug-mode runtime overflow telemetry
+
+`debug.sprite_overflow_count()` and `debug.sprite_overflow()`
+mirror the existing `debug.frame_overrun_count()` /
+`debug.frame_overran()` pair. In debug builds the NMI handler
+samples the PPU's sprite-overflow flag (`$2002` bit 5) at the
+top of vblank — it reflects whether any scanline of the
+just-finished frame had more than 8 sprites and fired the
+hardware "give up" pathway. If the bit is set the handler
+bumps a cumulative counter at `$07FD` and sets a per-frame
+sticky bit at `$07FC`, which the next `wait_frame` clears.
+
+User code reads those bytes via the new builtins:
+
+```nescript
+debug.assert(not debug.sprite_overflow())
+```
+
+…or, in an overlay:
+
+```nescript
+var ovf: u8 = 0
+ovf = debug.sprite_overflow_count()
+draw Digit at: (8, 8) frame: ovf
+```
+
+The PPU hardware flag has well-known quirks (it occasionally
+misses the 9th sprite or sets the flag when none actually
+overflowed), but it's correct for the overwhelming majority
+of cases and is essentially free to sample — one `LDA $2002;
+AND #$20` at NMI top, ~15 cycles per frame. Release builds
+never emit the check block, so the four bytes at `$07EF` /
+`$07FC`-`$07FD` remain free for the analyzer to allocate.
+
+Combined, the three layers catch the sprite-per-scanline
+limit at three different lifecycle stages: W0109 at compile
+time for statically-knowable layouts, `debug.sprite_overflow*`
+at playtest time for the dynamic cases W0109 can't see, and
+`cycle_sprites` at runtime as a graceful fallback for the
+cases the user knows are unavoidable.
+
 ---
 
 ## 5. The `inline` keyword is a hint and is silently ignored for short functions *(FIXED)*

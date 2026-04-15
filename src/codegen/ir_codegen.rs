@@ -149,6 +149,13 @@ pub struct IrCodeGen<'a> {
     /// `false` and emit byte-identical ROM bytes for the audio
     /// subsystem.
     sfx_pitch_used: bool,
+    /// Set to true the first time the codegen lowers an
+    /// `IrOp::CycleSprites`. Drives the `__sprite_cycle_used`
+    /// marker label, which the linker reads to switch the NMI
+    /// handler over to the rotating-offset OAM DMA variant. The
+    /// flag also guards emitting the marker label *once* even
+    /// when the program calls `cycle_sprites` from many sites.
+    sprite_cycle_used: bool,
     /// Set to true the first time we emit any PPU update op
     /// (`set_palette` / `load_background`). The linker uses the
     /// resulting `__ppu_update_used` marker label to decide whether
@@ -291,6 +298,7 @@ impl<'a> IrCodeGen<'a> {
             sprite_tiles: HashMap::new(),
             sfx_info: HashMap::new(),
             sfx_pitch_used: false,
+            sprite_cycle_used: false,
             music_info: HashMap::new(),
             state_indices: HashMap::new(),
             function_names,
@@ -711,14 +719,16 @@ impl<'a> IrCodeGen<'a> {
         self.emit(LDA, AM::Immediate(0));
         self.emit(STA, AM::ZeroPage(ZP_FRAME_FLAG));
         // In debug mode, also clear the per-frame "did this frame
-        // overrun" sticky bit at $07FE so user code sees a fresh
-        // value next NMI even when the program has no explicit
-        // `wait_frame` inside its handler. The IR-level WaitFrame
-        // op clears it too, so explicit-wait programs already get
-        // this for free; mirroring it here makes the implicit
-        // main-loop path consistent.
+        // overrun" sticky bit at $07FE and the "did sprite overflow
+        // fire" sticky bit at $07FC so user code sees fresh values
+        // next NMI even when the program has no explicit `wait_frame`
+        // inside its handler. The IR-level WaitFrame op clears
+        // them too, so explicit-wait programs already get this for
+        // free; mirroring it here makes the implicit main-loop
+        // path consistent.
         if self.debug_mode {
             self.emit(STA, AM::Absolute(0x07FE));
+            self.emit(STA, AM::Absolute(0x07FC));
         }
 
         // Dispatch on current_state using CMP + BNE + JMP trampoline
@@ -1247,9 +1257,10 @@ impl<'a> IrCodeGen<'a> {
             IrOp::WaitFrame => {
                 // Poll frame flag at $00 until nonzero, then clear it.
                 // In debug mode, also clear the per-frame "did the
-                // previous frame overrun" sticky bit so user code
-                // sees a fresh value next NMI. The cumulative
-                // counter at $07FF is intentionally left alone.
+                // previous frame overrun" and "did the previous frame
+                // overflow sprites" sticky bits so user code sees a
+                // fresh value next NMI. The cumulative counters at
+                // $07FF and $07FD are intentionally left alone.
                 let wait_label = format!("__ir_wait_{}", self.local_label_suffix());
                 self.emit_label(&wait_label);
                 self.emit(LDA, AM::ZeroPage(ZP_FRAME_FLAG));
@@ -1258,7 +1269,27 @@ impl<'a> IrCodeGen<'a> {
                 self.emit(STA, AM::ZeroPage(ZP_FRAME_FLAG));
                 if self.debug_mode {
                     self.emit(STA, AM::Absolute(0x07FE));
+                    self.emit(STA, AM::Absolute(0x07FC));
                 }
+            }
+            IrOp::CycleSprites => {
+                // Emit the `__sprite_cycle_used` marker label exactly
+                // once per program so the linker switches to the
+                // cycling variant of the NMI handler. The label is
+                // zero-length; it only matters as a lookup key in
+                // the assembled label table.
+                if !self.sprite_cycle_used {
+                    self.emit_label("__sprite_cycle_used");
+                    self.sprite_cycle_used = true;
+                }
+                // Add 4 to the rotating offset byte at $07EF. Four
+                // `INC $07EF`s would also work but cost one extra
+                // byte; `LDA / CLC / ADC #4 / STA` is 10 bytes and
+                // lets us rely on the natural u8 wrap at 256 → 0.
+                self.emit(LDA, AM::Absolute(0x07EF));
+                self.emit(CLC, AM::Implied);
+                self.emit(ADC, AM::Immediate(0x04));
+                self.emit(STA, AM::Absolute(0x07EF));
             }
             IrOp::Transition(name) => {
                 // Write the target state's index to current_state, then
@@ -2274,6 +2305,7 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
         } => vec![*a_lo, *a_hi, *b_lo, *b_hi],
         IrOp::ReadInput(_, _)
         | IrOp::WaitFrame
+        | IrOp::CycleSprites
         | IrOp::Transition(_)
         | IrOp::InlineAsm(_)
         | IrOp::Peek(_, _)
@@ -2924,6 +2956,185 @@ mod more_tests {
         assert!(
             reads_counter,
             "debug.frame_overrun_count() should LDA $07FF"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_debug_sprite_overflow_count_loads_07fd() {
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            var n: u8 = 0
+            on frame {
+                n = debug.sprite_overflow_count()
+                wait_frame
+            }
+            start Main
+        "#,
+        );
+        let reads_counter = insts
+            .iter()
+            .any(|i| i.opcode == LDA && i.mode == AM::Absolute(0x07FD));
+        assert!(
+            reads_counter,
+            "debug.sprite_overflow_count() should LDA $07FD"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_debug_sprite_overflow_flag_loads_07fc() {
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            var n: u8 = 0
+            on frame {
+                n = debug.sprite_overflow()
+                wait_frame
+            }
+            start Main
+        "#,
+        );
+        let reads_flag = insts
+            .iter()
+            .any(|i| i.opcode == LDA && i.mode == AM::Absolute(0x07FC));
+        assert!(reads_flag, "debug.sprite_overflow() should LDA $07FC");
+    }
+
+    #[test]
+    fn ir_codegen_wait_frame_clears_sprite_overflow_sticky_in_debug_mode() {
+        // The per-frame sticky bit at $07FC must be cleared by the
+        // wait_frame op in debug builds so user code reads a fresh
+        // value every frame — same pattern as the frame-overrun
+        // sticky at $07FE.
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        let clears = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x07FC));
+        assert!(
+            clears,
+            "debug-mode wait_frame should clear the $07FC sticky bit"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_wait_frame_release_does_not_touch_sprite_overflow_sticky() {
+        // Release builds must not emit a store to $07FC so the
+        // top-of-RAM debug slot stays available for user allocation.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        let touches = insts
+            .iter()
+            .any(|i| (i.opcode == STA || i.opcode == LDA) && i.mode == AM::Absolute(0x07FC));
+        assert!(!touches, "release-mode wait_frame must not touch $07FC");
+    }
+
+    #[test]
+    fn ir_codegen_cycle_sprites_emits_marker_and_add4() {
+        // `cycle_sprites` must emit exactly one `__sprite_cycle_used`
+        // label (the linker looks for its presence to switch NMI
+        // variants), a read-modify-write of $07EF that adds 4 to the
+        // rotating offset byte, and nothing else.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame {
+                cycle_sprites
+                wait_frame
+            }
+            start Main
+        "#,
+        );
+        let marker_count = insts
+            .iter()
+            .filter(|i| matches!(&i.mode, AM::Label(l) if l == "__sprite_cycle_used"))
+            .count();
+        assert_eq!(
+            marker_count, 1,
+            "cycle_sprites should emit exactly one __sprite_cycle_used marker label"
+        );
+
+        let has_lda = insts
+            .iter()
+            .any(|i| i.opcode == LDA && i.mode == AM::Absolute(0x07EF));
+        let has_adc = insts
+            .iter()
+            .any(|i| i.opcode == ADC && i.mode == AM::Immediate(0x04));
+        let has_sta = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x07EF));
+        assert!(
+            has_lda && has_adc && has_sta,
+            "cycle_sprites should compile to LDA $07EF / ADC #4 / STA $07EF"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_cycle_sprites_marker_dedup_across_multiple_calls() {
+        // A program with more than one `cycle_sprites` call still
+        // emits the marker exactly once — the flag on the codegen
+        // guards against duplicate labels that would break the
+        // assembler.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame {
+                cycle_sprites
+                cycle_sprites
+                cycle_sprites
+                wait_frame
+            }
+            start Main
+        "#,
+        );
+        let marker_count = insts
+            .iter()
+            .filter(|i| matches!(&i.mode, AM::Label(l) if l == "__sprite_cycle_used"))
+            .count();
+        assert_eq!(
+            marker_count, 1,
+            "multiple cycle_sprites calls should still produce exactly one marker label"
+        );
+        // And all three calls should still emit their ADC.
+        let adc_count = insts
+            .iter()
+            .filter(|i| i.opcode == ADC && i.mode == AM::Immediate(0x04))
+            .count();
+        assert_eq!(adc_count, 3, "each cycle_sprites call should emit an ADC");
+    }
+
+    #[test]
+    fn ir_codegen_program_without_cycle_sprites_emits_no_marker() {
+        // Opt-in: programs that never call `cycle_sprites` must not
+        // emit the marker label, so the linker keeps the original
+        // fixed-offset OAM DMA path and existing goldens stay
+        // byte-identical.
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame {
+                draw Blip at: (10, 20)
+                wait_frame
+            }
+            start Main
+        "#,
+        );
+        let has_marker = insts
+            .iter()
+            .any(|i| matches!(&i.mode, AM::Label(l) if l == "__sprite_cycle_used"));
+        assert!(
+            !has_marker,
+            "programs without cycle_sprites must not emit __sprite_cycle_used"
         );
     }
 

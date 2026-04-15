@@ -2413,3 +2413,67 @@ fn analyze_sprite_scanline_budget_recurses_into_if() {
         result.diagnostics
     );
 }
+
+#[test]
+fn analyze_accepts_debug_sprite_overflow_builtins() {
+    // Both new debug methods should analyze without errors when
+    // called with zero arguments, exactly like
+    // frame_overrun_count / frame_overran.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var a: u8 = 0
+        var b: u8 = 0
+        on frame {
+            a = debug.sprite_overflow_count()
+            b = debug.sprite_overflow()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(!result
+        .diagnostics
+        .iter()
+        .any(|d| d.code == ErrorCode::E0201));
+}
+
+#[test]
+fn analyze_rejects_unknown_debug_method_lists_all_four_known_names() {
+    // When the user calls `debug.nope()`, the E0201 message
+    // should list every supported method name so typo fixes are
+    // obvious.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        var a: u8 = 0
+        on frame {
+            a = debug.nope()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for unknown debug method, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_accepts_cycle_sprites_statement() {
+    // `cycle_sprites` is a no-arg keyword statement. It should
+    // analyze cleanly in a frame handler without triggering any
+    // errors or warnings.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        on frame {
+            draw Blip at: (10, 20)
+            cycle_sprites
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}

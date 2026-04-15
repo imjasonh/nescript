@@ -579,7 +579,20 @@ impl Linker {
         // `--debug` is active; that tells the runtime to splice
         // in the extra frame-overrun check at the top of NMI.
         let debug_mode = has_label(user_code, "__debug_mode");
-        all_instructions.extend(runtime::gen_nmi(has_ppu_updates, has_audio, debug_mode));
+        // `__sprite_cycle_used` is dropped by the IR codegen
+        // whenever a `cycle_sprites` statement is lowered. When
+        // present, the NMI handler reads the rotating offset byte
+        // at $07EF instead of writing a literal 0 to $2003 before
+        // the OAM DMA, turning the classic "same sprites dropped
+        // every frame" hardware symptom into visible flicker that
+        // the eye reconstructs across frames.
+        let has_sprite_cycle = has_label(user_code, "__sprite_cycle_used");
+        all_instructions.extend(runtime::gen_nmi(runtime::NmiOptions {
+            has_ppu_updates,
+            has_audio,
+            debug_mode,
+            has_sprite_cycle,
+        }));
 
         // IRQ handler
         all_instructions.push(Instruction::new(NOP, AM::Label("__irq".into())));

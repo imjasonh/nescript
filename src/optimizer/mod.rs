@@ -571,6 +571,7 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         IrOp::LoadVarHi(_, _)
         | IrOp::ReadInput(_, _)
         | IrOp::WaitFrame
+        | IrOp::CycleSprites
         | IrOp::Transition(_)
         | IrOp::InlineAsm(_)
         | IrOp::Peek(_, _)
@@ -617,6 +618,7 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::ArrayStore(_, _, _)
         | IrOp::DrawSprite { .. }
         | IrOp::WaitFrame
+        | IrOp::CycleSprites
         | IrOp::Transition(_)
         | IrOp::Scroll(_, _)
         | IrOp::DebugLog(_)

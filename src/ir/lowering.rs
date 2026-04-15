@@ -957,6 +957,9 @@ impl LoweringContext {
             Statement::WaitFrame(_) => {
                 self.emit(IrOp::WaitFrame);
             }
+            Statement::CycleSprites(_) => {
+                self.emit(IrOp::CycleSprites);
+            }
             Statement::Call(name, args, _) => {
                 match name.as_str() {
                     // Built-in `poke(addr, value)` — write a byte to
@@ -1550,7 +1553,7 @@ impl LoweringContext {
             Expr::DebugCall(method, _args, _) => {
                 // The analyzer already validated the method name and
                 // argument count, so we can dispatch on the method
-                // name directly. Both currently-supported methods
+                // name directly. All currently-supported methods
                 // map to a Peek of a runtime address: the codegen
                 // strips the read out and substitutes a constant
                 // zero in release builds, so the builtin disappears
@@ -1559,6 +1562,8 @@ impl LoweringContext {
                 let addr: u16 = match method.as_str() {
                     "frame_overrun_count" => 0x07FF,
                     "frame_overran" => 0x07FE,
+                    "sprite_overflow_count" => 0x07FD,
+                    "sprite_overflow" => 0x07FC,
                     // Should be unreachable post-analyzer, but emit
                     // a zero rather than panicking so a parser test
                     // that bypasses the analyzer still produces IR.
@@ -1821,6 +1826,7 @@ fn is_splicable_void_stmt(stmt: &Statement) -> bool {
             | Statement::SetPalette(..)
             | Statement::LoadBackground(..)
             | Statement::WaitFrame(..)
+            | Statement::CycleSprites(..)
             | Statement::Play(..)
             | Statement::StartMusic(..)
             | Statement::StopMusic(..)

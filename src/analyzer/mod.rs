@@ -943,7 +943,10 @@ impl Analyzer {
                 // for completeness even though no current method
                 // accepts any.
                 match method.as_str() {
-                    "frame_overrun_count" | "frame_overran" => {
+                    "frame_overrun_count"
+                    | "frame_overran"
+                    | "sprite_overflow_count"
+                    | "sprite_overflow" => {
                         if !args.is_empty() {
                             self.diagnostics.push(Diagnostic::error(
                                 ErrorCode::E0203,
@@ -956,8 +959,8 @@ impl Analyzer {
                         self.diagnostics.push(Diagnostic::error(
                             ErrorCode::E0201,
                             format!(
-                                "unknown debug method '{method}' \
-                                 (expected 'frame_overrun_count' or 'frame_overran')"
+                                "unknown debug method '{method}' (expected 'frame_overrun_count', \
+                                 'frame_overran', 'sprite_overflow_count', or 'sprite_overflow')"
                             ),
                             *span,
                         ));
@@ -1964,6 +1967,7 @@ impl Analyzer {
                 }
             }
             Statement::WaitFrame(_) => {}
+            Statement::CycleSprites(_) => {}
             Statement::SetPalette(name, span) => {
                 if !self.palette_names.contains(name) {
                     self.diagnostics.push(Diagnostic::error(
@@ -2364,6 +2368,7 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
         Statement::Return(None, _)
         | Statement::Transition(_, _)
         | Statement::WaitFrame(_)
+        | Statement::CycleSprites(_)
         | Statement::Break(_)
         | Statement::Continue(_)
         | Statement::InlineAsm(_, _)

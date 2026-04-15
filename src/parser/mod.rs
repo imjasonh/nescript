@@ -2369,6 +2369,11 @@ impl Parser {
                 self.advance();
                 Ok(Statement::WaitFrame(span))
             }
+            TokenKind::KwCycleSprites => {
+                let span = self.current_span();
+                self.advance();
+                Ok(Statement::CycleSprites(span))
+            }
             TokenKind::KwLoadBackground => {
                 let span = self.current_span();
                 self.advance();
