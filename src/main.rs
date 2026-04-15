@@ -69,6 +69,15 @@ enum Cli {
         /// Input source file
         input: PathBuf,
     },
+    /// Decompile a .nes ROM back to .ne source code
+    Decompile {
+        /// Input ROM file (.nes)
+        input: PathBuf,
+
+        /// Output NEScript source file (default: input with .ne extension)
+        #[arg(short, long)]
+        output: Option<PathBuf>,
+    },
 }
 
 fn main() {
@@ -120,6 +129,27 @@ fn main() {
             Ok(()) => println!("no errors found in {}", input.display()),
             Err(()) => std::process::exit(1),
         },
+        Cli::Decompile { input, output } => {
+            let output = output.unwrap_or_else(|| {
+                let mut p = input.clone();
+                p.set_extension("ne");
+                p
+            });
+
+            match nescript::decompiler::decompile_rom(&input) {
+                Ok(decomp) => match nescript::decompiler::emitter::emit_source(&decomp, &output) {
+                    Ok(()) => println!("decompiled {} -> {}", input.display(), output.display()),
+                    Err(e) => {
+                        eprintln!("error writing decompiled source: {}", e);
+                        std::process::exit(1);
+                    }
+                },
+                Err(e) => {
+                    eprintln!("error decompiling ROM: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
     }
 }
 
