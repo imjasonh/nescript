@@ -33,6 +33,7 @@ pub enum ErrorCode {
     E0503, // undefined function
     E0504, // missing start declaration
     E0505, // multiple start declarations
+    E0506, // function has too many parameters (max 4 in v0.1)
 
     // W01xx: Warnings
     W0101, // expensive multiply/divide operation
@@ -62,6 +63,7 @@ impl fmt::Display for ErrorCode {
             Self::E0503 => "E0503",
             Self::E0504 => "E0504",
             Self::E0505 => "E0505",
+            Self::E0506 => "E0506",
             Self::W0101 => "W0101",
             Self::W0102 => "W0102",
             Self::W0103 => "W0103",

@@ -1258,6 +1258,30 @@ impl Analyzer {
             ));
             return;
         }
+        // The v0.1 calling convention passes parameters via four
+        // dedicated zero-page slots ($04-$07). Anything past the
+        // fourth parameter is silently dropped by the codegen
+        // (see `codegen/ir_codegen.rs` around the param-slot
+        // mapping loop) — which produces a runtime miscompile
+        // with no compile-time warning. Catch the over-arity case
+        // here so users get a clear error instead.
+        if fun.params.len() > 4 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    ErrorCode::E0506,
+                    format!(
+                        "function '{}' has {} parameters; the maximum is 4 in this version",
+                        fun.name,
+                        fun.params.len()
+                    ),
+                    fun.span,
+                )
+                .with_help(
+                    "the v0.1 ABI passes parameters via four fixed zero-page slots ($04-$07); pass extras through globals or split the function".to_string(),
+                ),
+            );
+            return;
+        }
         let sym_type = fun.return_type.clone().unwrap_or(NesType::U8);
         self.symbols.insert(
             fun.name.clone(),

@@ -280,6 +280,7 @@ reset_score()
 
 - **No recursion.** Both direct and indirect recursion are compile errors (`E0402`).
 - **Call depth limit.** The default maximum call depth is 8. Exceeding it produces error `E0401`.
+- **Maximum 4 parameters per function.** The v0.1 calling convention passes parameters via four fixed zero-page slots (`$04`-`$07`). Declaring a function with 5+ parameters produces error `E0506`. Pack additional state into globals or split the function into smaller helpers.
 
 ---
 
@@ -1203,6 +1204,7 @@ reference NEScript variables.
 | E0503  | Undefined function         |
 | E0504  | Missing start declaration  |
 | E0505  | Multiple start declarations|
+| E0506  | Function has too many parameters (max 4) |
 
 ### Warnings (W01xx)
 

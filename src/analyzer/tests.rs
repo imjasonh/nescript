@@ -2059,3 +2059,44 @@ fn analyze_debug_frame_overrun_count_with_args_errors() {
         "expected E0203 for arg count mismatch, got: {errors:?}"
     );
 }
+
+#[test]
+fn analyze_rejects_function_with_more_than_4_params() {
+    // The v0.1 calling convention only allocates 4 zero-page
+    // parameter slots ($04-$07). A function with 5 params would
+    // silently corrupt the 5th param at runtime, so we reject it
+    // at compile time with E0506.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        fun too_many(a: u8, b: u8, c: u8, d: u8, e: u8) {
+            a = 0
+        }
+        on frame { too_many(1, 2, 3, 4, 5) }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0506),
+        "expected E0506 for function with >4 params, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_accepts_function_with_exactly_4_params() {
+    // 4 params is the maximum and should compile cleanly.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        fun four_args(a: u8, b: u8, c: u8, d: u8) -> u8 {
+            return a + b + c + d
+        }
+        var n: u8 = 0
+        on frame {
+            n = four_args(1, 2, 3, 4)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}
