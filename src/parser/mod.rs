@@ -478,6 +478,7 @@ impl Parser {
             name,
             const_type,
             value,
+            placement: None,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }

@@ -292,6 +292,8 @@ pub struct ConstDecl {
     pub name: String,
     pub const_type: NesType,
     pub value: Expr,
+    /// If Some, this const is pinned to a specific ROM offset (decompiler-only).
+    pub placement: Option<Placement>,
     pub span: Span,
 }
 
@@ -300,6 +302,9 @@ pub enum Placement {
     Fast,
     Slow,
     Auto,
+    /// Fixed address in PRG ROM or zero-page (decompiler-generated).
+    /// The u32 is a byte offset (for PRG) or ZP address (for variables).
+    Fixed(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
