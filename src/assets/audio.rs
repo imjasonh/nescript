@@ -891,7 +891,6 @@ mod tests {
                 span: Span::dummy(),
             }),
             on_scanline: Vec::new(),
-            allow_unstructured: false,
             span: Span::dummy(),
         });
         let resolved = resolve_sfx(&prog).unwrap();
@@ -923,7 +922,6 @@ mod tests {
                 span: Span::dummy(),
             }),
             on_scanline: Vec::new(),
-            allow_unstructured: false,
             span: Span::dummy(),
         });
         let resolved = resolve_sfx(&prog).unwrap();
@@ -999,7 +997,6 @@ mod tests {
                 span: Span::dummy(),
             }),
             on_scanline: Vec::new(),
-            allow_unstructured: false,
             span: Span::dummy(),
         });
         let resolved = resolve_music(&prog).unwrap();
@@ -1127,7 +1124,6 @@ mod tests {
                 span: Span::dummy(),
             }),
             on_scanline: Vec::new(),
-            allow_unstructured: false,
             span: Span::dummy(),
         });
         let names = referenced_sfx_names(&prog);
