@@ -2,17 +2,16 @@
 //
 // Shuffles the deck on entry, then runs a brief dealing animation
 // before transitioning into Playing. The animation shows a single
-// face-down card sprite alternating between A's deck and B's deck
-// while a FlipCard sfx clicks on each dealt step. The deck counts
-// tick up alongside so it looks like the stacks are actually
-// growing.
+// face-down "in flight" card sprite alternating between A's deck
+// and B's deck while a FlipCard sfx clicks on each dealt step.
+// The deck counts tick up alongside so it looks like the stacks
+// are actually growing.
 //
-// This state is short (52 * FRAMES_DEAL_STEP / 2 = 104 frames per
-// full deal at FRAMES_DEAL_STEP = 4). The jsnes harness captures
-// at frame 180 so it will see roughly "halfway through the deal"
-// unless we accelerate things. We compromise by dealing one card
-// every 2 frames so the full deal lasts ~52 frames, giving
-// Playing time to show meaningful content before frame 180.
+// Pace: one dealt card every 2 frames → 104 frames for the full
+// 52-card deal. Combined with the title's 45-frame autopilot,
+// Playing starts at roughly frame 150, leaving ~30 frames before
+// the jsnes harness captures at frame 180 — enough for the
+// CPU-think delay and the start of A's first fly.
 
 state Deal {
     on enter {

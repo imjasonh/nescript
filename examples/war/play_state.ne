@@ -246,6 +246,11 @@ state Playing {
                 }
             }
             P_WAR_BURY => {
+                // Keep the previous round's face-up pair on the
+                // table while the buries thump in — visually the
+                // tied cards stay lit until the new pair lands.
+                draw_card_face(PLAY_A_X, PLAY_Y, card_a)
+                draw_card_face(PLAY_B_X, PLAY_Y, card_b)
                 // Bury up to 3 face-down cards from each deck, then
                 // draw a new face-up pair. We don't animate each
                 // individual buried card; just play a noise thump

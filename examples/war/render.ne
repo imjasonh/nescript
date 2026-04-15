@@ -155,16 +155,6 @@ fun draw_word_wins(x: u8, y: u8) {
     draw_letter(dww_px, y, 18)  // S
 }
 
-// "WAR" — the centred flash during a tie-break.
-fun draw_word_war(x: u8, y: u8) {
-    var dwa_px: u8 = x
-    draw_letter(dwa_px, y, 22)  // W
-    dwa_px += 8
-    draw_letter(dwa_px, y, 0)   // A
-    dwa_px += 8
-    draw_letter(dwa_px, y, 17)  // R
-}
-
 // "PRESS" — used on the title screen.
 fun draw_word_press(x: u8, y: u8) {
     var dwr_px: u8 = x

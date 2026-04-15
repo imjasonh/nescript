@@ -177,31 +177,81 @@ Game modes (`0`/`1`/`2` players) are captured by two `bool` flags
 
 ## 7. Implementation steps
 
-The checkboxes below are updated as each step lands. A step is only
-marked complete after the compiler still produces a working ROM and
-the change visibly does what it's supposed to.
+All steps complete. The order they actually shipped in is below
+(the original 12-step plan got compressed once the early steps
+turned up enough compiler bugs to demand investigation in
+parallel).
 
-- [ ] Step 1: Skeleton — top-level file, empty included files, compiles.
-- [ ] Step 2: Palette, felt background, card-back tiles, static card
-      rendered on the table.
-- [ ] Step 3: Card-face tiles (ranks, suits, big pips) + draw_card_face
-      helper showing all 13 ranks × 4 suits.
-- [ ] Step 4: Deck data structures, RNG, shuffle, init + HUD digit
-      rendering.
-- [ ] Step 5: Title state (WAR banner, 3-option menu, cursor, music,
-      autopilot).
-- [ ] Step 6: Deal state (animated deal + flip sfx).
-- [ ] Step 7: Play state phase machine with card animations and sfx.
-- [ ] Step 8: War tie-break (banner + bury animation + WarFlash).
-- [ ] Step 9: Victory state (winner banner + fanfare + auto-return).
-- [ ] Step 10: Polish pass (timing, readability, sfx/music tuning).
-- [ ] Step 11: Rebuild war.nes, capture goldens, verify diff.
-- [ ] Step 12: Update README.md and examples/README.md.
-- [ ] Code review pass: read every file end-to-end, fix mistakes.
+- [x] Step 1: Skeleton — top-level file, every included file
+      filled with a real implementation, compiles cleanly.
+- [x] Step 2: Felt background — replaced the builtin-smiley
+      grid with a custom `TILE_FELT_BG` cross-hatch tile.
+- [x] Step 3: Card art — bold rank glyphs (1 tile each), small
+      corner suits, big centre pip halves, card-back lattice,
+      card frame helpers (`draw_card_face` / `draw_card_back`).
+- [x] Step 4: Deck data structures — circular buffers with
+      front/count cursors, packed `(rank << 4) | suit` cards,
+      Galois LFSR PRNG, bounded random-swap shuffle, deal/split.
+- [x] Step 5: Title state — BIG WAR banner, "CARD GAME"
+      subtitle, 3-line menu with cursor, blinking PRESS A,
+      title-music + autopilot.
+- [x] Step 6: Deal state — animated deal with FlipCard sfx and
+      growing deck-back stacks.
+- [x] Step 7: Play state phase machine — `match phase` over the
+      11 P_* phases, fly animation that doesn't overshoot, win
+      cues, debounced human input.
+- [x] Step 8: War tie-break — BIG WAR banner reused as a
+      strobing flash, ThudDown noise sfx for each buried card,
+      pot grows by 6 per side per war.
+- [x] Step 9: Victory state — staggered "PLAYER X / WINS"
+      banner, top-of-deck showcase card, builtin fanfare,
+      auto-return to Title.
+- [x] Step 10: Polish pass — bold sprite font, card-fly
+      timing/overshoot fix, P_WAR_BURY redraws the previous
+      face-ups, draw_word_war removed (was orphaned by the BIG
+      WAR helper), title state shares the BIG WAR helper.
+- [x] Step 11: Capture goldens, verify all 31 ROMs match, war
+      golden lands cleanly on a mid-fly-A frame at frame 180.
+- [x] Step 12: Update README.md and examples/README.md.
+- [x] Code review pass: read every file end-to-end, fix any
+      mistakes found.
+
+Two compiler bugs were discovered along the way and fixed in
+the same PR (E0506 too-many-params + the wide_hi map leak in IR
+lowering). Three more compiler limitations are documented in
+`COMPILER_BUGS.md` with workarounds in the war source for now.
 
 ---
 
 ## 8. Design revisions
 
-(Empty — will be updated in-flight if anything changes from the
-approved design.)
+A few things shifted from the approved plan:
+
+- **`arm_fly` is 4 params, not 6.** The 5th and 6th params
+  (`fly_card`, `fly_face_up`) are written to globals at every
+  call site instead, because the v0.1 ABI silently drops params
+  past the 4th. The 4-param limit now produces a clean E0506
+  diagnostic so future authors won't trip on it.
+- **`card` parameter in `card_rank` / `card_suit` / `draw_card_face`
+  was renamed to per-function unique names** to dodge the IR
+  lowering's shared-VarId issue documented in
+  `COMPILER_BUGS.md` §1b. Same for `wrap52`'s `v` and the
+  `push_back_*` helpers. `x` and `y` are still shared because
+  they sit at the same parameter position in every helper that
+  takes them, so the routed slot mapping is consistent.
+- **The `Playing` state's phase machine uses `match`, not a
+  flat if-chain.** The if-chain shape allowed two phases to run
+  in the same frame after a `set_phase` transition, which made
+  the card-fly animation overshoot its endpoint by `FLY_STEP`.
+  `match` runs only the first matching arm.
+- **Card frame outline tiles (`TILE_FRAME_TL`/`TR`/`BL`/`BR`)
+  are still allocated in the Tileset but unused.** The card
+  faces use the rank/suit/pip tiles directly with white card
+  bodies that visually separate from the dark felt — a card
+  frame would have made each tile cramped without much
+  readability gain. Constants are kept for layout stability;
+  the tiles themselves serve as a 4-tile reserve for future
+  art tweaks.
+- **The deal animation** is a single bouncing card-back, not a
+  full 52-card cascade. Cleaner and cheaper, and the FlipCard
+  click rhythm carries the "we're dealing!" feel by itself.

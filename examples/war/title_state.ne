@@ -31,31 +31,17 @@ state Title {
         }
 
         // ── Big "WAR" title banner ───────────────────────
-        // Each letter is a 2x2 block of 16x16 BIG tiles.
-        // Three letters at 16px wide + 4px gap = 16*3 + 4*2 = 56px;
-        // centred at x = (256 - 56)/2 = 100.
-        // y = 32 puts the banner in the top third of the screen.
-        // BIG W
-        draw Tileset at: (100,  32) frame: TILE_BIG_W_TL
-        draw Tileset at: (108,  32) frame: TILE_BIG_W_TR
-        draw Tileset at: (100,  40) frame: TILE_BIG_W_BL
-        draw Tileset at: (108,  40) frame: TILE_BIG_W_BR
-        // BIG A
-        draw Tileset at: (120,  32) frame: TILE_BIG_A_TL
-        draw Tileset at: (128,  32) frame: TILE_BIG_A_TR
-        draw Tileset at: (120,  40) frame: TILE_BIG_A_BL
-        draw Tileset at: (128,  40) frame: TILE_BIG_A_BR
-        // BIG R
-        draw Tileset at: (140,  32) frame: TILE_BIG_R_TL
-        draw Tileset at: (148,  32) frame: TILE_BIG_R_TR
-        draw Tileset at: (140,  40) frame: TILE_BIG_R_BL
-        draw Tileset at: (148,  40) frame: TILE_BIG_R_BR
+        // Three 16×16 metasprite letters (BIG W, A, R), drawn
+        // via the same helper the in-game tie-break uses. Each
+        // letter is 8px wide (BIG_*_TL / BIG_*_TR side-by-side);
+        // letters land at x = 100, 120, 140 with the helper's
+        // internal 20-px stride.
+        draw_big_war_banner(100, 32)
 
         // Subtitle "CARD GAME" in 8x8 font under the banner.
-        // 9 letters incl. the embedded space → 9 sprites per row,
-        // which over-runs the 8-per-scanline limit. Splitting the
-        // subtitle across two y rows (offset by 8px) keeps each
-        // scanline under the limit.
+        // 8 letter sprites at y=64 — exactly at the per-scanline
+        // limit. The space between "CARD" and "GAME" is just a
+        // skipped tile column, so it doesn't burn an OAM slot.
         draw_letter(96,  64, 2)    // C
         draw_letter(104, 64, 0)    // A
         draw_letter(112, 64, 17)   // R
