@@ -259,7 +259,7 @@ pub fn validate_ines(data: &[u8]) -> Result<RomInfo, &'static str> {
     })
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct RomInfo {
     pub prg_banks: usize,
     pub chr_banks: usize,

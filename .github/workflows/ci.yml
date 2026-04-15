@@ -175,3 +175,20 @@ jobs:
             tests/emulator/actual/
             tests/emulator/goldens/
             tests/emulator/report.json
+
+  decompile-roundtrip:
+    name: Decompiler Round-Trip Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run identity roundtrip tests
+        # M5.1: Decompile all examples, recompile, verify byte-identical ROMs.
+        # Currently skipped (M1 completion blocked), but runs when M1 is done.
+        run: cargo test --all-targets roundtrip_identity_all_examples
+      - name: Run smoke tests
+        # M5.3-M5.4: Verify infrastructure is in place.
+        run: cargo test --all-targets roundtrip_smoke_test -- --nocapture
+      - name: List all examples being tested
+        run: cargo test --test decompiler_roundtrip roundtrip_list_examples -- --nocapture

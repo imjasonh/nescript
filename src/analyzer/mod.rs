@@ -829,7 +829,7 @@ impl Analyzer {
             // still error out with a clearer message than before.
             let size = match &field.field_type {
                 NesType::U8 | NesType::I8 | NesType::Bool => 1,
-                NesType::U16 => 2,
+                NesType::U16 | NesType::Fixed8p8 => 2,
                 NesType::Array(_, _) | NesType::Struct(_) => {
                     self.diagnostics.push(Diagnostic::error(
                         ErrorCode::E0201,
@@ -2015,7 +2015,7 @@ fn compute_depth(
 fn type_size_with(t: &NesType, struct_sizes: &HashMap<String, u16>) -> u16 {
     match t {
         NesType::U8 | NesType::I8 | NesType::Bool => 1,
-        NesType::U16 => 2,
+        NesType::U16 | NesType::Fixed8p8 => 2,
         NesType::Array(elem, count) => type_size_with(elem, struct_sizes) * count,
         NesType::Struct(name) => struct_sizes.get(name).copied().unwrap_or(0),
     }

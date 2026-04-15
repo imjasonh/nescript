@@ -312,6 +312,8 @@ pub enum NesType {
     /// A user-declared struct, identified by its name. The analyzer
     /// looks up field layouts in the `StructDecl` table.
     Struct(String),
+    /// Signed fixed-point Q8.8 arithmetic (16-bit storage).
+    Fixed8p8,
 }
 
 impl std::fmt::Display for NesType {
@@ -323,6 +325,7 @@ impl std::fmt::Display for NesType {
             Self::Bool => write!(f, "bool"),
             Self::Array(t, n) => write!(f, "{t}[{n}]"),
             Self::Struct(name) => write!(f, "{name}"),
+            Self::Fixed8p8 => write!(f, "fixed8.8"),
         }
     }
 }

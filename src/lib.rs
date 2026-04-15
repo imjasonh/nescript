@@ -2,6 +2,7 @@ pub mod analyzer;
 pub mod asm;
 pub mod assets;
 pub mod codegen;
+pub mod decompiler;
 pub mod errors;
 pub mod ir;
 pub mod lexer;
