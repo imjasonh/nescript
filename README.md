@@ -91,6 +91,7 @@ start Main
 | [`audio_demo.ne`](examples/audio_demo.ne) | Audio subsystem: user `sfx`/`music` blocks, builtin effects, `play`/`start_music`/`stop_music` |
 | [`noise_triangle_sfx.ne`](examples/noise_triangle_sfx.ne) | Noise and triangle channel sfx via `channel: noise` / `channel: triangle` on `sfx` blocks |
 | [`sfx_pitch_envelope.ne`](examples/sfx_pitch_envelope.ne) | Per-frame pulse `pitch:` arrays — the audio tick walks the pitch envelope in lockstep with the volume envelope and writes `$4002` on every NMI for a frequency-sweeping siren tone |
+| [`metasprite_demo.ne`](examples/metasprite_demo.ne) | `metasprite Hero { sprite: ..., dx: [...], dy: [...], frame: [...] }` declarative multi-tile groups — `draw Hero at: (x, y)` expands to one OAM slot per tile so 16×16 sprites stop needing four hand-written `draw` statements |
 | [`platformer.ne`](examples/platformer.ne) | **End-to-end side-scroller** — custom CHR tileset, full background nametable, metasprite player with gravity/jump physics, wrap-around scrolling, stomp-or-die enemy collisions, live stomp-count HUD, pickup coins, user-declared SFX + music, and a Title → Playing → GameOver state machine with a proximity-based autopilot so the headless harness demonstrates the full gameplay loop (stomp, stomp, die, retry) inside six seconds |
 
 ## Compiler Commands

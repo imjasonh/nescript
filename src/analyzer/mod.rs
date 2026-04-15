@@ -396,6 +396,68 @@ impl Analyzer {
             }
         }
 
+        // Validate metasprite declarations: the parallel offset
+        // arrays must all be the same length, the named sprite
+        // must exist, and the metasprite name must be unique
+        // (against other metasprites and against sprites — both
+        // share the same `draw` lookup namespace).
+        let mut seen_metasprites = HashSet::new();
+        let sprite_names: HashSet<String> =
+            program.sprites.iter().map(|s| s.name.clone()).collect();
+        for ms in &program.metasprites {
+            if !seen_metasprites.insert(ms.name.clone()) {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0501,
+                    format!("duplicate metasprite '{}'", ms.name),
+                    ms.span,
+                ));
+            }
+            if sprite_names.contains(&ms.name) {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0501,
+                    format!(
+                        "metasprite '{}' shadows a sprite with the same name; pick a unique identifier",
+                        ms.name
+                    ),
+                    ms.span,
+                ));
+            }
+            if !sprite_names.contains(&ms.sprite_name) {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "metasprite '{}' references unknown sprite '{}'",
+                        ms.name, ms.sprite_name
+                    ),
+                    ms.span,
+                ));
+            }
+            if ms.dx.len() != ms.dy.len() || ms.dx.len() != ms.frame.len() {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "metasprite '{}' has mismatched array lengths: \
+                         dx={}, dy={}, frame={} — all three must be equal",
+                        ms.name,
+                        ms.dx.len(),
+                        ms.dy.len(),
+                        ms.frame.len()
+                    ),
+                    ms.span,
+                ));
+            }
+            if ms.dx.is_empty() {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "metasprite '{}' is empty — declare at least one tile",
+                        ms.name
+                    ),
+                    ms.span,
+                ));
+            }
+        }
+
         // Register functions as symbols
         for fun in &program.functions {
             self.register_fun(fun);

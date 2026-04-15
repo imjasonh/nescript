@@ -12,10 +12,41 @@ pub struct Program {
     pub sprites: Vec<SpriteDecl>,
     pub palettes: Vec<PaletteDecl>,
     pub backgrounds: Vec<BackgroundDecl>,
+    pub metasprites: Vec<MetaspriteDecl>,
     pub sfx: Vec<SfxDecl>,
     pub music: Vec<MusicDecl>,
     pub banks: Vec<BankDecl>,
     pub start_state: String,
+    pub span: Span,
+}
+
+/// `metasprite Name { sprite: Tileset, dx: [...], dy: [...], frame: [...] }`
+/// — a multi-tile sprite group authored as parallel offset arrays.
+/// `draw Name at: (x, y)` lowers to one `DrawSprite` per tile, with
+/// each tile's screen position computed as `(x + dx[i], y + dy[i])`
+/// and its tile index taken from `frame[i]`. The underlying
+/// `sprite:` field names a previously-declared sprite/tileset that
+/// owns the actual CHR data — metasprites only describe layout.
+///
+/// All three offset/frame arrays must have the same length, which
+/// becomes the metasprite's tile count. The lowering does the
+/// per-tile cursor bump through the existing OAM cursor path so a
+/// metasprite that draws four tiles consumes four OAM slots in the
+/// same order the user wrote them.
+///
+/// Today only u8 (unsigned) offsets are supported. Negative
+/// offsets aren't representable in the current `NesType::U8` array
+/// literals — see `docs/future-work.md`.
+#[derive(Debug, Clone)]
+pub struct MetaspriteDecl {
+    pub name: String,
+    /// Underlying CHR-bearing sprite/tileset whose tiles are
+    /// indexed by this metasprite's `frame:` entries. Looked up
+    /// in [`Program::sprites`] at analysis time.
+    pub sprite_name: String,
+    pub dx: Vec<u8>,
+    pub dy: Vec<u8>,
+    pub frame: Vec<u8>,
     pub span: Span,
 }
 

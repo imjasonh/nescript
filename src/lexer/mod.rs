@@ -462,6 +462,7 @@ impl<'a> Lexer<'a> {
             "start" => TokenKind::KwStart,
             "transition" => TokenKind::KwTransition,
             "sprite" => TokenKind::KwSprite,
+            "metasprite" => TokenKind::KwMetasprite,
             "background" => TokenKind::KwBackground,
             "palette" => TokenKind::KwPalette,
             "sfx" => TokenKind::KwSfx,

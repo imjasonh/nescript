@@ -129,6 +129,7 @@ impl Parser {
         let mut sprites = Vec::new();
         let mut palettes = Vec::new();
         let mut backgrounds = Vec::new();
+        let mut metasprites = Vec::new();
         let mut sfx = Vec::new();
         let mut music = Vec::new();
         let mut banks = Vec::new();
@@ -164,6 +165,9 @@ impl Parser {
                 }
                 TokenKind::KwSprite => {
                     sprites.push(self.parse_sprite_decl()?);
+                }
+                TokenKind::KwMetasprite => {
+                    metasprites.push(self.parse_metasprite_decl()?);
                 }
                 TokenKind::KwPalette => {
                     palettes.push(self.parse_palette_decl()?);
@@ -253,6 +257,7 @@ impl Parser {
             sprites,
             palettes,
             backgrounds,
+            metasprites,
             sfx,
             music,
             banks,
@@ -848,6 +853,104 @@ impl Parser {
         Ok(SpriteDecl {
             name,
             chr_source,
+            span: Span::new(start.file_id, start.start, self.current_span().end),
+        })
+    }
+
+    /// Parse a `metasprite Name { sprite: ..., dx: [...], dy: [...],
+    /// frame: [...] }` block. The body uses parallel byte arrays so
+    /// the parser can reuse the existing [`Self::parse_byte_array`]
+    /// helper for each one — the analyzer is responsible for
+    /// asserting they're all the same length and that the named
+    /// sprite exists.
+    fn parse_metasprite_decl(&mut self) -> Result<MetaspriteDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwMetasprite)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut sprite_name: Option<String> = None;
+        let mut dx: Option<Vec<u8>> = None;
+        let mut dy: Option<Vec<u8>> = None;
+        let mut frame: Option<Vec<u8>> = None;
+
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            // Accept either a regular identifier or the `sprite`
+            // keyword in the property-name position. We fall
+            // through to the standard ident path for everything
+            // else so misspellings still produce the usual
+            // E0201 diagnostic.
+            let (key, key_span) = if *self.peek() == TokenKind::KwSprite {
+                let span = self.current_span();
+                self.advance();
+                ("sprite".to_string(), span)
+            } else {
+                self.expect_ident()?
+            };
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "sprite" => {
+                    let (sname, _) = self.expect_ident()?;
+                    sprite_name = Some(sname);
+                }
+                "dx" => {
+                    dx = Some(self.parse_byte_array("dx")?);
+                }
+                "dy" => {
+                    dy = Some(self.parse_byte_array("dy")?);
+                }
+                "frame" => {
+                    frame = Some(self.parse_byte_array("frame")?);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown metasprite property '{key}'"),
+                        key_span,
+                    ));
+                }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let sprite_name = sprite_name.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("metasprite '{name}' is missing the required 'sprite:' property"),
+                start,
+            )
+        })?;
+        let dx = dx.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("metasprite '{name}' is missing the required 'dx:' array"),
+                start,
+            )
+        })?;
+        let dy = dy.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("metasprite '{name}' is missing the required 'dy:' array"),
+                start,
+            )
+        })?;
+        let frame = frame.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("metasprite '{name}' is missing the required 'frame:' array"),
+                start,
+            )
+        })?;
+
+        Ok(MetaspriteDecl {
+            name,
+            sprite_name,
+            dx,
+            dy,
+            frame,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }

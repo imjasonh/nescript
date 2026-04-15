@@ -351,6 +351,69 @@ fn lower_debug_frame_overrun_count_emits_peek() {
 }
 
 #[test]
+fn lower_metasprite_draw_expands_to_one_op_per_tile() {
+    // `draw Hero at: (10, 20)` where Hero is a 4-tile metasprite
+    // should lower to four `DrawSprite` ops, each with the
+    // metasprite's underlying sprite name and one tile from the
+    // declaration's `frame:` array (offset by the sprite's base
+    // tile index — the runtime smiley occupies tile 0, so a
+    // single-sprite program starts user tiles at 1).
+    let ir = lower_ok(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tile {
+            pixels: [
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@"
+            ]
+        }
+        metasprite Hero {
+            sprite: Tile
+            dx:    [0, 8, 0, 8]
+            dy:    [0, 0, 8, 8]
+            frame: [0, 0, 0, 0]
+        }
+        on frame {
+            draw Hero at: (10, 20)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
+    let draws: Vec<_> = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .filter_map(|op| match op {
+            IrOp::DrawSprite { sprite_name, .. } => Some(sprite_name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        draws.len(),
+        4,
+        "metasprite with 4 tiles should expand to 4 DrawSprite ops"
+    );
+    for name in &draws {
+        assert_eq!(
+            name, "Tile",
+            "expanded ops should target the underlying sprite"
+        );
+    }
+}
+
+#[test]
 fn lower_nested_struct_literal_init_expands_to_leaves() {
     // A `Hero { pos: Vec2 { x: 1, y: 2 }, hp: 100, inv: [3,4,5,6] }`
     // initializer must produce one IrGlobal per leaf field with the

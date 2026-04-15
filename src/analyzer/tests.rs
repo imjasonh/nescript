@@ -490,6 +490,127 @@ fn analyze_struct_with_unknown_inner_struct_errors() {
 }
 
 #[test]
+fn analyze_metasprite_ok() {
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tile {
+            pixels: [
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@"
+            ]
+        }
+        metasprite Hero {
+            sprite: Tile
+            dx:    [0, 8]
+            dy:    [0, 0]
+            frame: [0, 0]
+        }
+        on frame { draw Hero at: (10, 10) wait_frame }
+        start Main
+    "#,
+    );
+    // Sanity: the metasprite was kept around in the program.
+    // (The analyzer doesn't move declarations into AnalysisResult,
+    // so we only check that no errors were emitted; the
+    // lowering test below validates the expansion path.)
+    assert!(result.diagnostics.iter().all(|d| !d.is_error()));
+}
+
+#[test]
+fn analyze_metasprite_unknown_sprite_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        metasprite Hero {
+            sprite: NotASprite
+            dx:    [0]
+            dy:    [0]
+            frame: [0]
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "metasprite referencing an unknown sprite should emit E0201, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_metasprite_mismatched_array_lengths_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tile {
+            pixels: [
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@"
+            ]
+        }
+        metasprite Hero {
+            sprite: Tile
+            dx:    [0, 8, 0]
+            dy:    [0, 0]
+            frame: [0, 1, 2]
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "mismatched dx/dy/frame lengths should emit E0201, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_metasprite_empty_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tile {
+            pixels: [
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@"
+            ]
+        }
+        metasprite Hero {
+            sprite: Tile
+            dx: []
+            dy: []
+            frame: []
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "empty metasprite should emit E0201, got: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_struct_with_array_of_structs_is_rejected() {
     // Arrays of structs aren't supported yet — the synthetic-
     // variable model can't index into per-element struct layouts

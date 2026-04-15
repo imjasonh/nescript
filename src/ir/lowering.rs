@@ -46,6 +46,23 @@ struct LoweringContext {
     /// by binary-op, compare, and assignment lowering when they
     /// need to decide between `Add`/`Add16`, etc.
     wide_hi: HashMap<IrTemp, IrTemp>,
+    /// Captured metasprite declarations keyed by name. When a
+    /// `Statement::Draw` names a metasprite (rather than a flat
+    /// sprite), the lowering expands it inline into one
+    /// [`IrOp::DrawSprite`] per tile, with x/y offsets folded into
+    /// the per-tile coordinates and the metasprite's `frame:`
+    /// entry used as the literal frame index. Storing the lookup
+    /// here keeps the per-statement lowering simple and avoids
+    /// having to thread the program through every helper.
+    metasprites: HashMap<String, MetaspriteInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct MetaspriteInfo {
+    sprite_name: String,
+    dx: Vec<u8>,
+    dy: Vec<u8>,
+    frame: Vec<u8>,
 }
 
 struct LoopContext {
@@ -92,6 +109,7 @@ impl LoweringContext {
             state_names: Vec::new(),
             start_state: String::new(),
             wide_hi: HashMap::new(),
+            metasprites: HashMap::new(),
         }
     }
 
@@ -268,6 +286,52 @@ impl LoweringContext {
         // Capture state metadata before lowering
         self.state_names = program.states.iter().map(|s| s.name.clone()).collect();
         program.start_state.clone_into(&mut self.start_state);
+
+        // Capture metasprite declarations so the per-statement
+        // Draw lowering can expand `draw Hero` into one
+        // DrawSprite op per tile. The `frame:` array in a
+        // metasprite is interpreted *relative to the underlying
+        // sprite's base tile* — i.e. `frame: [0, 1, 2, 3]` on a
+        // 16×16 sprite means "the four tiles this sprite owns".
+        // Since the IR codegen's DrawSprite op takes an *absolute*
+        // tile index whenever `frame` is set, we need to resolve
+        // the per-sprite base tile here and rewrite the array
+        // before storing it.
+        //
+        // Tile assignment mirrors `assets::resolve_sprites`: tile
+        // index 0 is reserved for the runtime's default smiley,
+        // user sprites start at 1, and each sprite consumes
+        // `chr_bytes.len() / 16` tiles (rounded up). Sprites with
+        // an external `@chr(...)` / `@binary(...)` source whose
+        // bytes aren't available at parse time fall back to a
+        // single-tile assumption — that's a regression for those
+        // exotic sources but keeps the in-tree examples working.
+        let mut sprite_base: HashMap<String, u8> = HashMap::new();
+        let mut next_tile: u8 = 1;
+        for sprite in &program.sprites {
+            sprite_base.insert(sprite.name.clone(), next_tile);
+            let tile_count = match &sprite.chr_source {
+                crate::parser::ast::AssetSource::Inline(bytes) => {
+                    (bytes.len().div_ceil(16)).max(1) as u8
+                }
+                _ => 1,
+            };
+            next_tile = next_tile.saturating_add(tile_count);
+        }
+        for ms in &program.metasprites {
+            let base = sprite_base.get(&ms.sprite_name).copied().unwrap_or(0);
+            let resolved_frames: Vec<u8> =
+                ms.frame.iter().map(|&f| base.saturating_add(f)).collect();
+            self.metasprites.insert(
+                ms.name.clone(),
+                MetaspriteInfo {
+                    sprite_name: ms.sprite_name.clone(),
+                    dx: ms.dx.clone(),
+                    dy: ms.dy.clone(),
+                    frame: resolved_frames,
+                },
+            );
+        }
 
         // Register enum variants first so constants that reference
         // them (e.g. `const FIRST: u8 = VariantA`) can resolve.
@@ -560,6 +624,47 @@ impl LoweringContext {
                 self.start_block(&cont);
             }
             Statement::Draw(draw) => {
+                if let Some(meta) = self.metasprites.get(&draw.sprite_name).cloned() {
+                    // Metasprite expansion: for each tile in the
+                    // declaration, emit one DrawSprite with x/y
+                    // offset by (dx[i], dy[i]) and frame = frame[i].
+                    // The IR codegen sees N independent draws so
+                    // the runtime OAM-cursor path picks them up
+                    // exactly like a hand-written sequence of
+                    // `draw` statements.
+                    //
+                    // The user's `frame:` argument is ignored when
+                    // drawing a metasprite — the per-tile frame
+                    // index comes from the declaration. The
+                    // analyzer doesn't currently flag this; future
+                    // work could warn on it.
+                    let base_x = self.lower_expr(&draw.x);
+                    let base_y = self.lower_expr(&draw.y);
+                    for ((dx_off, dy_off), tile) in
+                        meta.dx.iter().zip(&meta.dy).zip(&meta.frame)
+                    {
+                        let off_x = self.fresh_temp();
+                        self.emit(IrOp::LoadImm(off_x, *dx_off));
+                        let x_sum = self.fresh_temp();
+                        self.emit(IrOp::Add(x_sum, base_x, off_x));
+
+                        let off_y = self.fresh_temp();
+                        self.emit(IrOp::LoadImm(off_y, *dy_off));
+                        let y_sum = self.fresh_temp();
+                        self.emit(IrOp::Add(y_sum, base_y, off_y));
+
+                        let tile_imm = self.fresh_temp();
+                        self.emit(IrOp::LoadImm(tile_imm, *tile));
+
+                        self.emit(IrOp::DrawSprite {
+                            sprite_name: meta.sprite_name.clone(),
+                            x: x_sum,
+                            y: y_sum,
+                            frame: Some(tile_imm),
+                        });
+                    }
+                    return;
+                }
                 let x = self.lower_expr(&draw.x);
                 let y = self.lower_expr(&draw.y);
                 let frame = draw.frame.as_ref().map(|e| self.lower_expr(e));

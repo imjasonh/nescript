@@ -254,6 +254,45 @@ fn parse_draw_with_frame() {
     }
 }
 
+#[test]
+fn parse_metasprite_decl() {
+    // A metasprite collects parallel `dx` / `dy` / `frame`
+    // arrays plus a reference to the underlying sprite. The
+    // parser preserves them verbatim — array length validation
+    // happens later in the analyzer.
+    let src = r#"
+        game "T" { mapper: NROM }
+        sprite Tile {
+            pixels: [
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@"
+            ]
+        }
+        metasprite Hero {
+            sprite: Tile
+            dx:    [0, 8, 0, 8]
+            dy:    [0, 0, 8, 8]
+            frame: [0, 1, 2, 3]
+        }
+        on frame { wait_frame }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.metasprites.len(), 1);
+    let ms = &prog.metasprites[0];
+    assert_eq!(ms.name, "Hero");
+    assert_eq!(ms.sprite_name, "Tile");
+    assert_eq!(ms.dx, vec![0, 8, 0, 8]);
+    assert_eq!(ms.dy, vec![0, 0, 8, 8]);
+    assert_eq!(ms.frame, vec![0, 1, 2, 3]);
+}
+
 // ── Expressions ──
 
 #[test]
