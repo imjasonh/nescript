@@ -314,6 +314,76 @@ fn lower_wait_frame() {
 }
 
 #[test]
+fn lower_debug_frame_overrun_count_emits_peek() {
+    // `debug.frame_overrun_count()` lowers to a Peek of the
+    // canonical $07FF runtime address. The release-mode codegen
+    // gating happens later — at the IR level we always emit the
+    // Peek so the optimizer/codegen has a single uniform shape.
+    let ir = lower_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var n: u8 = 0
+        on frame {
+            n = debug.frame_overrun_count()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
+    let peek_addr = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .find_map(|op| match op {
+            IrOp::Peek(_, addr) => Some(*addr),
+            _ => None,
+        });
+    assert_eq!(
+        peek_addr,
+        Some(0x07FF),
+        "expected Peek($07FF) for frame_overrun_count"
+    );
+}
+
+#[test]
+fn lower_debug_frame_overran_emits_peek_07fe() {
+    let ir = lower_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var n: u8 = 0
+        on frame {
+            n = debug.frame_overran()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
+    let peek_addr = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .find_map(|op| match op {
+            IrOp::Peek(_, addr) => Some(*addr),
+            _ => None,
+        });
+    assert_eq!(
+        peek_addr,
+        Some(0x07FE),
+        "expected Peek($07FE) for frame_overran"
+    );
+}
+
+#[test]
 fn array_literal_global_init_is_captured() {
     // Regression test: `var xs: u8[4] = [1, 2, 3, 4]` used to lose
     // its initializer because `eval_const` returns None for

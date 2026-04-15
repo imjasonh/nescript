@@ -352,6 +352,14 @@ pub enum Expr {
     /// parser bans them inside `if`/`while`/`for` conditions to
     /// avoid ambiguity with the following block.
     StructLiteral(String, Vec<(String, Expr)>, Span),
+    /// `debug.METHOD(args)` expression form. Today only the
+    /// no-argument query methods (`frame_overrun_count`,
+    /// `frame_overran`) are accepted; other names are rejected by
+    /// the analyzer. Lowering inspects [`crate::ir::lowering`] and
+    /// emits either a Peek of the corresponding runtime address (in
+    /// debug mode) or a constant zero (in release mode), so the
+    /// builtin compiles to nothing in release builds.
+    DebugCall(String, Vec<Expr>, Span),
 }
 
 impl Expr {
@@ -368,7 +376,8 @@ impl Expr {
             | Self::ButtonRead(_, _, s)
             | Self::ArrayLiteral(_, s)
             | Self::Cast(_, _, s)
-            | Self::StructLiteral(_, _, s) => *s,
+            | Self::StructLiteral(_, _, s)
+            | Self::DebugCall(_, _, s) => *s,
         }
     }
 }

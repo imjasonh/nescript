@@ -2990,6 +2990,26 @@ impl Parser {
                 self.advance();
                 Ok(Expr::IntLiteral(v, span))
             }
+            TokenKind::KwDebug => {
+                // `debug.METHOD(args)` expression form. The
+                // statement form is parsed separately by
+                // parse_debug_statement; here we only accept the
+                // value-returning methods.
+                let span = self.current_span();
+                self.advance();
+                self.expect(&TokenKind::Dot)?;
+                let (method, _) = self.expect_ident()?;
+                self.expect(&TokenKind::LParen)?;
+                let mut args = Vec::new();
+                while *self.peek() != TokenKind::RParen && *self.peek() != TokenKind::Eof {
+                    args.push(self.parse_expr()?);
+                    if *self.peek() == TokenKind::Comma {
+                        self.advance();
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+                Ok(Expr::DebugCall(method, args, span))
+            }
             TokenKind::BoolLiteral(v) => {
                 let span = self.current_span();
                 self.advance();

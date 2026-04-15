@@ -89,12 +89,23 @@ pub const ZP_PENDING_BG_ATTRS_HI: u8 = 0x17;
 /// handler whenever it fires while the previous frame's ready
 /// flag is still set — which means the main loop didn't consume
 /// it, so user code spent more than one vblank-to-vblank window
-/// processing the last frame. Read it with `peek(0x07FF)` in
-/// user code to see how many overruns have happened since reset,
-/// or watch the address in a Mesen memory viewer. Placed at the
-/// top of main RAM to minimise the chance of a collision with
-/// analyzer-allocated variables (which grow from $0300 upward).
+/// processing the last frame. Read it with `peek(0x07FF)` or
+/// `debug.frame_overrun_count()` in user code to see how many
+/// overruns have happened since reset, or watch the address in
+/// a Mesen memory viewer. Placed at the top of main RAM to
+/// minimise the chance of a collision with analyzer-allocated
+/// variables (which grow from $0300 upward).
 pub const DEBUG_FRAME_OVERRUN_ADDR: u16 = 0x07FF;
+
+/// Debug-mode "did the previous frame overrun" sticky bit. Set
+/// to 1 by the NMI handler at the same time as it bumps
+/// [`DEBUG_FRAME_OVERRUN_ADDR`], and cleared to 0 by `wait_frame`
+/// once the main loop catches up. Exposed to user code as
+/// `debug.frame_overran()` — a per-frame "did this frame finish
+/// in time" predicate suited for `debug.assert(!debug.frame_overran())`
+/// guards. Lives one byte below the cumulative counter so the
+/// two can be inspected together in a Mesen memory viewer.
+pub const DEBUG_FRAME_OVERRUN_FLAG_ADDR: u16 = 0x07FE;
 
 // ── Extra channel state ──
 //
@@ -343,6 +354,16 @@ pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool, debug_mode: bool) -> Vec<
         out.push(Instruction::new(
             INC,
             AM::Absolute(DEBUG_FRAME_OVERRUN_ADDR),
+        ));
+        // Set the per-frame sticky bit. It stays set until the
+        // next `wait_frame` clears it, so a single
+        // `debug.assert(!debug.frame_overran())` guard at the top
+        // of `on frame { ... }` catches any miss in the previous
+        // window.
+        out.push(Instruction::new(LDA, AM::Immediate(0x01)));
+        out.push(Instruction::new(
+            STA,
+            AM::Absolute(DEBUG_FRAME_OVERRUN_FLAG_ADDR),
         ));
         out.push(Instruction::new(
             NOP,

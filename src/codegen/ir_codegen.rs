@@ -1093,13 +1093,20 @@ impl<'a> IrCodeGen<'a> {
                 self.store_temp(*dest);
             }
             IrOp::WaitFrame => {
-                // Poll frame flag at $00 until nonzero, then clear it
+                // Poll frame flag at $00 until nonzero, then clear it.
+                // In debug mode, also clear the per-frame "did the
+                // previous frame overrun" sticky bit so user code
+                // sees a fresh value next NMI. The cumulative
+                // counter at $07FF is intentionally left alone.
                 let wait_label = format!("__ir_wait_{}", self.instructions.len());
                 self.emit_label(&wait_label);
                 self.emit(LDA, AM::ZeroPage(ZP_FRAME_FLAG));
                 self.emit(BEQ, AM::LabelRelative(wait_label));
                 self.emit(LDA, AM::Immediate(0));
                 self.emit(STA, AM::ZeroPage(ZP_FRAME_FLAG));
+                if self.debug_mode {
+                    self.emit(STA, AM::Absolute(0x07FE));
+                }
             }
             IrOp::Transition(name) => {
                 // Write the target state's index to current_state, then
@@ -2609,6 +2616,76 @@ mod more_tests {
         // Should emit a BRK for the fail path
         let has_brk = insts.iter().any(|i| i.opcode == BRK);
         assert!(has_brk, "debug.assert should emit BRK on failure path");
+    }
+
+    #[test]
+    fn ir_codegen_wait_frame_clears_overrun_flag_in_debug_mode() {
+        // The per-frame frame-overrun sticky bit at $07FE is set
+        // by the NMI handler when an overrun is detected and
+        // cleared by `wait_frame` on the way out so user code sees
+        // a fresh value next NMI. The clear is gated on debug
+        // mode — release builds must not touch $07FE so existing
+        // ROMs stay byte-identical.
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        let clears_flag = insts
+            .iter()
+            .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x07FE));
+        assert!(
+            clears_flag,
+            "debug-mode wait_frame should clear the per-frame overrun flag at $07FE"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_wait_frame_release_does_not_touch_overrun_flag() {
+        let insts = lower_and_gen(
+            r#"
+            game "T" { mapper: NROM }
+            on frame { wait_frame }
+            start Main
+        "#,
+        );
+        let touches_flag = insts
+            .iter()
+            .any(|i| (i.opcode == STA || i.opcode == LDA) && i.mode == AM::Absolute(0x07FE));
+        assert!(
+            !touches_flag,
+            "release-mode wait_frame must not touch $07FE"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_debug_frame_overrun_count_loads_07ff_in_debug_mode() {
+        // The expression form should compile to an absolute load
+        // from the canonical runtime address. We use debug mode
+        // because that's the only configuration where the address
+        // is meaningful — but the load itself is the same in
+        // release builds, where it just reads the zero-initialized
+        // RAM byte and falls through.
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            var n: u8 = 0
+            on frame {
+                n = debug.frame_overrun_count()
+                wait_frame
+            }
+            start Main
+        "#,
+        );
+        let reads_counter = insts
+            .iter()
+            .any(|i| i.opcode == LDA && i.mode == AM::Absolute(0x07FF));
+        assert!(
+            reads_counter,
+            "debug.frame_overrun_count() should LDA $07FF"
+        );
     }
 
     #[test]

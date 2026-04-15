@@ -719,6 +719,38 @@ impl Analyzer {
                     ));
                 }
             }
+            Expr::DebugCall(method, args, span) => {
+                // Only the no-argument query methods are recognised
+                // today. Anything else is an error so a typo gets
+                // caught at compile time rather than silently
+                // returning zero. Argument expressions are walked
+                // for completeness even though no current method
+                // accepts any.
+                match method.as_str() {
+                    "frame_overrun_count" | "frame_overran" => {
+                        if !args.is_empty() {
+                            self.diagnostics.push(Diagnostic::error(
+                                ErrorCode::E0203,
+                                format!("`debug.{method}` takes no arguments, got {}", args.len()),
+                                *span,
+                            ));
+                        }
+                    }
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "unknown debug method '{method}' \
+                                 (expected 'frame_overrun_count' or 'frame_overran')"
+                            ),
+                            *span,
+                        ));
+                    }
+                }
+                for arg in args {
+                    self.walk_expr_reads(arg);
+                }
+            }
             Expr::IntLiteral(_, _) | Expr::BoolLiteral(_, _) | Expr::ButtonRead(_, _, _) => {}
         }
     }
@@ -1650,6 +1682,13 @@ impl Analyzer {
             Expr::ArrayLiteral(_, _) => Some(NesType::U8), // element type inferred from context
             Expr::Cast(_, target, _) => Some(target.clone()),
             Expr::StructLiteral(name, _, _) => Some(NesType::Struct(name.clone())),
+            // Both `debug.frame_overrun_count()` and
+            // `debug.frame_overran()` return a single byte, so they
+            // type-check as u8 even though the latter is conceptually
+            // a flag (0 / 1). Treating it as u8 lets it work in
+            // `debug.assert(!debug.frame_overran())` where the
+            // analyzer's bool-leniency rule for `!` already kicks in.
+            Expr::DebugCall(_, _, _) => Some(NesType::U8),
         }
     }
 }
@@ -1924,6 +1963,15 @@ fn collect_calls_expr(expr: &Expr, calls: &mut Vec<String>) {
         }
         Expr::Cast(inner, _, _) => {
             collect_calls_expr(inner, calls);
+        }
+        Expr::DebugCall(_, args, _) => {
+            // Debug calls aren't user-defined functions, so we
+            // don't add them to the call graph — but their
+            // argument expressions may still mention real calls
+            // we should track.
+            for arg in args {
+                collect_calls_expr(arg, calls);
+            }
         }
         Expr::IntLiteral(_, _)
         | Expr::BoolLiteral(_, _)

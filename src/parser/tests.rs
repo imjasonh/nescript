@@ -1696,6 +1696,61 @@ fn parse_debug_assert() {
     assert!(matches!(frame.statements[0], Statement::DebugAssert(..)));
 }
 
+#[test]
+fn parse_debug_frame_overrun_count_expression() {
+    // `debug.frame_overrun_count()` is an *expression* — distinct
+    // from the `debug.log` / `debug.assert` *statements*. It should
+    // parse to an Expr::DebugCall on the RHS of an assignment.
+    let src = r#"
+        game "T" { mapper: NROM }
+        var n: u8 = 0
+        on frame {
+            n = debug.frame_overrun_count()
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    let stmt = &frame.statements[0];
+    let Statement::Assign(_, _, rhs, _) = stmt else {
+        panic!("expected assign, got {stmt:?}");
+    };
+    match rhs {
+        Expr::DebugCall(method, args, _) => {
+            assert_eq!(method, "frame_overrun_count");
+            assert!(args.is_empty());
+        }
+        other => panic!("expected DebugCall expression, got {other:?}"),
+    }
+}
+
+#[test]
+fn parse_debug_frame_overran_in_assert() {
+    // The flag-style query nests inside `debug.assert(...)` — i.e.
+    // a debug-statement form whose argument is itself a
+    // debug-expression form. This exercises both parser paths in
+    // a single program.
+    let src = r#"
+        game "T" { mapper: NROM }
+        on frame {
+            debug.assert(not debug.frame_overran())
+        }
+        start Main
+    "#;
+    let prog = parse_ok(src);
+    let frame = prog.states[0].on_frame.as_ref().unwrap();
+    let Statement::DebugAssert(cond, _) = &frame.statements[0] else {
+        panic!("expected DebugAssert");
+    };
+    let Expr::UnaryOp(UnaryOp::Not, inner, _) = cond else {
+        panic!("expected not cond");
+    };
+    let Expr::DebugCall(method, _, _) = inner.as_ref() else {
+        panic!("expected DebugCall inside not");
+    };
+    assert_eq!(method, "frame_overran");
+}
+
 // ── Named colour palettes ──
 
 #[test]

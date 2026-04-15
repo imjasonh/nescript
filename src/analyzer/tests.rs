@@ -1735,3 +1735,74 @@ fn analyze_small_array_never_warns_w0108() {
         result.diagnostics
     );
 }
+
+#[test]
+fn analyze_debug_frame_overrun_count_ok() {
+    // The known-good debug expression methods type-check as u8 and
+    // can be assigned into a u8 variable without diagnostics.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var n: u8 = 0
+        on frame {
+            n = debug.frame_overrun_count()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_debug_frame_overran_in_assert_ok() {
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        on frame {
+            debug.assert(not debug.frame_overran())
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_debug_unknown_method_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        var n: u8 = 0
+        on frame {
+            n = debug.bogus()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for unknown debug method, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_debug_frame_overrun_count_with_args_errors() {
+    // The query methods take no arguments — passing one is an
+    // arity error, not a silent "unused arg" warning.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        var n: u8 = 0
+        on frame {
+            n = debug.frame_overrun_count(42)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0203),
+        "expected E0203 for arg count mismatch, got: {errors:?}"
+    );
+}
