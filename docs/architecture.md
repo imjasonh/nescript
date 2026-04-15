@@ -41,10 +41,10 @@ Each module has a `mod.rs` (implementation) and a co-located `tests.rs` with uni
 `mod.rs`, `tests.rs`. Performs semantic analysis on the AST: type checking, scope and symbol table management, call graph construction with depth analysis, state reachability, unused-variable detection, and dead-code-after-terminator warnings. Emits all user-facing diagnostics beyond lexer/parser syntax errors.
 
 ### `ir/`
-`mod.rs` (types), `lowering.rs` (AST → IR), `tests.rs`. The IR is a flat, register-agnostic representation built from virtual temps and basic blocks. Lowering flattens nested expressions, expands 16-bit operations, desugars `for` into `while`, and resolves constant expressions early.
+`mod.rs` (types), `lowering.rs` (AST → IR), `tests.rs`. The IR is a flat, register-agnostic representation built from virtual temps and basic blocks. Lowering flattens nested expressions, expands 16-bit operations, desugars `for` into `while`, resolves constant expressions early, and performs real `inline fun` splicing — functions marked `inline` whose bodies match one of the two splicable shapes (single `return <expr>` or void statement sequence) are captured before lowering begins and substituted at every call site. Bodies that don't match (conditional returns, loops, nested control flow) fall back to regular out-of-line calls and the analyzer emits `W0110` at the declaration.
 
 ### `optimizer/`
-`mod.rs`, `tests.rs`. Runs passes over the IR in order: strength reduction (mul/div by powers of two, mod by powers of two, ShiftVar → ShiftLeft/Right), function inlining (trivial-function elimination), constant folding (arithmetic + comparisons + shifts), and dead code elimination.
+`mod.rs`, `tests.rs`. Runs passes over the IR in order: strength reduction (mul/div by powers of two, mod by powers of two, ShiftVar → ShiftLeft/Right), constant folding (arithmetic + comparisons + shifts), copy propagation, and dead code elimination. The `inline fun` splicing happens one phase earlier in `ir/lowering.rs` so the optimizer sees already-inlined call sites.
 
 ### `codegen/`
 `ir_codegen.rs`, `peephole.rs`, `mod.rs`. `ir_codegen.rs` walks the optimized IR and emits 6502 instructions; variables land in allocated addresses and IR temps land in a recycling zero-page slot pool. `peephole.rs` runs after codegen to clean up the temp-heavy output (dead-load elimination, branch folding, INC/DEC fold, copy propagation).

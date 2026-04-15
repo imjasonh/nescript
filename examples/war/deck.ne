@@ -13,7 +13,12 @@
 // needed inside push_back because `front` and `count` are both
 // ≤ 51 by construction, so the sum is at most 102 and one
 // subtraction is enough.
-inline fun wrap52(v: u8) -> u8 {
+//
+// Not marked `inline`: the conditional early return is one of
+// the body shapes the inliner declines (W0110), and living
+// with the JSR is cheaper than rewriting this as `v % DECK_SIZE`
+// (which would pull in the software modulo routine).
+fun wrap52(v: u8) -> u8 {
     if v >= DECK_SIZE {
         return v - DECK_SIZE
     }

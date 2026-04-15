@@ -43,7 +43,8 @@ struct LoweringContext {
     /// registered as substitutions for the parameter names,
     /// and the body is lowered into the caller's current block
     /// in place of a `Call` op. See `try_inline_call_expr` /
-    /// `try_inline_call_stmt` below and `COMPILER_BUGS.md` §5.
+    /// `try_inline_call_stmt` below; the feature was added on
+    /// the War bug-cleanup branch (see `git log`).
     inline_bodies: HashMap<String, CapturedInline>,
     /// Substitution stack for nested inline expansions. The top
     /// frame is the active substitution map — `Expr::Ident(name)`
@@ -237,11 +238,18 @@ impl LoweringContext {
             if !fun.is_inline {
                 continue;
             }
+            // Defer to the shared `can_inline_fun` helper so the
+            // analyzer's W0110 check and this capture pass agree
+            // on exactly which bodies are splicable — any drift
+            // between the two would either swallow real bugs
+            // (lower inlines a body the analyzer thinks it
+            // wouldn't) or emit false-positive warnings (analyzer
+            // warns on something the lowerer actually inlines).
+            if !can_inline_fun(fun.return_type.as_ref(), &fun.body) {
+                continue;
+            }
             // Single-return-expression shape.
-            if fun.return_type.is_some()
-                && fun.body.statements.len() == 1
-                && matches!(fun.body.statements[0], Statement::Return(Some(_), _))
-            {
+            if fun.return_type.is_some() && fun.body.statements.len() == 1 {
                 if let Statement::Return(Some(expr), _) = &fun.body.statements[0] {
                     self.inline_bodies.insert(
                         fun.name.clone(),
@@ -253,25 +261,16 @@ impl LoweringContext {
                     continue;
                 }
             }
-            // Void multi-statement shape: no return type, and
-            // every body statement must be a shape we know how
-            // to splice. Only assigns, statement-context calls,
-            // draws, scroll, set_palette, and load_background
-            // are accepted — anything with nested control flow
-            // is too complex to inline without a full CFG
-            // clone.
-            if fun.return_type.is_none()
-                && !fun.body.statements.is_empty()
-                && fun.body.statements.iter().all(is_splicable_void_stmt)
-            {
-                self.inline_bodies.insert(
-                    fun.name.clone(),
-                    CapturedInline {
-                        params: fun.params.clone(),
-                        body: InlineBody::Void(fun.body.statements.clone()),
-                    },
-                );
-            }
+            // Void multi-statement shape: no return type, every
+            // body statement is splicable. The helper already
+            // checked both conditions so we just clone.
+            self.inline_bodies.insert(
+                fun.name.clone(),
+                CapturedInline {
+                    params: fun.params.clone(),
+                    body: InlineBody::Void(fun.body.statements.clone()),
+                },
+            );
         }
     }
 
@@ -626,7 +625,9 @@ impl LoweringContext {
         // true and, worse, `widen(t)` returning a stale `hi` temp ID
         // that collides with a later `fresh_temp()` allocation —
         // producing 16-bit IR ops where the destination temp is
-        // *also* one of the source temps. See COMPILER_BUGS.md §6.
+        // *also* one of the source temps (the `wide_hi` leak bug
+        // fixed on the War cleanup branch; see `git log` for the
+        // full reproduction).
         self.wide_hi.clear();
         self.current_blocks = Vec::new();
         self.current_locals = Vec::new();
@@ -724,9 +725,9 @@ impl LoweringContext {
     fn lower_handler(&mut self, name: &str, scope_prefix: &str, block: &Block, state: &StateDecl) {
         self.next_temp = 0;
         // Same per-function reset as `lower_function`. See the
-        // commentary there and COMPILER_BUGS.md §6 for why this is
-        // critical — without it, state-handler bodies pick up wide
-        // temp pairs left over from the previous function and emit
+        // commentary there for why this is critical — without it,
+        // state-handler bodies pick up wide temp pairs left over
+        // from the previous function and emit
         // catastrophically wrong 16-bit IR ops.
         self.wide_hi.clear();
         self.current_blocks = Vec::new();
@@ -1835,6 +1836,40 @@ fn is_splicable_void_stmt(stmt: &Statement) -> bool {
             | Statement::DebugLog(..)
             | Statement::DebugAssert(..)
     )
+}
+
+/// True if an `inline fun` with the given return type and body
+/// matches one of the shapes [`LoweringContext::capture_inline_bodies`]
+/// can splice into a caller. Two shapes are recognised:
+///
+/// 1. **Single-return expression**: the function has a declared
+///    return type and its body is exactly `{ return <expr> }`.
+/// 2. **Void multi-statement**: the function has no return type
+///    and every body statement passes [`is_splicable_void_stmt`].
+///
+/// Anything else (conditional early returns, loops, nested
+/// control flow, multiple returns, an empty void body) falls back
+/// to a regular `JSR` call at every site. The analyzer calls this
+/// to emit `W0110` when a declared-inline function won't actually
+/// be inlined, and the IR lowerer calls the same logic when it
+/// decides which bodies to capture — keeping both sides in sync.
+#[must_use]
+pub fn can_inline_fun(return_type: Option<&NesType>, body: &Block) -> bool {
+    // Single-return expression shape.
+    if return_type.is_some()
+        && body.statements.len() == 1
+        && matches!(body.statements[0], Statement::Return(Some(_), _))
+    {
+        return true;
+    }
+    // Void multi-statement shape.
+    if return_type.is_none()
+        && !body.statements.is_empty()
+        && body.statements.iter().all(is_splicable_void_stmt)
+    {
+        return true;
+    }
+    false
 }
 
 fn type_size(t: &NesType) -> u16 {

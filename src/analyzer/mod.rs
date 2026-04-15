@@ -688,6 +688,15 @@ impl Analyzer {
         // coordinates are skipped because the static analysis
         // can't know where the sprite will land at runtime.
         self.check_sprite_scanline_budget(program);
+
+        // Check every `inline fun` declaration against the
+        // IR lowerer's inline-eligibility rules. Functions
+        // whose body shape isn't splicable compile as regular
+        // out-of-line calls — which is correct, but silent:
+        // users who mark a helper `inline` to avoid call
+        // overhead might not realize the hint was declined.
+        // W0110 makes the fallback visible.
+        self.check_inline_declinability(program);
     }
 
     /// Qualify `name` under the current scope prefix. If no prefix
@@ -1145,6 +1154,47 @@ impl Analyzer {
             }
 
             self.diagnostics.push(diag);
+        }
+    }
+
+    /// Walk every `inline fun` declaration and check whether the
+    /// IR lowerer will actually inline its body. Functions that
+    /// won't inline (conditional returns, loops, transitions,
+    /// empty void bodies, etc.) compile as regular out-of-line
+    /// calls — correct but silent. W0110 surfaces the fallback
+    /// at the declaration site with help text pointing at the
+    /// two body shapes the inliner does accept.
+    ///
+    /// Defers to [`crate::ir::lowering::can_inline_fun`] so the
+    /// two sides (warning + actual capture) can never drift.
+    fn check_inline_declinability(&mut self, program: &Program) {
+        for fun in &program.functions {
+            if !fun.is_inline {
+                continue;
+            }
+            if crate::ir::can_inline_fun(fun.return_type.as_ref(), &fun.body) {
+                continue;
+            }
+            self.diagnostics.push(
+                Diagnostic::warning(
+                    ErrorCode::W0110,
+                    format!(
+                        "`inline fun {}` cannot be inlined; falling back to a regular call",
+                        fun.name
+                    ),
+                    fun.span,
+                )
+                .with_help(
+                    "the inliner accepts two body shapes: a single `return <expr>` (for \
+                     functions with a return type) or a sequence of plain statements with no \
+                     control flow (for void functions). Rewrite the body to fit one of those, \
+                     or remove the `inline` keyword if the JSR overhead is acceptable",
+                )
+                .with_note(
+                    "rejected body shapes include conditional early returns, if/while/for/loop \
+                     blocks, transitions, breaks, continues, and nested function definitions",
+                ),
+            );
         }
     }
 

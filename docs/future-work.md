@@ -151,11 +151,16 @@ op and writes a plain-text map of `<rom_offset> <file_id> <line> <col>`
 entries for every lowered statement. Debug builds emit array bounds checks
 (CMP against size, BCC past a `JMP __debug_halt` wedge) and bump an
 overrun counter at `$07FF` in the NMI handler when the main loop didn't
-reach `wait_frame` before the next vblank. **Plus** two new query
-expressions: `debug.frame_overrun_count()` returns the cumulative counter
-and `debug.frame_overran()` returns a per-frame sticky bit (cleared by
-the next `wait_frame`) so user code can write
-`debug.assert(not debug.frame_overran())` guards.
+reach `wait_frame` before the next vblank.
+
+**Plus four query expressions** that mirror the counter/sticky pattern:
+`debug.frame_overrun_count()` / `debug.frame_overran()` return the cumulative
+overrun counter and a per-frame sticky bit so user code can write
+`debug.assert(not debug.frame_overran())` guards, and
+`debug.sprite_overflow_count()` / `debug.sprite_overflow()` do the same for
+the NES PPU's sprite-per-scanline flag (`$2002` bit 5), which the NMI
+handler samples once per frame in debug mode. All four sticky bits clear
+on the next `wait_frame`.
 
 **Still TODO.**
 - **`debug.overlay(x, y, text)`** — needs the text/HUD subsystem (see
@@ -204,8 +209,13 @@ semantics come back, add the codes at that point.
    would be cheap but would invalidate any copy-pasted ca65 fragments.
 2. **Debug port address.** $4800 is conventional but not universal. Should
    we support multiple debug output methods?
-3. **OAM allocation strategy.** Sequential allocation vs priority-based with
-   automatic sprite cycling for the 8-per-scanline limit?
+3. **OAM allocation strategy.** Sequential allocation remains the default;
+   the `cycle_sprites` opt-in keyword rotates the DMA offset each frame so
+   scenes past the 8-per-scanline budget flicker instead of dropping the
+   same sprite every frame. Open question: should automatic cycling become
+   a `game` attribute (`sprite_flicker: true`) that emits the increment
+   without requiring a per-frame call, and/or add a `draw ... priority:
+   pinned` modifier for HUD sprites that must stay at low OAM slots?
 4. **Error recovery granularity.** How aggressively should the parser
    recover? More recovery means more errors per compile but also risks
    cascading false errors.

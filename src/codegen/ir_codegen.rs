@@ -242,9 +242,11 @@ impl<'a> IrCodeGen<'a> {
         // Before this change, parameters lived in `$04-$07` for the
         // duration of the function body, so any call nested inside
         // a function's body silently corrupted the caller's
-        // parameters — see COMPILER_BUGS.md §2. The per-function
-        // RAM slots + prologue spill fix that class of bug at the
-        // cost of 4 LDA/STA pairs per function entry.
+        // parameters (fixed on the War bug-cleanup branch; see
+        // `git log` for the original reproduction and root cause).
+        // The per-function RAM slots + prologue spill fix that
+        // class of bug at the cost of 4 LDA/STA pairs per function
+        // entry.
         //
         // Locals are laid out linearly across every function:
         // NEScript forbids recursion (E0402) and enforces a
@@ -3906,7 +3908,8 @@ mod more_tests {
 
 #[test]
 fn gen_function_prologue_spills_params_to_local_ram() {
-    // Regression test for COMPILER_BUGS.md §2: without the
+    // Regression test for the param-slot clobbering bug fixed
+    // on the War bug-cleanup branch (see `git log`): without the
     // param-spill prologue, a function's parameters live only
     // in the transport slots $04-$07. The first nested call
     // inside the body would overwrite those slots with its
@@ -3969,7 +3972,7 @@ fn gen_function_prologue_spills_params_to_local_ram() {
     assert!(
         saw_lda_zp4 && saw_sta_abs,
         "caller function should open with `LDA $04 / STA <absolute>` \
-         as the param-spill prologue — the fix for COMPILER_BUGS.md §2 \
-         is not in effect"
+         as the param-spill prologue — the param-clobbering fix is \
+         not in effect"
     );
 }

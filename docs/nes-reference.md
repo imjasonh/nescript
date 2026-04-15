@@ -53,10 +53,23 @@ The 6502's 3-register architecture drives the compiler's register allocator. The
 ### NEScript Memory Usage
 
 The compiler reserves the following:
-- `$00`-`$0F`: System use (frame counter, temp registers, NMI flags)
-- `$10`-`$FF`: Available for `fast` variables and compiler-promoted variables
+- `$00`-`$0F`: System use (frame counter, input, OAM cursor, SFX/music pointers, mul/div scratch)
+- `$10`: `ZP_BANK_CURRENT` (current switchable PRG bank index, only in banked programs)
+- `$11`-`$17`: PPU update slots (palette/nametable flags and pending pointers, only when the program declares palette or background blocks)
+- `$18`-`$7F`: Available for `fast` variables (user zero-page)
+- `$80`-`$FF`: IR codegen temp slots (scratch for expression evaluation)
 - `$0200`-`$02FF`: OAM shadow buffer (DMA'd to PPU each frame)
-- `$0300`-`$07FF`: General variables, state-local storage
+- `$0300`-`$07EE`: General variables, per-function RAM (parameter spill + locals), state-local storage
+- `$07EF`: `SPRITE_CYCLE_ADDR` — rotating offset byte used by `cycle_sprites` (only when the program emits a `cycle_sprites` statement)
+- `$07F0`-`$07F7`: Audio channel state (noise/triangle/sfx-pitch pointers; only when the program declares a matching sfx)
+- `$07FC`: `DEBUG_SPRITE_OVERFLOW_FLAG_ADDR` — per-frame sticky bit (debug builds only)
+- `$07FD`: `DEBUG_SPRITE_OVERFLOW_COUNT_ADDR` — cumulative PPU sprite overflow counter (debug builds only)
+- `$07FE`: `DEBUG_FRAME_OVERRUN_FLAG_ADDR` — per-frame sticky bit (debug builds only)
+- `$07FF`: `DEBUG_FRAME_OVERRUN_ADDR` — cumulative frame overrun counter (debug builds only)
+
+Release-mode programs that don't opt into audio, banking, debug, or
+sprite cycling leave the corresponding slots untouched and the
+analyzer is free to allocate user globals over them.
 
 ---
 

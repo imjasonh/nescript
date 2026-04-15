@@ -38,7 +38,9 @@ var hit:     u8 = 0    // 1 if the player is touching any hazard
 var hit_idx: u8 = 0    // which slot was hit (only meaningful if hit == 1)
 
 // Small absolute-difference helper. Saves lines at each call site.
-inline fun abs_diff(a: u8, b: u8) -> u8 {
+// Not marked `inline`: the conditional early return is one of
+// the shapes the inliner declines (W0110).
+fun abs_diff(a: u8, b: u8) -> u8 {
     if a > b {
         return a - b
     }

@@ -256,18 +256,42 @@ fun reset_score() {
 
 ### Inline Functions
 
-The `inline` keyword hints the compiler to inline the function at call sites:
+The `inline` keyword marks a function for inlining at call sites. The IR
+lowering pass captures the body up front and substitutes it wherever the
+function is called, skipping the normal `JSR` entirely. Two body shapes
+are accepted:
+
+**Single-return expression** — a function with a declared return type
+whose body is exactly `{ return <expr> }`. The expression is re-lowered
+in place of each call, with every parameter name substituted for the
+caller's argument temps.
 
 ```
-inline fun clamp(val: u8, max: u8) -> u8 {
-    if val > max {
-        return max
-    }
-    return val
+inline fun card_rank(card: u8) -> u8 {
+    return card >> 4
 }
 ```
 
-`inline` is a hint -- the compiler may decline for large functions.
+**Void multi-statement** — a function with no return type whose body is
+a sequence of plain statements (assigns, calls, draws, scroll,
+`set_palette`, `load_background`, `wait_frame`, `cycle_sprites`, inline
+asm, or the `debug.*` builtins). Nested control flow, `return`,
+`break`, `continue`, and `transition` are not allowed.
+
+```
+inline fun set_phase(p: u8) {
+    phase = p
+    phase_timer = 0
+    cursor_x = 0
+}
+```
+
+Functions marked `inline` whose body doesn't match either shape (a
+conditional early return, a `while` loop, nested `if`/`else`, etc.)
+fall back to a regular out-of-line `JSR` call. The compiler emits a
+`W0110` warning at the declaration site so the declined hint is
+visible — rewrite the body to fit one of the two shapes, or drop the
+`inline` keyword if the call overhead is acceptable.
 
 ### Calling Functions
 
@@ -610,7 +634,11 @@ draw Player at: (player_x, player_y)
 draw Coin at: (COIN_X, COIN_Y) frame: anim_frame
 ```
 
-The `draw` statement writes to the OAM shadow buffer. The NES supports up to 64 sprites per frame.
+The `draw` statement writes to the OAM shadow buffer. The NES supports
+up to 64 sprites per frame, and the PPU can only render 8 sprites per
+scanline — see the `cycle_sprites` statement below and the
+[sprite-per-scanline mitigations](#sprite-per-scanline-mitigations)
+section for how to handle scenes that exceed the 8-per-scanline budget.
 
 Syntax: `draw SpriteName at: (x_expr, y_expr) [frame: expr]`
 
@@ -633,6 +661,38 @@ wait_frame()
 ```
 
 This triggers OAM DMA transfer and PPU updates before yielding. Inside `on frame`, a `wait_frame()` is implicit at the end of each frame.
+
+### Cycle Sprites
+
+Rotate the runtime's sprite-cycling offset by one OAM slot (4 bytes),
+naturally wrapping at 256 back to 0. When any statement in a program
+emits `cycle_sprites`, the linker switches the NMI handler over to a
+variant that writes the current offset byte (at `$07EF`) to `$2003`
+before triggering the OAM DMA — so each frame's DMA lands in a
+different slot of the PPU's OAM buffer.
+
+```
+on frame {
+    draw Enemy0 at: (e0x, e0y)
+    draw Enemy1 at: (e1x, e1y)
+    // ...lots of enemies...
+    cycle_sprites
+    wait_frame
+}
+```
+
+The practical effect is the classic NES flicker: scenes with more than
+8 sprites on a single scanline drop a *different* sprite on each
+frame, and the eye reconstructs the missing pixels from frame
+persistence. Permanent dropout becomes visible flicker, which reads as
+a hardware limit rather than a game bug.
+
+`cycle_sprites` is opt-in by design. Programs that never call it emit
+the original fixed-offset NMI path (byte-identical to every
+pre-cycling ROM). See
+[sprite-per-scanline mitigations](#sprite-per-scanline-mitigations)
+for when to use it together with the compile-time `W0109` warning and
+the debug-mode `debug.sprite_overflow*()` telemetry.
 
 ### Scroll
 
@@ -1107,7 +1167,67 @@ In debug mode, the compiler inserts:
 - Array bounds checking on indexed access
 - Arithmetic overflow warnings
 - Stack depth monitoring at function entry
-- Frame overrun detection (warns if frame handler exceeds vblank period)
+- Frame overrun detection (bumps a counter at `$07FF` whenever the
+  frame handler runs past vblank)
+- Sprite-per-scanline overflow detection (bumps a counter at `$07FD`
+  whenever the PPU's sprite overflow flag at `$2002` bit 5 was set
+  for the just-finished frame)
+
+### Debug Queries
+
+Four builtin expressions let user code inspect the debug counters and
+sticky bits. All four return a `u8`, peek a fixed runtime address in
+debug builds, and compile to a constant zero in release builds (so
+`debug.assert(not debug.frame_overran())` guards disappear entirely
+when you ship).
+
+```
+var n: u8 = debug.frame_overrun_count()    // cumulative overruns since reset
+debug.assert(not debug.frame_overran())    // sticky bit, cleared on next wait_frame
+
+var s: u8 = debug.sprite_overflow_count()  // cumulative PPU sprite overflows
+debug.assert(not debug.sprite_overflow())  // sticky bit, cleared on next wait_frame
+```
+
+The sprite overflow pair reads the NES hardware flag (`$2002` bit 5),
+which has a few well-known quirks but is correct for the overwhelming
+majority of cases. Use it together with the compile-time `W0109` static
+check and the runtime `cycle_sprites` flicker mitigation — see the
+sprite-per-scanline section below.
+
+### Sprite-per-scanline mitigations
+
+The NES PPU can only render 8 sprites per scanline. Anything past the
+budget is silently dropped, and because sprites land in the shadow OAM
+in draw order, the same sprite gets dropped every frame — a permanent
+dropout that reads as a bug rather than a hardware limit. NEScript
+ships three layers of mitigation:
+
+1. **Compile time** — the `W0109` warning fires on layouts with more
+   than 8 literal-coordinate sprites overlapping any scanline. Catches
+   static HUDs, text labels, and title screens.
+2. **Runtime** — the `cycle_sprites` keyword statement bumps a
+   rotating offset byte at `$07EF`. A cycling variant of the NMI
+   handler writes that byte to `$2003` before the OAM DMA, so each
+   frame's DMA lands in a different slot of the PPU's OAM buffer.
+   Over N frames each of the N overlapping sprites gets dropped
+   approximately once, producing visible flicker the eye
+   reconstructs from frame persistence — the classic NES idiom
+   used by Gradius, Battletoads, and every shmup.
+3. **Playtesting** — `debug.sprite_overflow()` /
+   `debug.sprite_overflow_count()` expose the PPU hardware flag as
+   debug queries so user code can assert the budget holds, or a
+   debug overlay can display the running count.
+
+```
+on frame {
+    // ... draw all your sprites ...
+    cycle_sprites   // rotate one slot per frame
+    wait_frame
+}
+```
+
+See `examples/sprite_flicker_demo.ne` for the end-to-end flow.
 
 ---
 
@@ -1214,6 +1334,17 @@ reference NEScript variables.
 | W0102  | Loop without break or wait_frame         |
 | W0103  | Unused variable                          |
 | W0104  | Unreachable code (after return/break/transition, or state unreachable from start) |
+| W0105  | Palette sub-palette universal mismatch (mirror collision) |
+| W0106  | Implicit drop of non-void function return value |
+| W0107  | `fast` variable rarely accessed (wastes a zero-page slot) |
+| W0108  | Array elements past byte 255 unreachable via 8-bit X index |
+| W0109  | More than 8 literal-coordinate sprites overlap one scanline (NES hardware limit — see `cycle_sprites` and `debug.sprite_overflow()` for runtime mitigations) |
+| W0110  | `inline fun` body shape cannot be inlined; falling back to a regular `JSR` call (rewrite as a single-return expression or a void statement sequence, or drop the `inline` keyword) |
+
+`nescript build` prints warnings in addition to errors on a successful
+compile, so code-quality hints surface during normal development without
+needing a separate `nescript check` pass. Errors still halt the build;
+warnings never do.
 
 ### Example Error Output
 

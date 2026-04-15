@@ -216,10 +216,10 @@ parallel).
 - [x] Code review pass: read every file end-to-end, fix any
       mistakes found.
 
-Two compiler bugs were discovered along the way and fixed in
-the same PR (E0506 too-many-params + the wide_hi map leak in IR
-lowering). Three more compiler limitations are documented in
-`COMPILER_BUGS.md` with workarounds in the war source for now.
+Seven compiler bugs were discovered along the way and all fixed
+on this branch — see `git log` for the full list. Every
+workaround that was originally in the war source has been
+reverted now that the underlying bugs are fixed.
 
 ---
 
@@ -229,16 +229,11 @@ A few things shifted from the approved plan:
 
 - **`arm_fly` is 4 params, not 6.** The 5th and 6th params
   (`fly_card`, `fly_face_up`) are written to globals at every
-  call site instead, because the v0.1 ABI silently drops params
-  past the 4th. The 4-param limit now produces a clean E0506
-  diagnostic so future authors won't trip on it.
-- **`card` parameter in `card_rank` / `card_suit` / `draw_card_face`
-  was renamed to per-function unique names** to dodge the IR
-  lowering's shared-VarId issue documented in
-  `COMPILER_BUGS.md` §1b. Same for `wrap52`'s `v` and the
-  `push_back_*` helpers. `x` and `y` are still shared because
-  they sit at the same parameter position in every helper that
-  takes them, so the routed slot mapping is consistent.
+  call site instead, because the v0.1 ABI only passes four
+  parameters via the zero-page transport slots. The 4-param
+  limit now produces a clean E0506 diagnostic so future authors
+  see the error up front instead of chasing silent
+  miscompiles.
 - **The `Playing` state's phase machine uses `match`, not a
   flat if-chain.** The if-chain shape allowed two phases to run
   in the same frame after a `set_phase` transition, which made

@@ -2103,10 +2103,11 @@ fn analyze_accepts_function_with_exactly_4_params() {
 
 #[test]
 fn analyze_allows_same_local_name_in_two_functions() {
-    // Regression test for COMPILER_BUGS.md §3: function-body
-    // `var` declarations used to live in a flat global namespace,
-    // so two functions both declaring `var i` collided on E0501.
-    // They should now coexist in their own per-function scopes.
+    // Regression test for the function-local scope-qualification
+    // fix on the War bug-cleanup branch (see `git log`): function-
+    // body `var` declarations used to live in a flat global
+    // namespace, so two functions both declaring `var i` collided
+    // on E0501. They now coexist in per-function scopes.
     analyze_ok(
         r#"
         game "T" { mapper: NROM }
@@ -2132,11 +2133,12 @@ fn analyze_allows_same_local_name_in_two_functions() {
 
 #[test]
 fn analyze_allows_same_param_name_in_two_functions() {
-    // Regression test for COMPILER_BUGS.md §1b: parameters
+    // Regression test for the scope-qualified parameter fix on
+    // the War bug-cleanup branch (see `git log`): parameters
     // across different functions used to share VarIds because
     // the IR lowerer's `var_map` was global. Both declaration
-    // (analyzer) and lowering (IR) should now give each
-    // function's parameters their own independent entries.
+    // (analyzer) and lowering (IR) now give each function's
+    // parameters their own independent entries.
     analyze_ok(
         r#"
         game "T" { mapper: NROM }
@@ -2475,5 +2477,147 @@ fn analyze_accepts_cycle_sprites_statement() {
         }
         start Main
     "#,
+    );
+}
+
+#[test]
+fn analyze_inline_fun_with_conditional_return_trips_w0110() {
+    // A function marked `inline` whose body has an early
+    // conditional return can't be inlined by the simple
+    // substitution machinery — it compiles as a regular
+    // `JSR` call, and W0110 must fire at the declaration.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        inline fun wrap(v: u8) -> u8 {
+            if v >= 52 {
+                return v - 52
+            }
+            return v
+        }
+        var x: u8 = 0
+        on frame {
+            x = wrap(60)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    let w0110: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == ErrorCode::W0110)
+        .collect();
+    assert_eq!(
+        w0110.len(),
+        1,
+        "expected exactly one W0110, got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        w0110[0].message.contains("wrap"),
+        "W0110 should name the declined function, got: {}",
+        w0110[0].message
+    );
+    assert!(
+        w0110[0].help.is_some() && w0110[0].note.is_some(),
+        "W0110 should carry both help and note text"
+    );
+}
+
+#[test]
+fn analyze_inline_fun_with_single_return_expression_is_accepted() {
+    // A body that is exactly `return <expr>` is the canonical
+    // inlinable shape — no W0110 should fire.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        inline fun card_rank(card: u8) -> u8 {
+            return card >> 4
+        }
+        var x: u8 = 0
+        on frame {
+            x = card_rank(0x93)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0110),
+        "did not expect W0110 for single-return inline, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_inline_void_fun_is_accepted() {
+    // A void body with nothing but assigns is inlinable.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        var a: u8 = 0
+        var b: u8 = 0
+        inline fun set_pair(x: u8, y: u8) {
+            a = x
+            b = y
+        }
+        on frame {
+            set_pair(5, 6)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0110),
+        "did not expect W0110 for void inline, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_inline_fun_with_loop_body_trips_w0110() {
+    // A `while` loop inside a marked-inline body is another
+    // disqualifying shape.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        var sum: u8 = 0
+        inline fun accumulate(n: u8) {
+            var i: u8 = 0
+            while i < n {
+                sum += i
+                i += 1
+            }
+        }
+        on frame {
+            accumulate(5)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0110),
+        "expected W0110 for loop-body inline, got: {:?}",
+        result.diagnostics
     );
 }

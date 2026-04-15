@@ -743,7 +743,8 @@ fn lower_modulo_emits_mod_op_not_load_imm_zero() {
 
 #[test]
 fn wide_hi_does_not_leak_between_functions() {
-    // Regression test for COMPILER_BUGS.md §6: the IR lowerer's
+    // Regression test for the `wide_hi` leak bug fixed on the
+    // War bug-cleanup branch (see `git log`): the IR lowerer's
     // `wide_hi` map used to persist across function boundaries
     // even though `next_temp` resets to 0 per function. A
     // function whose body had no u16 ops would inherit stale
@@ -790,7 +791,7 @@ fn wide_hi_does_not_leak_between_functions() {
         {
             // The dest of a 16-bit compare must never alias one
             // of its operand high bytes — that's the symptom of
-            // bug #6 from war/COMPILER_BUGS.md.
+            // the `wide_hi` leak bug.
             if dest == b_hi || dest == a_hi {
                 wide_eq_dest_aliases += 1;
             }
@@ -804,7 +805,8 @@ fn wide_hi_does_not_leak_between_functions() {
 
 #[test]
 fn inline_fun_expression_body_emits_no_call_at_use_site() {
-    // Regression test for COMPILER_BUGS.md §5: `inline fun`
+    // Regression test for the real-inlining feature added on
+    // the War bug-cleanup branch (see `git log`): `inline fun`
     // with a single-return-expression body should be spliced
     // at every call site instead of emitting a Call op. The
     // lowered frame handler should contain zero Call ops
