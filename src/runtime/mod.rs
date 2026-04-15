@@ -89,12 +89,26 @@ pub const ZP_PENDING_BG_ATTRS_HI: u8 = 0x17;
 /// handler whenever it fires while the previous frame's ready
 /// flag is still set — which means the main loop didn't consume
 /// it, so user code spent more than one vblank-to-vblank window
-/// processing the last frame. Read it with `peek(0x07FF)` in
-/// user code to see how many overruns have happened since reset,
-/// or watch the address in a Mesen memory viewer. Placed at the
-/// top of main RAM to minimise the chance of a collision with
-/// analyzer-allocated variables (which grow from $0300 upward).
+/// processing the last frame. Read it with `peek(0x07FF)` or
+/// `debug.frame_overrun_count()` in user code to see how many
+/// overruns have happened since reset, or watch the address in
+/// a Mesen memory viewer. Placed at the top of main RAM to
+/// minimise the chance of a collision with analyzer-allocated
+/// variables (which grow from $0300 upward).
 pub const DEBUG_FRAME_OVERRUN_ADDR: u16 = 0x07FF;
+
+/// Debug-mode "did the previous frame overrun" sticky bit. Set
+/// to 1 by the NMI handler at the same time as it bumps
+/// [`DEBUG_FRAME_OVERRUN_ADDR`], and cleared to 0 by either an
+/// explicit `wait_frame` IR op *or* the implicit main-loop
+/// flag-clear that runs between every dispatch — so a program
+/// whose `on frame { ... }` body has no explicit `wait_frame`
+/// still sees a fresh value next NMI. Exposed to user code as
+/// `debug.frame_overran()` — a per-frame "did this frame finish
+/// in time" predicate suited for `debug.assert(not debug.frame_overran())`
+/// guards. Lives one byte below the cumulative counter so the
+/// two can be inspected together in a Mesen memory viewer.
+pub const DEBUG_FRAME_OVERRUN_FLAG_ADDR: u16 = 0x07FE;
 
 // ── Extra channel state ──
 //
@@ -120,6 +134,16 @@ pub const AUDIO_NOISE_COUNTER: u16 = 0x07F2;
 pub const AUDIO_TRIANGLE_PTR_LO: u16 = 0x07F3;
 pub const AUDIO_TRIANGLE_PTR_HI: u16 = 0x07F4;
 pub const AUDIO_TRIANGLE_COUNTER: u16 = 0x07F5;
+/// Pulse-1 sfx per-frame pitch envelope pointer. Only populated
+/// (and only read by the audio tick) in programs that declare at
+/// least one sfx with a varying-pitch `pitch:` array; programs
+/// that stick to scalar `pitch:` keep their byte-for-byte
+/// pre-pitch-envelope ROM output. The tick treats a zero
+/// high-byte as "no pitch update for the currently-playing sfx",
+/// which lets a single program mix sfx with and without pitch
+/// envelopes.
+pub const AUDIO_SFX_PITCH_PTR_LO: u16 = 0x07F6;
+pub const AUDIO_SFX_PITCH_PTR_HI: u16 = 0x07F7;
 
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
@@ -343,6 +367,16 @@ pub fn gen_nmi(has_ppu_updates: bool, has_audio: bool, debug_mode: bool) -> Vec<
         out.push(Instruction::new(
             INC,
             AM::Absolute(DEBUG_FRAME_OVERRUN_ADDR),
+        ));
+        // Set the per-frame sticky bit. It stays set until the
+        // next `wait_frame` clears it, so a single
+        // `debug.assert(!debug.frame_overran())` guard at the top
+        // of `on frame { ... }` catches any miss in the previous
+        // window.
+        out.push(Instruction::new(LDA, AM::Immediate(0x01)));
+        out.push(Instruction::new(
+            STA,
+            AM::Absolute(DEBUG_FRAME_OVERRUN_FLAG_ADDR),
         ));
         out.push(Instruction::new(
             NOP,
@@ -757,7 +791,11 @@ pub fn gen_multiply() -> Vec<Instruction> {
 /// instruction stream as before. The linker decides whether to
 /// enable each by scanning for the `__noise_used` and
 /// `__triangle_used` marker labels emitted by the IR codegen.
-pub fn gen_audio_tick(has_noise: bool, has_triangle: bool) -> Vec<Instruction> {
+pub fn gen_audio_tick(
+    has_noise: bool,
+    has_triangle: bool,
+    has_sfx_pitch: bool,
+) -> Vec<Instruction> {
     let mut out = Vec::new();
 
     out.push(Instruction::new(NOP, AM::Label("__audio_tick".into())));
@@ -797,6 +835,61 @@ pub fn gen_audio_tick(has_noise: bool, has_triangle: bool) -> Vec<Instruction> {
         NOP,
         AM::Label("__audio_sfx_ptr_ok".into()),
     ));
+    // Optional per-frame pitch update. Only emitted in programs
+    // that declare at least one varying-pitch sfx, gated on the
+    // `__sfx_pitch_used` codegen marker. The block reads a byte
+    // through (AUDIO_SFX_PITCH_PTR),Y, writes it to `$4002`
+    // (pulse-1 period low), then advances the pointer in
+    // lockstep with the volume envelope above. A zero high byte
+    // in the pointer is treated as "no pitch envelope on the
+    // currently-playing sfx" so a program can mix scalar-pitch
+    // and varying-pitch sfx without the latter clobbering the
+    // former when it isn't playing.
+    //
+    // The pointer lives in main RAM (no zero-page slot pressure)
+    // and is copied into ZP scratch $02/$03 for the indirect
+    // read because the 6502 has no `(abs),Y` mode — the same
+    // technique used by `gen_noise_tick` / `gen_triangle_tick`.
+    if has_sfx_pitch {
+        // Bail out if the high byte is zero — sentinel for "the
+        // currently-playing sfx has no pitch envelope".
+        out.push(Instruction::new(LDA, AM::Absolute(AUDIO_SFX_PITCH_PTR_HI)));
+        out.push(Instruction::new(
+            BEQ,
+            AM::LabelRelative("__audio_sfx_pitch_done".into()),
+        ));
+        // Stash main-RAM pointer in ZP scratch $02/$03.
+        out.push(Instruction::new(LDA, AM::Absolute(AUDIO_SFX_PITCH_PTR_LO)));
+        out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+        out.push(Instruction::new(LDA, AM::Absolute(AUDIO_SFX_PITCH_PTR_HI)));
+        out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+        out.push(Instruction::new(LDY, AM::Immediate(0)));
+        out.push(Instruction::new(LDA, AM::IndirectY(0x02)));
+        // Zero pitch byte? Treat it as the matching mute sentinel
+        // (volume envelope's zero will already mute on the next
+        // tick) and skip the period write so we don't yank pulse-1
+        // to a 0 period for one frame before muting.
+        out.push(Instruction::new(
+            BEQ,
+            AM::LabelRelative("__audio_sfx_pitch_advance".into()),
+        ));
+        out.push(Instruction::new(STA, AM::Absolute(0x4002)));
+        out.push(Instruction::new(
+            NOP,
+            AM::Label("__audio_sfx_pitch_advance".into()),
+        ));
+        // Advance the main-RAM pointer 1 byte.
+        out.push(Instruction::new(INC, AM::Absolute(AUDIO_SFX_PITCH_PTR_LO)));
+        out.push(Instruction::new(
+            BNE,
+            AM::LabelRelative("__audio_sfx_pitch_done".into()),
+        ));
+        out.push(Instruction::new(INC, AM::Absolute(AUDIO_SFX_PITCH_PTR_HI)));
+        out.push(Instruction::new(
+            NOP,
+            AM::Label("__audio_sfx_pitch_done".into()),
+        ));
+    }
     out.push(Instruction::new(NOP, AM::Label("__audio_sfx_done".into())));
 
     // ── Music tick ──
@@ -1311,12 +1404,28 @@ pub fn gen_mapper_init(
     mirroring: Mirroring,
     total_prg_banks: usize,
 ) -> Vec<Instruction> {
-    match mapper {
+    let mut out = match mapper {
         Mapper::NROM => Vec::new(),
         Mapper::MMC1 => gen_mmc1_init(mirroring),
         Mapper::UxROM => gen_uxrom_init(total_prg_banks),
         Mapper::MMC3 => gen_mmc3_init(mirroring),
+    };
+    // Initialize ZP_BANK_CURRENT to the fixed bank index for any
+    // banked mapper. The trampoline emitted by
+    // `gen_bank_trampoline` reads this slot to decide which bank
+    // to restore after a cross-bank call, so it has to be a
+    // sensible value from the very first call. Without this the
+    // RAM-clear leaves it at $00, which would put bank 0 at
+    // $8000 instead of the fixed bank after a fixed-bank caller's
+    // first cross-bank call — a behavior change vs. the pre-
+    // banked-banked codegen that some examples rely on.
+    if mapper != Mapper::NROM && total_prg_banks > 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        let fixed_bank_index = (total_prg_banks - 1) as u8;
+        out.push(Instruction::new(LDA, AM::Immediate(fixed_bank_index)));
+        out.push(Instruction::new(STA, AM::ZeroPage(ZP_BANK_CURRENT)));
     }
+    out
 }
 
 /// MMC1 reset: pulse the reset bit, then write the control register.
@@ -1496,13 +1605,28 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
 }
 
 /// Generate a cross-bank trampoline stub. Placed in the fixed bank
-/// and called by user code (also in the fixed bank) via
-/// `JSR <tramp_label>`. Behavior:
+/// and called by *any* user code via `JSR <tramp_label>` regardless
+/// of which bank the caller currently lives in. Behavior:
 ///
-///   1. Load the target bank number into A, JSR `__bank_select`.
-///   2. JSR the user-supplied entry label inside the target bank.
-///   3. Load the fixed bank number, JSR `__bank_select` to restore.
-///   4. RTS.
+///   1. Read [`ZP_BANK_CURRENT`] into A, push it on the hardware
+///      stack — that's the bank we'll need to switch back to.
+///   2. Load the target bank number into A, JSR `__bank_select`.
+///   3. JSR the user-supplied entry label inside the target bank.
+///   4. Pull the saved bank back into A and JSR `__bank_select` to
+///      restore the caller's view of $8000-$BFFF.
+///   5. RTS.
+///
+/// The save/restore via `ZP_BANK_CURRENT + PHA/PLA` makes the same
+/// trampoline work for **fixed-bank → switchable-bank** *and*
+/// **switchable-bank → switchable-bank** call directions: the
+/// caller's bank ends up restored regardless of where the call
+/// originated. Nested cross-bank calls compose because each
+/// trampoline's PHA/PLA pair is balanced against its own JSR/RTS,
+/// so the saved bank values stack like any other 6502 frame.
+///
+/// The trampoline body itself lives in the fixed bank, which is
+/// always mapped at `$C000-$FFFF`, so it's reachable from every
+/// switchable bank without further mapper trickery.
 ///
 /// `tramp_label` is the label that callers will JSR (the IR codegen
 /// emits `JSR __tramp_<fn_name>` at every cross-bank call site).
@@ -1510,17 +1634,21 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
 /// callee's first instruction — conventionally `__ir_fn_<fn_name>`,
 /// the same label IR codegen would have emitted for an in-bank call.
 /// `bank_index` is the physical PRG bank number of the target bank.
-/// `fixed_bank_index` is the physical bank number of the fixed bank
-/// (always `total_banks - 1`).
 #[must_use]
 pub fn gen_bank_trampoline(
     tramp_label: &str,
     entry_label: &str,
     bank_index: u8,
-    fixed_bank_index: u8,
 ) -> Vec<Instruction> {
     let mut out = Vec::new();
     out.push(Instruction::new(NOP, AM::Label(tramp_label.to_string())));
+    // Save the caller's current bank. `__bank_select` writes its
+    // input into ZP_BANK_CURRENT, so this slot already mirrors the
+    // last-selected bank (initialized to the fixed bank index by
+    // `gen_mapper_init` so even fixed-bank callers see a sane
+    // value the first time around).
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_BANK_CURRENT)));
+    out.push(Instruction::implied(PHA));
     // Switch to target bank.
     out.push(Instruction::new(LDA, AM::Immediate(bank_index)));
     out.push(Instruction::new(JSR, AM::Label("__bank_select".into())));
@@ -1528,8 +1656,10 @@ pub fn gen_bank_trampoline(
     // the switchable bank and is resolved by the linker after the
     // banked code is assembled.
     out.push(Instruction::new(JSR, AM::Label(entry_label.to_string())));
-    // Restore the fixed bank.
-    out.push(Instruction::new(LDA, AM::Immediate(fixed_bank_index)));
+    // Restore the caller's bank (pulled from the stack) so control
+    // returns with $8000-$BFFF showing whatever the caller had
+    // mapped before the trampoline ran.
+    out.push(Instruction::implied(PLA));
     out.push(Instruction::new(JSR, AM::Label("__bank_select".into())));
     out.push(Instruction::implied(RTS));
     out

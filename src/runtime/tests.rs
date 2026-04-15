@@ -195,7 +195,7 @@ fn multiply_routine_assembles() {
 
 #[test]
 fn audio_tick_defines_required_labels() {
-    let tick = gen_audio_tick(false, false);
+    let tick = gen_audio_tick(false, false, false);
     // The IR codegen JSRs into `__audio_tick`; that's the entry.
     let has_entry = tick
         .iter()
@@ -215,7 +215,7 @@ fn audio_tick_defines_required_labels() {
 
 #[test]
 fn audio_tick_ends_with_rts() {
-    let tick = gen_audio_tick(false, false);
+    let tick = gen_audio_tick(false, false, false);
     assert_eq!(
         tick.last().unwrap().opcode,
         RTS,
@@ -228,7 +228,7 @@ fn audio_tick_reads_sfx_envelope_via_indirect_y() {
     // The sfx branch walks the envelope via (ZP_SFX_PTR_LO),Y with
     // Y=0 — each NMI reads one byte through the pointer and writes
     // it to $4000. Verify the indirect-indexed load is present.
-    let tick = gen_audio_tick(false, false);
+    let tick = gen_audio_tick(false, false, false);
     let has_load = tick
         .iter()
         .any(|i| i.opcode == LDA && i.mode == AM::IndirectY(ZP_SFX_PTR_LO));
@@ -241,7 +241,7 @@ fn audio_tick_reads_sfx_envelope_via_indirect_y() {
 #[test]
 fn audio_tick_writes_pulse1_envelope_register() {
     // After reading the envelope byte the tick writes it to $4000.
-    let tick = gen_audio_tick(false, false);
+    let tick = gen_audio_tick(false, false, false);
     let has_store = tick
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4000));
@@ -254,7 +254,7 @@ fn audio_tick_noise_block_writes_400c_when_enabled() {
     // envelope byte and writes it to the APU noise volume register
     // at $400C. Verify both the marker label and the STA $400C are
     // present.
-    let tick = gen_audio_tick(true, false);
+    let tick = gen_audio_tick(true, false, false);
     let has_label = tick
         .iter()
         .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_noise_tick"));
@@ -270,7 +270,7 @@ fn audio_tick_noise_block_absent_when_disabled() {
     // The pulse-only path must not emit any noise label, so
     // programs that never declare a noise sfx get byte-identical
     // code to the pre-feature version.
-    let tick = gen_audio_tick(false, false);
+    let tick = gen_audio_tick(false, false, false);
     let has_label = tick
         .iter()
         .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_noise_tick"));
@@ -289,7 +289,7 @@ fn audio_tick_noise_block_absent_when_disabled() {
 
 #[test]
 fn audio_tick_triangle_block_writes_4008_when_enabled() {
-    let tick = gen_audio_tick(false, true);
+    let tick = gen_audio_tick(false, true, false);
     let has_label = tick
         .iter()
         .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_triangle_tick"));
@@ -305,7 +305,7 @@ fn audio_tick_triangle_block_writes_4008_when_enabled() {
 
 #[test]
 fn audio_tick_triangle_block_absent_when_disabled() {
-    let tick = gen_audio_tick(false, false);
+    let tick = gen_audio_tick(false, false, false);
     let has_label = tick
         .iter()
         .any(|i| matches!(&i.mode, AM::Label(n) if n == "__audio_triangle_tick"));
@@ -317,11 +317,57 @@ fn audio_tick_triangle_block_absent_when_disabled() {
 }
 
 #[test]
+fn audio_tick_sfx_pitch_block_writes_4002_when_enabled() {
+    // With `has_sfx_pitch = true` the tick gains a per-frame pitch
+    // update path that writes to `$4002` (pulse-1 period low) on
+    // every NMI. The path also needs to read the pitch envelope
+    // pointer from main RAM, so we check both the absolute-RAM
+    // load and the period write.
+    let tick = gen_audio_tick(false, false, true);
+    let writes_4002 = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4002));
+    assert!(
+        writes_4002,
+        "sfx pitch tick path should write to $4002 (pulse-1 period low)"
+    );
+    let reads_pitch_ptr = tick
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::Absolute(AUDIO_SFX_PITCH_PTR_LO));
+    assert!(
+        reads_pitch_ptr,
+        "sfx pitch tick path should LDA from AUDIO_SFX_PITCH_PTR_LO"
+    );
+}
+
+#[test]
+fn audio_tick_sfx_pitch_block_absent_when_disabled() {
+    // Programs without varying-pitch sfx must not pay any bytes
+    // for the pitch update path, otherwise existing audio_demo /
+    // friendly_assets goldens would byte-shift.
+    let tick = gen_audio_tick(false, false, false);
+    let writes_4002 = tick
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4002));
+    assert!(
+        !writes_4002,
+        "sfx pitch tick path must not appear when flag is off"
+    );
+    let reads_pitch_ptr = tick
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::Absolute(AUDIO_SFX_PITCH_PTR_LO));
+    assert!(
+        !reads_pitch_ptr,
+        "AUDIO_SFX_PITCH_PTR_LO must not be touched when flag is off"
+    );
+}
+
+#[test]
 fn audio_tick_both_channels_assemble() {
     // With both new channels enabled, the tick + period table must
     // still fit its internal branches (±127 bytes) and assemble
     // successfully.
-    let mut combined = gen_audio_tick(true, true);
+    let mut combined = gen_audio_tick(true, true, false);
     combined.extend(gen_period_table());
     let result = asm::assemble(&combined, 0xC000);
     assert!(!result.bytes.is_empty());
@@ -335,7 +381,7 @@ fn audio_tick_mutes_pulse2_on_non_looping_end_of_track() {
     // tick writes $30 to $4004 and clears ZP_MUSIC_STATE. We verify
     // the mute path exists by checking both writes exist somewhere
     // in the tick body.
-    let tick = gen_audio_tick(false, false);
+    let tick = gen_audio_tick(false, false, false);
     let has_mute = tick
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4004));
@@ -356,7 +402,7 @@ fn audio_tick_assembles_without_error() {
     // uses label-relative branches internally which need to fit
     // within ±127 bytes — if the body grows past that the branches
     // will panic at assemble time.
-    let mut combined = gen_audio_tick(false, false);
+    let mut combined = gen_audio_tick(false, false, false);
     combined.extend(gen_period_table());
     let result = asm::assemble(&combined, 0xC000);
     assert!(
@@ -574,17 +620,31 @@ fn mapper_init_mmc1_horizontal_vs_vertical_control_bits() {
 }
 
 #[test]
-fn mapper_init_uxrom_emits_label_and_nothing_else() {
+fn mapper_init_uxrom_emits_label_and_seeds_zp_bank_current() {
     // UxROM powers up with bank 0 at $8000 and the last bank fixed
-    // at $C000 — exactly what the NEScript runtime expects. All we
-    // need is a marker label so debuggers can find the (empty)
-    // init span.
+    // at $C000, so apart from a marker label there's no mapper-
+    // specific init to do — *but* the runtime now seeds
+    // ZP_BANK_CURRENT with the fixed bank index so the
+    // banked-call trampoline knows which bank to restore on the
+    // way out. The seed is a 2-instruction LDA #imm / STA $10
+    // pair appended after the marker label.
     let init = gen_mapper_init(Mapper::UxROM, Mirroring::Horizontal, 3);
-    assert_eq!(init.len(), 1);
     assert!(
         matches!(&init[0].mode, AM::Label(n) if n == "__uxrom_init"),
-        "UxROM init should emit just the marker label",
+        "UxROM init should still start with the marker label",
     );
+    assert_eq!(
+        init.len(),
+        3,
+        "UxROM init should be marker + LDA #fixed + STA ZP_BANK_CURRENT"
+    );
+    assert_eq!(init[1].opcode, LDA);
+    assert!(
+        matches!(init[1].mode, AM::Immediate(2)),
+        "fixed bank index for 3 banks is 2"
+    );
+    assert_eq!(init[2].opcode, STA);
+    assert!(matches!(init[2].mode, AM::ZeroPage(addr) if addr == ZP_BANK_CURRENT));
 }
 
 #[test]
@@ -763,17 +823,18 @@ fn bank_select_assembles_for_every_mapper() {
 }
 
 #[test]
-fn trampoline_switches_target_then_restores_fixed() {
-    // A trampoline must JSR `__bank_select` twice: once with the
-    // target bank's index, once with the fixed bank's index. The
-    // two LDA immediates in the stub should match those two bank
-    // numbers in order. The trampoline name is the label callers
-    // will JSR (one trampoline per banked function); the entry
-    // label is whatever lives in the switchable bank.
-    let t = gen_bank_trampoline("__tramp_helper", "__ir_fn_helper", 0, 3);
+fn trampoline_switches_target_then_restores_caller() {
+    // A trampoline must save the caller's bank from
+    // ZP_BANK_CURRENT, switch to the target, call the entry, then
+    // restore the saved value. We check the immediate loaded
+    // (target bank), the PHA/PLA pair around the body, and the
+    // JSR sequence.
+    let t = gen_bank_trampoline("__tramp_helper", "__ir_fn_helper", 0);
     // First instruction is the trampoline label.
     assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_helper"));
-    // Extract the sequence of immediate loads.
+    // The only LDA immediate is the target bank itself — the
+    // restore path uses PLA, not a hardcoded LDA, so the caller's
+    // bank can be anything.
     let imms: Vec<u8> = t
         .iter()
         .filter_map(|i| {
@@ -785,8 +846,29 @@ fn trampoline_switches_target_then_restores_fixed() {
             None
         })
         .collect();
-    assert_eq!(imms, vec![0, 3], "trampoline should load target then fixed");
-    // And two JSRs to __bank_select, plus one JSR to the entry.
+    assert_eq!(
+        imms,
+        vec![0],
+        "trampoline must load only the target bank as an immediate"
+    );
+    // The trampoline must read ZP_BANK_CURRENT into A then PHA
+    // (save), and later PLA (restore).
+    let reads_current = t.iter().any(|i| {
+        i.opcode == LDA && matches!(i.mode, AM::ZeroPage(addr) if addr == ZP_BANK_CURRENT)
+    });
+    assert!(
+        reads_current,
+        "trampoline must LDA ZP_BANK_CURRENT to capture the caller's bank"
+    );
+    let pushes = t.iter().filter(|i| i.opcode == PHA).count();
+    let pops = t.iter().filter(|i| i.opcode == PLA).count();
+    assert_eq!(
+        (pushes, pops),
+        (1, 1),
+        "trampoline must have exactly one PHA / PLA pair"
+    );
+    // And two JSRs to __bank_select, plus one JSR to the entry —
+    // dispatch order is still target-first, restore-last.
     let jsrs: Vec<&str> = t
         .iter()
         .filter_map(|i| {
@@ -801,7 +883,7 @@ fn trampoline_switches_target_then_restores_fixed() {
     assert_eq!(
         jsrs,
         vec!["__bank_select", "__ir_fn_helper", "__bank_select"],
-        "trampoline JSRs must dispatch in the correct order"
+        "trampoline JSRs must dispatch target → entry → restore"
     );
     // Final instruction returns to caller.
     assert_eq!(t.last().unwrap().opcode, RTS);
@@ -814,8 +896,56 @@ fn trampoline_label_uses_caller_supplied_name() {
     // without knowing bank indices. `gen_bank_trampoline` should
     // emit that exact label as its leading pseudo-op so the
     // assembler resolves the JSR.
-    let t = gen_bank_trampoline("__tramp_big_helper", "__ir_fn_big_helper", 1, 3);
+    let t = gen_bank_trampoline("__tramp_big_helper", "__ir_fn_big_helper", 1);
     assert!(matches!(&t[0].mode, AM::Label(n) if n == "__tramp_big_helper"));
+}
+
+#[test]
+fn mapper_init_seeds_zp_bank_current_with_fixed_bank_index() {
+    // The trampoline reads ZP_BANK_CURRENT to decide which bank
+    // to switch back to after a cross-bank call. For fixed-bank
+    // callers that have never explicitly switched banks, the
+    // value must point at the fixed bank — otherwise the very
+    // first cross-bank call from the fixed bank would restore
+    // bank 0 (the RAM-clear default) at $8000, breaking the
+    // pre-banked-banked semantics that other examples rely on.
+    //
+    // For UxROM with 6 banks, the fixed bank is index 5.
+    let init = gen_mapper_init(Mapper::UxROM, Mirroring::Horizontal, 6);
+    let mut found_seed = false;
+    let mut last_imm: Option<u8> = None;
+    for inst in &init {
+        if inst.opcode == LDA {
+            if let AM::Immediate(v) = inst.mode {
+                last_imm = Some(v);
+            }
+        }
+        if inst.opcode == STA {
+            if let AM::ZeroPage(addr) = inst.mode {
+                if addr == ZP_BANK_CURRENT && last_imm == Some(5) {
+                    found_seed = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        found_seed,
+        "gen_mapper_init must seed ZP_BANK_CURRENT with the fixed bank index (5 here)"
+    );
+}
+
+#[test]
+fn nrom_mapper_init_does_not_seed_zp_bank_current() {
+    // NROM has no banks at all, so seeding ZP_BANK_CURRENT would
+    // both waste a couple of bytes and cause the existing NROM
+    // example ROMs (every flat-mapper sample) to byte-shift.
+    // Verify the init stays empty for NROM.
+    let init = gen_mapper_init(Mapper::NROM, Mirroring::Horizontal, 1);
+    assert!(
+        init.is_empty(),
+        "NROM mapper init must remain empty: {init:?}"
+    );
 }
 
 #[test]

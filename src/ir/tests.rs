@@ -314,6 +314,190 @@ fn lower_wait_frame() {
 }
 
 #[test]
+fn lower_debug_frame_overrun_count_emits_peek() {
+    // `debug.frame_overrun_count()` lowers to a Peek of the
+    // canonical $07FF runtime address. The release-mode codegen
+    // gating happens later — at the IR level we always emit the
+    // Peek so the optimizer/codegen has a single uniform shape.
+    let ir = lower_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var n: u8 = 0
+        on frame {
+            n = debug.frame_overrun_count()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
+    let peek_addr = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .find_map(|op| match op {
+            IrOp::Peek(_, addr) => Some(*addr),
+            _ => None,
+        });
+    assert_eq!(
+        peek_addr,
+        Some(0x07FF),
+        "expected Peek($07FF) for frame_overrun_count"
+    );
+}
+
+#[test]
+fn lower_metasprite_draw_expands_to_one_op_per_tile() {
+    // `draw Hero at: (10, 20)` where Hero is a 4-tile metasprite
+    // should lower to four `DrawSprite` ops, each with the
+    // metasprite's underlying sprite name and one tile from the
+    // declaration's `frame:` array (offset by the sprite's base
+    // tile index — the runtime smiley occupies tile 0, so a
+    // single-sprite program starts user tiles at 1).
+    let ir = lower_ok(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tile {
+            pixels: [
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@"
+            ]
+        }
+        metasprite Hero {
+            sprite: Tile
+            dx:    [0, 8, 0, 8]
+            dy:    [0, 0, 8, 8]
+            frame: [0, 0, 0, 0]
+        }
+        on frame {
+            draw Hero at: (10, 20)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
+    let ops: Vec<&IrOp> = frame_fn.blocks.iter().flat_map(|b| &b.ops).collect();
+    let draws: Vec<_> = ops
+        .iter()
+        .filter_map(|op| match op {
+            IrOp::DrawSprite { sprite_name, .. } => Some(sprite_name.clone()),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        draws.len(),
+        4,
+        "metasprite with 4 tiles should expand to 4 DrawSprite ops"
+    );
+    for name in &draws {
+        assert_eq!(
+            name, "Tile",
+            "expanded ops should target the underlying sprite"
+        );
+    }
+    // Each tile in the metasprite uses `frame: 0` relative to
+    // the underlying sprite. The single-sprite program has `Tile`
+    // at base index 1 (smiley occupies 0), so the resolved
+    // absolute frame index for every expanded DrawSprite is 1 —
+    // we should see at least one `LoadImm(_, 1)` matching that.
+    let load_imm_1_count = ops
+        .iter()
+        .filter(|op| matches!(op, IrOp::LoadImm(_, 1)))
+        .count();
+    assert!(
+        load_imm_1_count >= 4,
+        "metasprite expansion should LoadImm(_, 1) at least once per tile (sprite Tile sits at base index 1, frame: [0,0,0,0]); got {load_imm_1_count}"
+    );
+}
+
+#[test]
+fn lower_nested_struct_literal_init_expands_to_leaves() {
+    // A `Hero { pos: Vec2 { x: 1, y: 2 }, hp: 100, inv: [3,4,5,6] }`
+    // initializer must produce one IrGlobal per leaf field with the
+    // right scalar `init_value` / per-element `init_array`. The
+    // intermediate `hero.pos` is registered with `size: 0` so name
+    // lookups still work but no separate init bytes are emitted.
+    let ir = lower_ok(
+        r#"
+        game "T" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        struct Hero { pos: Vec2, hp: u8, inv: u8[4] }
+        var hero: Hero = Hero { pos: Vec2 { x: 1, y: 2 }, hp: 100, inv: [3, 4, 5, 6] }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    let by_name = |n: &str| {
+        ir.globals
+            .iter()
+            .find(|g| g.name == n)
+            .unwrap_or_else(|| panic!("missing global: {n}"))
+    };
+    let pos_x = by_name("hero.pos.x");
+    let pos_y = by_name("hero.pos.y");
+    let hp = by_name("hero.hp");
+    let inv = by_name("hero.inv");
+    assert_eq!(pos_x.init_value, Some(1));
+    assert_eq!(pos_y.init_value, Some(2));
+    assert_eq!(hp.init_value, Some(100));
+    assert_eq!(inv.init_array, vec![3, 4, 5, 6]);
+    // The intermediate must exist with size 0 so codegen can
+    // resolve `hero.pos` lookups even though it carries no bytes.
+    let pos = by_name("hero.pos");
+    assert_eq!(pos.size, 0);
+    assert_eq!(pos.init_value, None);
+    assert!(pos.init_array.is_empty());
+}
+
+#[test]
+fn lower_debug_frame_overran_emits_peek_07fe() {
+    let ir = lower_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var n: u8 = 0
+        on frame {
+            n = debug.frame_overran()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .unwrap();
+    let peek_addr = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .find_map(|op| match op {
+            IrOp::Peek(_, addr) => Some(*addr),
+            _ => None,
+        });
+    assert_eq!(
+        peek_addr,
+        Some(0x07FE),
+        "expected Peek($07FE) for frame_overran"
+    );
+}
+
+#[test]
 fn array_literal_global_init_is_captured() {
     // Regression test: `var xs: u8[4] = [1, 2, 3, 4]` used to lose
     // its initializer because `eval_const` returns None for

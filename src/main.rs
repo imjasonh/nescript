@@ -503,6 +503,8 @@ mod tests {
             name: "Stage".to_string(),
             tiles: [0u8; 960],
             attrs: [0u8; 64],
+            chr_bytes: Vec::new(),
+            chr_base_tile: 0,
         }];
         let mut labels = HashMap::new();
         labels.insert("__palette_Main".to_string(), 0xC100);

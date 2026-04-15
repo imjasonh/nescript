@@ -396,6 +396,110 @@ impl Analyzer {
             }
         }
 
+        // Validate metasprite declarations: the parallel offset
+        // arrays must all be the same length, the named sprite
+        // must exist, and the metasprite name must be unique
+        // (against other metasprites and against sprites — both
+        // share the same `draw` lookup namespace).
+        //
+        // We also enforce a more restrictive rule for the v1
+        // metasprite lowering: every sprite that PRECEDES a
+        // metasprite-targeted sprite in declaration order must use
+        // an inline `pixels:` body. The IR lowering at
+        // `ir/lowering.rs::lower_program` walks the sprite list to
+        // compute base tile indices for the metasprite's `frame:`
+        // resolution, but it can't read external `@chr(...)` /
+        // `@binary(...)` files at lowering time and falls back to
+        // a single-tile assumption — that would silently misalign
+        // the metasprite's frame indices. Reject those programs at
+        // analysis time so users get a clear error instead of a
+        // visual glitch at runtime.
+        let mut seen_metasprites = HashSet::new();
+        let sprite_names: HashSet<String> =
+            program.sprites.iter().map(|s| s.name.clone()).collect();
+        for ms in &program.metasprites {
+            if !seen_metasprites.insert(ms.name.clone()) {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0501,
+                    format!("duplicate metasprite '{}'", ms.name),
+                    ms.span,
+                ));
+            }
+            if sprite_names.contains(&ms.name) {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0501,
+                    format!(
+                        "metasprite '{}' shadows a sprite with the same name; pick a unique identifier",
+                        ms.name
+                    ),
+                    ms.span,
+                ));
+            }
+            if sprite_names.contains(&ms.sprite_name) {
+                // Check that every sprite up to *and including*
+                // the target uses an inline pixels source. Any
+                // earlier non-inline sprite would shift the base
+                // tile of the target by an unknown amount; the
+                // target itself also has to be inline so the
+                // lowering knows how many tiles to consume for it.
+                for sprite in &program.sprites {
+                    let is_inline = matches!(
+                        sprite.chr_source,
+                        crate::parser::ast::AssetSource::Inline(_)
+                    );
+                    if !is_inline {
+                        self.diagnostics.push(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "metasprite '{}' depends on sprite '{}' which uses an external `@chr` or `@binary` source; \
+                                 the v1 metasprite lowering can't compute base tile indices for non-inline sprites — \
+                                 inline the pixel art with a `pixels:` block, or remove the metasprite",
+                                ms.name, sprite.name
+                            ),
+                            ms.span,
+                        ));
+                        break;
+                    }
+                    if sprite.name == ms.sprite_name {
+                        break;
+                    }
+                }
+            } else {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "metasprite '{}' references unknown sprite '{}'",
+                        ms.name, ms.sprite_name
+                    ),
+                    ms.span,
+                ));
+            }
+            if ms.dx.len() != ms.dy.len() || ms.dx.len() != ms.frame.len() {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "metasprite '{}' has mismatched array lengths: \
+                         dx={}, dy={}, frame={} — all three must be equal",
+                        ms.name,
+                        ms.dx.len(),
+                        ms.dy.len(),
+                        ms.frame.len()
+                    ),
+                    ms.span,
+                ));
+            }
+            if ms.dx.is_empty() {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "metasprite '{}' is empty — declare at least one tile",
+                        ms.name
+                    ),
+                    ms.span,
+                ));
+            }
+        }
+
         // Register functions as symbols
         for fun in &program.functions {
             self.register_fun(fun);
@@ -719,6 +823,38 @@ impl Analyzer {
                     ));
                 }
             }
+            Expr::DebugCall(method, args, span) => {
+                // Only the no-argument query methods are recognised
+                // today. Anything else is an error so a typo gets
+                // caught at compile time rather than silently
+                // returning zero. Argument expressions are walked
+                // for completeness even though no current method
+                // accepts any.
+                match method.as_str() {
+                    "frame_overrun_count" | "frame_overran" => {
+                        if !args.is_empty() {
+                            self.diagnostics.push(Diagnostic::error(
+                                ErrorCode::E0203,
+                                format!("`debug.{method}` takes no arguments, got {}", args.len()),
+                                *span,
+                            ));
+                        }
+                    }
+                    _ => {
+                        self.diagnostics.push(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "unknown debug method '{method}' \
+                                 (expected 'frame_overrun_count' or 'frame_overran')"
+                            ),
+                            *span,
+                        ));
+                    }
+                }
+                for arg in args {
+                    self.walk_expr_reads(arg);
+                }
+            }
             Expr::IntLiteral(_, _) | Expr::BoolLiteral(_, _) | Expr::ButtonRead(_, _, _) => {}
         }
     }
@@ -809,9 +945,10 @@ impl Analyzer {
     /// Register a struct declaration. Computes each field's byte
     /// offset from the base address (fields are laid out contiguously
     /// in declaration order with no padding), and records the total
-    /// size. Fields may be u8, i8, bool, or u16. Nested structs and
-    /// array fields are still rejected — the IR-lowering path doesn't
-    /// model them yet.
+    /// size. Field types may be `u8`, `i8`, `bool`, `u16`, an array
+    /// of any of those, or another previously-declared struct.
+    /// Nested struct fields require the inner struct to have been
+    /// declared earlier in the program (we don't topologically sort).
     fn register_struct(&mut self, s: &StructDecl) {
         if self.struct_layouts.contains_key(&s.name) {
             self.diagnostics.push(Diagnostic::error(
@@ -821,25 +958,60 @@ impl Analyzer {
             ));
             return;
         }
+        // Snapshot the existing per-struct sizes so the size
+        // helper can resolve nested struct field sizes without
+        // borrowing `self` mutably.
+        let struct_sizes: HashMap<String, u16> = self
+            .struct_layouts
+            .iter()
+            .map(|(n, l)| (n.clone(), l.size))
+            .collect();
         let mut fields = Vec::new();
         let mut offset: u16 = 0;
         for field in &s.fields {
-            // Reject non-primitive field types for now. u16 is
-            // allowed and takes two bytes; arrays and nested structs
-            // still error out with a clearer message than before.
+            // Compute the size for this field. Primitives are 1 or
+            // 2 bytes; arrays multiply element size by length;
+            // nested structs look up the previously-registered
+            // size. A nested struct that hasn't been declared yet
+            // is an error — the user must put inner structs
+            // before the outer ones.
             let size = match &field.field_type {
                 NesType::U8 | NesType::I8 | NesType::Bool => 1,
                 NesType::U16 => 2,
-                NesType::Array(_, _) | NesType::Struct(_) => {
-                    self.diagnostics.push(Diagnostic::error(
-                        ErrorCode::E0201,
-                        format!(
-                            "struct field '{}' has unsupported type '{}' (struct fields must be u8, i8, u16, or bool)",
-                            field.name, field.field_type
-                        ),
-                        field.span,
-                    ));
-                    continue;
+                NesType::Array(elem, count) => {
+                    // Reject arrays of structs for now — the
+                    // synthetic-variable model used by the
+                    // analyzer flattens scalars into one symbol
+                    // per leaf, but an array-of-structs would
+                    // need either per-element flattening or a
+                    // proper indexed-struct codegen path.
+                    if let NesType::Struct(_) = elem.as_ref() {
+                        self.diagnostics.push(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "struct field '{}' is an array of structs, which is not yet supported",
+                                field.name
+                            ),
+                            field.span,
+                        ));
+                        continue;
+                    }
+                    let elem_size = type_size_with(elem, &struct_sizes);
+                    elem_size * *count
+                }
+                NesType::Struct(sname) => {
+                    let Some(inner) = struct_sizes.get(sname).copied() else {
+                        self.diagnostics.push(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "struct '{}' field '{}' references unknown struct type '{sname}'; declare '{sname}' before '{}'",
+                                s.name, field.name, s.name
+                            ),
+                            field.span,
+                        ));
+                        continue;
+                    };
+                    inner
                 }
             };
             fields.push((field.name.clone(), field.field_type.clone(), offset));
@@ -884,6 +1056,80 @@ impl Analyzer {
                     span: *variant_span,
                 },
             );
+        }
+    }
+
+    /// Recursively walk a struct layout and synthesize one symbol +
+    /// allocation per leaf field, plus a Struct-typed symbol for
+    /// each nested-struct intermediate so dotted-name lookups for
+    /// `outer.inner` (without the trailing leaf) still resolve.
+    ///
+    /// For example, given `var p: Player` where `Player { pos:
+    /// Point, hp: u8, inv: u8[4] }` and `Point { x: u8, y: u8 }`,
+    /// this produces:
+    ///
+    /// - `p.pos`        — Symbol(Struct("Point"))
+    /// - `p.pos.x`      — Symbol(U8) + allocation
+    /// - `p.pos.y`      — Symbol(U8) + allocation
+    /// - `p.hp`         — Symbol(U8) + allocation
+    /// - `p.inv`        — Symbol(Array(U8, 4)) + allocation
+    fn flatten_struct_fields(
+        &mut self,
+        base_name: &str,
+        base_addr: u16,
+        layout: &StructLayout,
+        var_span: Span,
+    ) {
+        // Snapshot the per-struct sizes once at the top of the
+        // recursion so deep struct trees don't rebuild the same
+        // map at every leaf — `type_size_with` is the only
+        // consumer and it just needs the size lookup.
+        let struct_sizes: HashMap<String, u16> = self
+            .struct_layouts
+            .iter()
+            .map(|(n, l)| (n.clone(), l.size))
+            .collect();
+        for (field_name, field_type, offset) in &layout.fields {
+            let full_name = format!("{base_name}.{field_name}");
+            let field_addr = base_addr + offset;
+            match field_type {
+                NesType::Struct(sname) => {
+                    // Register the intermediate as a Struct
+                    // symbol so a `name.field` walk finds it
+                    // even when only the leaves carry storage.
+                    self.symbols.insert(
+                        full_name.clone(),
+                        Symbol {
+                            name: full_name.clone(),
+                            sym_type: field_type.clone(),
+                            is_const: false,
+                            span: var_span,
+                        },
+                    );
+                    let nested = self.struct_layouts[sname].clone();
+                    self.flatten_struct_fields(&full_name, field_addr, &nested, var_span);
+                }
+                _ => {
+                    // u8 / i8 / u16 / bool / array — leaf field.
+                    // The leaf's allocation size mirrors the
+                    // top-level rule used by `register_var`.
+                    self.symbols.insert(
+                        full_name.clone(),
+                        Symbol {
+                            name: full_name.clone(),
+                            sym_type: field_type.clone(),
+                            is_const: false,
+                            span: var_span,
+                        },
+                    );
+                    let field_size = type_size_with(field_type, &struct_sizes);
+                    self.var_allocations.push(VarAllocation {
+                        name: full_name,
+                        address: field_addr,
+                        size: field_size,
+                    });
+                }
+            }
         }
     }
 
@@ -959,37 +1205,19 @@ impl Analyzer {
             return;
         };
 
-        // For struct-typed variables, synthesize per-field entries in
-        // the symbol table and var_allocations. This lets the rest of
-        // the compiler treat `pos.x` and `pos.y` as ordinary variables
-        // at known addresses, without special-casing struct layout.
+        // For struct-typed variables, synthesize per-field entries
+        // in the symbol table and var_allocations. This lets the
+        // rest of the compiler treat `pos.x` and `pos.y` as
+        // ordinary variables at known addresses, without special-
+        // casing struct layout. Nested structs recurse — a
+        // `Player { pos: Point, ... }` variable produces both
+        // `p.pos` (typed `Struct("Point")`) and `p.pos.x`,
+        // `p.pos.y` leaves. Array fields produce a single
+        // synthetic with the array type so the existing
+        // `Expr::ArrayIndex` lowering picks them up.
         if let NesType::Struct(sname) = &var.var_type {
             let layout = self.struct_layouts[sname].clone();
-            for (field_name, field_type, offset) in &layout.fields {
-                let full_name = format!("{}.{field_name}", var.name);
-                self.symbols.insert(
-                    full_name.clone(),
-                    Symbol {
-                        name: full_name.clone(),
-                        sym_type: field_type.clone(),
-                        is_const: false,
-                        span: var.span,
-                    },
-                );
-                // u16 struct fields occupy two bytes — record that
-                // explicitly so the IR codegen's global-init pass and
-                // any size-aware bookkeeping treat the high byte as
-                // part of the same allocation.
-                let field_size = match field_type {
-                    NesType::U16 => 2,
-                    _ => 1,
-                };
-                self.var_allocations.push(VarAllocation {
-                    name: full_name,
-                    address: address + offset,
-                    size: field_size,
-                });
-            }
+            self.flatten_struct_fields(&var.name, address, &layout, var.span);
             // Also register the struct variable itself (as a symbol
             // only — it doesn't have a single VarAllocation entry).
             self.symbols.insert(
@@ -1650,6 +1878,13 @@ impl Analyzer {
             Expr::ArrayLiteral(_, _) => Some(NesType::U8), // element type inferred from context
             Expr::Cast(_, target, _) => Some(target.clone()),
             Expr::StructLiteral(name, _, _) => Some(NesType::Struct(name.clone())),
+            // Both `debug.frame_overrun_count()` and
+            // `debug.frame_overran()` return a single byte, so they
+            // type-check as u8 even though the latter is conceptually
+            // a flag (0 / 1). Treating it as u8 lets it work in
+            // `debug.assert(!debug.frame_overran())` where the
+            // analyzer's bool-leniency rule for `!` already kicks in.
+            Expr::DebugCall(_, _, _) => Some(NesType::U8),
         }
     }
 }
@@ -1924,6 +2159,15 @@ fn collect_calls_expr(expr: &Expr, calls: &mut Vec<String>) {
         }
         Expr::Cast(inner, _, _) => {
             collect_calls_expr(inner, calls);
+        }
+        Expr::DebugCall(_, args, _) => {
+            // Debug calls aren't user-defined functions, so we
+            // don't add them to the call graph — but their
+            // argument expressions may still mention real calls
+            // we should track.
+            for arg in args {
+                collect_calls_expr(arg, calls);
+            }
         }
         Expr::IntLiteral(_, _)
         | Expr::BoolLiteral(_, _)

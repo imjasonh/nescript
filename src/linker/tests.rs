@@ -131,6 +131,56 @@ fn link_with_sprites_spanning_multiple_tiles() {
 }
 
 #[test]
+fn link_with_background_chr_places_blob_after_sprites() {
+    // A `BackgroundData` carrying its own CHR data should drop
+    // the bytes into CHR ROM at `chr_base_tile * 16`. The
+    // linker must NOT touch any earlier tiles (the smiley at
+    // tile 0 plus any sprites). We seed a sprite at tile 1 and
+    // a background at tile 5, then verify the linker placed
+    // both blobs at their expected offsets.
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![Instruction::implied(NOP)];
+    let sprite_bytes: Vec<u8> = vec![0xAA; 16]; // tile 1
+    let bg_chr: Vec<u8> = (0u8..32u8).collect(); // tiles 5, 6
+    let sprites = vec![SpriteData {
+        name: "Player".into(),
+        tile_index: 1,
+        chr_bytes: sprite_bytes.clone(),
+    }];
+    let backgrounds = vec![crate::assets::BackgroundData {
+        name: "Stage".into(),
+        tiles: [5u8; 960],
+        attrs: [0u8; 64],
+        chr_bytes: bg_chr.clone(),
+        chr_base_tile: 5,
+    }];
+    let rom = linker.link_banked_with_ppu(&user_code, &sprites, &[], &[], &[], &backgrounds, &[]);
+    let chr_start = 16 + 16384;
+    // Sprite bytes still at tile 1.
+    assert_eq!(
+        &rom[chr_start + 16..chr_start + 32],
+        sprite_bytes.as_slice(),
+        "sprite tile bytes should survive the background CHR splice"
+    );
+    // Background CHR at tile 5 (offset 80).
+    assert_eq!(
+        &rom[chr_start + 80..chr_start + 80 + 32],
+        bg_chr.as_slice(),
+        "background CHR bytes should land at chr_base_tile * 16"
+    );
+    // Tiles 2/3/4 should still be all zeros — the linker mustn't
+    // shadow the gap between the sprite tile and the background.
+    for tile in 2..5usize {
+        let off = chr_start + tile * 16;
+        assert_eq!(
+            &rom[off..off + 16],
+            &[0u8; 16],
+            "tile {tile} should remain zero between sprite and background"
+        );
+    }
+}
+
+#[test]
 fn link_splices_audio_tick_when_user_marker_present() {
     // When user code contains the `__audio_used` marker label (the
     // IR codegen emits this whenever it sees a `play`/`start_music`/
@@ -187,6 +237,7 @@ fn link_with_audio_data_places_sfx_blobs_in_prg() {
         period_lo: 0x50,
         period_hi: 0x08,
         envelope: vec![0xBF, 0xB8, 0xB4, 0xB0, 0x00],
+        pitch_envelope: Vec::new(),
         channel: Channel::Pulse1,
     }];
     let rom = linker.link_with_all_assets(&user_code, &[], &sfx, &[]);
@@ -239,6 +290,7 @@ fn link_with_audio_resolves_sfx_pointer_references() {
         period_lo: 0x50,
         period_hi: 0x08,
         envelope: vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00],
+        pitch_envelope: Vec::new(),
         channel: Channel::Pulse1,
     }];
     let rom = linker.link_with_all_assets(&user_code, &[], &sfx, &[]);
@@ -282,6 +334,7 @@ fn link_without_audio_marker_does_not_emit_period_table() {
             period_lo: 0,
             period_hi: 0,
             envelope: vec![0xAA, 0xBB, 0x00],
+            pitch_envelope: Vec::new(),
             channel: Channel::Pulse1,
         }],
         &[],

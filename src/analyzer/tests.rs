@@ -371,32 +371,113 @@ fn analyze_struct_u16_field_allocates_two_bytes() {
 }
 
 #[test]
-fn analyze_struct_with_array_field_is_rejected() {
-    // Array fields are still rejected — the analyzer only accepts
-    // u8/i8/u16/bool scalar fields in v1 structs.
-    let errors = analyze_errors(
+fn analyze_struct_with_array_field_is_supported() {
+    // Array struct fields are supported. The analyzer flattens
+    // them into a single synthetic var typed `Array(u8, 4)` so
+    // the existing array-index codegen lowers `b.xs[i]` exactly
+    // like a top-level array.
+    let result = analyze_ok(
         r#"
         game "Test" { mapper: NROM }
         struct Bag { xs: u8[4] }
         var b: Bag
-        on frame { wait_frame }
+        on frame {
+            b.xs[0] = 7
+            wait_frame
+        }
         start Main
     "#,
     );
-    assert!(
-        errors.contains(&ErrorCode::E0201),
-        "array struct field should emit E0201: {errors:?}"
-    );
+    let alloc = result
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "b.xs")
+        .expect("expected synthetic `b.xs` allocation");
+    assert_eq!(alloc.size, 4, "u8[4] should reserve 4 bytes");
+    let sym = result
+        .symbols
+        .get("b.xs")
+        .expect("expected symbol entry for `b.xs`");
+    assert!(matches!(sym.sym_type, NesType::Array(_, 4)));
 }
 
 #[test]
-fn analyze_struct_with_nested_struct_field_is_rejected() {
-    // Nested struct fields are still rejected — only scalar primitives.
+fn analyze_struct_with_nested_struct_field_is_supported() {
+    // Nested struct fields are flattened recursively. A
+    // `Player { pos: Point, hp: u8 }` variable produces both
+    // `p.pos.x` / `p.pos.y` leaves and an intermediate
+    // `p.pos` Struct symbol.
+    let result = analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Point { x: u8, y: u8 }
+        struct Player { pos: Point, hp: u8 }
+        var p: Player
+        on frame {
+            p.pos.x = 5
+            p.pos.y = 6
+            p.hp = 100
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    // Each leaf field gets its own allocation entry.
+    assert!(result.var_allocations.iter().any(|a| a.name == "p.pos.x"));
+    assert!(result.var_allocations.iter().any(|a| a.name == "p.pos.y"));
+    assert!(result.var_allocations.iter().any(|a| a.name == "p.hp"));
+    // The intermediate `p.pos` is a Struct symbol but has no
+    // standalone allocation — its bytes are owned by the leaves.
+    let pos = result
+        .symbols
+        .get("p.pos")
+        .expect("intermediate `p.pos` should exist as a symbol");
+    assert!(matches!(pos.sym_type, NesType::Struct(_)));
+    assert!(result.var_allocations.iter().all(|a| a.name != "p.pos"));
+}
+
+#[test]
+fn analyze_struct_with_nested_struct_field_addresses_are_contiguous() {
+    // The four leaf fields of a `Player { pos: Point, hp: u8,
+    // inv: u8[4] }` should land at successive addresses with no
+    // padding — Point.x at base, Point.y at base+1, hp at base+2,
+    // inv at base+3..base+6.
+    let result = analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Point { x: u8, y: u8 }
+        struct Player { pos: Point, hp: u8, inv: u8[4] }
+        var p: Player
+        on frame {
+            p.pos.x = 1
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    let alloc = |name: &str| {
+        result
+            .var_allocations
+            .iter()
+            .find(|a| a.name == name)
+            .unwrap_or_else(|| panic!("missing allocation: {name}"))
+            .address
+    };
+    let base = alloc("p.pos.x");
+    assert_eq!(alloc("p.pos.y"), base + 1);
+    assert_eq!(alloc("p.hp"), base + 2);
+    assert_eq!(alloc("p.inv"), base + 3);
+}
+
+#[test]
+fn analyze_struct_with_unknown_inner_struct_errors() {
+    // A nested-struct field that references an undeclared inner
+    // struct must emit E0201 with a "declare it earlier" hint.
+    // (We don't topologically sort declarations.)
     let errors = analyze_errors(
         r#"
         game "Test" { mapper: NROM }
-        struct Inner { a: u8 }
-        struct Outer { inner: Inner }
+        struct Outer { inner: NotDeclared }
         var o: Outer
         on frame { wait_frame }
         start Main
@@ -404,7 +485,179 @@ fn analyze_struct_with_nested_struct_field_is_rejected() {
     );
     assert!(
         errors.contains(&ErrorCode::E0201),
-        "nested struct field should emit E0201: {errors:?}"
+        "expected E0201, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_metasprite_ok() {
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tile {
+            pixels: [
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@"
+            ]
+        }
+        metasprite Hero {
+            sprite: Tile
+            dx:    [0, 8]
+            dy:    [0, 0]
+            frame: [0, 0]
+        }
+        on frame { draw Hero at: (10, 10) wait_frame }
+        start Main
+    "#,
+    );
+    // Sanity: the metasprite was kept around in the program.
+    // (The analyzer doesn't move declarations into AnalysisResult,
+    // so we only check that no errors were emitted; the
+    // lowering test below validates the expansion path.)
+    assert!(result.diagnostics.iter().all(|d| !d.is_error()));
+}
+
+#[test]
+fn analyze_metasprite_unknown_sprite_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        metasprite Hero {
+            sprite: NotASprite
+            dx:    [0]
+            dy:    [0]
+            frame: [0]
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "metasprite referencing an unknown sprite should emit E0201, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_metasprite_with_external_chr_sprite_errors() {
+    // The IR lowering walks `program.sprites` to compute base
+    // tile indices for the metasprite's `frame:` array, but it
+    // can't read external `@chr(...)` files at lowering time
+    // and would fall back to a 1-tile assumption. That would
+    // silently misalign the metasprite, so the analyzer rejects
+    // the combination upfront with a clear "use inline pixels"
+    // hint.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tileset @chr("art/sheet.png")
+        metasprite Hero {
+            sprite: Tileset
+            dx:    [0, 8]
+            dy:    [0, 0]
+            frame: [0, 1]
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "metasprite over an external-CHR sprite should emit E0201, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_metasprite_mismatched_array_lengths_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tile {
+            pixels: [
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@"
+            ]
+        }
+        metasprite Hero {
+            sprite: Tile
+            dx:    [0, 8, 0]
+            dy:    [0, 0]
+            frame: [0, 1, 2]
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "mismatched dx/dy/frame lengths should emit E0201, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_metasprite_empty_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tile {
+            pixels: [
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@",
+                "@@@@@@@@"
+            ]
+        }
+        metasprite Hero {
+            sprite: Tile
+            dx: []
+            dy: []
+            frame: []
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "empty metasprite should emit E0201, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_struct_with_array_of_structs_is_rejected() {
+    // Arrays of structs aren't supported yet — the synthetic-
+    // variable model can't index into per-element struct layouts
+    // without additional codegen work. Make sure it errors
+    // cleanly with E0201 instead of producing a broken layout.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Point { x: u8, y: u8 }
+        struct Cluster { points: Point[4] }
+        var c: Cluster
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for array-of-structs, got: {errors:?}"
     );
 }
 
@@ -1733,5 +1986,76 @@ fn analyze_small_array_never_warns_w0108() {
             .any(|d| d.code == ErrorCode::W0108),
         "small array should not emit W0108, got: {:?}",
         result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_debug_frame_overrun_count_ok() {
+    // The known-good debug expression methods type-check as u8 and
+    // can be assigned into a u8 variable without diagnostics.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var n: u8 = 0
+        on frame {
+            n = debug.frame_overrun_count()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_debug_frame_overran_in_assert_ok() {
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        on frame {
+            debug.assert(not debug.frame_overran())
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_debug_unknown_method_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        var n: u8 = 0
+        on frame {
+            n = debug.bogus()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for unknown debug method, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_debug_frame_overrun_count_with_args_errors() {
+    // The query methods take no arguments — passing one is an
+    // arity error, not a silent "unused arg" warning.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        var n: u8 = 0
+        on frame {
+            n = debug.frame_overrun_count(42)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0203),
+        "expected E0203 for arg count mismatch, got: {errors:?}"
     );
 }

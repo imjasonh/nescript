@@ -46,6 +46,23 @@ struct LoweringContext {
     /// by binary-op, compare, and assignment lowering when they
     /// need to decide between `Add`/`Add16`, etc.
     wide_hi: HashMap<IrTemp, IrTemp>,
+    /// Captured metasprite declarations keyed by name. When a
+    /// `Statement::Draw` names a metasprite (rather than a flat
+    /// sprite), the lowering expands it inline into one
+    /// [`IrOp::DrawSprite`] per tile, with x/y offsets folded into
+    /// the per-tile coordinates and the metasprite's `frame:`
+    /// entry used as the literal frame index. Storing the lookup
+    /// here keeps the per-statement lowering simple and avoids
+    /// having to thread the program through every helper.
+    metasprites: HashMap<String, MetaspriteInfo>,
+}
+
+#[derive(Debug, Clone)]
+struct MetaspriteInfo {
+    sprite_name: String,
+    dx: Vec<u8>,
+    dy: Vec<u8>,
+    frame: Vec<u8>,
 }
 
 struct LoopContext {
@@ -92,6 +109,7 @@ impl LoweringContext {
             state_names: Vec::new(),
             start_state: String::new(),
             wide_hi: HashMap::new(),
+            metasprites: HashMap::new(),
         }
     }
 
@@ -121,6 +139,72 @@ impl LoweringContext {
             self.next_var_id += 1;
             self.var_map.insert(name.to_string(), id);
             id
+        }
+    }
+
+    /// Recursively expand a struct-literal global initializer into
+    /// per-leaf-field `IrGlobal` entries. Handles three field-value
+    /// shapes:
+    ///
+    /// - Scalar constant expressions (e.g. `x: 5`) → emit one
+    ///   `IrGlobal` whose `init_value` is the folded constant.
+    /// - Nested struct literals (e.g. `pos: Vec2 { x: 1, y: 2 }`)
+    ///   → recurse with `base_name = "outer.pos"`, expanding the
+    ///   inner literal's fields under the dotted path.
+    /// - Array literals (e.g. `inv: [1, 2, 3, 4]`) → emit one
+    ///   `IrGlobal` whose `init_array` carries the per-byte values.
+    ///
+    /// Each leaf global's size is derived from the analyzer's
+    /// recorded field type so `u16` fields still claim two bytes.
+    fn expand_struct_literal_init(&mut self, base_name: &str, fields: &[(String, Expr)]) {
+        for (fname, fexpr) in fields {
+            let full = format!("{base_name}.{fname}");
+            let fvid = self.get_or_create_var(&full);
+            let field_type = self.var_types.get(&full).cloned();
+            match fexpr {
+                Expr::StructLiteral(_, inner_fields, _) => {
+                    // Register the intermediate symbol with size 0 —
+                    // its byte-allocation lives in the leaves, but
+                    // the IR codegen still needs a global record so
+                    // that name lookups don't fail.
+                    self.globals.push(IrGlobal {
+                        var_id: fvid,
+                        name: full.clone(),
+                        size: 0,
+                        init_value: None,
+                        init_array: Vec::new(),
+                    });
+                    self.expand_struct_literal_init(&full, inner_fields);
+                }
+                Expr::ArrayLiteral(elems, _) => {
+                    let init_array: Vec<u8> = elems
+                        .iter()
+                        .filter_map(|e| self.eval_const(e).map(|v| v as u8))
+                        .collect();
+                    let size = type_size(field_type.as_ref().unwrap_or(&NesType::U8));
+                    self.globals.push(IrGlobal {
+                        var_id: fvid,
+                        name: full,
+                        size,
+                        init_value: None,
+                        init_array,
+                    });
+                }
+                _ => {
+                    let fval = self.eval_const(fexpr);
+                    let size = match field_type {
+                        Some(NesType::U16) => 2,
+                        _ => 1,
+                    };
+                    self.globals.push(IrGlobal {
+                        var_id: fvid,
+                        name: full,
+                        size,
+                        init_value: fval,
+                        init_array: Vec::new(),
+                    });
+                }
+            }
         }
     }
 
@@ -203,6 +287,52 @@ impl LoweringContext {
         self.state_names = program.states.iter().map(|s| s.name.clone()).collect();
         program.start_state.clone_into(&mut self.start_state);
 
+        // Capture metasprite declarations so the per-statement
+        // Draw lowering can expand `draw Hero` into one
+        // DrawSprite op per tile. The `frame:` array in a
+        // metasprite is interpreted *relative to the underlying
+        // sprite's base tile* — i.e. `frame: [0, 1, 2, 3]` on a
+        // 16×16 sprite means "the four tiles this sprite owns".
+        // Since the IR codegen's DrawSprite op takes an *absolute*
+        // tile index whenever `frame` is set, we need to resolve
+        // the per-sprite base tile here and rewrite the array
+        // before storing it.
+        //
+        // Tile assignment mirrors `assets::resolve_sprites`: tile
+        // index 0 is reserved for the runtime's default smiley,
+        // user sprites start at 1, and each sprite consumes
+        // `chr_bytes.len() / 16` tiles (rounded up). Sprites with
+        // an external `@chr(...)` / `@binary(...)` source whose
+        // bytes aren't available at parse time fall back to a
+        // single-tile assumption — that's a regression for those
+        // exotic sources but keeps the in-tree examples working.
+        let mut sprite_base: HashMap<String, u8> = HashMap::new();
+        let mut next_tile: u8 = 1;
+        for sprite in &program.sprites {
+            sprite_base.insert(sprite.name.clone(), next_tile);
+            let tile_count = match &sprite.chr_source {
+                crate::parser::ast::AssetSource::Inline(bytes) => {
+                    (bytes.len().div_ceil(16)).max(1) as u8
+                }
+                _ => 1,
+            };
+            next_tile = next_tile.saturating_add(tile_count);
+        }
+        for ms in &program.metasprites {
+            let base = sprite_base.get(&ms.sprite_name).copied().unwrap_or(0);
+            let resolved_frames: Vec<u8> =
+                ms.frame.iter().map(|&f| base.saturating_add(f)).collect();
+            self.metasprites.insert(
+                ms.name.clone(),
+                MetaspriteInfo {
+                    sprite_name: ms.sprite_name.clone(),
+                    dx: ms.dx.clone(),
+                    dy: ms.dy.clone(),
+                    frame: resolved_frames,
+                },
+            );
+        }
+
         // Register enum variants first so constants that reference
         // them (e.g. `const FIRST: u8 = VariantA`) can resolve.
         for e in &program.enums {
@@ -226,7 +356,10 @@ impl LoweringContext {
         // op referencing it by name still resolves. Array-literal
         // initializers are lowered into `init_array` on the parent
         // global — the IR codegen's startup loop emits one LDA/STA
-        // per byte into the global's base address.
+        // per byte into the global's base address. Nested struct
+        // literals (`Player { pos: Vec2 { x: 1, y: 2 }, ... }`)
+        // and array-literal field values (`Hero { inv: [1,2,3,4] }`)
+        // are expanded recursively below.
         for var in &program.globals {
             let var_id = self.get_or_create_var(&var.name);
             let init = var.init.as_ref().and_then(|e| self.eval_const(e));
@@ -245,26 +378,7 @@ impl LoweringContext {
                 init_array,
             });
             if let Some(Expr::StructLiteral(_, fields, _)) = &var.init {
-                for (fname, fexpr) in fields {
-                    let full = format!("{}.{fname}", var.name);
-                    let fvid = self.get_or_create_var(&full);
-                    let fval = self.eval_const(fexpr);
-                    // Look up the field's type from the analyzer's
-                    // symbol table so u16 fields record a size of 2
-                    // and the IR codegen's initializer loop writes
-                    // both bytes.
-                    let field_size = match self.var_types.get(&full) {
-                        Some(NesType::U16) => 2,
-                        _ => 1,
-                    };
-                    self.globals.push(IrGlobal {
-                        var_id: fvid,
-                        name: full,
-                        size: field_size,
-                        init_value: fval,
-                        init_array: Vec::new(),
-                    });
-                }
+                self.expand_struct_literal_init(&var.name, fields);
             }
         }
 
@@ -510,6 +624,45 @@ impl LoweringContext {
                 self.start_block(&cont);
             }
             Statement::Draw(draw) => {
+                if let Some(meta) = self.metasprites.get(&draw.sprite_name).cloned() {
+                    // Metasprite expansion: for each tile in the
+                    // declaration, emit one DrawSprite with x/y
+                    // offset by (dx[i], dy[i]) and frame = frame[i].
+                    // The IR codegen sees N independent draws so
+                    // the runtime OAM-cursor path picks them up
+                    // exactly like a hand-written sequence of
+                    // `draw` statements.
+                    //
+                    // The user's `frame:` argument is ignored when
+                    // drawing a metasprite — the per-tile frame
+                    // index comes from the declaration. The
+                    // analyzer doesn't currently flag this; future
+                    // work could warn on it.
+                    let base_x = self.lower_expr(&draw.x);
+                    let base_y = self.lower_expr(&draw.y);
+                    for ((dx_off, dy_off), tile) in meta.dx.iter().zip(&meta.dy).zip(&meta.frame) {
+                        let off_x = self.fresh_temp();
+                        self.emit(IrOp::LoadImm(off_x, *dx_off));
+                        let x_sum = self.fresh_temp();
+                        self.emit(IrOp::Add(x_sum, base_x, off_x));
+
+                        let off_y = self.fresh_temp();
+                        self.emit(IrOp::LoadImm(off_y, *dy_off));
+                        let y_sum = self.fresh_temp();
+                        self.emit(IrOp::Add(y_sum, base_y, off_y));
+
+                        let tile_imm = self.fresh_temp();
+                        self.emit(IrOp::LoadImm(tile_imm, *tile));
+
+                        self.emit(IrOp::DrawSprite {
+                            sprite_name: meta.sprite_name.clone(),
+                            x: x_sum,
+                            y: y_sum,
+                            frame: Some(tile_imm),
+                        });
+                    }
+                    return;
+                }
                 let x = self.lower_expr(&draw.x);
                 let y = self.lower_expr(&draw.y);
                 let frame = draw.frame.as_ref().map(|e| self.lower_expr(e));
@@ -1089,6 +1242,29 @@ impl LoweringContext {
             Expr::Cast(inner, _, _) => {
                 // For now, just evaluate the inner expression (truncation/extension is a no-op on 8-bit)
                 self.lower_expr(inner)
+            }
+            Expr::DebugCall(method, _args, _) => {
+                // The analyzer already validated the method name and
+                // argument count, so we can dispatch on the method
+                // name directly. Both currently-supported methods
+                // map to a Peek of a runtime address: the codegen
+                // strips the read out and substitutes a constant
+                // zero in release builds, so the builtin disappears
+                // from non-debug ROMs.
+                let t = self.fresh_temp();
+                let addr: u16 = match method.as_str() {
+                    "frame_overrun_count" => 0x07FF,
+                    "frame_overran" => 0x07FE,
+                    // Should be unreachable post-analyzer, but emit
+                    // a zero rather than panicking so a parser test
+                    // that bypasses the analyzer still produces IR.
+                    _ => {
+                        self.emit(IrOp::LoadImm(t, 0));
+                        return t;
+                    }
+                };
+                self.emit(IrOp::Peek(t, addr));
+                t
             }
         }
     }

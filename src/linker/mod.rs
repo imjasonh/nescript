@@ -341,7 +341,6 @@ impl Linker {
         // maps to $C000-$FFFF and one of the switchable banks maps
         // to $8000-$BFFF.
         let total_banks = switchable_banks.len() + 1;
-        let fixed_bank_index = total_banks - 1;
 
         // Discovery pass: assemble each switchable bank that has
         // its own instruction stream so we know what labels live
@@ -447,8 +446,6 @@ impl Linker {
         // which switchable bank is currently mapped at $8000.
         if self.mapper != Mapper::NROM {
             all_instructions.extend(runtime::gen_bank_select(self.mapper));
-            #[allow(clippy::cast_possible_truncation)]
-            let fixed_bank_num = fixed_bank_index as u8;
             for (i, bank) in switchable_banks.iter().enumerate() {
                 if bank.trampolines.is_empty() {
                     continue;
@@ -460,7 +457,6 @@ impl Linker {
                         &tramp.tramp_label,
                         &tramp.entry_label,
                         bank_num,
-                        fixed_bank_num,
                     ));
                 }
             }
@@ -493,8 +489,13 @@ impl Linker {
         let has_audio = has_label(user_code, "__audio_used");
         let has_noise = has_label(user_code, "__noise_used");
         let has_triangle = has_label(user_code, "__triangle_used");
+        let has_sfx_pitch = has_label(user_code, "__sfx_pitch_used");
         if has_audio {
-            all_instructions.extend(runtime::gen_audio_tick(has_noise, has_triangle));
+            all_instructions.extend(runtime::gen_audio_tick(
+                has_noise,
+                has_triangle,
+                has_sfx_pitch,
+            ));
             all_instructions.extend(runtime::gen_period_table());
             // Emit one data block per sfx blob: a label followed by
             // the envelope bytes. `play Name` codegen emits a
@@ -504,6 +505,18 @@ impl Linker {
                     &blob.label(),
                     blob.envelope.clone(),
                 ));
+                // Optional pitch envelope blob. Only emitted for
+                // sfx the compiler decided actually need per-frame
+                // pitch updates — the pitch_envelope is empty for
+                // single-pitch sfx and the `gen_data_block` call
+                // is skipped, keeping ROM bytes identical to the
+                // pre-pitch-envelope behaviour.
+                if blob.has_pitch_envelope() {
+                    all_instructions.extend(runtime::gen_data_block(
+                        &blob.pitch_label(),
+                        blob.pitch_envelope.clone(),
+                    ));
+                }
             }
             // Same for music: label + note stream.
             for blob in music {
@@ -666,8 +679,14 @@ impl Linker {
             builder.set_prg_banks(banks);
         }
 
-        // CHR ROM: tile 0 is reserved for the default smiley, followed by
-        // any user-declared sprites placed at their assigned tile indices.
+        // CHR ROM: tile 0 is reserved for the default smiley,
+        // followed by any user-declared sprites placed at their
+        // assigned tile indices, followed by any auto-generated
+        // background CHR data at `chr_base_tile * 16`. Each
+        // background's `chr_bytes` was sized by the resolver
+        // against the sprite range so no two contiguous tile
+        // ranges overlap, but we still bounds-check on copy in
+        // case a future change shifts the layout.
         let mut chr = vec![0u8; 8192];
         chr[..16].copy_from_slice(&DEFAULT_SPRITE_CHR);
         for sprite in sprites {
@@ -676,6 +695,23 @@ impl Linker {
             if end <= chr.len() {
                 chr[offset..end].copy_from_slice(&sprite.chr_bytes);
             }
+        }
+        for bg in backgrounds {
+            if bg.chr_bytes.is_empty() {
+                continue;
+            }
+            let offset = bg.chr_base_tile as usize * 16;
+            let end = offset + bg.chr_bytes.len();
+            assert!(
+                end <= chr.len(),
+                "background '{}' auto-CHR ({} bytes at base tile {}) overflows the {}-byte CHR ROM; \
+                 the resolver should have caught this — file a bug",
+                bg.name,
+                bg.chr_bytes.len(),
+                bg.chr_base_tile,
+                chr.len()
+            );
+            chr[offset..end].copy_from_slice(&bg.chr_bytes);
         }
         builder.set_chr(chr);
 

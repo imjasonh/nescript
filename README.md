@@ -82,12 +82,17 @@ start Main
 | [`sprites_and_palettes.ne`](examples/sprites_and_palettes.ne) | Inline CHR data, scroll, type casting |
 | [`mmc1_banked.ne`](examples/mmc1_banked.ne) | MMC1 mapper, bank declarations, multiply |
 | [`uxrom_user_banked.ne`](examples/uxrom_user_banked.ne) | UxROM mapper with a `bank Foo { fun ... }` block — first example to put real user code in a switchable bank, called via a generated cross-bank trampoline |
+| [`uxrom_banked_to_banked.ne`](examples/uxrom_banked_to_banked.ne) | UxROM with two `bank Foo { fun ... }` blocks — exercises a banked→banked call (`step` in `Logic` calls `clamp` in `Helpers`) routed through the same trampoline that handles fixed→banked |
 | [`palette_and_background.ne`](examples/palette_and_background.ne) | Palette and background declarations, reset-time load, vblank-safe `set_palette` / `load_background` swaps |
+| [`auto_chr_background.ne`](examples/auto_chr_background.ne) | `background Stage @nametable("file.png")` with **automatic CHR generation** — the resolver dedupes the PNG's 8×8 cells, encodes them as 2-bitplane CHR, and slots them into CHR ROM after the sprite tile range |
 | [`friendly_assets.ne`](examples/friendly_assets.ne) | **Pleasant asset syntax** — named NES colours, grouped `bg0..sp3` palettes with `universal:`, ASCII pixel-art sprites, `legend { } + map:` tilemaps, `palette_map:` attribute grids, scalar sfx `pitch:`, note-name music with `tempo:` |
 | [`structs_enums_for.ne`](examples/structs_enums_for.ne) | Structs, enums, `for` loops, struct literals |
+| [`nested_structs.ne`](examples/nested_structs.ne) | Nested-struct fields (`hero.pos.x`) and array struct fields (`hero.inv[0]`) with chained literal initializers |
 | [`inline_asm_demo.ne`](examples/inline_asm_demo.ne) | Inline asm with `{var}` substitution, `poke`/`peek` |
 | [`audio_demo.ne`](examples/audio_demo.ne) | Audio subsystem: user `sfx`/`music` blocks, builtin effects, `play`/`start_music`/`stop_music` |
 | [`noise_triangle_sfx.ne`](examples/noise_triangle_sfx.ne) | Noise and triangle channel sfx via `channel: noise` / `channel: triangle` on `sfx` blocks |
+| [`sfx_pitch_envelope.ne`](examples/sfx_pitch_envelope.ne) | Per-frame pulse `pitch:` arrays — the audio tick walks the pitch envelope in lockstep with the volume envelope and writes `$4002` on every NMI for a frequency-sweeping siren tone |
+| [`metasprite_demo.ne`](examples/metasprite_demo.ne) | `metasprite Hero { sprite: ..., dx: [...], dy: [...], frame: [...] }` declarative multi-tile groups — `draw Hero at: (x, y)` expands to one OAM slot per tile so 16×16 sprites stop needing four hand-written `draw` statements |
 | [`platformer.ne`](examples/platformer.ne) | **End-to-end side-scroller** — custom CHR tileset, full background nametable, metasprite player with gravity/jump physics, wrap-around scrolling, stomp-or-die enemy collisions, live stomp-count HUD, pickup coins, user-declared SFX + music, and a Title → Playing → GameOver state machine with a proximity-based autopilot so the headless harness demonstrates the full gameplay loop (stomp, stomp, die, retry) inside six seconds |
 
 ## Compiler Commands

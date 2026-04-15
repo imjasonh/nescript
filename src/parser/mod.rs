@@ -129,6 +129,7 @@ impl Parser {
         let mut sprites = Vec::new();
         let mut palettes = Vec::new();
         let mut backgrounds = Vec::new();
+        let mut metasprites = Vec::new();
         let mut sfx = Vec::new();
         let mut music = Vec::new();
         let mut banks = Vec::new();
@@ -164,6 +165,9 @@ impl Parser {
                 }
                 TokenKind::KwSprite => {
                     sprites.push(self.parse_sprite_decl()?);
+                }
+                TokenKind::KwMetasprite => {
+                    metasprites.push(self.parse_metasprite_decl()?);
                 }
                 TokenKind::KwPalette => {
                     palettes.push(self.parse_palette_decl()?);
@@ -253,6 +257,7 @@ impl Parser {
             sprites,
             palettes,
             backgrounds,
+            metasprites,
             sfx,
             music,
             banks,
@@ -848,6 +853,104 @@ impl Parser {
         Ok(SpriteDecl {
             name,
             chr_source,
+            span: Span::new(start.file_id, start.start, self.current_span().end),
+        })
+    }
+
+    /// Parse a `metasprite Name { sprite: ..., dx: [...], dy: [...],
+    /// frame: [...] }` block. The body uses parallel byte arrays so
+    /// the parser can reuse the existing [`Self::parse_byte_array`]
+    /// helper for each one — the analyzer is responsible for
+    /// asserting they're all the same length and that the named
+    /// sprite exists.
+    fn parse_metasprite_decl(&mut self) -> Result<MetaspriteDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwMetasprite)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut sprite_name: Option<String> = None;
+        let mut dx: Option<Vec<u8>> = None;
+        let mut dy: Option<Vec<u8>> = None;
+        let mut frame: Option<Vec<u8>> = None;
+
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            // Accept either a regular identifier or the `sprite`
+            // keyword in the property-name position. We fall
+            // through to the standard ident path for everything
+            // else so misspellings still produce the usual
+            // E0201 diagnostic.
+            let (key, key_span) = if *self.peek() == TokenKind::KwSprite {
+                let span = self.current_span();
+                self.advance();
+                ("sprite".to_string(), span)
+            } else {
+                self.expect_ident()?
+            };
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "sprite" => {
+                    let (sname, _) = self.expect_ident()?;
+                    sprite_name = Some(sname);
+                }
+                "dx" => {
+                    dx = Some(self.parse_byte_array("dx")?);
+                }
+                "dy" => {
+                    dy = Some(self.parse_byte_array("dy")?);
+                }
+                "frame" => {
+                    frame = Some(self.parse_byte_array("frame")?);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown metasprite property '{key}'"),
+                        key_span,
+                    ));
+                }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let sprite_name = sprite_name.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("metasprite '{name}' is missing the required 'sprite:' property"),
+                start,
+            )
+        })?;
+        let dx = dx.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("metasprite '{name}' is missing the required 'dx:' array"),
+                start,
+            )
+        })?;
+        let dy = dy.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("metasprite '{name}' is missing the required 'dy:' array"),
+                start,
+            )
+        })?;
+        let frame = frame.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("metasprite '{name}' is missing the required 'frame:' array"),
+                start,
+            )
+        })?;
+
+        Ok(MetaspriteDecl {
+            name,
+            sprite_name,
+            dx,
+            dy,
+            frame,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
@@ -2691,13 +2794,38 @@ impl Parser {
                 ))
             }
             TokenKind::Dot => {
-                // Field assignment: name.field = value
-                self.advance();
-                let (field, _) = self.expect_ident()?;
+                // Field assignment: `name.field = value`, including
+                // chains (`outer.inner.field = value`) and array
+                // fields (`name.inv[idx] = value`). The dotted
+                // chain is eagerly joined into a single synthetic
+                // identifier so the analyzer/lowering can treat it
+                // identically to a flat variable name.
+                let mut chain = vec![name];
+                while *self.peek() == TokenKind::Dot {
+                    self.advance();
+                    let (field, _) = self.expect_ident()?;
+                    chain.push(field);
+                }
+                if *self.peek() == TokenKind::LBracket {
+                    self.advance();
+                    let index = self.parse_expr()?;
+                    self.expect(&TokenKind::RBracket)?;
+                    let op = self.parse_assign_op()?;
+                    let value = self.parse_expr()?;
+                    let joined = chain.join(".");
+                    return Ok(Statement::Assign(
+                        LValue::ArrayIndex(joined, Box::new(index)),
+                        op,
+                        value,
+                        start,
+                    ));
+                }
+                let last = chain.pop().expect("at least one field consumed");
+                let base = chain.join(".");
                 let op = self.parse_assign_op()?;
                 let value = self.parse_expr()?;
                 Ok(Statement::Assign(
-                    LValue::Field(name, field),
+                    LValue::Field(base, last),
                     op,
                     value,
                     start,
@@ -2990,6 +3118,26 @@ impl Parser {
                 self.advance();
                 Ok(Expr::IntLiteral(v, span))
             }
+            TokenKind::KwDebug => {
+                // `debug.METHOD(args)` expression form. The
+                // statement form is parsed separately by
+                // parse_debug_statement; here we only accept the
+                // value-returning methods.
+                let span = self.current_span();
+                self.advance();
+                self.expect(&TokenKind::Dot)?;
+                let (method, _) = self.expect_ident()?;
+                self.expect(&TokenKind::LParen)?;
+                let mut args = Vec::new();
+                while *self.peek() != TokenKind::RParen && *self.peek() != TokenKind::Eof {
+                    args.push(self.parse_expr()?);
+                    if *self.peek() == TokenKind::Comma {
+                        self.advance();
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+                Ok(Expr::DebugCall(method, args, span))
+            }
             TokenKind::BoolLiteral(v) => {
                 let span = self.current_span();
                 self.advance();
@@ -3052,11 +3200,36 @@ impl Parser {
                     return Ok(Expr::Call(name, args, span));
                 }
 
-                // Check for field access: `name.field`
+                // Check for field access: `name.field`, including
+                // chains like `outer.inner.field` for nested
+                // structs and `name.field[idx]` for array fields.
+                // The synthetic flat-name model used by the
+                // analyzer/lowering keys symbols by the joined
+                // dotted path, so we eagerly consume the entire
+                // chain into a single identifier string.
                 if *self.peek() == TokenKind::Dot {
-                    self.advance();
-                    let (field, _) = self.expect_ident()?;
-                    return Ok(Expr::FieldAccess(name, field, span));
+                    let mut chain = vec![name];
+                    while *self.peek() == TokenKind::Dot {
+                        self.advance();
+                        let (field, _) = self.expect_ident()?;
+                        chain.push(field);
+                    }
+                    // After the dotted chain we may still see an
+                    // array index — `player.inv[0]` becomes
+                    // `ArrayIndex("player.inv", idx)`. Otherwise
+                    // the last segment is the field of the path
+                    // before it: `p.pos.x` becomes
+                    // `FieldAccess("p.pos", "x")`.
+                    if *self.peek() == TokenKind::LBracket {
+                        self.advance();
+                        let index = self.parse_expr()?;
+                        self.expect(&TokenKind::RBracket)?;
+                        let joined = chain.join(".");
+                        return Ok(Expr::ArrayIndex(joined, Box::new(index), span));
+                    }
+                    let last = chain.pop().expect("at least one field consumed");
+                    let base = chain.join(".");
+                    return Ok(Expr::FieldAccess(base, last, span));
                 }
 
                 // Check for struct literal: `Name { field: expr, ... }`.

@@ -158,7 +158,39 @@ pub fn compile_source(
         .map_err(|e| CompileError::AssetResolution(format!("music: {e}")))?;
     let palettes = assets::resolve_palettes(&program, source_dir)
         .map_err(|e| CompileError::AssetResolution(format!("palettes: {e}")))?;
-    let backgrounds = assets::resolve_backgrounds(&program, source_dir)
+    // Compute the first CHR tile index that backgrounds can claim.
+    // Sprite tile 0 is the runtime default smiley; the resolver
+    // packs user sprites in starting at tile 1, so the next free
+    // tile is whatever sits past the last sprite. We derive it
+    // from the resolved `SpriteData` rather than re-walking the
+    // AST to keep the two sides honest.
+    //
+    // Hard-error if the sprite range already fills the 256-tile
+    // pattern table. A silent cap would let a background tile
+    // overwrite the last sprite tile — the kind of latent
+    // miscompile we'd rather catch at link time than at runtime.
+    // The check is lifted out of `resolve_backgrounds` so the
+    // diagnostic mentions the sprite count, not just the
+    // background that happened to trip the limit.
+    let next_sprite_tile_u16 = sprites
+        .iter()
+        .map(|s| {
+            let count = s.chr_bytes.len().div_ceil(16) as u16;
+            u16::from(s.tile_index) + count
+        })
+        .max()
+        .unwrap_or(1u16);
+    let has_png_background = program.backgrounds.iter().any(|b| b.png_source.is_some());
+    if has_png_background && next_sprite_tile_u16 >= 256 {
+        return Err(CompileError::AssetResolution(format!(
+            "sprite tile range ends at index {next_sprite_tile_u16} which leaves no room for \
+             background tiles in the 256-tile pattern table; remove or shrink a sprite, or \
+             use an inline background body instead of `@nametable(...)`"
+        )));
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    let next_sprite_tile: u8 = next_sprite_tile_u16.min(255) as u8;
+    let backgrounds = assets::resolve_backgrounds(&program, source_dir, next_sprite_tile)
         .map_err(|e| CompileError::AssetResolution(format!("backgrounds: {e}")))?;
 
     // IR → 6502 codegen. We hold on to the codegen after

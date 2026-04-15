@@ -79,6 +79,20 @@ pub struct SfxData {
     /// (`0x00` for pulse/noise, `0x80` for triangle). Linked into
     /// PRG ROM as a labelled data block.
     pub envelope: Vec<u8>,
+    /// Per-frame pitch bytes. Empty when the sfx has a single
+    /// scalar pitch (the existing latch-once behaviour) or when
+    /// the channel doesn't currently support per-frame pitch
+    /// updates (today only Pulse 1 does — triangle and noise
+    /// share the same data shape but the runtime path hasn't been
+    /// extended yet, see `docs/future-work.md`). When non-empty
+    /// the audio tick writes one byte per NMI to the channel's
+    /// period-lo register, in lockstep with the volume envelope.
+    /// Length doesn't have to match `envelope` — the runtime
+    /// re-reads the same byte each frame, so a shorter pitch
+    /// stream simply latches its last value. The pitch stream
+    /// has its own zero-byte sentinel matching the volume
+    /// envelope's length so the lockstep walk terminates cleanly.
+    pub pitch_envelope: Vec<u8>,
     /// APU channel this sfx drives.
     pub channel: Channel,
 }
@@ -103,6 +117,27 @@ impl SfxData {
     #[must_use]
     pub fn label(&self) -> String {
         format!("__sfx_{}", sanitize_label(&self.name))
+    }
+
+    /// ROM label for the optional per-frame pitch envelope blob.
+    /// Only meaningful when [`SfxData::pitch_envelope`] is
+    /// non-empty; the codegen / linker uses it to splice the blob
+    /// into PRG and to set up the pitch-walk pointer at trigger
+    /// time. The label format mirrors the volume envelope label
+    /// to keep `--symbols` output uniform.
+    #[must_use]
+    pub fn pitch_label(&self) -> String {
+        format!("__sfx_pitch_{}", sanitize_label(&self.name))
+    }
+
+    /// True iff this sfx carries a per-frame pitch envelope. The
+    /// runtime audio tick has a slightly different (and slightly
+    /// larger) code path for sfx with pitch envelopes, so the
+    /// codegen gates emission of that path on whether *any* sfx
+    /// in the program has one.
+    #[must_use]
+    pub fn has_pitch_envelope(&self) -> bool {
+        !self.pitch_envelope.is_empty()
     }
 }
 
@@ -334,13 +369,56 @@ fn compile_pulse_sfx(decl: &SfxDecl) -> SfxData {
     // Zero sentinel — the audio tick sees this, mutes the channel,
     // and clears the sfx counter so subsequent NMIs don't keep walking.
     envelope.push(0x00);
+    // Per-frame pitch envelope — populated when the user provides
+    // more than one distinct pitch byte. A single scalar (or a
+    // multi-element array where every byte is the same) keeps
+    // the historical "latch period at trigger and never touch
+    // it again" behaviour and emits no pitch blob, so existing
+    // sfx ROMs are byte-identical. The pitch envelope is padded
+    // (or truncated) to match the volume envelope length so the
+    // runtime can walk both pointers in lockstep. The trailing
+    // zero byte is *padding*, not a sentinel the runtime ever
+    // reads — the volume tick `JMP`s to `__audio_sfx_done` on
+    // its own zero sentinel before the pitch update block runs,
+    // so the pitch pointer never advances past the user's last
+    // byte. Keeping the trailing zero costs one ROM byte but
+    // makes the blob length predictable for the linker symbol
+    // dump and matches the `volume` envelope's shape.
+    let pitch_envelope = build_pulse_pitch_envelope(&decl.pitch, decl.volume.len());
     SfxData {
         name: decl.name.clone(),
         period_lo,
         period_hi,
         envelope,
+        pitch_envelope,
         channel: decl.channel,
     }
+}
+
+/// Build the pulse-channel pitch envelope from a user-declared
+/// `pitch:` array. Returns an empty vector when the array
+/// describes a single static pitch (length ≤ 1, or all bytes the
+/// same), in which case the runtime keeps its existing latch-once
+/// behaviour and no pitch blob is emitted at all. Otherwise the
+/// returned vector has exactly `volume_frames + 1` bytes — the
+/// extra byte is a zero sentinel that lines up with the volume
+/// envelope's mute byte so the runtime tick sees both end markers
+/// on the same NMI. Pitches shorter than `volume_frames` repeat
+/// their last value; longer pitches truncate.
+fn build_pulse_pitch_envelope(pitch: &[u8], volume_frames: usize) -> Vec<u8> {
+    if pitch.len() <= 1 {
+        return Vec::new();
+    }
+    if pitch.iter().all(|&p| p == pitch[0]) {
+        return Vec::new();
+    }
+    let mut out = Vec::with_capacity(volume_frames + 1);
+    let last = *pitch.last().unwrap_or(&0);
+    for i in 0..volume_frames {
+        out.push(pitch.get(i).copied().unwrap_or(last));
+    }
+    out.push(0x00);
+    out
 }
 
 /// Triangle envelope: each byte is a linear-counter reload value
@@ -380,6 +458,10 @@ fn compile_triangle_sfx(decl: &SfxDecl) -> SfxData {
         period_lo,
         period_hi,
         envelope,
+        // Triangle per-frame pitch isn't wired up yet (the runtime
+        // tick's triangle block writes only $4008, not $400A); see
+        // docs/future-work.md for the gap.
+        pitch_envelope: Vec::new(),
         channel: decl.channel,
     }
 }
@@ -416,6 +498,10 @@ fn compile_noise_sfx(decl: &SfxDecl) -> SfxData {
         period_lo,
         period_hi,
         envelope,
+        // Noise per-frame pitch (period-index sweeping) isn't
+        // wired up yet — the existing runtime tick only updates
+        // `$400C` per frame. See docs/future-work.md.
+        pitch_envelope: Vec::new(),
         channel: decl.channel,
     }
 }
@@ -688,6 +774,7 @@ mod tests {
             sprites: Vec::new(),
             palettes: Vec::new(),
             backgrounds: Vec::new(),
+            metasprites: Vec::new(),
             sfx: Vec::new(),
             music: Vec::new(),
             banks: Vec::new(),
@@ -1087,6 +1174,85 @@ mod tests {
         assert_eq!(note_name_to_index("C#4"), None); // `#` not allowed in idents
         assert_eq!(note_name_to_index("Csx4"), None); // bogus accidental
         assert_eq!(note_name_to_index("CoolName"), None);
+    }
+
+    #[test]
+    fn build_pulse_pitch_envelope_scalar_returns_empty() {
+        // A single pitch byte (the historical scalar `pitch:` form)
+        // keeps the latch-once driver path. The runtime never
+        // reads the pitch envelope blob, and we don't want to
+        // emit one — the empty vec signals that to the linker.
+        assert!(build_pulse_pitch_envelope(&[0x40], 8).is_empty());
+        // Same for "the user wrote an array but every element is
+        // the same byte" — semantically identical to scalar pitch.
+        assert!(build_pulse_pitch_envelope(&[0x40, 0x40, 0x40], 8).is_empty());
+        // And the degenerate empty case.
+        assert!(build_pulse_pitch_envelope(&[], 8).is_empty());
+    }
+
+    #[test]
+    fn build_pulse_pitch_envelope_varying_pads_to_volume_length() {
+        // The runtime walks pitch and volume in lockstep, so the
+        // pitch blob is sized to match the volume envelope's
+        // length plus a trailing zero sentinel.
+        let env = build_pulse_pitch_envelope(&[0x40, 0x30, 0x20], 5);
+        assert_eq!(
+            env,
+            vec![0x40, 0x30, 0x20, 0x20, 0x20, 0x00],
+            "pitches shorter than volume frames should latch their last value"
+        );
+    }
+
+    #[test]
+    fn build_pulse_pitch_envelope_truncates_when_longer_than_volume() {
+        // A pitch array longer than the volume envelope is
+        // truncated — the runtime stops walking when the volume
+        // envelope hits its zero sentinel anyway.
+        let env = build_pulse_pitch_envelope(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x60], 3);
+        assert_eq!(env, vec![0x10, 0x20, 0x30, 0x00]);
+    }
+
+    #[test]
+    fn compile_pulse_sfx_with_varying_pitch_populates_envelope() {
+        // End-to-end: a pulse sfx with a varying `pitch:` array
+        // should produce a non-empty `pitch_envelope` whose length
+        // matches the volume envelope (excluding the sentinel),
+        // and whose label is the canonical `__sfx_pitch_<name>`.
+        let decl = SfxDecl {
+            name: "Siren".to_string(),
+            duty: 2,
+            pitch: vec![0x40, 0x30, 0x20],
+            volume: vec![15, 10, 5],
+            channel: Channel::Pulse1,
+            span: crate::lexer::Span::dummy(),
+        };
+        let sfx = compile_pulse_sfx(&decl);
+        assert!(sfx.has_pitch_envelope());
+        // Three volume frames + sentinel.
+        assert_eq!(sfx.envelope.len(), 4);
+        assert_eq!(sfx.pitch_envelope.len(), 4);
+        assert_eq!(sfx.pitch_envelope[0], 0x40);
+        assert_eq!(sfx.pitch_envelope[3], 0x00); // sentinel
+        assert_eq!(sfx.pitch_label(), "__sfx_pitch_Siren");
+    }
+
+    #[test]
+    fn compile_pulse_sfx_with_scalar_pitch_omits_envelope() {
+        // The historical scalar form should still produce no
+        // pitch envelope — gating the runtime extension on
+        // emptiness keeps existing scalar-pitch ROMs byte-
+        // identical.
+        let decl = SfxDecl {
+            name: "Coin".to_string(),
+            duty: 2,
+            pitch: vec![0x50],
+            volume: vec![15, 10, 5],
+            channel: Channel::Pulse1,
+            span: crate::lexer::Span::dummy(),
+        };
+        let sfx = compile_pulse_sfx(&decl);
+        assert!(!sfx.has_pitch_envelope());
+        assert!(sfx.pitch_envelope.is_empty());
     }
 
     #[test]
