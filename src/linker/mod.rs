@@ -489,8 +489,13 @@ impl Linker {
         let has_audio = has_label(user_code, "__audio_used");
         let has_noise = has_label(user_code, "__noise_used");
         let has_triangle = has_label(user_code, "__triangle_used");
+        let has_sfx_pitch = has_label(user_code, "__sfx_pitch_used");
         if has_audio {
-            all_instructions.extend(runtime::gen_audio_tick(has_noise, has_triangle));
+            all_instructions.extend(runtime::gen_audio_tick(
+                has_noise,
+                has_triangle,
+                has_sfx_pitch,
+            ));
             all_instructions.extend(runtime::gen_period_table());
             // Emit one data block per sfx blob: a label followed by
             // the envelope bytes. `play Name` codegen emits a
@@ -500,6 +505,18 @@ impl Linker {
                     &blob.label(),
                     blob.envelope.clone(),
                 ));
+                // Optional pitch envelope blob. Only emitted for
+                // sfx the compiler decided actually need per-frame
+                // pitch updates — the pitch_envelope is empty for
+                // single-pitch sfx and the `gen_data_block` call
+                // is skipped, keeping ROM bytes identical to the
+                // pre-pitch-envelope behaviour.
+                if blob.has_pitch_envelope() {
+                    all_instructions.extend(runtime::gen_data_block(
+                        &blob.pitch_label(),
+                        blob.pitch_envelope.clone(),
+                    ));
+                }
             }
             // Same for music: label + note stream.
             for blob in music {

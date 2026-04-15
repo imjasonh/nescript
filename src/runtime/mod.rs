@@ -131,6 +131,16 @@ pub const AUDIO_NOISE_COUNTER: u16 = 0x07F2;
 pub const AUDIO_TRIANGLE_PTR_LO: u16 = 0x07F3;
 pub const AUDIO_TRIANGLE_PTR_HI: u16 = 0x07F4;
 pub const AUDIO_TRIANGLE_COUNTER: u16 = 0x07F5;
+/// Pulse-1 sfx per-frame pitch envelope pointer. Only populated
+/// (and only read by the audio tick) in programs that declare at
+/// least one sfx with a varying-pitch `pitch:` array; programs
+/// that stick to scalar `pitch:` keep their byte-for-byte
+/// pre-pitch-envelope ROM output. The tick treats a zero
+/// high-byte as "no pitch update for the currently-playing sfx",
+/// which lets a single program mix sfx with and without pitch
+/// envelopes.
+pub const AUDIO_SFX_PITCH_PTR_LO: u16 = 0x07F6;
+pub const AUDIO_SFX_PITCH_PTR_HI: u16 = 0x07F7;
 
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
@@ -778,7 +788,11 @@ pub fn gen_multiply() -> Vec<Instruction> {
 /// instruction stream as before. The linker decides whether to
 /// enable each by scanning for the `__noise_used` and
 /// `__triangle_used` marker labels emitted by the IR codegen.
-pub fn gen_audio_tick(has_noise: bool, has_triangle: bool) -> Vec<Instruction> {
+pub fn gen_audio_tick(
+    has_noise: bool,
+    has_triangle: bool,
+    has_sfx_pitch: bool,
+) -> Vec<Instruction> {
     let mut out = Vec::new();
 
     out.push(Instruction::new(NOP, AM::Label("__audio_tick".into())));
@@ -818,6 +832,61 @@ pub fn gen_audio_tick(has_noise: bool, has_triangle: bool) -> Vec<Instruction> {
         NOP,
         AM::Label("__audio_sfx_ptr_ok".into()),
     ));
+    // Optional per-frame pitch update. Only emitted in programs
+    // that declare at least one varying-pitch sfx, gated on the
+    // `__sfx_pitch_used` codegen marker. The block reads a byte
+    // through (AUDIO_SFX_PITCH_PTR),Y, writes it to `$4002`
+    // (pulse-1 period low), then advances the pointer in
+    // lockstep with the volume envelope above. A zero high byte
+    // in the pointer is treated as "no pitch envelope on the
+    // currently-playing sfx" so a program can mix scalar-pitch
+    // and varying-pitch sfx without the latter clobbering the
+    // former when it isn't playing.
+    //
+    // The pointer lives in main RAM (no zero-page slot pressure)
+    // and is copied into ZP scratch $02/$03 for the indirect
+    // read because the 6502 has no `(abs),Y` mode — the same
+    // technique used by `gen_noise_tick` / `gen_triangle_tick`.
+    if has_sfx_pitch {
+        // Bail out if the high byte is zero — sentinel for "the
+        // currently-playing sfx has no pitch envelope".
+        out.push(Instruction::new(LDA, AM::Absolute(AUDIO_SFX_PITCH_PTR_HI)));
+        out.push(Instruction::new(
+            BEQ,
+            AM::LabelRelative("__audio_sfx_pitch_done".into()),
+        ));
+        // Stash main-RAM pointer in ZP scratch $02/$03.
+        out.push(Instruction::new(LDA, AM::Absolute(AUDIO_SFX_PITCH_PTR_LO)));
+        out.push(Instruction::new(STA, AM::ZeroPage(0x02)));
+        out.push(Instruction::new(LDA, AM::Absolute(AUDIO_SFX_PITCH_PTR_HI)));
+        out.push(Instruction::new(STA, AM::ZeroPage(0x03)));
+        out.push(Instruction::new(LDY, AM::Immediate(0)));
+        out.push(Instruction::new(LDA, AM::IndirectY(0x02)));
+        // Zero pitch byte? Treat it as the matching mute sentinel
+        // (volume envelope's zero will already mute on the next
+        // tick) and skip the period write so we don't yank pulse-1
+        // to a 0 period for one frame before muting.
+        out.push(Instruction::new(
+            BEQ,
+            AM::LabelRelative("__audio_sfx_pitch_advance".into()),
+        ));
+        out.push(Instruction::new(STA, AM::Absolute(0x4002)));
+        out.push(Instruction::new(
+            NOP,
+            AM::Label("__audio_sfx_pitch_advance".into()),
+        ));
+        // Advance the main-RAM pointer 1 byte.
+        out.push(Instruction::new(INC, AM::Absolute(AUDIO_SFX_PITCH_PTR_LO)));
+        out.push(Instruction::new(
+            BNE,
+            AM::LabelRelative("__audio_sfx_pitch_done".into()),
+        ));
+        out.push(Instruction::new(INC, AM::Absolute(AUDIO_SFX_PITCH_PTR_HI)));
+        out.push(Instruction::new(
+            NOP,
+            AM::Label("__audio_sfx_pitch_done".into()),
+        ));
+    }
     out.push(Instruction::new(NOP, AM::Label("__audio_sfx_done".into())));
 
     // ── Music tick ──

@@ -30,12 +30,12 @@ use crate::assets::{MusicData, SfxData};
 use crate::ir::{IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator, VarId};
 use crate::parser::ast::Channel;
 use crate::runtime::{
-    AUDIO_NOISE_COUNTER, AUDIO_NOISE_PTR_HI, AUDIO_NOISE_PTR_LO, AUDIO_TRIANGLE_COUNTER,
-    AUDIO_TRIANGLE_PTR_HI, AUDIO_TRIANGLE_PTR_LO, ZP_MUSIC_BASE_HI, ZP_MUSIC_BASE_LO,
-    ZP_MUSIC_COUNTER, ZP_MUSIC_PTR_HI, ZP_MUSIC_PTR_LO, ZP_MUSIC_STATE, ZP_OAM_CURSOR,
-    ZP_PENDING_BG_ATTRS_HI, ZP_PENDING_BG_ATTRS_LO, ZP_PENDING_BG_TILES_HI, ZP_PENDING_BG_TILES_LO,
-    ZP_PENDING_PALETTE_HI, ZP_PENDING_PALETTE_LO, ZP_PPU_UPDATE_FLAGS, ZP_SFX_COUNTER,
-    ZP_SFX_PTR_HI, ZP_SFX_PTR_LO,
+    AUDIO_NOISE_COUNTER, AUDIO_NOISE_PTR_HI, AUDIO_NOISE_PTR_LO, AUDIO_SFX_PITCH_PTR_HI,
+    AUDIO_SFX_PITCH_PTR_LO, AUDIO_TRIANGLE_COUNTER, AUDIO_TRIANGLE_PTR_HI, AUDIO_TRIANGLE_PTR_LO,
+    ZP_MUSIC_BASE_HI, ZP_MUSIC_BASE_LO, ZP_MUSIC_COUNTER, ZP_MUSIC_PTR_HI, ZP_MUSIC_PTR_LO,
+    ZP_MUSIC_STATE, ZP_OAM_CURSOR, ZP_PENDING_BG_ATTRS_HI, ZP_PENDING_BG_ATTRS_LO,
+    ZP_PENDING_BG_TILES_HI, ZP_PENDING_BG_TILES_LO, ZP_PENDING_PALETTE_HI, ZP_PENDING_PALETTE_LO,
+    ZP_PPU_UPDATE_FLAGS, ZP_SFX_COUNTER, ZP_SFX_PTR_HI, ZP_SFX_PTR_LO,
 };
 
 /// Base zero-page address for IR temp slots.
@@ -82,15 +82,26 @@ pub struct IrCodeGen<'a> {
     use_counts: HashMap<IrTemp, u32>,
     /// Sprite name to tile index mapping.
     sprite_tiles: HashMap<String, u8>,
-    /// Sfx name to `(period_lo, period_hi, envelope_label, channel)`.
-    /// Populated by `with_audio` from the resolved [`SfxData`] list.
+    /// Per-sfx codegen metadata captured by [`Self::with_audio`].
+    /// Tuple layout:
+    /// - trigger period low / high (channel-specific — see below);
+    /// - the volume-envelope blob's PRG label;
+    /// - the APU channel the sfx drives;
+    /// - an optional per-frame pitch envelope blob label
+    ///   (`Some(label)` when the sfx has a varying-pitch envelope,
+    ///   `None` for the scalar-pitch fast path that doesn't touch
+    ///   the runtime pitch tick).
+    ///
     /// `play Name` consults this to pick:
     /// - the right trigger register pair (pulse 1 = $4002/$4003,
     ///   triangle = $400A/$400B, noise = $400E/$400F);
     /// - the right per-channel envelope pointer slot (pulse 1 uses
     ///   zero-page `ZP_SFX_PTR`, triangle/noise live in main RAM
-    ///   at the `AUDIO_*_PTR_*` addresses).
-    sfx_info: HashMap<String, (u8, u8, String, Channel)>,
+    ///   at the `AUDIO_*_PTR_*` addresses);
+    /// - whether to seed [`AUDIO_SFX_PITCH_PTR_LO`] with the
+    ///   pitch-envelope label or with zero (the runtime "no pitch
+    ///   update" sentinel).
+    sfx_info: HashMap<String, (u8, u8, String, Channel, Option<String>)>,
     /// Music name to `(header_byte, stream_label)`. Populated by
     /// `with_audio`. `start_music Name` stamps `header | 0x02` into
     /// `ZP_MUSIC_STATE` and loads the pointer from `stream_label`.
@@ -118,6 +129,14 @@ pub struct IrCodeGen<'a> {
     /// Same as `noise_used`, but for triangle sfx. Drives the
     /// `__triangle_used` marker label.
     triangle_used: bool,
+    /// True when at least one sfx in the program declares a
+    /// varying-pitch envelope. Drives the `__sfx_pitch_used`
+    /// marker label, which the linker reads to decide whether to
+    /// splice the per-frame pitch update path into the audio
+    /// tick. Programs without varying-pitch sfx leave this
+    /// `false` and emit byte-identical ROM bytes for the audio
+    /// subsystem.
+    sfx_pitch_used: bool,
     /// Set to true the first time we emit any PPU update op
     /// (`set_palette` / `load_background`). The linker uses the
     /// resulting `__ppu_update_used` marker label to decide whether
@@ -252,6 +271,7 @@ impl<'a> IrCodeGen<'a> {
             use_counts: HashMap::new(),
             sprite_tiles: HashMap::new(),
             sfx_info: HashMap::new(),
+            sfx_pitch_used: false,
             music_info: HashMap::new(),
             state_indices: HashMap::new(),
             function_names,
@@ -351,9 +371,15 @@ impl<'a> IrCodeGen<'a> {
     #[must_use]
     pub fn with_audio(mut self, sfx: &[SfxData], music: &[MusicData]) -> Self {
         for s in sfx {
+            let pitch_label = if s.has_pitch_envelope() {
+                self.sfx_pitch_used = true;
+                Some(s.pitch_label())
+            } else {
+                None
+            };
             self.sfx_info.insert(
                 s.name.clone(),
-                (s.period_lo, s.period_hi, s.label(), s.channel),
+                (s.period_lo, s.period_hi, s.label(), s.channel, pitch_label),
             );
         }
         for m in music {
@@ -547,6 +573,18 @@ impl<'a> IrCodeGen<'a> {
         // `__ppu_update_used` marker pattern already in use.
         if self.debug_mode {
             self.emit_label("__debug_mode");
+        }
+
+        // `__sfx_pitch_used` follows the same marker-label pattern
+        // as `__audio_used`. It tells the linker that at least one
+        // sfx in the program declared a per-frame `pitch:` array
+        // and so the audio tick needs the extra pitch-update
+        // block. Programs without a varying-pitch sfx never set
+        // `sfx_pitch_used` and the linker emits the smaller pre-
+        // pitch-envelope tick path, so existing example ROMs are
+        // byte-identical.
+        if self.sfx_pitch_used {
+            self.emit_label("__sfx_pitch_used");
         }
 
         // 1. Variable initializers
@@ -1383,7 +1421,9 @@ impl<'a> IrCodeGen<'a> {
     /// diagnostic for the unknown name.
     fn gen_play_sfx(&mut self, name: &str) {
         self.emit_audio_marker();
-        let Some((period_lo, period_hi, label, channel)) = self.sfx_info.get(name).cloned() else {
+        let Some((period_lo, period_hi, label, channel, pitch_label)) =
+            self.sfx_info.get(name).cloned()
+        else {
             // Unknown name. The analyzer warns on this; emit a no-op
             // sequence so the rest of the code still assembles. The
             // unknown branch is easy to spot in `--asm-dump`: it
@@ -1392,17 +1432,31 @@ impl<'a> IrCodeGen<'a> {
             return;
         };
         match channel {
-            Channel::Pulse1 | Channel::Pulse2 => self.emit_play_pulse(period_lo, period_hi, &label),
+            Channel::Pulse1 | Channel::Pulse2 => {
+                self.emit_play_pulse(period_lo, period_hi, &label, pitch_label.as_deref());
+            }
             Channel::Triangle => self.emit_play_triangle(period_lo, period_hi, &label),
             Channel::Noise => self.emit_play_noise(period_lo, period_hi, &label),
         }
     }
 
-    /// Original pulse-1 `play` sequence — unchanged from before the
-    /// channel feature. Kept as its own helper so the channel
-    /// dispatch above reads cleanly and the byte layout is trivial
-    /// to eyeball against the old code.
-    fn emit_play_pulse(&mut self, period_lo: u8, period_hi: u8, label: &str) {
+    /// Pulse `play` sequence. The byte layout is unchanged from
+    /// the pre-pitch-envelope codegen unless either (a) the sfx
+    /// being played has its own pitch envelope or (b) the program
+    /// has at least one varying-pitch sfx anywhere — in which
+    /// case the sequence also seeds (or zeros) the runtime's
+    /// per-frame pitch pointer at
+    /// [`AUDIO_SFX_PITCH_PTR_LO`] / `_HI`. The runtime tick
+    /// treats a zero high byte as "no pitch envelope on the
+    /// currently-playing sfx" so a single program can mix scalar
+    /// and varying-pitch sfx without one clobbering the other.
+    fn emit_play_pulse(
+        &mut self,
+        period_lo: u8,
+        period_hi: u8,
+        label: &str,
+        pitch_label: Option<&str>,
+    ) {
         // $4000: we don't write a volume envelope here. The first
         // envelope byte is consumed by the next NMI audio tick. We
         // only need to set up the trigger (period + length).
@@ -1421,6 +1475,29 @@ impl<'a> IrCodeGen<'a> {
         self.emit(STA, AM::ZeroPage(ZP_SFX_PTR_LO));
         self.emit(LDA, AM::SymbolHi(label.to_string()));
         self.emit(STA, AM::ZeroPage(ZP_SFX_PTR_HI));
+        // Optional pitch envelope pointer setup. We only emit any
+        // store at all when the *program* has at least one
+        // varying-pitch sfx (`self.sfx_pitch_used`) — that's the
+        // gate that keeps existing scalar-pitch programs
+        // byte-identical. Within such a program every play
+        // sequence still runs through this branch so a scalar
+        // sfx that follows a varying-pitch one zeros the pointer
+        // and the runtime tick safely skips the pitch update.
+        if self.sfx_pitch_used {
+            if let Some(pl) = pitch_label {
+                self.emit(LDA, AM::SymbolLo(pl.to_string()));
+                self.emit(STA, AM::Absolute(AUDIO_SFX_PITCH_PTR_LO));
+                self.emit(LDA, AM::SymbolHi(pl.to_string()));
+                self.emit(STA, AM::Absolute(AUDIO_SFX_PITCH_PTR_HI));
+            } else {
+                // Scalar-pitch sfx in a mixed program: clear the
+                // pointer so the tick's high-byte sentinel check
+                // bails out before reading the (now-stale) blob.
+                self.emit(LDA, AM::Immediate(0));
+                self.emit(STA, AM::Absolute(AUDIO_SFX_PITCH_PTR_LO));
+                self.emit(STA, AM::Absolute(AUDIO_SFX_PITCH_PTR_HI));
+            }
+        }
         // Mark sfx as active. The audio tick checks this and bails
         // on zero. We use `$FF` (any nonzero value works) as a flag;
         // the tick zeros it when it hits the envelope sentinel.
