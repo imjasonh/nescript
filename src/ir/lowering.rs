@@ -1325,7 +1325,7 @@ impl LoweringContext {
 fn type_size(t: &NesType) -> u16 {
     match t {
         NesType::U8 | NesType::I8 | NesType::Bool => 1,
-        NesType::U16 | NesType::Fixed8p8 => 2,
+        NesType::U16 => 2,
         NesType::Array(elem, count) => type_size(elem) * count,
         // Struct sizes are resolved in the analyzer. IR lowering only
         // sees struct types on `var` declarations, which are skipped

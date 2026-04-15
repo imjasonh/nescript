@@ -15,7 +15,6 @@ pub struct Program {
     pub sfx: Vec<SfxDecl>,
     pub music: Vec<MusicDecl>,
     pub banks: Vec<BankDecl>,
-    pub raw_banks: Vec<RawBankDecl>,
     pub start_state: String,
     pub span: Span,
 }
@@ -242,19 +241,6 @@ pub enum BankType {
     Chr,
 }
 
-/// `raw_bank Name @ N { binary: "path.bin" }` — pass-through binary bank.
-/// Used by decompiler to emit opaque PRG/CHR code without parsing.
-/// The linker splices the binary file verbatim at bank offset N.
-#[derive(Debug, Clone)]
-pub struct RawBankDecl {
-    pub name: String,
-    /// Bank index (0, 1, 2, ... for PRG; or 0 for CHR)
-    pub index: u8,
-    /// Source file path
-    pub source: AssetSource,
-    pub span: Span,
-}
-
 #[derive(Debug, Clone)]
 pub struct StateDecl {
     pub name: String,
@@ -306,8 +292,6 @@ pub struct ConstDecl {
     pub name: String,
     pub const_type: NesType,
     pub value: Expr,
-    /// If Some, this const is pinned to a specific ROM offset (decompiler-only).
-    pub placement: Option<Placement>,
     pub span: Span,
 }
 
@@ -316,9 +300,6 @@ pub enum Placement {
     Fast,
     Slow,
     Auto,
-    /// Fixed address in PRG ROM or zero-page (decompiler-generated).
-    /// The u32 is a byte offset (for PRG) or ZP address (for variables).
-    Fixed(u32),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -331,8 +312,6 @@ pub enum NesType {
     /// A user-declared struct, identified by its name. The analyzer
     /// looks up field layouts in the `StructDecl` table.
     Struct(String),
-    /// Signed fixed-point Q8.8 arithmetic (16-bit storage).
-    Fixed8p8,
 }
 
 impl std::fmt::Display for NesType {
@@ -344,7 +323,6 @@ impl std::fmt::Display for NesType {
             Self::Bool => write!(f, "bool"),
             Self::Array(t, n) => write!(f, "{t}[{n}]"),
             Self::Struct(name) => write!(f, "{name}"),
-            Self::Fixed8p8 => write!(f, "fixed8.8"),
         }
     }
 }

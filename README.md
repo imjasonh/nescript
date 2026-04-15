@@ -66,7 +66,6 @@ start Main
 ## Documentation
 
 - **[Language Guide](docs/language-guide.md)** -- complete reference for every language feature
-- **[Decompiler Guide](docs/decompiler-guide.md)** -- reverse-engineer ROMs back to `.ne` source
 - **[Architecture](docs/architecture.md)** -- compiler internals and module overview
 - **[NES Reference](docs/nes-reference.md)** -- hardware quick reference for contributors
 - **[Examples README](examples/README.md)** -- how to build and run examples
@@ -102,9 +101,6 @@ nescript build game.ne --output my_game.nes
 
 # Type-check only (no ROM output)
 nescript check game.ne
-
-# Decompile a ROM back to .ne source
-nescript decompile game.nes -o game_decompiled.ne
 
 # View generated 6502 assembly
 nescript build game.ne --asm-dump
