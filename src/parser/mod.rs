@@ -2791,6 +2791,22 @@ impl Parser {
                 NesType::Bool
             }
             TokenKind::Ident(name) => {
+                // Check for fixed8.8 special syntax
+                if name == "fixed8" {
+                    self.advance();
+                    if *self.peek() == TokenKind::Dot {
+                        self.advance();
+                        if let TokenKind::IntLiteral(8) = self.peek().clone() {
+                            self.advance();
+                            return Ok(NesType::Fixed8p8);
+                        }
+                    }
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        "expected 'fixed8.8', found invalid fixed-point format",
+                        self.current_span(),
+                    ));
+                }
                 // User-declared struct types are referenced by name.
                 // The analyzer validates that the name exists.
                 self.advance();
