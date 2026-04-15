@@ -273,6 +273,23 @@ impl<'a> IrCodeGen<'a> {
         }
     }
 
+    /// Suffix used by the codegen's local-label generators (e.g.
+    /// `__ir_cmp_e_<suffix>`, `__ir_wait_<suffix>`). For fixed-bank
+    /// code this is just the current `instructions.len()`, which
+    /// matches the pre-banked-banked behaviour byte-for-byte.
+    /// For *banked* code we additionally prefix the bank name so
+    /// labels can't collide across two switchable banks — the
+    /// linker's discovery pass panics on duplicate labels across
+    /// switchable banks, which used to make banked → banked
+    /// codegen impossible to test even after the trampoline path
+    /// was fixed.
+    fn local_label_suffix(&self) -> String {
+        match &self.current_bank {
+            None => format!("{}", self.instructions.len()),
+            Some(bank) => format!("{bank}_{}", self.instructions.len()),
+        }
+    }
+
     /// Per-banked-function instruction streams produced by the most
     /// recent [`Self::generate`] call. The map is keyed by bank name
     /// (matching the program's `bank Foo { ... }` declarations) and
@@ -470,7 +487,7 @@ impl<'a> IrCodeGen<'a> {
         // that the short-branch fixup would panic at link time.
         // BCC-over-JMP keeps the hot path at two branches (well
         // under 8 cycles) and the failure path at a 3-byte JMP.
-        let skip_label = format!("__ir_bc_ok_{}", self.instructions.len());
+        let skip_label = format!("__ir_bc_ok_{}", self.local_label_suffix());
         self.emit(CMP, AM::Immediate(size_u8));
         self.emit(BCC, AM::LabelRelative(skip_label.clone()));
         self.emit(JMP, AM::Label("__debug_halt".to_string()));
@@ -489,7 +506,7 @@ impl<'a> IrCodeGen<'a> {
         amt: IrTemp,
         shift_op: crate::asm::Opcode,
     ) {
-        let suffix = self.instructions.len();
+        let suffix = self.local_label_suffix();
         let loop_label = format!("__ir_shift_loop_{suffix}");
         let done_label = format!("__ir_shift_done_{suffix}");
         let amt_addr = self.temp_addr(amt);
@@ -974,21 +991,30 @@ impl<'a> IrCodeGen<'a> {
                     self.load_temp(*arg);
                     self.emit(STA, AM::ZeroPage(0x04 + i as u8));
                 }
-                // Pick the right JSR target. Three cases:
-                //   1. Callee is in the fixed bank (most common):
-                //      JSR `__ir_fn_<name>` — the original behaviour.
-                //   2. Callee is in a switchable bank and the caller
-                //      is in the fixed bank: JSR `__tramp_<name>`,
-                //      the linker-emitted trampoline that switches
-                //      banks, calls the body, then switches back.
-                //   3. Caller and callee live in the same switchable
-                //      bank: direct JSR to `__ir_fn_<name>` works
-                //      because both labels exist in the bank's own
-                //      assembler pass.
+                // Pick the right JSR target. Four cases:
+                //   1. Caller and callee are both in the fixed bank
+                //      (most common): JSR `__ir_fn_<name>` directly.
+                //   2. Caller is in the fixed bank, callee is in a
+                //      switchable bank: JSR `__tramp_<name>`, the
+                //      linker-emitted trampoline that swaps to the
+                //      target bank, runs the callee, then restores
+                //      the caller's bank.
+                //   3. Caller and callee live in the *same*
+                //      switchable bank: direct JSR to `__ir_fn_<name>`
+                //      — both labels exist in the bank's own
+                //      assembler pass, so the link resolves locally
+                //      without going through the fixed bank.
+                //   4. Caller and callee live in *different*
+                //      switchable banks: same trampoline as case 2.
+                //      The trampoline reads `ZP_BANK_CURRENT` to
+                //      figure out which bank to restore on the way
+                //      out, so it doesn't need to know the caller's
+                //      bank at link time.
                 //
-                // Cross-bank calls between two different switchable
-                // banks aren't supported in the first pass — the
-                // codegen panics rather than silently miscompiling.
+                // Banked → fixed bank calls (case 5) work without a
+                // trampoline because the fixed bank is always mapped
+                // at $C000-$FFFF — a direct JSR into the fixed bank
+                // doesn't need any bank-switching.
                 let callee_bank = self.function_banks.get(name).cloned();
                 let label = match (&self.current_bank, &callee_bank) {
                     (None, None) => format!("__ir_fn_{name}"),
@@ -996,13 +1022,13 @@ impl<'a> IrCodeGen<'a> {
                     (Some(from_bank), Some(to_bank)) if from_bank == to_bank => {
                         format!("__ir_fn_{name}")
                     }
-                    (Some(from_bank), Some(to_bank)) => {
-                        panic!(
-                            "cross-bank call from bank '{from_bank}' to '{to_bank}' \
-                             is not supported (function '{name}'); only fixed-bank \
-                             callers can invoke banked functions in the v1 \
-                             user-banked codegen"
-                        );
+                    (Some(_), Some(_)) => {
+                        // Banked → banked cross-bank call. The
+                        // fixed-bank trampoline saves the caller's
+                        // current bank, switches to the callee's
+                        // bank, calls, then restores the caller's
+                        // bank — same path as fixed → banked.
+                        format!("__tramp_{name}")
                     }
                     (Some(_), None) => {
                         // Banked function calls a fixed-bank function.
@@ -1098,7 +1124,7 @@ impl<'a> IrCodeGen<'a> {
                 // previous frame overrun" sticky bit so user code
                 // sees a fresh value next NMI. The cumulative
                 // counter at $07FF is intentionally left alone.
-                let wait_label = format!("__ir_wait_{}", self.instructions.len());
+                let wait_label = format!("__ir_wait_{}", self.local_label_suffix());
                 self.emit_label(&wait_label);
                 self.emit(LDA, AM::ZeroPage(ZP_FRAME_FLAG));
                 self.emit(BEQ, AM::LabelRelative(wait_label));
@@ -1148,7 +1174,7 @@ impl<'a> IrCodeGen<'a> {
                 if self.debug_mode {
                     // Load cond; if nonzero (true) skip; else halt
                     self.load_temp(*cond);
-                    let pass_label = format!("__ir_assert_pass_{}", self.instructions.len());
+                    let pass_label = format!("__ir_assert_pass_{}", self.local_label_suffix());
                     self.emit(BNE, AM::LabelRelative(pass_label.clone()));
                     // Assertion failed: write marker to debug port and BRK
                     self.emit(LDA, AM::Immediate(0xFF));
@@ -1736,10 +1762,11 @@ impl<'a> IrCodeGen<'a> {
         b_hi: IrTemp,
         kind: Cmp16Kind,
     ) {
-        let true_label = format!("__ir_cmp16_t_{}", self.instructions.len());
-        let false_label = format!("__ir_cmp16_f_{}", self.instructions.len());
-        let end_label = format!("__ir_cmp16_e_{}", self.instructions.len());
-        let lo_label = format!("__ir_cmp16_lo_{}", self.instructions.len());
+        let suffix = self.local_label_suffix();
+        let true_label = format!("__ir_cmp16_t_{suffix}");
+        let false_label = format!("__ir_cmp16_f_{suffix}");
+        let end_label = format!("__ir_cmp16_e_{suffix}");
+        let lo_label = format!("__ir_cmp16_lo_{suffix}");
 
         // Compare high bytes.
         self.load_temp(a_hi);
@@ -1829,8 +1856,9 @@ impl<'a> IrCodeGen<'a> {
         let b_addr = self.temp_addr(b);
         self.emit(CMP, AM::ZeroPage(b_addr));
 
-        let true_label = format!("__ir_cmp_t_{}", self.instructions.len());
-        let end_label = format!("__ir_cmp_e_{}", self.instructions.len());
+        let suffix = self.local_label_suffix();
+        let true_label = format!("__ir_cmp_t_{suffix}");
+        let end_label = format!("__ir_cmp_e_{suffix}");
 
         match kind {
             CmpKind::Eq => self.emit(BEQ, AM::LabelRelative(true_label.clone())),
@@ -3298,6 +3326,121 @@ mod more_tests {
             !has_halt_label,
             "release builds must not emit the bounds-check halt routine"
         );
+    }
+
+    #[test]
+    fn ir_codegen_banked_to_banked_call_emits_trampoline_jsr() {
+        // A banked function that calls another function in a
+        // *different* switchable bank should JSR `__tramp_<callee>`,
+        // not `__ir_fn_<callee>`. The codegen previously panicked
+        // for this case; the trampoline now save/restores the
+        // caller's bank so a single per-callee stub works for any
+        // caller bank. The JSR itself lands inside the caller
+        // bank's banked instruction stream — fixed-bank code is
+        // unaffected.
+        let (prog, _) = parser::parse(
+            r#"
+            game "T" { mapper: UxROM }
+            var x: u8 = 0
+            bank Logic {
+                fun step() { helper() }
+            }
+            bank Helpers {
+                fun helper() { x = x + 1 }
+            }
+            on frame { step() }
+            start Main
+        "#,
+        );
+        let prog = prog.unwrap();
+        let analysis = analyzer::analyze(&prog);
+        let ir_program = ir::lower(&prog, &analysis);
+        let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
+        codegen.generate(&ir_program);
+        let banked = codegen.banked_streams();
+        let logic_stream = banked
+            .get("Logic")
+            .expect("expected Logic bank stream from codegen");
+        let helper_jsr = logic_stream
+            .iter()
+            .any(|i| i.opcode == JSR && matches!(&i.mode, AM::Label(l) if l == "__tramp_helper"));
+        assert!(
+            helper_jsr,
+            "Logic bank's `step` body should JSR __tramp_helper for the banked → banked call"
+        );
+        // And critically, the same stream should NOT contain a
+        // direct `JSR __ir_fn_helper` — that would jump straight
+        // into a $8000-window address that isn't currently mapped.
+        let direct_jsr = logic_stream
+            .iter()
+            .any(|i| i.opcode == JSR && matches!(&i.mode, AM::Label(l) if l == "__ir_fn_helper"));
+        assert!(
+            !direct_jsr,
+            "banked → banked codegen must go through the trampoline, not __ir_fn_helper"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_local_label_suffix_is_bank_namespaced() {
+        // When two banked functions in *different* banks both emit
+        // a local label like `__ir_cmp_e_<n>`, the suffix has to
+        // include the bank name so the linker's discovery pass
+        // (which checks for cross-bank label collisions) doesn't
+        // panic on the second occurrence. Without the namespacing
+        // step, this exact program used to fail at link time with
+        // `duplicate label '__ir_cmp_e_8' across switchable banks`.
+        let (prog, _) = parser::parse(
+            r#"
+            game "T" { mapper: UxROM }
+            var x: u8 = 0
+            bank A {
+                fun a_fn() { if x == 0 { x = 1 } }
+            }
+            bank B {
+                fun b_fn() { if x == 0 { x = 2 } }
+            }
+            on frame { a_fn() b_fn() }
+            start Main
+        "#,
+        );
+        let prog = prog.unwrap();
+        let analysis = analyzer::analyze(&prog);
+        let ir_program = ir::lower(&prog, &analysis);
+        let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program);
+        codegen.generate(&ir_program);
+        let banked = codegen.banked_streams();
+        let a_labels: Vec<_> = banked
+            .get("A")
+            .expect("A stream")
+            .iter()
+            .filter_map(|i| match &i.mode {
+                AM::Label(l) if l.contains("__ir_cmp") => Some(l.clone()),
+                _ => None,
+            })
+            .collect();
+        let b_labels: Vec<_> = banked
+            .get("B")
+            .expect("B stream")
+            .iter()
+            .filter_map(|i| match &i.mode {
+                AM::Label(l) if l.contains("__ir_cmp") => Some(l.clone()),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !a_labels.is_empty(),
+            "bank A should emit at least one cmp label"
+        );
+        assert!(
+            !b_labels.is_empty(),
+            "bank B should emit at least one cmp label"
+        );
+        for a in &a_labels {
+            assert!(
+                !b_labels.contains(a),
+                "bank A label '{a}' collides with one in bank B"
+            );
+        }
     }
 
     #[test]

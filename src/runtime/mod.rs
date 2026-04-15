@@ -1332,12 +1332,28 @@ pub fn gen_mapper_init(
     mirroring: Mirroring,
     total_prg_banks: usize,
 ) -> Vec<Instruction> {
-    match mapper {
+    let mut out = match mapper {
         Mapper::NROM => Vec::new(),
         Mapper::MMC1 => gen_mmc1_init(mirroring),
         Mapper::UxROM => gen_uxrom_init(total_prg_banks),
         Mapper::MMC3 => gen_mmc3_init(mirroring),
+    };
+    // Initialize ZP_BANK_CURRENT to the fixed bank index for any
+    // banked mapper. The trampoline emitted by
+    // `gen_bank_trampoline` reads this slot to decide which bank
+    // to restore after a cross-bank call, so it has to be a
+    // sensible value from the very first call. Without this the
+    // RAM-clear leaves it at $00, which would put bank 0 at
+    // $8000 instead of the fixed bank after a fixed-bank caller's
+    // first cross-bank call — a behavior change vs. the pre-
+    // banked-banked codegen that some examples rely on.
+    if mapper != Mapper::NROM && total_prg_banks > 0 {
+        #[allow(clippy::cast_possible_truncation)]
+        let fixed_bank_index = (total_prg_banks - 1) as u8;
+        out.push(Instruction::new(LDA, AM::Immediate(fixed_bank_index)));
+        out.push(Instruction::new(STA, AM::ZeroPage(ZP_BANK_CURRENT)));
     }
+    out
 }
 
 /// MMC1 reset: pulse the reset bit, then write the control register.
@@ -1517,13 +1533,28 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
 }
 
 /// Generate a cross-bank trampoline stub. Placed in the fixed bank
-/// and called by user code (also in the fixed bank) via
-/// `JSR <tramp_label>`. Behavior:
+/// and called by *any* user code via `JSR <tramp_label>` regardless
+/// of which bank the caller currently lives in. Behavior:
 ///
-///   1. Load the target bank number into A, JSR `__bank_select`.
-///   2. JSR the user-supplied entry label inside the target bank.
-///   3. Load the fixed bank number, JSR `__bank_select` to restore.
-///   4. RTS.
+///   1. Read [`ZP_BANK_CURRENT`] into A, push it on the hardware
+///      stack — that's the bank we'll need to switch back to.
+///   2. Load the target bank number into A, JSR `__bank_select`.
+///   3. JSR the user-supplied entry label inside the target bank.
+///   4. Pull the saved bank back into A and JSR `__bank_select` to
+///      restore the caller's view of $8000-$BFFF.
+///   5. RTS.
+///
+/// The save/restore via `ZP_BANK_CURRENT + PHA/PLA` makes the same
+/// trampoline work for **fixed-bank → switchable-bank** *and*
+/// **switchable-bank → switchable-bank** call directions: the
+/// caller's bank ends up restored regardless of where the call
+/// originated. Nested cross-bank calls compose because each
+/// trampoline's PHA/PLA pair is balanced against its own JSR/RTS,
+/// so the saved bank values stack like any other 6502 frame.
+///
+/// The trampoline body itself lives in the fixed bank, which is
+/// always mapped at `$C000-$FFFF`, so it's reachable from every
+/// switchable bank without further mapper trickery.
 ///
 /// `tramp_label` is the label that callers will JSR (the IR codegen
 /// emits `JSR __tramp_<fn_name>` at every cross-bank call site).
@@ -1531,17 +1562,21 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
 /// callee's first instruction — conventionally `__ir_fn_<fn_name>`,
 /// the same label IR codegen would have emitted for an in-bank call.
 /// `bank_index` is the physical PRG bank number of the target bank.
-/// `fixed_bank_index` is the physical bank number of the fixed bank
-/// (always `total_banks - 1`).
 #[must_use]
 pub fn gen_bank_trampoline(
     tramp_label: &str,
     entry_label: &str,
     bank_index: u8,
-    fixed_bank_index: u8,
 ) -> Vec<Instruction> {
     let mut out = Vec::new();
     out.push(Instruction::new(NOP, AM::Label(tramp_label.to_string())));
+    // Save the caller's current bank. `__bank_select` writes its
+    // input into ZP_BANK_CURRENT, so this slot already mirrors the
+    // last-selected bank (initialized to the fixed bank index by
+    // `gen_mapper_init` so even fixed-bank callers see a sane
+    // value the first time around).
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_BANK_CURRENT)));
+    out.push(Instruction::implied(PHA));
     // Switch to target bank.
     out.push(Instruction::new(LDA, AM::Immediate(bank_index)));
     out.push(Instruction::new(JSR, AM::Label("__bank_select".into())));
@@ -1549,8 +1584,10 @@ pub fn gen_bank_trampoline(
     // the switchable bank and is resolved by the linker after the
     // banked code is assembled.
     out.push(Instruction::new(JSR, AM::Label(entry_label.to_string())));
-    // Restore the fixed bank.
-    out.push(Instruction::new(LDA, AM::Immediate(fixed_bank_index)));
+    // Restore the caller's bank (pulled from the stack) so control
+    // returns with $8000-$BFFF showing whatever the caller had
+    // mapped before the trampoline ran.
+    out.push(Instruction::implied(PLA));
     out.push(Instruction::new(JSR, AM::Label("__bank_select".into())));
     out.push(Instruction::implied(RTS));
     out

@@ -341,7 +341,6 @@ impl Linker {
         // maps to $C000-$FFFF and one of the switchable banks maps
         // to $8000-$BFFF.
         let total_banks = switchable_banks.len() + 1;
-        let fixed_bank_index = total_banks - 1;
 
         // Discovery pass: assemble each switchable bank that has
         // its own instruction stream so we know what labels live
@@ -447,8 +446,6 @@ impl Linker {
         // which switchable bank is currently mapped at $8000.
         if self.mapper != Mapper::NROM {
             all_instructions.extend(runtime::gen_bank_select(self.mapper));
-            #[allow(clippy::cast_possible_truncation)]
-            let fixed_bank_num = fixed_bank_index as u8;
             for (i, bank) in switchable_banks.iter().enumerate() {
                 if bank.trampolines.is_empty() {
                     continue;
@@ -460,7 +457,6 @@ impl Linker {
                         &tramp.tramp_label,
                         &tramp.entry_label,
                         bank_num,
-                        fixed_bank_num,
                     ));
                 }
             }
