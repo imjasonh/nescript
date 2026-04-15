@@ -132,6 +132,7 @@ impl Parser {
         let mut sfx = Vec::new();
         let mut music = Vec::new();
         let mut banks = Vec::new();
+        let mut raw_banks: Vec<RawBankDecl> = Vec::new();
         let mut start_state = None;
         let mut on_frame = None;
         let span = self.current_span();
@@ -188,6 +189,9 @@ impl Parser {
                     // each one belongs to.
                     functions.extend(nested_funs);
                 }
+                TokenKind::KwRawBank => {
+                    raw_banks.push(self.parse_raw_bank_decl()?);
+                }
                 TokenKind::KwOn => {
                     // Top-level `on frame` — implicit single state for M1
                     on_frame = Some(self.parse_on_frame()?);
@@ -238,9 +242,23 @@ impl Parser {
             }
         }
 
-        let start_state = start_state.ok_or_else(|| {
-            Diagnostic::error(ErrorCode::E0504, "missing 'start' declaration", span)
-        })?;
+        // Raw-bank programs (pure pass-through decompiler output) don't
+        // need a `start` declaration because they contain no state
+        // machine and no NEScript-generated code. A synthetic empty
+        // start state keeps downstream consumers happy without touching
+        // the runtime — the linker checks `program.raw_banks.is_empty()`
+        // to decide between normal and raw-bank mode.
+        let start_state = match (start_state, raw_banks.is_empty()) {
+            (Some(s), _) => s,
+            (None, true) => {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0504,
+                    "missing 'start' declaration",
+                    span,
+                ))
+            }
+            (None, false) => String::new(),
+        };
 
         Ok(Program {
             game,
@@ -256,6 +274,7 @@ impl Parser {
             sfx,
             music,
             banks,
+            raw_banks,
             start_state,
             span,
         })
@@ -729,6 +748,123 @@ impl Parser {
                 self.current_span(),
             )),
         }
+    }
+
+    // ── raw_bank declaration (decompiler-only) ──
+    //
+    //   raw_bank Name prg <index> { binary: "file.bin" }
+    //   raw_bank Name chr         { binary: "file.bin" }
+    //
+    // Emits verbatim bytes from `binary_path` into the named bank. A
+    // program containing any raw_bank is compiled in raw-bank mode:
+    // the linker skips codegen and produces `iNES header + raw bytes`
+    // directly. See `src/decompiler/` for the producer side.
+
+    fn parse_raw_bank_decl(&mut self) -> Result<RawBankDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwRawBank)?;
+        let (name, _) = self.expect_ident()?;
+
+        // Bank kind: `prg` or `chr` as bare identifiers (not keywords,
+        // to avoid clashing with the existing `chr:` asset-source
+        // attribute used by sprite declarations).
+        let (kind_str, kind_span) = self.expect_ident()?;
+        let kind = match kind_str.as_str() {
+            "prg" => RawBankKind::Prg,
+            "chr" => RawBankKind::Chr,
+            other => {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!("expected 'prg' or 'chr' after raw_bank name, found '{other}'"),
+                    kind_span,
+                ));
+            }
+        };
+
+        // PRG banks have an explicit index; CHR banks do not.
+        let index = match kind {
+            RawBankKind::Prg => {
+                let tok_span = self.current_span();
+                match self.peek().clone() {
+                    TokenKind::IntLiteral(n) => {
+                        self.advance();
+                        if n > u16::from(u8::MAX) {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!("raw_bank PRG index {n} exceeds the 0..255 limit"),
+                                tok_span,
+                            ));
+                        }
+                        n as u8
+                    }
+                    _ => {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "expected PRG bank index (integer literal) after 'prg', found '{}'",
+                                self.peek()
+                            ),
+                            tok_span,
+                        ));
+                    }
+                }
+            }
+            RawBankKind::Chr => 0,
+        };
+
+        self.expect(&TokenKind::LBrace)?;
+
+        // Single property: `binary: "path"`. We keep this as a key/value
+        // block to leave room for future attributes (size, offset,
+        // free_space, …) without another grammar change.
+        let mut binary_path: Option<String> = None;
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let (key, key_span) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "binary" => match self.peek().clone() {
+                    TokenKind::StringLiteral(s) => {
+                        self.advance();
+                        binary_path = Some(s);
+                    }
+                    _ => {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "expected string literal after 'binary:', found '{}'",
+                                self.peek()
+                            ),
+                            self.current_span(),
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown raw_bank property '{key}'"),
+                        key_span,
+                    )
+                    .with_help("supported properties: binary"));
+                }
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let binary_path = binary_path.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0504,
+                "raw_bank declaration missing required 'binary' property",
+                start,
+            )
+        })?;
+
+        Ok(RawBankDecl {
+            name,
+            kind,
+            index,
+            binary_path,
+            span: Span::new(start.file_id, start.start, self.current_span().end),
+        })
     }
 
     // ── Top-level on frame ──

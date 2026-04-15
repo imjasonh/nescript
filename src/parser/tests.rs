@@ -2415,3 +2415,152 @@ fn parse_background_raw_tiles_and_attributes_still_work() {
     assert_eq!(prog.backgrounds[0].tiles, vec![0, 1, 2, 3]);
     assert_eq!(prog.backgrounds[0].attributes, vec![0xFF, 0x55]);
 }
+
+// ── raw_bank declarations (decompiler-only pass-through) ──
+
+#[test]
+fn parse_raw_bank_prg_minimal() {
+    // A pure raw-bank program: no `start`, no `on frame`, just the
+    // game declaration plus a PRG bank binary reference.
+    let src = r#"
+        game "Raw" { mapper: NROM }
+        raw_bank Prg0 prg 0 { binary: "raw.prg.bin" }
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.raw_banks.len(), 1);
+    let bank = &prog.raw_banks[0];
+    assert_eq!(bank.name, "Prg0");
+    assert_eq!(bank.kind, RawBankKind::Prg);
+    assert_eq!(bank.index, 0);
+    assert_eq!(bank.binary_path, "raw.prg.bin");
+    // Raw-bank programs don't require a start state; the parser
+    // inserts an empty placeholder so downstream consumers that
+    // pattern-match on `start_state` don't have to care.
+    assert_eq!(prog.start_state, "");
+    assert!(prog.states.is_empty());
+    assert!(prog.functions.is_empty());
+}
+
+#[test]
+fn parse_raw_bank_chr_minimal() {
+    let src = r#"
+        game "Raw" { mapper: NROM }
+        raw_bank MyChr chr { binary: "raw.chr.bin" }
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.raw_banks.len(), 1);
+    let bank = &prog.raw_banks[0];
+    assert_eq!(bank.name, "MyChr");
+    assert_eq!(bank.kind, RawBankKind::Chr);
+    // CHR index is always 0 — there's at most one CHR blob per program.
+    assert_eq!(bank.index, 0);
+    assert_eq!(bank.binary_path, "raw.chr.bin");
+}
+
+#[test]
+fn parse_raw_bank_multiple_prg_banks() {
+    // A 32 KB ROM with two PRG banks plus CHR. The parser must accept
+    // multiple raw_bank declarations in a single program and keep their
+    // declaration order.
+    let src = r#"
+        game "Raw" { mapper: NROM }
+        raw_bank Prg0 prg 0 { binary: "bank0.bin" }
+        raw_bank Prg1 prg 1 { binary: "bank1.bin" }
+        raw_bank Chr  chr   { binary: "chr.bin" }
+    "#;
+    let prog = parse_ok(src);
+    assert_eq!(prog.raw_banks.len(), 3);
+    assert_eq!(prog.raw_banks[0].kind, RawBankKind::Prg);
+    assert_eq!(prog.raw_banks[0].index, 0);
+    assert_eq!(prog.raw_banks[1].kind, RawBankKind::Prg);
+    assert_eq!(prog.raw_banks[1].index, 1);
+    assert_eq!(prog.raw_banks[2].kind, RawBankKind::Chr);
+}
+
+#[test]
+fn parse_raw_bank_rejects_unknown_kind() {
+    // The kind token must be `prg` or `chr`. Anything else is an
+    // E0201 parse error on the unrecognised identifier. This is a
+    // diagnostic quality test — if users mistype, they should get
+    // a clear error pointing at the offending word.
+    let src = r#"
+        game "Raw" { mapper: NROM }
+        raw_bank Foo wram 0 { binary: "x.bin" }
+    "#;
+    let codes = parse_err(src);
+    assert!(
+        codes.contains(&crate::errors::ErrorCode::E0201),
+        "expected E0201 for unknown bank kind, got {codes:?}"
+    );
+}
+
+#[test]
+fn parse_raw_bank_rejects_missing_binary() {
+    // A raw_bank block without a `binary:` property is an error.
+    let src = r#"
+        game "Raw" { mapper: NROM }
+        raw_bank Prg0 prg 0 { }
+    "#;
+    let codes = parse_err(src);
+    // Either E0504 (missing required property) or E0201 is acceptable;
+    // we pin on one for regression-test purposes.
+    assert!(
+        codes.contains(&crate::errors::ErrorCode::E0504),
+        "expected E0504 for missing binary, got {codes:?}"
+    );
+}
+
+#[test]
+fn parse_raw_bank_rejects_prg_without_index() {
+    // `raw_bank Foo prg { ... }` — PRG requires an explicit bank index.
+    let src = r#"
+        game "Raw" { mapper: NROM }
+        raw_bank Prg0 prg { binary: "x.bin" }
+    "#;
+    let codes = parse_err(src);
+    assert!(
+        codes.contains(&crate::errors::ErrorCode::E0201),
+        "expected E0201 for missing PRG index, got {codes:?}"
+    );
+}
+
+#[test]
+fn parse_raw_bank_rejects_unknown_property() {
+    // Unknown key inside the block — future-proof the parser to catch
+    // typos instead of silently ignoring them.
+    let src = r#"
+        game "Raw" { mapper: NROM }
+        raw_bank Prg0 prg 0 { binaryPath: "x.bin" }
+    "#;
+    let codes = parse_err(src);
+    assert!(
+        codes.contains(&crate::errors::ErrorCode::E0201),
+        "expected E0201 for unknown property, got {codes:?}"
+    );
+}
+
+#[test]
+fn normal_program_still_requires_start_state() {
+    // Guardrail: the "raw-bank skips start-state" logic must not
+    // accidentally relax the requirement for normal programs. A
+    // program with no raw_banks and no `start` must still error.
+    let src = r#"
+        game "T" { mapper: NROM }
+        var px: u8 = 0
+        on frame { px = 1 }
+    "#;
+    // NOTE: `on frame` without an explicit `start` is auto-wrapped
+    // into a synthetic Main state, so this IS accepted. Test a
+    // stricter case instead: no frame handler and no start.
+    let _ = parse_ok(src);
+
+    let src_strict = r#"
+        game "T" { mapper: NROM }
+        var px: u8 = 0
+    "#;
+    let codes = parse_err(src_strict);
+    assert!(
+        codes.contains(&crate::errors::ErrorCode::E0504),
+        "expected E0504 for missing start, got {codes:?}"
+    );
+}

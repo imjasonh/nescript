@@ -479,6 +479,7 @@ impl<'a> Lexer<'a> {
             }
             "raw" => TokenKind::KwRaw,
             "bank" => TokenKind::KwBank,
+            "raw_bank" => TokenKind::KwRawBank,
             "loop" => TokenKind::KwLoop,
             "wait_frame" => TokenKind::KwWaitFrame,
             "u8" => TokenKind::KwU8,

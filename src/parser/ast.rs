@@ -15,6 +15,13 @@ pub struct Program {
     pub sfx: Vec<SfxDecl>,
     pub music: Vec<MusicDecl>,
     pub banks: Vec<BankDecl>,
+    /// `raw_bank Name prg N { binary: "file.bin" }` declarations. When
+    /// present, the program is compiled in "raw-bank mode" — all PRG
+    /// and CHR data comes verbatim from the named binary files and
+    /// `NEScript`'s runtime/codegen is bypassed entirely. Used by the
+    /// decompiler to convert existing `.nes` ROMs into editable `.ne`
+    /// source that recompiles to a byte-identical ROM.
+    pub raw_banks: Vec<RawBankDecl>,
     pub start_state: String,
     pub span: Span,
 }
@@ -239,6 +246,45 @@ pub struct BankDecl {
 pub enum BankType {
     Prg,
     Chr,
+}
+
+/// `raw_bank Name prg <index> { binary: "file.bin" }` or
+/// `raw_bank Name chr { binary: "file.bin" }`
+///
+/// Decompiler-generated declaration that splices a binary file verbatim
+/// into the output ROM. PRG raw banks are indexed 0..N and must cover
+/// every PRG bank declared by the `game` block's mapper. CHR raw banks
+/// are unindexed (at most one CHR blob per program).
+///
+/// A program containing any `raw_bank` declaration must contain no
+/// state handlers, functions, globals, or asset declarations — the
+/// linker runs a dedicated raw-bank path that emits the iNES header +
+/// concatenated bank bytes with no `NEScript` runtime.
+#[derive(Debug, Clone)]
+pub struct RawBankDecl {
+    pub name: String,
+    pub kind: RawBankKind,
+    /// For `Prg`, the bank index (0-based). For `Chr`, always 0.
+    pub index: u8,
+    /// Path to the binary file, resolved relative to the source file
+    /// directory.
+    pub binary_path: String,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawBankKind {
+    Prg,
+    Chr,
+}
+
+impl std::fmt::Display for RawBankKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Prg => write!(f, "prg"),
+            Self::Chr => write!(f, "chr"),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]

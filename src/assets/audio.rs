@@ -691,6 +691,7 @@ mod tests {
             sfx: Vec::new(),
             music: Vec::new(),
             banks: Vec::new(),
+            raw_banks: Vec::new(),
             start_state: "Main".to_string(),
             span: Span::dummy(),
         }
