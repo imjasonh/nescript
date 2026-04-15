@@ -16,8 +16,9 @@ enum Direction { Up, Down, Left, Right }
 
 enum AnimFrame { Idle, Run1, Run2 }
 
-// A struct bundles related state into a single variable. Only u8 /
-// i8 / bool fields are allowed in v0.1 — no nesting, arrays, or u16.
+// A struct bundles related state into a single variable.
+// See examples/nested_structs.ne for nested-struct and array-field
+// fields; this example sticks to flat scalar fields for simplicity.
 struct Player {
     x: u8,
     y: u8,

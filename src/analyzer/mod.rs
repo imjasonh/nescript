@@ -841,9 +841,10 @@ impl Analyzer {
     /// Register a struct declaration. Computes each field's byte
     /// offset from the base address (fields are laid out contiguously
     /// in declaration order with no padding), and records the total
-    /// size. Fields may be u8, i8, bool, or u16. Nested structs and
-    /// array fields are still rejected — the IR-lowering path doesn't
-    /// model them yet.
+    /// size. Field types may be `u8`, `i8`, `bool`, `u16`, an array
+    /// of any of those, or another previously-declared struct.
+    /// Nested struct fields require the inner struct to have been
+    /// declared earlier in the program (we don't topologically sort).
     fn register_struct(&mut self, s: &StructDecl) {
         if self.struct_layouts.contains_key(&s.name) {
             self.diagnostics.push(Diagnostic::error(
@@ -853,25 +854,60 @@ impl Analyzer {
             ));
             return;
         }
+        // Snapshot the existing per-struct sizes so the size
+        // helper can resolve nested struct field sizes without
+        // borrowing `self` mutably.
+        let struct_sizes: HashMap<String, u16> = self
+            .struct_layouts
+            .iter()
+            .map(|(n, l)| (n.clone(), l.size))
+            .collect();
         let mut fields = Vec::new();
         let mut offset: u16 = 0;
         for field in &s.fields {
-            // Reject non-primitive field types for now. u16 is
-            // allowed and takes two bytes; arrays and nested structs
-            // still error out with a clearer message than before.
+            // Compute the size for this field. Primitives are 1 or
+            // 2 bytes; arrays multiply element size by length;
+            // nested structs look up the previously-registered
+            // size. A nested struct that hasn't been declared yet
+            // is an error — the user must put inner structs
+            // before the outer ones.
             let size = match &field.field_type {
                 NesType::U8 | NesType::I8 | NesType::Bool => 1,
                 NesType::U16 => 2,
-                NesType::Array(_, _) | NesType::Struct(_) => {
-                    self.diagnostics.push(Diagnostic::error(
-                        ErrorCode::E0201,
-                        format!(
-                            "struct field '{}' has unsupported type '{}' (struct fields must be u8, i8, u16, or bool)",
-                            field.name, field.field_type
-                        ),
-                        field.span,
-                    ));
-                    continue;
+                NesType::Array(elem, count) => {
+                    // Reject arrays of structs for now — the
+                    // synthetic-variable model used by the
+                    // analyzer flattens scalars into one symbol
+                    // per leaf, but an array-of-structs would
+                    // need either per-element flattening or a
+                    // proper indexed-struct codegen path.
+                    if let NesType::Struct(_) = elem.as_ref() {
+                        self.diagnostics.push(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "struct field '{}' is an array of structs, which is not yet supported",
+                                field.name
+                            ),
+                            field.span,
+                        ));
+                        continue;
+                    }
+                    let elem_size = type_size_with(elem, &struct_sizes);
+                    elem_size * *count
+                }
+                NesType::Struct(sname) => {
+                    let Some(inner) = struct_sizes.get(sname).copied() else {
+                        self.diagnostics.push(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "struct '{}' field '{}' references unknown struct type '{sname}'; declare '{sname}' before '{}'",
+                                s.name, field.name, s.name
+                            ),
+                            field.span,
+                        ));
+                        continue;
+                    };
+                    inner
                 }
             };
             fields.push((field.name.clone(), field.field_type.clone(), offset));
@@ -916,6 +952,76 @@ impl Analyzer {
                     span: *variant_span,
                 },
             );
+        }
+    }
+
+    /// Recursively walk a struct layout and synthesize one symbol +
+    /// allocation per leaf field, plus a Struct-typed symbol for
+    /// each nested-struct intermediate so dotted-name lookups for
+    /// `outer.inner` (without the trailing leaf) still resolve.
+    ///
+    /// For example, given `var p: Player` where `Player { pos:
+    /// Point, hp: u8, inv: u8[4] }` and `Point { x: u8, y: u8 }`,
+    /// this produces:
+    ///
+    /// - `p.pos`        — Symbol(Struct("Point"))
+    /// - `p.pos.x`      — Symbol(U8) + allocation
+    /// - `p.pos.y`      — Symbol(U8) + allocation
+    /// - `p.hp`         — Symbol(U8) + allocation
+    /// - `p.inv`        — Symbol(Array(U8, 4)) + allocation
+    fn flatten_struct_fields(
+        &mut self,
+        base_name: &str,
+        base_addr: u16,
+        layout: &StructLayout,
+        var_span: Span,
+    ) {
+        for (field_name, field_type, offset) in &layout.fields {
+            let full_name = format!("{base_name}.{field_name}");
+            let field_addr = base_addr + offset;
+            match field_type {
+                NesType::Struct(sname) => {
+                    // Register the intermediate as a Struct
+                    // symbol so a `name.field` walk finds it
+                    // even when only the leaves carry storage.
+                    self.symbols.insert(
+                        full_name.clone(),
+                        Symbol {
+                            name: full_name.clone(),
+                            sym_type: field_type.clone(),
+                            is_const: false,
+                            span: var_span,
+                        },
+                    );
+                    let nested = self.struct_layouts[sname].clone();
+                    self.flatten_struct_fields(&full_name, field_addr, &nested, var_span);
+                }
+                _ => {
+                    // u8 / i8 / u16 / bool / array — leaf field.
+                    // The leaf's allocation size mirrors the
+                    // top-level rule used by `register_var`.
+                    self.symbols.insert(
+                        full_name.clone(),
+                        Symbol {
+                            name: full_name.clone(),
+                            sym_type: field_type.clone(),
+                            is_const: false,
+                            span: var_span,
+                        },
+                    );
+                    let struct_sizes: HashMap<String, u16> = self
+                        .struct_layouts
+                        .iter()
+                        .map(|(n, l)| (n.clone(), l.size))
+                        .collect();
+                    let field_size = type_size_with(field_type, &struct_sizes);
+                    self.var_allocations.push(VarAllocation {
+                        name: full_name,
+                        address: field_addr,
+                        size: field_size,
+                    });
+                }
+            }
         }
     }
 
@@ -991,37 +1097,19 @@ impl Analyzer {
             return;
         };
 
-        // For struct-typed variables, synthesize per-field entries in
-        // the symbol table and var_allocations. This lets the rest of
-        // the compiler treat `pos.x` and `pos.y` as ordinary variables
-        // at known addresses, without special-casing struct layout.
+        // For struct-typed variables, synthesize per-field entries
+        // in the symbol table and var_allocations. This lets the
+        // rest of the compiler treat `pos.x` and `pos.y` as
+        // ordinary variables at known addresses, without special-
+        // casing struct layout. Nested structs recurse — a
+        // `Player { pos: Point, ... }` variable produces both
+        // `p.pos` (typed `Struct("Point")`) and `p.pos.x`,
+        // `p.pos.y` leaves. Array fields produce a single
+        // synthetic with the array type so the existing
+        // `Expr::ArrayIndex` lowering picks them up.
         if let NesType::Struct(sname) = &var.var_type {
             let layout = self.struct_layouts[sname].clone();
-            for (field_name, field_type, offset) in &layout.fields {
-                let full_name = format!("{}.{field_name}", var.name);
-                self.symbols.insert(
-                    full_name.clone(),
-                    Symbol {
-                        name: full_name.clone(),
-                        sym_type: field_type.clone(),
-                        is_const: false,
-                        span: var.span,
-                    },
-                );
-                // u16 struct fields occupy two bytes — record that
-                // explicitly so the IR codegen's global-init pass and
-                // any size-aware bookkeeping treat the high byte as
-                // part of the same allocation.
-                let field_size = match field_type {
-                    NesType::U16 => 2,
-                    _ => 1,
-                };
-                self.var_allocations.push(VarAllocation {
-                    name: full_name,
-                    address: address + offset,
-                    size: field_size,
-                });
-            }
+            self.flatten_struct_fields(&var.name, address, &layout, var.span);
             // Also register the struct variable itself (as a symbol
             // only — it doesn't have a single VarAllocation entry).
             self.symbols.insert(

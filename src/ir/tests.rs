@@ -351,6 +351,45 @@ fn lower_debug_frame_overrun_count_emits_peek() {
 }
 
 #[test]
+fn lower_nested_struct_literal_init_expands_to_leaves() {
+    // A `Hero { pos: Vec2 { x: 1, y: 2 }, hp: 100, inv: [3,4,5,6] }`
+    // initializer must produce one IrGlobal per leaf field with the
+    // right scalar `init_value` / per-element `init_array`. The
+    // intermediate `hero.pos` is registered with `size: 0` so name
+    // lookups still work but no separate init bytes are emitted.
+    let ir = lower_ok(
+        r#"
+        game "T" { mapper: NROM }
+        struct Vec2 { x: u8, y: u8 }
+        struct Hero { pos: Vec2, hp: u8, inv: u8[4] }
+        var hero: Hero = Hero { pos: Vec2 { x: 1, y: 2 }, hp: 100, inv: [3, 4, 5, 6] }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    let by_name = |n: &str| {
+        ir.globals
+            .iter()
+            .find(|g| g.name == n)
+            .unwrap_or_else(|| panic!("missing global: {n}"))
+    };
+    let pos_x = by_name("hero.pos.x");
+    let pos_y = by_name("hero.pos.y");
+    let hp = by_name("hero.hp");
+    let inv = by_name("hero.inv");
+    assert_eq!(pos_x.init_value, Some(1));
+    assert_eq!(pos_y.init_value, Some(2));
+    assert_eq!(hp.init_value, Some(100));
+    assert_eq!(inv.init_array, vec![3, 4, 5, 6]);
+    // The intermediate must exist with size 0 so codegen can
+    // resolve `hero.pos` lookups even though it carries no bytes.
+    let pos = by_name("hero.pos");
+    assert_eq!(pos.size, 0);
+    assert_eq!(pos.init_value, None);
+    assert!(pos.init_array.is_empty());
+}
+
+#[test]
 fn lower_debug_frame_overran_emits_peek_07fe() {
     let ir = lower_ok(
         r#"

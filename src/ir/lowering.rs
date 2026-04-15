@@ -124,6 +124,72 @@ impl LoweringContext {
         }
     }
 
+    /// Recursively expand a struct-literal global initializer into
+    /// per-leaf-field `IrGlobal` entries. Handles three field-value
+    /// shapes:
+    ///
+    /// - Scalar constant expressions (e.g. `x: 5`) → emit one
+    ///   `IrGlobal` whose `init_value` is the folded constant.
+    /// - Nested struct literals (e.g. `pos: Vec2 { x: 1, y: 2 }`)
+    ///   → recurse with `base_name = "outer.pos"`, expanding the
+    ///   inner literal's fields under the dotted path.
+    /// - Array literals (e.g. `inv: [1, 2, 3, 4]`) → emit one
+    ///   `IrGlobal` whose `init_array` carries the per-byte values.
+    ///
+    /// Each leaf global's size is derived from the analyzer's
+    /// recorded field type so `u16` fields still claim two bytes.
+    fn expand_struct_literal_init(&mut self, base_name: &str, fields: &[(String, Expr)]) {
+        for (fname, fexpr) in fields {
+            let full = format!("{base_name}.{fname}");
+            let fvid = self.get_or_create_var(&full);
+            let field_type = self.var_types.get(&full).cloned();
+            match fexpr {
+                Expr::StructLiteral(_, inner_fields, _) => {
+                    // Register the intermediate symbol with size 0 —
+                    // its byte-allocation lives in the leaves, but
+                    // the IR codegen still needs a global record so
+                    // that name lookups don't fail.
+                    self.globals.push(IrGlobal {
+                        var_id: fvid,
+                        name: full.clone(),
+                        size: 0,
+                        init_value: None,
+                        init_array: Vec::new(),
+                    });
+                    self.expand_struct_literal_init(&full, inner_fields);
+                }
+                Expr::ArrayLiteral(elems, _) => {
+                    let init_array: Vec<u8> = elems
+                        .iter()
+                        .filter_map(|e| self.eval_const(e).map(|v| v as u8))
+                        .collect();
+                    let size = type_size(field_type.as_ref().unwrap_or(&NesType::U8));
+                    self.globals.push(IrGlobal {
+                        var_id: fvid,
+                        name: full,
+                        size,
+                        init_value: None,
+                        init_array,
+                    });
+                }
+                _ => {
+                    let fval = self.eval_const(fexpr);
+                    let size = match field_type {
+                        Some(NesType::U16) => 2,
+                        _ => 1,
+                    };
+                    self.globals.push(IrGlobal {
+                        var_id: fvid,
+                        name: full,
+                        size,
+                        init_value: fval,
+                        init_array: Vec::new(),
+                    });
+                }
+            }
+        }
+    }
+
     /// Try to evaluate an expression at compile time, using the
     /// already-registered constants as operands. Returns `None` if
     /// the expression references something that isn't known at this
@@ -226,7 +292,10 @@ impl LoweringContext {
         // op referencing it by name still resolves. Array-literal
         // initializers are lowered into `init_array` on the parent
         // global — the IR codegen's startup loop emits one LDA/STA
-        // per byte into the global's base address.
+        // per byte into the global's base address. Nested struct
+        // literals (`Player { pos: Vec2 { x: 1, y: 2 }, ... }`)
+        // and array-literal field values (`Hero { inv: [1,2,3,4] }`)
+        // are expanded recursively below.
         for var in &program.globals {
             let var_id = self.get_or_create_var(&var.name);
             let init = var.init.as_ref().and_then(|e| self.eval_const(e));
@@ -245,26 +314,7 @@ impl LoweringContext {
                 init_array,
             });
             if let Some(Expr::StructLiteral(_, fields, _)) = &var.init {
-                for (fname, fexpr) in fields {
-                    let full = format!("{}.{fname}", var.name);
-                    let fvid = self.get_or_create_var(&full);
-                    let fval = self.eval_const(fexpr);
-                    // Look up the field's type from the analyzer's
-                    // symbol table so u16 fields record a size of 2
-                    // and the IR codegen's initializer loop writes
-                    // both bytes.
-                    let field_size = match self.var_types.get(&full) {
-                        Some(NesType::U16) => 2,
-                        _ => 1,
-                    };
-                    self.globals.push(IrGlobal {
-                        var_id: fvid,
-                        name: full,
-                        size: field_size,
-                        init_value: fval,
-                        init_array: Vec::new(),
-                    });
-                }
+                self.expand_struct_literal_init(&var.name, fields);
             }
         }
 

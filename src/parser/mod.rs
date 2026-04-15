@@ -2691,13 +2691,38 @@ impl Parser {
                 ))
             }
             TokenKind::Dot => {
-                // Field assignment: name.field = value
-                self.advance();
-                let (field, _) = self.expect_ident()?;
+                // Field assignment: `name.field = value`, including
+                // chains (`outer.inner.field = value`) and array
+                // fields (`name.inv[idx] = value`). The dotted
+                // chain is eagerly joined into a single synthetic
+                // identifier so the analyzer/lowering can treat it
+                // identically to a flat variable name.
+                let mut chain = vec![name];
+                while *self.peek() == TokenKind::Dot {
+                    self.advance();
+                    let (field, _) = self.expect_ident()?;
+                    chain.push(field);
+                }
+                if *self.peek() == TokenKind::LBracket {
+                    self.advance();
+                    let index = self.parse_expr()?;
+                    self.expect(&TokenKind::RBracket)?;
+                    let op = self.parse_assign_op()?;
+                    let value = self.parse_expr()?;
+                    let joined = chain.join(".");
+                    return Ok(Statement::Assign(
+                        LValue::ArrayIndex(joined, Box::new(index)),
+                        op,
+                        value,
+                        start,
+                    ));
+                }
+                let last = chain.pop().expect("at least one field consumed");
+                let base = chain.join(".");
                 let op = self.parse_assign_op()?;
                 let value = self.parse_expr()?;
                 Ok(Statement::Assign(
-                    LValue::Field(name, field),
+                    LValue::Field(base, last),
                     op,
                     value,
                     start,
@@ -3072,11 +3097,36 @@ impl Parser {
                     return Ok(Expr::Call(name, args, span));
                 }
 
-                // Check for field access: `name.field`
+                // Check for field access: `name.field`, including
+                // chains like `outer.inner.field` for nested
+                // structs and `name.field[idx]` for array fields.
+                // The synthetic flat-name model used by the
+                // analyzer/lowering keys symbols by the joined
+                // dotted path, so we eagerly consume the entire
+                // chain into a single identifier string.
                 if *self.peek() == TokenKind::Dot {
-                    self.advance();
-                    let (field, _) = self.expect_ident()?;
-                    return Ok(Expr::FieldAccess(name, field, span));
+                    let mut chain = vec![name];
+                    while *self.peek() == TokenKind::Dot {
+                        self.advance();
+                        let (field, _) = self.expect_ident()?;
+                        chain.push(field);
+                    }
+                    // After the dotted chain we may still see an
+                    // array index — `player.inv[0]` becomes
+                    // `ArrayIndex("player.inv", idx)`. Otherwise
+                    // the last segment is the field of the path
+                    // before it: `p.pos.x` becomes
+                    // `FieldAccess("p.pos", "x")`.
+                    if *self.peek() == TokenKind::LBracket {
+                        self.advance();
+                        let index = self.parse_expr()?;
+                        self.expect(&TokenKind::RBracket)?;
+                        let joined = chain.join(".");
+                        return Ok(Expr::ArrayIndex(joined, Box::new(index), span));
+                    }
+                    let last = chain.pop().expect("at least one field consumed");
+                    let base = chain.join(".");
+                    return Ok(Expr::FieldAccess(base, last, span));
                 }
 
                 // Check for struct literal: `Name { field: expr, ... }`.

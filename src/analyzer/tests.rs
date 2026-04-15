@@ -371,32 +371,113 @@ fn analyze_struct_u16_field_allocates_two_bytes() {
 }
 
 #[test]
-fn analyze_struct_with_array_field_is_rejected() {
-    // Array fields are still rejected — the analyzer only accepts
-    // u8/i8/u16/bool scalar fields in v1 structs.
-    let errors = analyze_errors(
+fn analyze_struct_with_array_field_is_supported() {
+    // Array struct fields are supported. The analyzer flattens
+    // them into a single synthetic var typed `Array(u8, 4)` so
+    // the existing array-index codegen lowers `b.xs[i]` exactly
+    // like a top-level array.
+    let result = analyze_ok(
         r#"
         game "Test" { mapper: NROM }
         struct Bag { xs: u8[4] }
         var b: Bag
-        on frame { wait_frame }
+        on frame {
+            b.xs[0] = 7
+            wait_frame
+        }
         start Main
     "#,
     );
-    assert!(
-        errors.contains(&ErrorCode::E0201),
-        "array struct field should emit E0201: {errors:?}"
-    );
+    let alloc = result
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "b.xs")
+        .expect("expected synthetic `b.xs` allocation");
+    assert_eq!(alloc.size, 4, "u8[4] should reserve 4 bytes");
+    let sym = result
+        .symbols
+        .get("b.xs")
+        .expect("expected symbol entry for `b.xs`");
+    assert!(matches!(sym.sym_type, NesType::Array(_, 4)));
 }
 
 #[test]
-fn analyze_struct_with_nested_struct_field_is_rejected() {
-    // Nested struct fields are still rejected — only scalar primitives.
+fn analyze_struct_with_nested_struct_field_is_supported() {
+    // Nested struct fields are flattened recursively. A
+    // `Player { pos: Point, hp: u8 }` variable produces both
+    // `p.pos.x` / `p.pos.y` leaves and an intermediate
+    // `p.pos` Struct symbol.
+    let result = analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Point { x: u8, y: u8 }
+        struct Player { pos: Point, hp: u8 }
+        var p: Player
+        on frame {
+            p.pos.x = 5
+            p.pos.y = 6
+            p.hp = 100
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    // Each leaf field gets its own allocation entry.
+    assert!(result.var_allocations.iter().any(|a| a.name == "p.pos.x"));
+    assert!(result.var_allocations.iter().any(|a| a.name == "p.pos.y"));
+    assert!(result.var_allocations.iter().any(|a| a.name == "p.hp"));
+    // The intermediate `p.pos` is a Struct symbol but has no
+    // standalone allocation — its bytes are owned by the leaves.
+    let pos = result
+        .symbols
+        .get("p.pos")
+        .expect("intermediate `p.pos` should exist as a symbol");
+    assert!(matches!(pos.sym_type, NesType::Struct(_)));
+    assert!(result.var_allocations.iter().all(|a| a.name != "p.pos"));
+}
+
+#[test]
+fn analyze_struct_with_nested_struct_field_addresses_are_contiguous() {
+    // The four leaf fields of a `Player { pos: Point, hp: u8,
+    // inv: u8[4] }` should land at successive addresses with no
+    // padding — Point.x at base, Point.y at base+1, hp at base+2,
+    // inv at base+3..base+6.
+    let result = analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Point { x: u8, y: u8 }
+        struct Player { pos: Point, hp: u8, inv: u8[4] }
+        var p: Player
+        on frame {
+            p.pos.x = 1
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    let alloc = |name: &str| {
+        result
+            .var_allocations
+            .iter()
+            .find(|a| a.name == name)
+            .unwrap_or_else(|| panic!("missing allocation: {name}"))
+            .address
+    };
+    let base = alloc("p.pos.x");
+    assert_eq!(alloc("p.pos.y"), base + 1);
+    assert_eq!(alloc("p.hp"), base + 2);
+    assert_eq!(alloc("p.inv"), base + 3);
+}
+
+#[test]
+fn analyze_struct_with_unknown_inner_struct_errors() {
+    // A nested-struct field that references an undeclared inner
+    // struct must emit E0201 with a "declare it earlier" hint.
+    // (We don't topologically sort declarations.)
     let errors = analyze_errors(
         r#"
         game "Test" { mapper: NROM }
-        struct Inner { a: u8 }
-        struct Outer { inner: Inner }
+        struct Outer { inner: NotDeclared }
         var o: Outer
         on frame { wait_frame }
         start Main
@@ -404,7 +485,29 @@ fn analyze_struct_with_nested_struct_field_is_rejected() {
     );
     assert!(
         errors.contains(&ErrorCode::E0201),
-        "nested struct field should emit E0201: {errors:?}"
+        "expected E0201, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_struct_with_array_of_structs_is_rejected() {
+    // Arrays of structs aren't supported yet — the synthetic-
+    // variable model can't index into per-element struct layouts
+    // without additional codegen work. Make sure it errors
+    // cleanly with E0201 instead of producing a broken layout.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        struct Point { x: u8, y: u8 }
+        struct Cluster { points: Point[4] }
+        var c: Cluster
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for array-of-structs, got: {errors:?}"
     );
 }
 
