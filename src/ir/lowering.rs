@@ -640,9 +640,7 @@ impl LoweringContext {
                     // work could warn on it.
                     let base_x = self.lower_expr(&draw.x);
                     let base_y = self.lower_expr(&draw.y);
-                    for ((dx_off, dy_off), tile) in
-                        meta.dx.iter().zip(&meta.dy).zip(&meta.frame)
-                    {
+                    for ((dx_off, dy_off), tile) in meta.dx.iter().zip(&meta.dy).zip(&meta.frame) {
                         let off_x = self.fresh_temp();
                         self.emit(IrOp::LoadImm(off_x, *dx_off));
                         let x_sum = self.fresh_temp();

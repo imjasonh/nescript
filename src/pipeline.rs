@@ -158,7 +158,21 @@ pub fn compile_source(
         .map_err(|e| CompileError::AssetResolution(format!("music: {e}")))?;
     let palettes = assets::resolve_palettes(&program, source_dir)
         .map_err(|e| CompileError::AssetResolution(format!("palettes: {e}")))?;
-    let backgrounds = assets::resolve_backgrounds(&program, source_dir)
+    // Compute the first CHR tile index that backgrounds can claim.
+    // Sprite tile 0 is the runtime default smiley; the resolver
+    // packs user sprites in starting at tile 1, so the next free
+    // tile is whatever sits past the last sprite. We derive it
+    // from the resolved `SpriteData` rather than re-walking the
+    // AST to keep the two sides honest.
+    let next_sprite_tile = sprites
+        .iter()
+        .map(|s| {
+            let count = s.chr_bytes.len().div_ceil(16) as u16;
+            u16::from(s.tile_index) + count
+        })
+        .max()
+        .map_or(1u8, |max| max.min(255) as u8);
+    let backgrounds = assets::resolve_backgrounds(&program, source_dir, next_sprite_tile)
         .map_err(|e| CompileError::AssetResolution(format!("backgrounds: {e}")))?;
 
     // IR → 6502 codegen. We hold on to the codegen after

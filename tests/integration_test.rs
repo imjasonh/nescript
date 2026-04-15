@@ -1154,7 +1154,7 @@ fn compile_banked(source: &str) -> Vec<u8> {
     let music = assets::resolve_music(&program).expect("music resolution should succeed");
     let palettes = assets::resolve_palettes(&program, Path::new("."))
         .expect("palette resolution should succeed");
-    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."))
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."), 0)
         .expect("background resolution should succeed");
 
     let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
@@ -1932,7 +1932,7 @@ fn e2e_png_palette_source_compiles_and_splices_bytes_into_prg() {
     // relative PNG path lands on the fixture we just wrote.
     let palettes =
         assets::resolve_palettes(&program, &dir).expect("palette resolution should succeed");
-    let backgrounds = assets::resolve_backgrounds(&program, &dir).expect("bg ok");
+    let backgrounds = assets::resolve_backgrounds(&program, &dir, 0).expect("bg ok");
     assert_eq!(palettes.len(), 1);
     assert_eq!(palettes[0].name, "Main");
     // First two bytes should map via `nearest_nes_color` to black
@@ -2018,7 +2018,7 @@ fn compile_banked_with_opts(source: &str, optimize: bool) -> Vec<u8> {
     let music = assets::resolve_music(&program).expect("music resolution should succeed");
     let palettes = assets::resolve_palettes(&program, Path::new("."))
         .expect("palette resolution should succeed");
-    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."))
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."), 0)
         .expect("background resolution should succeed");
 
     let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
@@ -2261,7 +2261,7 @@ fn source_map_survives_aggressive_peephole_folding() {
     let sfx = assets::resolve_sfx(&program).unwrap();
     let music = assets::resolve_music(&program).unwrap();
     let palettes = assets::resolve_palettes(&program, Path::new(".")).unwrap();
-    let backgrounds = assets::resolve_backgrounds(&program, Path::new(".")).unwrap();
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."), 0).unwrap();
 
     let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
         .with_sprites(&sprites)
@@ -2402,7 +2402,7 @@ fn debug_build_emits_bounds_check_halt_routine() {
     let music = assets::resolve_music(&program).unwrap();
     let palettes = assets::resolve_palettes(&program, Path::new("."))
         .expect("palette resolution should succeed");
-    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."))
+    let backgrounds = assets::resolve_backgrounds(&program, Path::new("."), 0)
         .expect("background resolution should succeed");
 
     let mut cg_debug = IrCodeGen::new(&analysis.var_allocations, &ir_program)

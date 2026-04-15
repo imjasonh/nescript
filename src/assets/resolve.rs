@@ -29,11 +29,24 @@ impl PaletteData {
 /// (32 columns × 30 rows) and `attrs` is the 64-byte attribute
 /// table. Both are zero-padded up from the declared sizes so the
 /// runtime NMI helper can always push fixed-length data.
+///
+/// `chr_bytes` and `chr_base_tile` describe the per-background
+/// CHR data the resolver auto-generates from a `@nametable(...)`
+/// PNG source. `chr_bytes` is empty (and `chr_base_tile == 0`)
+/// for inline `tiles:` / `attributes:` declarations — those still
+/// reference whatever tiles the user supplied via separate
+/// sprite / `@chr(...)` declarations, so the linker doesn't
+/// touch the CHR ROM on their behalf. PNG-sourced backgrounds
+/// instead emit a flat 16-byte-per-tile blob keyed by
+/// `chr_base_tile`, which the linker copies into CHR ROM at
+/// `chr_base_tile * 16`.
 #[derive(Debug, Clone)]
 pub struct BackgroundData {
     pub name: String,
     pub tiles: [u8; 960],
     pub attrs: [u8; 64],
+    pub chr_bytes: Vec<u8>,
+    pub chr_base_tile: u8,
 }
 
 impl BackgroundData {
@@ -155,22 +168,42 @@ pub fn resolve_palettes(program: &Program, source_dir: &Path) -> Result<Vec<Pale
 ///
 /// When a declaration uses the PNG shortcut form
 /// (`@nametable("file.png")`), the image is decoded via
-/// [`crate::assets::png_to_nametable`] into a 960-byte tile index
-/// table + 64-byte attribute table. The CHR data itself is **not**
-/// generated automatically — callers are expected to provide matching
-/// CHR via a sprite / `@chr(...)` declaration in the same order the
-/// deduplicator walks the PNG (row-major unique-first). This
-/// limitation is tracked in `docs/future-work.md`.
+/// [`crate::assets::png_to_nametable_with_chr`] into a 960-byte
+/// tile index table + 64-byte attribute table + the CHR data for
+/// the unique tiles. The auto-generated CHR is offset by
+/// `next_sprite_tile` so it sits immediately after the user's
+/// sprite tile range — the linker copies it into CHR ROM via
+/// `BackgroundData::chr_bytes` and `chr_base_tile`. Inline
+/// `tiles:` / `attributes:` declarations leave `chr_bytes`
+/// empty; those still rely on the user supplying tiles via
+/// separate sprite declarations.
 pub fn resolve_backgrounds(
     program: &Program,
     source_dir: &Path,
+    next_sprite_tile: u8,
 ) -> Result<Vec<BackgroundData>, String> {
     let mut out = Vec::with_capacity(program.backgrounds.len());
+    let mut next_tile = next_sprite_tile;
     for b in &program.backgrounds {
-        let (tiles, attrs) = if let Some(png_path) = &b.png_source {
+        if let Some(png_path) = &b.png_source {
             let full_path = source_dir.join(png_path);
-            crate::assets::png_to_nametable(&full_path)
-                .map_err(|e| format!("background '{}' PNG source: {e}", b.name))?
+            let nt = crate::assets::png_to_nametable_with_chr(&full_path, next_tile)
+                .map_err(|e| format!("background '{}' PNG source: {e}", b.name))?;
+            // Each unique tile is exactly 16 bytes of CHR data;
+            // `next_tile` advances past the new range so a second
+            // PNG-sourced background lands its tiles after the
+            // first one's.
+            #[allow(clippy::cast_possible_truncation)]
+            let tile_count: u8 = (nt.chr_bytes.len() / 16) as u8;
+            let chr_base_tile = next_tile;
+            next_tile = next_tile.saturating_add(tile_count);
+            out.push(BackgroundData {
+                name: b.name.clone(),
+                tiles: nt.tiles,
+                attrs: nt.attrs,
+                chr_bytes: nt.chr_bytes,
+                chr_base_tile,
+            });
         } else {
             let mut tiles = [0u8; 960];
             for (i, t) in b.tiles.iter().enumerate().take(960) {
@@ -180,13 +213,14 @@ pub fn resolve_backgrounds(
             for (i, a) in b.attributes.iter().enumerate().take(64) {
                 attrs[i] = *a;
             }
-            (tiles, attrs)
-        };
-        out.push(BackgroundData {
-            name: b.name.clone(),
-            tiles,
-            attrs,
-        });
+            out.push(BackgroundData {
+                name: b.name.clone(),
+                tiles,
+                attrs,
+                chr_bytes: Vec::new(),
+                chr_base_tile: 0,
+            });
+        }
     }
     Ok(out)
 }
@@ -402,7 +436,7 @@ mod tests {
             png_source: None,
             span: Span::dummy(),
         });
-        let resolved = resolve_backgrounds(&program, Path::new(".")).unwrap();
+        let resolved = resolve_backgrounds(&program, Path::new("."), 0).unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "Stage");
         assert_eq!(resolved[0].tiles.len(), 960);
@@ -444,7 +478,7 @@ mod tests {
             png_source: Some(png_path.file_name().unwrap().to_string_lossy().to_string()),
             span: Span::dummy(),
         });
-        let resolved = resolve_backgrounds(&program, &dir).unwrap();
+        let resolved = resolve_backgrounds(&program, &dir, 0).unwrap();
         let _ = std::fs::remove_file(&png_path);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].tiles.len(), 960);
@@ -481,7 +515,7 @@ mod tests {
             png_source: Some(png_path.file_name().unwrap().to_string_lossy().to_string()),
             span: Span::dummy(),
         });
-        let err = resolve_backgrounds(&program, &dir).unwrap_err();
+        let err = resolve_backgrounds(&program, &dir, 0).unwrap_err();
         let _ = std::fs::remove_file(&png_path);
         assert!(
             err.contains("background 'Oops' PNG source"),

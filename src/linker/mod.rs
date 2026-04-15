@@ -679,8 +679,14 @@ impl Linker {
             builder.set_prg_banks(banks);
         }
 
-        // CHR ROM: tile 0 is reserved for the default smiley, followed by
-        // any user-declared sprites placed at their assigned tile indices.
+        // CHR ROM: tile 0 is reserved for the default smiley,
+        // followed by any user-declared sprites placed at their
+        // assigned tile indices, followed by any auto-generated
+        // background CHR data at `chr_base_tile * 16`. Each
+        // background's `chr_bytes` was sized by the resolver
+        // against the sprite range so no two contiguous tile
+        // ranges overlap, but we still bounds-check on copy in
+        // case a future change shifts the layout.
         let mut chr = vec![0u8; 8192];
         chr[..16].copy_from_slice(&DEFAULT_SPRITE_CHR);
         for sprite in sprites {
@@ -688,6 +694,16 @@ impl Linker {
             let end = offset + sprite.chr_bytes.len();
             if end <= chr.len() {
                 chr[offset..end].copy_from_slice(&sprite.chr_bytes);
+            }
+        }
+        for bg in backgrounds {
+            if bg.chr_bytes.is_empty() {
+                continue;
+            }
+            let offset = bg.chr_base_tile as usize * 16;
+            let end = offset + bg.chr_bytes.len();
+            if end <= chr.len() {
+                chr[offset..end].copy_from_slice(&bg.chr_bytes);
             }
         }
         builder.set_chr(chr);
