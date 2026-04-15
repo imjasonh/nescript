@@ -3,10 +3,6 @@
 // `phase` cycles through the P_* constants defined in
 // war/constants.ne. `phase_timer` counts frames inside the
 // current phase and is reset to 0 whenever the phase changes.
-//
-// All function-local var names are prefixed with the function's
-// short name (or with `pf_` for "play frame") so the global
-// symbol table stays collision-free.
 
 // Set the current phase and zero the timer in one shot. Inlined
 // so each call site is just two stores.
@@ -30,57 +26,46 @@ fun draw_table() {
 }
 
 // Bury helper for a war: move one card from the deck into the
-// pot (face-down). Must be called with a non-empty deck. Two
-// near-identical helpers (one per side) keep the locals
-// uniquely-named.
+// pot (face-down). Must be called with a non-empty deck.
 fun bury_from_a() {
-    var bfa_c: u8 = draw_front_a()
-    push_back_pot(bfa_c)
+    var c: u8 = draw_front_a()
+    push_back_pot(c)
 }
 fun bury_from_b() {
-    var bfb_c: u8 = draw_front_b()
-    push_back_pot(bfb_c)
+    var c: u8 = draw_front_b()
+    push_back_pot(c)
 }
 
-// Draw the BIG WAR banner — three 16x16 metasprites at the
-// centre of the screen. 12 sprites total, drawn in the centre
-// row so they don't conflict with the deck stacks (rows 64-87)
-// or the face-up cards (rows 128-151).
-//
-// All offsets stepped through locals to dodge the `x + N`
-// parameter aliasing bug; see draw_word_player.
+// Draw the BIG WAR banner — three 16×16 metasprite letters at
+// the centre of the screen. 12 sprites total, drawn in the
+// centre row so they don't conflict with the deck stacks (rows
+// 64-87) or the face-up cards (rows 128-151).
 fun draw_big_war_banner(x: u8, y: u8) {
-    var bwb_y1: u8 = y + 8
-    var bwb_x1: u8 = x + 8
-    var bwb_x2: u8 = x + 20
-    var bwb_x3: u8 = x + 28
-    var bwb_x4: u8 = x + 40
-    var bwb_x5: u8 = x + 48
     // BIG W
-    draw Tileset at: (x,      y)      frame: TILE_BIG_W_TL
-    draw Tileset at: (bwb_x1, y)      frame: TILE_BIG_W_TR
-    draw Tileset at: (x,      bwb_y1) frame: TILE_BIG_W_BL
-    draw Tileset at: (bwb_x1, bwb_y1) frame: TILE_BIG_W_BR
+    draw Tileset at: (x,      y)     frame: TILE_BIG_W_TL
+    draw Tileset at: (x + 8,  y)     frame: TILE_BIG_W_TR
+    draw Tileset at: (x,      y + 8) frame: TILE_BIG_W_BL
+    draw Tileset at: (x + 8,  y + 8) frame: TILE_BIG_W_BR
     // BIG A
-    draw Tileset at: (bwb_x2, y)      frame: TILE_BIG_A_TL
-    draw Tileset at: (bwb_x3, y)      frame: TILE_BIG_A_TR
-    draw Tileset at: (bwb_x2, bwb_y1) frame: TILE_BIG_A_BL
-    draw Tileset at: (bwb_x3, bwb_y1) frame: TILE_BIG_A_BR
+    draw Tileset at: (x + 20, y)     frame: TILE_BIG_A_TL
+    draw Tileset at: (x + 28, y)     frame: TILE_BIG_A_TR
+    draw Tileset at: (x + 20, y + 8) frame: TILE_BIG_A_BL
+    draw Tileset at: (x + 28, y + 8) frame: TILE_BIG_A_BR
     // BIG R
-    draw Tileset at: (bwb_x4, y)      frame: TILE_BIG_R_TL
-    draw Tileset at: (bwb_x5, y)      frame: TILE_BIG_R_TR
-    draw Tileset at: (bwb_x4, bwb_y1) frame: TILE_BIG_R_BL
-    draw Tileset at: (bwb_x5, bwb_y1) frame: TILE_BIG_R_BR
+    draw Tileset at: (x + 40, y)     frame: TILE_BIG_R_TL
+    draw Tileset at: (x + 48, y)     frame: TILE_BIG_R_TR
+    draw Tileset at: (x + 40, y + 8) frame: TILE_BIG_R_BL
+    draw Tileset at: (x + 48, y + 8) frame: TILE_BIG_R_BR
 }
 
 // Begin the A-side draw animation: pull the top card off deck_a,
 // stash it as the face-up `card_a`, arm the fly state for the
 // deck → play slide, and play the click sfx.
 //
-// fly_card / fly_face_up are stuffed directly into globals
-// instead of being passed to arm_fly, because arm_fly only takes
-// 4 params (the v0.1 ABI limit) and silently drops anything past
-// the fourth.
+// fly_card / fly_face_up are written directly to globals
+// instead of being passed to arm_fly, because arm_fly already
+// takes 4 parameters and the v0.1 ABI caps function signatures
+// at 4 parameters (E0506).
 fun begin_draw_a() {
     if deck_a_count > 0 {
         card_a = draw_front_a()
@@ -189,16 +174,16 @@ state Playing {
                 // Both cards go into the pot regardless of outcome.
                 push_back_pot(card_a)
                 push_back_pot(card_b)
-                pf_result = compare_cards(card_a, card_b)
-                if pf_result == 1 {
+                var result: u8 = compare_cards(card_a, card_b)
+                if result == 1 {
                     play CheerA
                     set_phase(P_WIN_A)
                 }
-                if pf_result == 2 {
+                if result == 2 {
                     play CheerB
                     set_phase(P_WIN_B)
                 }
-                if pf_result == 0 {
+                if result == 0 {
                     // It's a tie — but only enter the war flow if both
                     // sides actually have cards left to bury. If a
                     // player ran out of cards on this very tie, the

@@ -34,17 +34,21 @@ state Victory {
         // deck is empty (shouldn't happen — we only arrive
         // here because the *loser* is empty) fall back to a
         // card back so the layout is stable.
+        // Pull the winner's top card into a single local. Only
+        // one `var top` declaration per on-frame body — NEScript
+        // scopes locals per function body, not per if-block.
+        var top: u8 = 0
         if winner == 0 {
             if deck_a_count > 0 {
-                var vic_top_a: u8 = deck_a[deck_a_front]
-                draw_card_face(120, 128, vic_top_a)
+                top = deck_a[deck_a_front]
+                draw_card_face(120, 128, top)
             } else {
                 draw_card_back(120, 128)
             }
         } else {
             if deck_b_count > 0 {
-                var vic_top_b: u8 = deck_b[deck_b_front]
-                draw_card_face(120, 128, vic_top_b)
+                top = deck_b[deck_b_front]
+                draw_card_face(120, 128, top)
             } else {
                 draw_card_back(120, 128)
             }

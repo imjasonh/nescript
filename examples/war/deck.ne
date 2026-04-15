@@ -6,12 +6,6 @@
 // the buffer. Everything wraps mod 52 — since 52 isn't a power
 // of two, we use `if idx >= 52 { idx -= 52 }` instead of `%` to
 // avoid the expensive software mod routine.
-//
-// NEScript v0.1 has a flat global symbol table for every `var`
-// declaration (function-locals included), so each function's
-// locals are prefixed with the function's short name to avoid
-// E0501 collisions across the program. Function parameters ARE
-// scoped per-function, so we can keep their names short.
 
 // ── Helpers shared by every deck ──────────────────────────
 //
@@ -19,19 +13,11 @@
 // needed inside push_back because `front` and `count` are both
 // ≤ 51 by construction, so the sum is at most 102 and one
 // subtraction is enough.
-//
-// Every parameter name in this file is unique across the entire
-// program. NEScript v0.1's IR lowering uses a single global
-// var_map for parameter names, so two functions both named
-// `wrap52(v: u8)` and `another(v: u8)` end up sharing a VarId
-// and the codegen routes their parameter reads to whichever
-// zero-page slot the LAST function to be lowered claimed. See
-// COMPILER_BUGS.md §1b for the gory details.
-inline fun wrap52(w52_v: u8) -> u8 {
-    if w52_v >= DECK_SIZE {
-        return w52_v - DECK_SIZE
+inline fun wrap52(v: u8) -> u8 {
+    if v >= DECK_SIZE {
+        return v - DECK_SIZE
     }
-    return w52_v
+    return v
 }
 
 // ── deck_a ────────────────────────────────────────────────
@@ -44,20 +30,15 @@ fun deck_a_empty() -> u8 {
 }
 
 fun draw_front_a() -> u8 {
-    var dfa_card: u8 = deck_a[deck_a_front]
+    var card: u8 = deck_a[deck_a_front]
     deck_a_front = wrap52(deck_a_front + 1)
     deck_a_count -= 1
-    return dfa_card
+    return card
 }
 
-fun push_back_a(pba_in: u8) {
-    // Snapshot `pba_in` into a local before calling wrap52,
-    // because NEScript v0.1's parameter-passing ABI uses fixed
-    // zero-page slots — wrap52's first param shares slot $04
-    // with our `pba_in` and would silently clobber it.
-    var pba_card: u8 = pba_in
-    var pba_slot: u8 = wrap52(deck_a_front + deck_a_count)
-    deck_a[pba_slot] = pba_card
+fun push_back_a(card: u8) {
+    var slot: u8 = wrap52(deck_a_front + deck_a_count)
+    deck_a[slot] = card
     deck_a_count += 1
 }
 
@@ -71,23 +52,22 @@ fun deck_b_empty() -> u8 {
 }
 
 fun draw_front_b() -> u8 {
-    var dfb_card: u8 = deck_b[deck_b_front]
+    var card: u8 = deck_b[deck_b_front]
     deck_b_front = wrap52(deck_b_front + 1)
     deck_b_count -= 1
-    return dfb_card
+    return card
 }
 
-fun push_back_b(pbb_in: u8) {
-    var pbb_card: u8 = pbb_in
-    var pbb_slot: u8 = wrap52(deck_b_front + deck_b_count)
-    deck_b[pbb_slot] = pbb_card
+fun push_back_b(card: u8) {
+    var slot: u8 = wrap52(deck_b_front + deck_b_count)
+    deck_b[slot] = card
     deck_b_count += 1
 }
 
 // ── pot ───────────────────────────────────────────────────
 
-fun push_back_pot(pbp_in: u8) {
-    pot[pot_count] = pbp_in
+fun push_back_pot(card: u8) {
+    pot[pot_count] = card
     pot_count += 1
 }
 
@@ -98,19 +78,19 @@ fun clear_pot() {
 // Transfer every card currently in the pot into deck_a, in FIFO
 // order (so the face-up and face-down cards layer naturally).
 fun pot_to_a() {
-    var pta_i: u8 = 0
-    while pta_i < pot_count {
-        push_back_a(pot[pta_i])
-        pta_i += 1
+    var i: u8 = 0
+    while i < pot_count {
+        push_back_a(pot[i])
+        i += 1
     }
     pot_count = 0
 }
 
 fun pot_to_b() {
-    var ptb_i: u8 = 0
-    while ptb_i < pot_count {
-        push_back_b(pot[ptb_i])
-        ptb_i += 1
+    var i: u8 = 0
+    while i < pot_count {
+        push_back_b(pot[i])
+        i += 1
     }
     pot_count = 0
 }
@@ -125,43 +105,42 @@ fun pot_to_b() {
 // half, and reset both queues' cursors.
 //
 // The random-swap shuffle is a bounded alternative to
-// Fisher-Yates: it does N swaps between two random indices, where
-// each index is rand() & 0x3F (0..63) and the swap is only done
-// when both indices are < 52. 200 iterations on a 52-card deck is
-// empirically well-mixed and uses only bitwise ops (no multiply,
-// no divide, no W0101 warning).
+// Fisher-Yates: it does 200 swaps between two random indices,
+// where each index is rand() & 0x3F (0..63) and the swap is
+// only done when both indices are < 52. Uses only bitwise ops
+// (no multiply, no divide).
 
 fun build_master_deck() {
-    var bmd_r: u8 = 1
-    var bmd_i: u8 = 0
-    while bmd_r <= RANK_KING {
-        var bmd_s: u8 = 0
-        while bmd_s < 4 {
+    var r: u8 = 1
+    var i: u8 = 0
+    while r <= RANK_KING {
+        var s: u8 = 0
+        while s < 4 {
             // Pack rank into the high nibble, suit into the low.
             // rank fits in 4 bits (max 13) and suit fits in 2
             // bits, so the shift-and-or is exact.
-            var bmd_shifted: u8 = bmd_r << 4
-            deck_a[bmd_i] = bmd_shifted | bmd_s
-            bmd_i += 1
-            bmd_s += 1
+            var packed: u8 = r << 4
+            deck_a[i] = packed | s
+            i += 1
+            s += 1
         }
-        bmd_r += 1
+        r += 1
     }
 }
 
 fun shuffle_deck_a() {
-    var shf_k: u8 = 0
-    while shf_k < 200 {
-        var shf_i: u8 = rand_u8() & 0x3F
-        var shf_j: u8 = rand_u8() & 0x3F
-        if shf_i < DECK_SIZE {
-            if shf_j < DECK_SIZE {
-                var shf_tmp: u8 = deck_a[shf_i]
-                deck_a[shf_i] = deck_a[shf_j]
-                deck_a[shf_j] = shf_tmp
+    var k: u8 = 0
+    while k < 200 {
+        var i: u8 = rand_u8() & 0x3F
+        var j: u8 = rand_u8() & 0x3F
+        if i < DECK_SIZE {
+            if j < DECK_SIZE {
+                var tmp: u8 = deck_a[i]
+                deck_a[i] = deck_a[j]
+                deck_a[j] = tmp
             }
         }
-        shf_k += 1
+        k += 1
     }
 }
 
@@ -169,10 +148,10 @@ fun shuffle_deck_a() {
 // first 26 stay in deck_a, the second 26 move into deck_b.
 // Reset both queues' front/count cursors in the process.
 fun split_decks() {
-    var spd_i: u8 = 0
-    while spd_i < HALF_DECK {
-        deck_b[spd_i] = deck_a[HALF_DECK + spd_i]
-        spd_i += 1
+    var i: u8 = 0
+    while i < HALF_DECK {
+        deck_b[i] = deck_a[HALF_DECK + i]
+        i += 1
     }
     deck_a_front = 0
     deck_a_count = HALF_DECK

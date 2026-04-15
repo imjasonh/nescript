@@ -210,13 +210,27 @@ impl<'a> IrCodeGen<'a> {
                 var_sizes.insert(global.var_id, alloc.size);
             }
         }
-        // Map each function's parameter VarIds to the zero-page
-        // parameter-passing slots $04-$07 (up to 4 params). Map the
-        // rest of each function's locals into main RAM starting at
-        // `$0300` (after the OAM buffer). Locals don't overlap with
-        // globals (which were placed by the analyzer) and are
-        // disjoint across functions so nested calls don't corrupt
-        // each other.
+        // Map every function-local — parameters AND body-declared
+        // vars — into a dedicated RAM slot at `$0300+`. Parameters
+        // are still passed via the zero-page transport slots
+        // `$04-$07` as the calling convention, but `gen_function`
+        // emits a prologue at function entry that copies those
+        // transport slots into these per-function RAM slots. That
+        // way, when a function makes a nested call, the nested
+        // call clobbers `$04-$07` (writing its own arguments into
+        // them) without disturbing the caller's saved parameters.
+        //
+        // Before this change, parameters lived in `$04-$07` for the
+        // duration of the function body, so any call nested inside
+        // a function's body silently corrupted the caller's
+        // parameters — see COMPILER_BUGS.md §2. The per-function
+        // RAM slots + prologue spill fix that class of bug at the
+        // cost of 4 LDA/STA pairs per function entry.
+        //
+        // Locals are laid out linearly across every function:
+        // NEScript forbids recursion (E0402) and enforces a
+        // bounded call depth (E0401), so lifetime overlap between
+        // functions is fine and we don't need to pack them.
         let mut local_ram_next: u16 = 0x0300;
         // Advance past any RAM global so locals don't clobber them.
         // Each global occupies `[address, address + size)` — for an
@@ -236,17 +250,10 @@ impl<'a> IrCodeGen<'a> {
             local_ram_next = max_ram_global_end;
         }
         for func in &ir.functions {
-            for (i, local) in func.locals.iter().enumerate() {
-                if i < func.param_count {
-                    if i < 4 {
-                        var_addrs.insert(local.var_id, 0x04 + i as u16);
-                        var_sizes.insert(local.var_id, local.size);
-                    }
-                } else {
-                    var_addrs.insert(local.var_id, local_ram_next);
-                    var_sizes.insert(local.var_id, local.size);
-                    local_ram_next += local.size.max(1);
-                }
+            for local in &func.locals {
+                var_addrs.insert(local.var_id, local_ram_next);
+                var_sizes.insert(local.var_id, local.size);
+                local_ram_next += local.size.max(1);
             }
         }
         let function_names = ir.functions.iter().map(|f| f.name.clone()).collect();
@@ -813,6 +820,36 @@ impl<'a> IrCodeGen<'a> {
         self.in_frame_handler = func.name.ends_with("_frame");
 
         self.emit_label(&format!("__ir_fn_{}", func.name));
+
+        // Prologue: spill the parameter-transport slots $04-$07
+        // into the function's per-local RAM slots. The caller
+        // stages arguments into $04-$07 before the JSR; this
+        // copy makes sure that when the function body later
+        // makes a nested call (which clobbers $04-$07 again to
+        // pass its own arguments), the caller's parameters are
+        // still available in their dedicated RAM slots.
+        //
+        // Parameters are the first `param_count` entries of
+        // `func.locals`. The analyzer refuses functions with
+        // more than 4 parameters (E0506), so the `.take(4)`
+        // below is a defensive guard — it should never be hit
+        // in a well-formed program.
+        for (i, local) in func
+            .locals
+            .iter()
+            .take(func.param_count)
+            .take(4)
+            .enumerate()
+        {
+            if let Some(&addr) = self.var_addrs.get(&local.var_id) {
+                self.emit(LDA, AM::ZeroPage(0x04 + i as u8));
+                if addr < 0x100 {
+                    self.emit(STA, AM::ZeroPage(addr as u8));
+                } else {
+                    self.emit(STA, AM::Absolute(addr));
+                }
+            }
+        }
 
         // At the start of a frame handler that actually draws
         // sprites, clear the OAM shadow buffer so stale sprites from
@@ -3597,4 +3634,74 @@ mod more_tests {
             "every emitted __src_ label should have a matching source_locs entry"
         );
     }
+}
+
+#[test]
+fn gen_function_prologue_spills_params_to_local_ram() {
+    // Regression test for COMPILER_BUGS.md §2: without the
+    // param-spill prologue, a function's parameters live only
+    // in the transport slots $04-$07. The first nested call
+    // inside the body would overwrite those slots with its
+    // own arguments, silently corrupting the caller's params.
+    //
+    // Compile a function that takes `x: u8`, calls `helper(x)`,
+    // then uses `x` again. Verify the callee reads `x` from a
+    // RAM slot (absolute addressing at $0300+) rather than
+    // directly from `$04`.
+    use crate::parser;
+    let src = r#"
+        game "Test" { mapper: NROM }
+        var out: u8 = 0
+        fun helper(a: u8) -> u8 { return a }
+        fun caller(x: u8) -> u8 {
+            var tmp: u8 = helper(x)
+            return tmp + x
+        }
+        on frame { out = caller(42) }
+        start Main
+    "#;
+    let (prog, _) = parser::parse(src);
+    let prog = prog.unwrap();
+    let analysis = crate::analyzer::analyze(&prog);
+    assert!(
+        analysis.diagnostics.iter().all(|d| !d.is_error()),
+        "unexpected analysis errors: {:?}",
+        analysis.diagnostics
+    );
+    let ir = crate::ir::lower(&prog, &analysis);
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir);
+    let insts = codegen.generate(&ir);
+
+    // Find the __ir_fn_caller label. Immediately after it, look
+    // for the spill pattern: `LDA $04 / STA <absolute $0300+>`.
+    let caller_idx = insts
+        .iter()
+        .position(|i| i.mode == AM::Label("__ir_fn_caller".into()))
+        .expect("caller function should be emitted");
+    let mut saw_lda_zp4 = false;
+    let mut saw_sta_abs = false;
+    for inst in &insts[caller_idx + 1..] {
+        if let AM::Label(l) = &inst.mode {
+            if l.starts_with("__ir_fn_") && l != "__ir_fn_caller" {
+                break;
+            }
+        }
+        if inst.opcode == LDA && inst.mode == AM::ZeroPage(0x04) {
+            saw_lda_zp4 = true;
+        }
+        if saw_lda_zp4 && inst.opcode == STA {
+            if let AM::Absolute(a) = inst.mode {
+                if a >= 0x0300 {
+                    saw_sta_abs = true;
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        saw_lda_zp4 && saw_sta_abs,
+        "caller function should open with `LDA $04 / STA <absolute>` \
+         as the param-spill prologue — the fix for COMPILER_BUGS.md §2 \
+         is not in effect"
+    );
 }

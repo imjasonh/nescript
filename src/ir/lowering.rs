@@ -26,6 +26,14 @@ struct LoweringContext {
     /// symbol table). Used to decide between 8-bit and 16-bit IR
     /// ops for identifier reads/writes and binary operations.
     var_types: HashMap<String, NesType>,
+    /// Current local scope prefix — mirrors the analyzer's field
+    /// of the same name. While lowering a function or handler
+    /// body this is `Some("<func_name>")` (or `Some("State__frame")`,
+    /// etc), and `get_or_create_var` prepends
+    /// `"__local__{prefix}__"` to any bare identifier lookup so
+    /// function-local vars resolve to the scoped entry the
+    /// analyzer registered for them. `None` outside of any body.
+    current_scope_prefix: Option<String>,
     next_var_id: u32,
     next_temp: u32,
     next_block: u32,
@@ -98,6 +106,7 @@ impl LoweringContext {
             var_map,
             const_values: HashMap::new(),
             var_types,
+            current_scope_prefix: None,
             next_var_id,
             next_temp: 0,
             next_block: 0,
@@ -113,13 +122,6 @@ impl LoweringContext {
         }
     }
 
-    /// Register a function parameter's type in the `var_types` map
-    /// so that identifier reads inside the function body know
-    /// whether to load as a byte or a word.
-    fn register_param_type(&mut self, name: &str, ty: &NesType) {
-        self.var_types.insert(name.to_string(), ty.clone());
-    }
-
     fn fresh_temp(&mut self) -> IrTemp {
         let t = IrTemp(self.next_temp);
         self.next_temp += 1;
@@ -131,15 +133,30 @@ impl LoweringContext {
         format!("{prefix}_{}", self.next_block)
     }
 
-    fn get_or_create_var(&mut self, name: &str) -> VarId {
-        if let Some(&id) = self.var_map.get(name) {
-            id
-        } else {
-            let id = VarId(self.next_var_id);
-            self.next_var_id += 1;
-            self.var_map.insert(name.to_string(), id);
-            id
+    /// Resolve a user-written identifier to the scoped key used by
+    /// the symbol table. Mirrors `Analyzer::resolve_key`: tries the
+    /// current function/handler's qualified key first, falls back
+    /// to the bare key for globals / consts / enum variants /
+    /// state-level vars / function names.
+    fn scoped_key(&self, name: &str) -> String {
+        if let Some(prefix) = &self.current_scope_prefix {
+            let qualified = format!("__local__{prefix}__{name}");
+            if self.var_map.contains_key(&qualified) || self.var_types.contains_key(&qualified) {
+                return qualified;
+            }
         }
+        name.to_string()
+    }
+
+    fn get_or_create_var(&mut self, name: &str) -> VarId {
+        let key = self.scoped_key(name);
+        if let Some(&id) = self.var_map.get(&key) {
+            return id;
+        }
+        let id = VarId(self.next_var_id);
+        self.next_var_id += 1;
+        self.var_map.insert(key, id);
+        id
     }
 
     /// Recursively expand a struct-literal global initializer into
@@ -408,8 +425,15 @@ impl LoweringContext {
         self.wide_hi.clear();
         self.current_blocks = Vec::new();
         self.current_locals = Vec::new();
+        // Enter the function's local scope so all bare identifier
+        // lookups inside the body resolve against the analyzer's
+        // `__local__{function_name}__{name}` entries.
+        self.current_scope_prefix = Some(fun.name.clone());
 
-        // Register parameters as locals
+        // Register parameters as locals. They're looked up via
+        // their bare name (which `get_or_create_var` now qualifies
+        // via `scoped_key`), so two different functions can each
+        // have a parameter named `x` without the VarIds colliding.
         for param in &fun.params {
             let var_id = self.get_or_create_var(&param.name);
             self.current_locals.push(IrLocal {
@@ -417,7 +441,10 @@ impl LoweringContext {
                 name: param.name.clone(),
                 size: type_size(&param.param_type),
             });
-            self.register_param_type(&param.name, &param.param_type);
+            // Register the param type under the scoped key so
+            // `lower_expr` can decide 8-bit vs 16-bit loads.
+            let key = format!("__local__{}__{}", fun.name, param.name);
+            self.var_types.insert(key, param.param_type.clone());
         }
 
         let entry = self.fresh_label(&format!("fn_{}_entry", fun.name));
@@ -443,21 +470,40 @@ impl LoweringContext {
             bank: fun.bank.clone(),
             source_span: fun.span,
         });
+        self.current_scope_prefix = None;
     }
 
     fn lower_state(&mut self, state: &StateDecl, _is_start: bool) {
-        // Lower each event handler as a separate function
+        // Lower each event handler as a separate function. Each
+        // handler uses a distinct scope prefix so a `var i` in
+        // `Title::on frame` and one in `Playing::on frame` get
+        // different VarIds.
 
         if let Some(on_enter) = &state.on_enter {
-            self.lower_handler(&format!("{}_enter", state.name), on_enter, state);
+            self.lower_handler(
+                &format!("{}_enter", state.name),
+                &format!("{}__enter", state.name),
+                on_enter,
+                state,
+            );
         }
 
         if let Some(on_exit) = &state.on_exit {
-            self.lower_handler(&format!("{}_exit", state.name), on_exit, state);
+            self.lower_handler(
+                &format!("{}_exit", state.name),
+                &format!("{}__exit", state.name),
+                on_exit,
+                state,
+            );
         }
 
         if let Some(on_frame) = &state.on_frame {
-            self.lower_handler(&format!("{}_frame", state.name), on_frame, state);
+            self.lower_handler(
+                &format!("{}_frame", state.name),
+                &format!("{}__frame", state.name),
+                on_frame,
+                state,
+            );
         }
 
         // Lower each scanline handler as a function named
@@ -465,11 +511,12 @@ impl LoweringContext {
         // IRQ dispatch wrapper separately.
         for (line, block) in &state.on_scanline {
             let name = format!("{}_scanline_{line}", state.name);
-            self.lower_handler(&name, block, state);
+            let scope = format!("{}__scanline_{line}", state.name);
+            self.lower_handler(&name, &scope, block, state);
         }
     }
 
-    fn lower_handler(&mut self, name: &str, block: &Block, state: &StateDecl) {
+    fn lower_handler(&mut self, name: &str, scope_prefix: &str, block: &Block, state: &StateDecl) {
         self.next_temp = 0;
         // Same per-function reset as `lower_function`. See the
         // commentary there and COMPILER_BUGS.md §6 for why this is
@@ -478,6 +525,7 @@ impl LoweringContext {
         // catastrophically wrong 16-bit IR ops.
         self.wide_hi.clear();
         self.current_blocks = Vec::new();
+        self.current_scope_prefix = Some(scope_prefix.to_string());
         // Seed `current_locals` with the state's declared locals so any
         // `VarDecl` inside the handler body — tracked by
         // `lower_statement` via `current_locals` — is appended alongside
@@ -488,6 +536,13 @@ impl LoweringContext {
         // addresses) would never see them. The result would be a
         // silent `LoadVar`/`StoreVar` emit-nothing bug that leaves the
         // temp slots uninitialized at runtime.
+        //
+        // State-level locals (declared at `state Foo { var i: u8 }`
+        // outside any handler) live in the GLOBAL scope so every
+        // handler in the state can read/write them across frames.
+        // `get_or_create_var` would try the scoped key first —
+        // which isn't registered for state-locals — then fall back
+        // to the bare key, which IS registered.
         self.current_locals = Vec::new();
         for var in &state.locals {
             let var_id = self.get_or_create_var(&var.name);
@@ -516,6 +571,7 @@ impl LoweringContext {
             bank: None,
             source_span: state.span,
         });
+        self.current_scope_prefix = None;
     }
 
     fn lower_block(&mut self, block: &Block) {

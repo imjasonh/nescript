@@ -6,10 +6,6 @@
 // a 16×24 card face burns 6 sprite slots, a single-character
 // letter burns 1, and so on. The caller is responsible for
 // sprite budgeting — see PLAN.md §3.
-//
-// Function-local var names are prefixed with the function's
-// short name to avoid the global symbol-table collisions that
-// E0501 would otherwise complain about.
 
 // ── Card face ──────────────────────────────────────────────
 //
@@ -22,69 +18,46 @@
 //
 // Every tile in the card has a fully-opaque white background
 // (palette index 2) so the felt green behind the card does not
-// bleed through — see `assets.ne` for the art itself. The big
-// centre pip is a single 16×16 shape split across the bottom
-// two rows (4 tiles total); `rank` sits in the top-left corner
-// and `small_suit` in the top-right.
-fun draw_card_face(dcf_in_x: u8, dcf_in_y: u8, dcf_in_card: u8) {
-    // Snapshot every parameter into a fresh local *before* any
-    // nested function call. NEScript v0.1 passes parameters via
-    // fixed zero-page slots ($04, $05, $06), and any inner call
-    // overwrites those slots with its own parameter values —
-    // including the inline `card_rank` / `card_suit` calls below,
-    // which would otherwise leave `x` and `y` corrupted by the
-    // time the draw lines run.
-    var dcf_x:    u8 = dcf_in_x
-    var dcf_y:    u8 = dcf_in_y
-    var dcf_card: u8 = dcf_in_card
-    var dcf_rank: u8 = card_rank(dcf_card)
-    var dcf_suit: u8 = card_suit(dcf_card)
-    var dcf_rank_tile:  u8 = TILE_RANK_BASE + dcf_rank - 1
-    var dcf_small_tile: u8 = TILE_SUIT_SMALL_BASE + dcf_suit
-    var dcf_pip_tl:     u8 = TILE_PIP_TL_BASE + dcf_suit
-    var dcf_pip_tr:     u8 = TILE_PIP_TR_BASE + dcf_suit
-    var dcf_pip_bl:     u8 = TILE_PIP_BL_BASE + dcf_suit
-    var dcf_pip_br:     u8 = TILE_PIP_BR_BASE + dcf_suit
-    var dcf_x1: u8 = dcf_x + 8
-    var dcf_y1: u8 = dcf_y + 8
-    var dcf_y2: u8 = dcf_y + 16
+// bleed through — see `assets.ne` for the art itself.
+fun draw_card_face(x: u8, y: u8, card: u8) {
+    var rank: u8 = card_rank(card)
+    var suit: u8 = card_suit(card)
+    var rank_tile:  u8 = TILE_RANK_BASE + rank - 1
+    var small_tile: u8 = TILE_SUIT_SMALL_BASE + suit
+    var pip_tl:     u8 = TILE_PIP_TL_BASE + suit
+    var pip_tr:     u8 = TILE_PIP_TR_BASE + suit
+    var pip_bl:     u8 = TILE_PIP_BL_BASE + suit
+    var pip_br:     u8 = TILE_PIP_BR_BASE + suit
     // Row 0 — rank corner + small suit
-    draw Tileset at: (dcf_x,  dcf_y)  frame: dcf_rank_tile
-    draw Tileset at: (dcf_x1, dcf_y)  frame: dcf_small_tile
+    draw Tileset at: (x,     y)      frame: rank_tile
+    draw Tileset at: (x + 8, y)      frame: small_tile
     // Row 1 — top half of the 16×16 big pip
-    draw Tileset at: (dcf_x,  dcf_y1) frame: dcf_pip_tl
-    draw Tileset at: (dcf_x1, dcf_y1) frame: dcf_pip_tr
+    draw Tileset at: (x,     y + 8)  frame: pip_tl
+    draw Tileset at: (x + 8, y + 8)  frame: pip_tr
     // Row 2 — bottom half of the 16×16 big pip
-    draw Tileset at: (dcf_x,  dcf_y2) frame: dcf_pip_bl
-    draw Tileset at: (dcf_x1, dcf_y2) frame: dcf_pip_br
+    draw Tileset at: (x,     y + 16) frame: pip_bl
+    draw Tileset at: (x + 8, y + 16) frame: pip_br
 }
 
-// Draw the card-back lattice at (x, y). 6 sprites again. Rows
-// 0 and 2 reuse the same top/bottom back tiles; row 1 uses the
-// bottom row of the lattice as a filler so the pattern stays
-// continuous.
+// Draw the card-back checkerboard at (x, y). 6 sprites. The
+// back tiles tile seamlessly so every cell of the 16×24 card
+// body carries a 2-pixel square of the same black/white grid.
 fun draw_card_back(x: u8, y: u8) {
-    var dcb_x1: u8 = x + 8
-    var dcb_y1: u8 = y + 8
-    var dcb_y2: u8 = y + 16
-    draw Tileset at: (x,      y)      frame: TILE_BACK_TL
-    draw Tileset at: (dcb_x1, y)      frame: TILE_BACK_TR
-    draw Tileset at: (x,      dcb_y1) frame: TILE_BACK_BL
-    draw Tileset at: (dcb_x1, dcb_y1) frame: TILE_BACK_BR
-    draw Tileset at: (x,      dcb_y2) frame: TILE_BACK_TL
-    draw Tileset at: (dcb_x1, dcb_y2) frame: TILE_BACK_TR
+    draw Tileset at: (x,     y)      frame: TILE_BACK_TL
+    draw Tileset at: (x + 8, y)      frame: TILE_BACK_TR
+    draw Tileset at: (x,     y + 8)  frame: TILE_BACK_BL
+    draw Tileset at: (x + 8, y + 8)  frame: TILE_BACK_BR
+    draw Tileset at: (x,     y + 16) frame: TILE_BACK_TL
+    draw Tileset at: (x + 8, y + 16) frame: TILE_BACK_TR
 }
 
 // Dispatch between front and back based on the fly_face_up flag
-// stamped by the phase handlers. Snapshots params first because
-// the inner call clobbers $04/$05.
+// stamped by the phase handlers.
 fun draw_flying_card(x: u8, y: u8) {
-    var dfc_x: u8 = x
-    var dfc_y: u8 = y
     if fly_face_up == 0 {
-        draw_card_back(dfc_x, dfc_y)
+        draw_card_back(x, y)
     } else {
-        draw_card_face(dfc_x, dfc_y, fly_card)
+        draw_card_face(x, y, fly_card)
     }
 }
 
@@ -95,91 +68,62 @@ fun draw_digit(x: u8, y: u8, d: u8) {
     draw Tileset at: (x, y) frame: TILE_DIGIT_BASE + d
 }
 
-// Draw a two-digit decimal count (0..99) at (x, y). Leading zero
-// is preserved so the HUD always renders two glyphs wide, which
-// keeps the layout stable as the counts change.
+// Draw a two-digit decimal count (0..99) at (x, y). Leading
+// zero is preserved so the HUD always renders two glyphs wide,
+// which keeps the layout stable as the counts change.
 fun draw_count(x: u8, y: u8, v: u8) {
-    var dct_tens: u8 = 0
-    var dct_n: u8 = v
+    var tens: u8 = 0
+    var n: u8 = v
     // Divide by 10 without the software divide: repeatedly
     // subtract 10 until n < 10. For v ≤ 52 this loops at most
     // 5 times, cheaper than calling `/` and `%`.
-    while dct_n >= 10 {
-        dct_n -= 10
-        dct_tens += 1
+    while n >= 10 {
+        n -= 10
+        tens += 1
     }
-    draw_digit(x,     y, dct_tens)
-    draw_digit(x + 8, y, dct_n)
+    draw_digit(x,     y, tens)
+    draw_digit(x + 8, y, n)
 }
 
 // Draw a single letter 'A'..'Z' using the sprite font. `ch` is
-// the letter index (0 = A, 25 = Z). Deliberately NOT marked
-// `inline`: when this was inlined the resulting code put each
-// inlined `draw` at double the intended X step (the inliner
-// appears to re-evaluate the (x + N) parameter expression in a
-// way that compounds across consecutive draws). Keeping it as
-// a real function call gives every draw_letter call its own
-// argument-evaluation context and the spacing comes out right.
+// the letter index (0 = A, 25 = Z).
 fun draw_letter(x: u8, y: u8, ch: u8) {
     draw Tileset at: (x, y) frame: TILE_LETTER_BASE + ch
 }
 
 // Short helper for drawing the word "PLAYER" at (x, y). 6 letters.
 // Used by the HUD and the victory banner.
-//
-// We accumulate the X position in a local instead of passing
-// `x + N` as a call argument: the latter pattern miscompiles in
-// NEScript v0.1 (consecutive `x + N` arguments to the same
-// function appear to alias the parameter slot, leaving the second
-// onward call site reading a stale offset). Stepping a local
-// avoids the issue entirely.
 fun draw_word_player(x: u8, y: u8) {
-    var dwp_px: u8 = x
-    draw_letter(dwp_px, y, 15)  // P
-    dwp_px += 8
-    draw_letter(dwp_px, y, 11)  // L
-    dwp_px += 8
-    draw_letter(dwp_px, y, 0)   // A
-    dwp_px += 8
-    draw_letter(dwp_px, y, 24)  // Y
-    dwp_px += 8
-    draw_letter(dwp_px, y, 4)   // E
-    dwp_px += 8
-    draw_letter(dwp_px, y, 17)  // R
+    draw_letter(x,      y, 15)  // P
+    draw_letter(x + 8,  y, 11)  // L
+    draw_letter(x + 16, y, 0)   // A
+    draw_letter(x + 24, y, 24)  // Y
+    draw_letter(x + 32, y, 4)   // E
+    draw_letter(x + 40, y, 17)  // R
 }
 
 // "WINS" — used on the victory screen.
 fun draw_word_wins(x: u8, y: u8) {
-    var dww_px: u8 = x
-    draw_letter(dww_px, y, 22)  // W
-    dww_px += 8
-    draw_letter(dww_px, y, 8)   // I
-    dww_px += 8
-    draw_letter(dww_px, y, 13)  // N
-    dww_px += 8
-    draw_letter(dww_px, y, 18)  // S
+    draw_letter(x,      y, 22)  // W
+    draw_letter(x + 8,  y, 8)   // I
+    draw_letter(x + 16, y, 13)  // N
+    draw_letter(x + 24, y, 18)  // S
 }
 
 // "PRESS" — used on the title screen.
 fun draw_word_press(x: u8, y: u8) {
-    var dwr_px: u8 = x
-    draw_letter(dwr_px, y, 15)  // P
-    dwr_px += 8
-    draw_letter(dwr_px, y, 17)  // R
-    dwr_px += 8
-    draw_letter(dwr_px, y, 4)   // E
-    dwr_px += 8
-    draw_letter(dwr_px, y, 18)  // S
-    dwr_px += 8
-    draw_letter(dwr_px, y, 18)  // S
+    draw_letter(x,      y, 15)  // P
+    draw_letter(x + 8,  y, 17)  // R
+    draw_letter(x + 16, y, 4)   // E
+    draw_letter(x + 24, y, 18)  // S
+    draw_letter(x + 32, y, 18)  // S
 }
 
 // ── Fly animation driver ──────────────────────────────────
 //
-// We avoid the software multiply (and the W0101 "expensive
-// multiply" warning) by stepping the fly position by a fixed
-// constant each frame instead of computing `start + dx * t /
-// FRAMES`. The constant FLY_STEP is chosen so that
+// Avoiding a software multiply: instead of computing
+// `start + dx * t / FRAMES` we step the fly position by a
+// fixed constant each frame. FLY_STEP is chosen so that
 // FRAMES_FLY * FLY_STEP equals the deck-to-play distance on
 // both axes:
 //
@@ -192,8 +136,8 @@ const FLY_STEP: u8 = 4
 
 // Step the global (fly_x, fly_y) by FLY_STEP in the directions
 // stored in fly_dx_sign / fly_dy_sign. Sign 0 = positive (move
-// right / down), 1 = negative (move left / up). Called once per
-// frame inside the relevant fly-phase handler.
+// right / down), 1 = negative (move left / up). Called once
+// per frame inside the relevant fly-phase handler.
 fun step_fly_pos() {
     if fly_dx_sign == 0 {
         fly_x += FLY_STEP
@@ -208,11 +152,9 @@ fun step_fly_pos() {
 }
 
 // Initialise the fly state for a card slide from (sx, sy) using
-// the given direction signs. NEScript v0.1 only allocates four
-// zero-page slots ($04-$07) for function parameters, so callers
-// must stash `fly_card` and `fly_face_up` directly into the
-// globals before invoking arm_fly — passing them as the 5th and
-// 6th params would silently drop the values on the floor.
+// the given direction signs, card byte, and face-up flag. The
+// caller is responsible for picking signs so the end position
+// lands where it should after FRAMES_FLY frames.
 fun arm_fly(sx: u8, sy: u8, dxsign: u8, dysign: u8) {
     fly_x = sx
     fly_y = sy

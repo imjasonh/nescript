@@ -119,6 +119,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         function_return_types: HashMap::new(),
         current_return_type: None,
         in_function_body: false,
+        current_scope_prefix: None,
         struct_layouts: HashMap::new(),
     };
     analyzer.analyze_program(program);
@@ -180,6 +181,24 @@ struct Analyzer {
     /// distinguish "void function" from "state handler" when checking
     /// `return value` statements.
     in_function_body: bool,
+    /// Current local scope prefix used to qualify function-body
+    /// `var` declarations. `None` at the top level and during
+    /// state-level declaration registration; set to `Some("foo")`
+    /// while analyzing the body of `fun foo`, and to
+    /// `Some("Title::frame")` (etc.) while analyzing a state
+    /// handler body. When it is `Some(prefix)`, `register_var`
+    /// stores the declaration under a qualified key
+    /// `"__local__{prefix}__{name}"`, and `resolve_*` helpers
+    /// below fall back through the qualified key first and the
+    /// bare key second so identifier reads inside a body resolve
+    /// to the locally-scoped entry when one exists.
+    ///
+    /// This is how functions and handlers get their own local
+    /// namespaces without requiring a full nested-scope stack.
+    /// Top-level globals, consts, state-level vars, function
+    /// names, and enum variants still live at the bare name in
+    /// `self.symbols`.
+    current_scope_prefix: Option<String>,
     /// Struct name to layout. Each field has an offset in bytes from
     /// the base address of the struct.
     struct_layouts: HashMap<String, StructLayout>,
@@ -524,16 +543,27 @@ impl Analyzer {
             ));
         }
 
-        // Type-check all state bodies
+        // Type-check all state bodies. Each handler body is its
+        // own local scope: a `var i` inside `Title::on frame`
+        // does not collide with a `var i` inside `Playing::on
+        // frame`. State-level `var`s (declared at `state Foo { var x
+        // }`) stay in the global scope so every handler in the
+        // state can read and write them across frames.
         for state in &program.states {
             if let Some(block) = &state.on_enter {
+                self.current_scope_prefix = Some(format!("{}__enter", state.name));
                 self.check_block(block, &state_names);
+                self.current_scope_prefix = None;
             }
             if let Some(block) = &state.on_exit {
+                self.current_scope_prefix = Some(format!("{}__exit", state.name));
                 self.check_block(block, &state_names);
+                self.current_scope_prefix = None;
             }
             if let Some(block) = &state.on_frame {
+                self.current_scope_prefix = Some(format!("{}__frame", state.name));
                 self.check_block(block, &state_names);
+                self.current_scope_prefix = None;
             }
             // `on scanline(N)` is only valid with mappers that have a
             // scanline-counting IRQ source (currently only MMC3).
@@ -544,43 +574,64 @@ impl Analyzer {
                     state.span,
                 ));
             }
-            for (_, block) in &state.on_scanline {
+            for (line, block) in &state.on_scanline {
+                self.current_scope_prefix = Some(format!("{}__scanline_{}", state.name, line));
                 self.check_block(block, &state_names);
+                self.current_scope_prefix = None;
             }
         }
 
-        // Type-check function bodies. Parameters are registered as
-        // symbols for the duration of the body check so that identifier
-        // references (and the W0103 used-variable tracker) can resolve
-        // them. They are unregistered afterwards to avoid leaking into
-        // the global scope. Parameters are also pre-marked as "used" so
-        // we do not emit W0103 for unused function arguments (which are
-        // a common and deliberate pattern).
+        // Type-check function bodies. Each function body gets its
+        // own local scope by setting `current_scope_prefix` to
+        // the function's name. Parameters are registered as
+        // function-local symbols under the prefixed key so two
+        // different functions can both declare a parameter named
+        // `x` without the analyzer's duplicate-declaration check
+        // firing. Each parameter also gets its own dedicated RAM
+        // slot allocated via `allocate_ram` — the codegen emits a
+        // prologue that copies the transport slots `$04-$07`
+        // into these RAM slots at function entry, so the param
+        // values survive any nested calls the function body
+        // makes. Parameters are pre-marked as "used" so we do
+        // not emit W0103 for unused function arguments.
         for fun in &program.functions {
-            let mut added_params = Vec::new();
+            self.current_scope_prefix = Some(fun.name.clone());
             for param in &fun.params {
-                if !self.symbols.contains_key(&param.name) {
+                let key = self.scoped_name(&param.name);
+                let size = match param.param_type {
+                    NesType::U8 | NesType::I8 | NesType::Bool => 1,
+                    NesType::U16 => 2,
+                    // Struct/array parameters are not supported
+                    // in v0.1; the parser already rejects them,
+                    // so defaulting to 1 byte here is just a
+                    // fallback to keep the analyzer from
+                    // crashing on malformed ASTs.
+                    _ => 1,
+                };
+                if let Some(address) = self.allocate_ram(size, fun.span) {
                     self.symbols.insert(
-                        param.name.clone(),
+                        key.clone(),
                         Symbol {
-                            name: param.name.clone(),
+                            name: key.clone(),
                             sym_type: param.param_type.clone(),
                             is_const: false,
                             span: fun.span,
                         },
                     );
-                    added_params.push(param.name.clone());
+                    self.var_allocations.push(VarAllocation {
+                        name: key.clone(),
+                        address,
+                        size,
+                    });
+                    self.used_vars.insert(key);
                 }
-                self.mark_var_used(&param.name);
             }
             self.current_return_type.clone_from(&fun.return_type);
             self.in_function_body = true;
             self.check_block(&fun.body, &state_names);
             self.current_return_type = None;
             self.in_function_body = false;
-            for name in &added_params {
-                self.symbols.remove(name);
-            }
+            self.current_scope_prefix = None;
         }
 
         // Build call graph
@@ -629,18 +680,68 @@ impl Analyzer {
         self.check_unreachable_states(program);
     }
 
+    /// Qualify `name` under the current scope prefix. If no prefix
+    /// is active (top-level analysis, state-level declaration) the
+    /// name is returned unchanged. Inside a function body the
+    /// result is `"__local__{prefix}__{name}"` — the same key the
+    /// IR lowerer and codegen use when walking a function's locals.
+    fn scoped_name(&self, name: &str) -> String {
+        match &self.current_scope_prefix {
+            Some(prefix) => format!("__local__{prefix}__{name}"),
+            None => name.to_string(),
+        }
+    }
+
+    /// Resolve a user-written identifier to the matching symbol
+    /// table key. Tries the current scope's qualified key first
+    /// (so function-local vars shadow same-named globals) and
+    /// falls back to the bare key for globals, consts, enum
+    /// variants, state-locals, and function names.
+    fn resolve_key(&self, name: &str) -> String {
+        if let Some(prefix) = &self.current_scope_prefix {
+            let qualified = format!("__local__{prefix}__{name}");
+            if self.symbols.contains_key(&qualified) {
+                return qualified;
+            }
+        }
+        name.to_string()
+    }
+
+    /// Look up a user-written identifier in the symbol table,
+    /// preferring the current scope's qualified entry (if any)
+    /// and falling back to the bare global entry.
+    fn resolve_symbol(&self, name: &str) -> Option<&Symbol> {
+        if let Some(prefix) = &self.current_scope_prefix {
+            let qualified = format!("__local__{prefix}__{name}");
+            if let Some(sym) = self.symbols.get(&qualified) {
+                return Some(sym);
+            }
+        }
+        self.symbols.get(name)
+    }
+
+    /// True if a symbol exists for `name` in the current scope or
+    /// in the global scope.
+    fn symbol_exists(&self, name: &str) -> bool {
+        self.resolve_symbol(name).is_some()
+    }
+
     /// Mark a variable name as having been read somewhere in the program.
-    /// Also bumps the W0107 access counter.
+    /// Also bumps the W0107 access counter. Resolves the name through
+    /// the current scope so the right (qualified-or-bare) key is
+    /// recorded.
     fn mark_var_used(&mut self, name: &str) {
-        self.used_vars.insert(name.to_string());
-        self.bump_var_access(name);
+        let key = self.resolve_key(name);
+        self.used_vars.insert(key.clone());
+        *self.var_access_counts.entry(key).or_insert(0) += 1;
     }
 
     /// Increment the observed access count for `name`. Called for
     /// both reads (via [`Analyzer::mark_var_used`]) and writes (at
     /// `Statement::Assign` handling). Used for W0107.
     fn bump_var_access(&mut self, name: &str) {
-        *self.var_access_counts.entry(name.to_string()).or_insert(0) += 1;
+        let key = self.resolve_key(name);
+        *self.var_access_counts.entry(key).or_insert(0) += 1;
     }
 
     /// Emit W0107 if `var` is declared `fast` but sees fewer than
@@ -712,7 +813,7 @@ impl Analyzer {
     fn walk_expr_reads(&mut self, expr: &Expr) {
         match expr {
             Expr::Ident(name, span) => {
-                if self.symbols.contains_key(name) {
+                if self.symbol_exists(name) {
                     self.mark_var_used(name);
                 } else {
                     self.emit_undefined_var(name, *span);
@@ -720,7 +821,7 @@ impl Analyzer {
             }
             Expr::ArrayIndex(name, idx, span) => {
                 // Array base is a read; index may contain more reads.
-                if self.symbols.contains_key(name) {
+                if self.symbol_exists(name) {
                     self.mark_var_used(name);
                 } else {
                     self.emit_undefined_var(name, *span);
@@ -728,14 +829,15 @@ impl Analyzer {
                 self.walk_expr_reads(idx);
             }
             Expr::FieldAccess(name, field, span) => {
-                // Resolve the struct variable and verify the field
-                // exists. Mark the synthetic `name.field` variable as
-                // used so W0103 doesn't fire.
-                let full_name = format!("{name}.{field}");
+                // Resolve the struct variable through the scope
+                // stack and verify the field exists. Mark both the
+                // base and the synthetic `name.field` entry used.
+                let base_key = self.resolve_key(name);
+                let full_name = format!("{base_key}.{field}");
                 if self.symbols.contains_key(&full_name) {
                     self.mark_var_used(name);
-                    self.mark_var_used(&full_name);
-                } else if !self.symbols.contains_key(name) {
+                    self.used_vars.insert(full_name);
+                } else if !self.symbols.contains_key(&base_key) {
                     self.emit_undefined_var(name, *span);
                 } else {
                     self.diagnostics.push(Diagnostic::error(
@@ -1134,7 +1236,19 @@ impl Analyzer {
     }
 
     fn register_var(&mut self, var: &VarDecl) {
-        if self.symbols.contains_key(&var.name) {
+        // Scope-qualified storage key. At the top level this is
+        // the bare `var.name`; inside a function or handler body
+        // it is `"__local__{prefix}__{name}"` so two different
+        // functions can each declare a local `var i` without
+        // colliding on the flat symbol table.
+        let key = self.scoped_name(&var.name);
+
+        // Duplicate check runs against the qualified key so
+        // shadowing a global with a function-local var is fine
+        // (the local key is distinct). Two locals with the same
+        // name inside the same scope still collide and report
+        // E0501 correctly.
+        if self.symbols.contains_key(&key) {
             self.diagnostics.push(Diagnostic::error(
                 ErrorCode::E0501,
                 format!("duplicate declaration of '{}'", var.name),
@@ -1194,9 +1308,9 @@ impl Analyzer {
             // symbol so that later references don't cascade into E0502,
             // but don't record a var_allocations entry.
             self.symbols.insert(
-                var.name.clone(),
+                key.clone(),
                 Symbol {
-                    name: var.name.clone(),
+                    name: key,
                     sym_type: var.var_type.clone(),
                     is_const: false,
                     span: var.span,
@@ -1215,15 +1329,21 @@ impl Analyzer {
         // `p.pos.y` leaves. Array fields produce a single
         // synthetic with the array type so the existing
         // `Expr::ArrayIndex` lowering picks them up.
+        //
+        // Struct fields use the qualified key as the base so
+        // function-local struct instances don't collide with
+        // same-named globals. `flatten_struct_fields` builds
+        // `"{key}.{field}"` paths, which inherits the scope
+        // prefix automatically.
         if let NesType::Struct(sname) = &var.var_type {
             let layout = self.struct_layouts[sname].clone();
-            self.flatten_struct_fields(&var.name, address, &layout, var.span);
+            self.flatten_struct_fields(&key, address, &layout, var.span);
             // Also register the struct variable itself (as a symbol
             // only — it doesn't have a single VarAllocation entry).
             self.symbols.insert(
-                var.name.clone(),
+                key.clone(),
                 Symbol {
-                    name: var.name.clone(),
+                    name: key,
                     sym_type: var.var_type.clone(),
                     is_const: false,
                     span: var.span,
@@ -1233,9 +1353,9 @@ impl Analyzer {
         }
 
         self.symbols.insert(
-            var.name.clone(),
+            key.clone(),
             Symbol {
-                name: var.name.clone(),
+                name: key.clone(),
                 sym_type: var.var_type.clone(),
                 is_const: false,
                 span: var.span,
@@ -1243,7 +1363,7 @@ impl Analyzer {
         );
 
         self.var_allocations.push(VarAllocation {
-            name: var.name.clone(),
+            name: key,
             address,
             size,
         });
@@ -1441,10 +1561,12 @@ impl Analyzer {
                 }
             }
             Statement::Assign(lvalue, _, expr, span) => {
-                // Check if trying to assign to a constant
+                // Check if trying to assign to a constant. Lookups
+                // go through `resolve_symbol` so a function-local
+                // shadowing a global const/var is handled correctly.
                 match lvalue {
                     LValue::Var(name) => {
-                        if let Some(sym) = self.symbols.get(name) {
+                        if let Some(sym) = self.resolve_symbol(name) {
                             if sym.is_const {
                                 self.diagnostics.push(Diagnostic::error(
                                     ErrorCode::E0203,
@@ -1467,7 +1589,7 @@ impl Analyzer {
                         }
                     }
                     LValue::ArrayIndex(name, idx) => {
-                        if let Some(sym) = self.symbols.get(name) {
+                        if let Some(sym) = self.resolve_symbol(name) {
                             if sym.is_const {
                                 self.diagnostics.push(Diagnostic::error(
                                     ErrorCode::E0203,
@@ -1484,13 +1606,20 @@ impl Analyzer {
                         self.walk_expr_reads(idx);
                     }
                     LValue::Field(name, field) => {
-                        let full_name = format!("{name}.{field}");
+                        // Struct instances are stored under the
+                        // scope-qualified key (see register_var);
+                        // the per-field synthetic keys inherit that
+                        // prefix via `flatten_struct_fields`. Build
+                        // the field path off whichever key actually
+                        // exists — scoped first, bare second.
+                        let base_key = self.resolve_key(name);
+                        let full_name = format!("{base_key}.{field}");
                         if self.symbols.contains_key(&full_name) {
                             // Assigning to a field is a mutation; don't
                             // mark the struct variable as "read" just
                             // because we wrote to one of its fields.
-                            self.mark_var_used(&full_name);
-                        } else if self.symbols.contains_key(name) {
+                            self.used_vars.insert(full_name);
+                        } else if self.symbols.contains_key(&base_key) {
                             self.diagnostics.push(Diagnostic::error(
                                 ErrorCode::E0201,
                                 format!("'{name}' has no field '{field}'"),
@@ -1558,11 +1687,16 @@ impl Analyzer {
                 self.walk_expr_reads(end);
                 self.check_expr_type(start, &NesType::U8);
                 self.check_expr_type(end, &NesType::U8);
-                let was_shadowed = self.symbols.remove(var);
+                // Register the loop variable under the current
+                // scope's qualified key so two `for i in 0..n`
+                // loops in different functions get their own
+                // per-function RAM slot.
+                let loop_key = self.scoped_name(var);
+                let was_shadowed = self.symbols.remove(&loop_key);
                 self.symbols.insert(
-                    var.clone(),
+                    loop_key.clone(),
                     Symbol {
-                        name: var.clone(),
+                        name: loop_key.clone(),
                         sym_type: NesType::U8,
                         is_const: false,
                         span: *span,
@@ -1573,19 +1707,19 @@ impl Analyzer {
                 // other u8 local.
                 let loop_var_addr = self.allocate_ram(1, *span).unwrap_or(0x10);
                 self.var_allocations.push(VarAllocation {
-                    name: var.clone(),
+                    name: loop_key.clone(),
                     address: loop_var_addr,
                     size: 1,
                 });
                 // Loop variable is always "used" in the header.
-                self.mark_var_used(var);
+                self.used_vars.insert(loop_key.clone());
                 let was_in_loop = self.in_loop;
                 self.in_loop = true;
                 self.check_block(body, state_names);
                 self.in_loop = was_in_loop;
-                self.symbols.remove(var);
+                self.symbols.remove(&loop_key);
                 if let Some(old) = was_shadowed {
-                    self.symbols.insert(var.clone(), old);
+                    self.symbols.insert(loop_key, old);
                 }
             }
             Statement::Loop(body, span) => {
@@ -1780,15 +1914,17 @@ impl Analyzer {
 
     fn lvalue_type(&self, lvalue: &LValue, _span: Span) -> Option<NesType> {
         match lvalue {
-            LValue::Var(name) => self.symbols.get(name).map(|s| s.sym_type.clone()),
+            LValue::Var(name) => self.resolve_symbol(name).map(|s| s.sym_type.clone()),
             LValue::ArrayIndex(name, _) => {
-                self.symbols.get(name).and_then(|sym| match &sym.sym_type {
-                    NesType::Array(elem, _) => Some(elem.as_ref().clone()),
-                    _ => None,
-                })
+                self.resolve_symbol(name)
+                    .and_then(|sym| match &sym.sym_type {
+                        NesType::Array(elem, _) => Some(elem.as_ref().clone()),
+                        _ => None,
+                    })
             }
             LValue::Field(name, field) => {
-                let full_name = format!("{name}.{field}");
+                let base_key = self.resolve_key(name);
+                let full_name = format!("{base_key}.{field}");
                 self.symbols.get(&full_name).map(|s| s.sym_type.clone())
             }
         }
@@ -1873,7 +2009,7 @@ impl Analyzer {
                 }
             }
             Expr::BoolLiteral(_, _) => Some(NesType::Bool),
-            Expr::Ident(name, _) => self.symbols.get(name).map(|s| s.sym_type.clone()),
+            Expr::Ident(name, _) => self.resolve_symbol(name).map(|s| s.sym_type.clone()),
             Expr::ButtonRead(_, _, _) => Some(NesType::Bool),
             Expr::BinaryOp(_, op, _, _) => match op {
                 BinOp::Eq
@@ -1890,13 +2026,14 @@ impl Analyzer {
             Expr::UnaryOp(_, _, _) => Some(NesType::U8),
             Expr::Call(_, _, _) => Some(NesType::U8), // Simplified for M1
             Expr::ArrayIndex(name, _, _) => {
-                self.symbols.get(name).and_then(|s| match &s.sym_type {
+                self.resolve_symbol(name).and_then(|s| match &s.sym_type {
                     NesType::Array(elem, _) => Some(elem.as_ref().clone()),
                     _ => None,
                 })
             }
             Expr::FieldAccess(name, field, _) => {
-                let full_name = format!("{name}.{field}");
+                let base_key = self.resolve_key(name);
+                let full_name = format!("{base_key}.{field}");
                 self.symbols.get(&full_name).map(|s| s.sym_type.clone())
             }
             Expr::ArrayLiteral(_, _) => Some(NesType::U8), // element type inferred from context

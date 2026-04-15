@@ -47,36 +47,36 @@ state Deal {
         // deal_next counter controls how many of the 52 have
         // "landed", so the first half goes to A and the second
         // half to B — matching the actual split_decks() logic.
-        var dl_dealt_a: u8 = deal_next
-        var dl_dealt_b: u8 = 0
-        if dl_dealt_a > HALF_DECK {
-            dl_dealt_b = dl_dealt_a - HALF_DECK
-            dl_dealt_a = HALF_DECK
+        var dealt_a: u8 = deal_next
+        var dealt_b: u8 = 0
+        if dealt_a > HALF_DECK {
+            dealt_b = dealt_a - HALF_DECK
+            dealt_a = HALF_DECK
         }
 
         // Both decks drawn as card backs whenever they have at
         // least one card. Before that, skip the draw so the slot
         // is empty.
-        if dl_dealt_a > 0 {
+        if dealt_a > 0 {
             draw_card_back(DECK_A_X, DECK_Y)
         }
-        if dl_dealt_b > 0 {
+        if dealt_b > 0 {
             draw_card_back(DECK_B_X, DECK_Y)
         }
 
-        draw_count(COUNT_A_X, COUNT_Y, dl_dealt_a)
-        draw_count(COUNT_B_X, COUNT_Y, dl_dealt_b)
+        draw_count(COUNT_A_X, COUNT_Y, dealt_a)
+        draw_count(COUNT_B_X, COUNT_Y, dealt_b)
 
         // ── Flying card ──────────────────────────────────
         // A single face-down card bouncing between the centre
         // and each deck. The x position alternates based on the
         // low bit of deal_next (even → going to A, odd → B).
         if deal_next < DECK_SIZE {
-            var dl_fly_x: u8 = DECK_A_X + 32
+            var fly_x_pos: u8 = DECK_A_X + 32
             if (deal_next & 1) != 0 {
-                dl_fly_x = DECK_B_X - 32
+                fly_x_pos = DECK_B_X - 32
             }
-            draw_card_back(dl_fly_x, 96)
+            draw_card_back(fly_x_pos, 96)
         }
 
         // ── Transition ───────────────────────────────────

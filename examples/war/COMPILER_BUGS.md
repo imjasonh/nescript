@@ -2,15 +2,30 @@
 
 This document captures bugs and limitations discovered while
 building `examples/war.ne`. Each entry includes a minimal
-reproduction, the symptom we observed, the root cause if known,
-and a workaround we used in `examples/war/*.ne`. The intent is
-to track these so they can be fixed in a future compiler pass —
-once they are, the corresponding workarounds in `war/*.ne`
-should be reverted to keep the example honest.
+reproduction, the symptom we observed, the root cause, the
+workaround originally used in `examples/war/*.ne`, and the
+compiler fix that shipped (when shipped).
+
+## Status summary
+
+| # | Short name | Status | Fix commit | Regression test |
+|---|---|---|---|---|
+| 1 | `fun` with > 4 params silently drops the rest | **FIXED** (E0506 diagnostic) | `analyzer: reject functions with more than 4 parameters (E0506)` | `analyze_rejects_function_with_more_than_4_params`, `analyze_accepts_function_with_exactly_4_params` |
+| 1b | Same-named params share VarIds across functions | **FIXED** (scope-qualified keys) | `analyzer/ir: scope function locals per function body` | `analyze_allows_same_param_name_in_two_functions` |
+| 2 | Param transport slots $04-$07 clobbered by nested calls | **FIXED** (codegen prologue spill) | `codegen: spill parameters from $04-$07 into per-function RAM slots` | `codegen::ir_codegen::gen_function_prologue_spills_params_to_local_ram` |
+| 3 | Function-local `var` declarations share one flat namespace | **FIXED** (scope-qualified keys) | `analyzer/ir: scope function locals per function body` | `analyze_allows_same_local_name_in_two_functions`, `analyze_allows_same_local_name_in_two_state_handlers`, `analyze_still_rejects_duplicate_local_in_same_function` |
+| 4 | 8-sprites-per-scanline limit invisible to user code | Open (hardware limit; static analyzer hint could help) | — | — |
+| 5 | `inline` keyword silently declined for short functions | Open | — | — |
+| 6 | `wide_hi` IR map leaked between functions (u16→u8 aliasing) | **FIXED** (cleared per function) | `ir: clear wide_hi between functions to fix 16-bit op aliasing` | `ir::tests::wide_hi_does_not_leak_between_functions` |
+
+**Once a fix lands, revert the workaround in `examples/war/*.ne`
+in the same commit** so the example keeps the game honest and
+the PR diff visibly proves the fix works end-to-end. Bugs #1,
+#1b, #2, #3, and #6 have had their workarounds reverted.
 
 ---
 
-## 1. Functions with more than 4 parameters silently corrupt the 5th+
+## 1. Functions with more than 4 parameters silently corrupt the 5th+ *(FIXED)*
 
 ### Symptom
 
@@ -94,7 +109,7 @@ Two reasonable options:
 
 ---
 
-## 1b. Function parameters with the same name in different functions share a VarId, which collides their zero-page slot mapping
+## 1b. Function parameters with the same name in different functions share a VarId, which collides their zero-page slot mapping *(FIXED)*
 
 ### Symptom
 
@@ -171,24 +186,35 @@ function (see bug #3); we extended the same scheme to params:
 `pbb_card` / `dcf_card` snapshots from bug #2 stay because they
 also help with the bug-2 clobbering.
 
-### Fix proposal
+### Fix
 
-Two layers to fix in:
+Both the analyzer and the IR lowerer now qualify function-body
+`var` / parameter declarations with the enclosing function name
+(or state handler name) under an internal key
+`"__local__{scope}__{name}"`. Each function's locals and
+parameters therefore get **distinct** symbol-table entries and
+VarIds even when the source names collide.
 
-1. **IR lowering**: give every function its own `var_map` for
-   parameters and locals. The global `var_map` should only hold
-   top-level `var` / `const` / `enum` symbols.
+Lookups inside a function body go through
+`Analyzer::resolve_symbol` / `LoweringContext::scoped_key`,
+which prefer the scope-qualified key over the bare one — so
+a function-local `var x` correctly shadows a same-named global
+(or another function's `var x`).
 
-2. **Codegen**: even after the IR fix, the global `var_addrs`
-   `HashMap` should grow a per-function dimension (one map per
-   `IrFunction`) so two different functions can independently
-   assign their own VarIds to overlapping zero-page slots.
+State-level locals (declared at `state Foo { var x: u8 }`
+outside any handler) stay in the global namespace so every
+handler in the state can read/write them across frames.
 
-Either fix alone is probably enough; both together is robust.
+See `src/analyzer/mod.rs::resolve_symbol` / `resolve_key` /
+`scoped_name` and `src/ir/lowering.rs::scoped_key`.
+
+Together with fix #2 below, bugs #1b and #2 are completely
+gone: the workaround-prefixed locals and params in `war/*.ne`
+(the `dcf_`, `dwp_`, `pba_`, etc tags) are all reverted.
 
 ---
 
-## 2. Function parameters share zero-page slots with nested calls — values clobbered across `JSR`
+## 2. Function parameters share zero-page slots with nested calls — values clobbered across `JSR` *(FIXED)*
 
 ### Symptom
 
@@ -231,24 +257,38 @@ throughout the body. See `war/render.ne::draw_card_face`,
 `war/render.ne::draw_flying_card`, `war/deck.ne::push_back_a`,
 `war/deck.ne::push_back_b`.
 
-### Fix proposal
+### Fix
 
-1. **Spill on entry**: at the top of every function body that
-   makes a call, copy `$04..$07` into per-function RAM slots and
-   rewrite all parameter reads to load from the RAM copies.
-   Equivalent to what users are doing manually today.
+`codegen::ir_codegen::IrCodeGen::new` now allocates every
+function-local — including its parameters — into a dedicated
+per-function RAM slot at `$0300+`. Parameters are still passed
+via the zero-page transport slots `$04-$07` as the calling
+convention, but `gen_function` now emits a 4-instruction
+**prologue** at every function entry:
 
-2. **Smarter scheduling**: only spill a parameter slot if it's
-   live across a call site (CFG-aware liveness pass on params).
-   Same effect, less RAM cost for short helpers that never read
-   their params after calling out.
+```
+LDA $04         ; transport slot 0
+STA <param_0_addr>
+LDA $05         ; transport slot 1
+STA <param_1_addr>
+... etc ...
+```
 
-Either fix would let users write straightforward function bodies
-without having to remember the snapshot dance.
+By the time the body runs, every parameter lives in the
+function's dedicated RAM slot, so any nested call can freely
+clobber `$04-$07` (passing its own arguments to _its_ callee)
+without corrupting the caller's saved parameters.
+
+The cost is 4 LDA/STA pairs at every function entry (≈ 20
+bytes of ROM, 16 cycles). Worth it to make the calling
+convention sound.
+
+See `codegen::ir_codegen::gen_function_prologue_spills_params_to_local_ram`
+for the regression test.
 
 ---
 
-## 3. Function-local variable names are in a flat global namespace
+## 3. Function-local variable names are in a flat global namespace *(FIXED)*
 
 ### Symptom
 
@@ -302,18 +342,23 @@ identifying its enclosing function (e.g. `dfa_card` in
 `dwp_px` in `draw_word_player`). This makes long files harder to
 read but is fully mechanical.
 
-### Fix proposal
+### Fix
 
-Rework `register_var` to maintain a stack of scopes (one per
-function body, one per nested block). Each `Statement::VarDecl`
-inserts into the current scope. Lookup walks the stack from
-innermost to outermost. The existing global symbol table is
-unchanged for top-level globals / consts / fun names; only
-function-locals shift to the scoped table.
+Same as #1b: the analyzer and IR lowerer now internally
+qualify function-body `var` declarations with the enclosing
+scope's name, so `foo`'s `var i` and `bar`'s `var i` resolve
+to `__local__foo__i` and `__local__bar__i` respectively. The
+two entries coexist peacefully in the (still-flat) symbol
+table.
 
-A smaller intermediate fix: keep the flat table but qualify
-each local's stored name as `<function>::<var>` so the global
-table sees unique entries even when source names collide.
+What *didn't* change: two `var i` declarations inside the
+same function body still collide with E0501 (we scoped per
+function body, not per nested block). That's a deliberate
+trade-off — per-block scoping would require live-range
+analysis to reuse RAM slots across blocks, which is a much
+bigger change. The analyzer test
+`analyze_still_rejects_duplicate_local_in_same_function`
+pins this behaviour.
 
 ---
 

@@ -2100,3 +2100,103 @@ fn analyze_accepts_function_with_exactly_4_params() {
     "#,
     );
 }
+
+#[test]
+fn analyze_allows_same_local_name_in_two_functions() {
+    // Regression test for COMPILER_BUGS.md §3: function-body
+    // `var` declarations used to live in a flat global namespace,
+    // so two functions both declaring `var i` collided on E0501.
+    // They should now coexist in their own per-function scopes.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        fun foo() -> u8 {
+            var i: u8 = 0
+            while i < 5 { i += 1 }
+            return i
+        }
+        fun bar() -> u8 {
+            var i: u8 = 0
+            while i < 10 { i += 1 }
+            return i
+        }
+        var total: u8 = 0
+        on frame {
+            total = foo() + bar()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_allows_same_param_name_in_two_functions() {
+    // Regression test for COMPILER_BUGS.md §1b: parameters
+    // across different functions used to share VarIds because
+    // the IR lowerer's `var_map` was global. Both declaration
+    // (analyzer) and lowering (IR) should now give each
+    // function's parameters their own independent entries.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        fun shift_left(x: u8) -> u8 { return x << 1 }
+        fun shift_right(x: u8) -> u8 { return x >> 1 }
+        var n: u8 = 0
+        on frame {
+            n = shift_left(5) + shift_right(20)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_allows_same_local_name_in_two_state_handlers() {
+    // Each state handler gets its own local scope, so both
+    // `Title::on frame` and `Playing::on frame` can declare
+    // `var i` independently.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        state Title {
+            on frame {
+                var i: u8 = 0
+                while i < 3 { i += 1 }
+                if button.start { transition Playing }
+            }
+        }
+        state Playing {
+            on frame {
+                var i: u8 = 0
+                while i < 7 { i += 1 }
+            }
+        }
+        start Title
+    "#,
+    );
+}
+
+#[test]
+fn analyze_still_rejects_duplicate_local_in_same_function() {
+    // Two `var i` declarations inside the SAME function body
+    // should still trip E0501 — we scoped locals per function,
+    // not per statement.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        fun foo() -> u8 {
+            var i: u8 = 0
+            var i: u8 = 1
+            return i
+        }
+        on frame { var r: u8 = foo() wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0501),
+        "expected E0501 for duplicate `var i` in same function, got: {errors:?}"
+    );
+}

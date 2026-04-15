@@ -40,7 +40,6 @@ var a_is_cpu: u8 = 1              // bool-ish
 var b_is_cpu: u8 = 1
 var phase: u8 = 0                 // one of the P_* constants
 var phase_timer: u8 = 0           // counts up during each phase
-var pf_result: u8 = 0             // P_RESOLVE comparison result (1=A, 2=B, 0=tie)
 
 // ── Animation state ───────────────────────────────────────
 // Shared by every card-fly phase. We step (fly_x, fly_y) by a
