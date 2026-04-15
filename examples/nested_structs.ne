@@ -28,9 +28,11 @@ struct Hero {
     inv: u8[4],
 }
 
-// Hero positions are initialized inline so the on-frame handler
-// only has to step them. Inventory bytes are a separate `var`
-// because struct literals don't accept array fields yet.
+// Hero positions are initialized inline. Both the nested
+// `Vec2 { ... }` and the inline `inv: [1, 2, 3, 4]` array
+// initializers are unpacked into per-leaf-field IR globals by
+// `expand_struct_literal_init` in src/ir/lowering.rs, so each
+// leaf gets its own `LDA #imm; STA addr` pair at reset.
 var hero1: Hero = Hero { pos: Vec2 { x: 32, y: 96 }, hp: 100, inv: [1, 2, 3, 4] }
 var hero2: Hero = Hero { pos: Vec2 { x: 200, y: 128 }, hp: 100, inv: [10, 20, 30, 40] }
 

@@ -391,10 +391,9 @@ fn lower_metasprite_draw_expands_to_one_op_per_tile() {
         .iter()
         .find(|f| f.name.contains("frame"))
         .unwrap();
-    let draws: Vec<_> = frame_fn
-        .blocks
+    let ops: Vec<&IrOp> = frame_fn.blocks.iter().flat_map(|b| &b.ops).collect();
+    let draws: Vec<_> = ops
         .iter()
-        .flat_map(|b| &b.ops)
         .filter_map(|op| match op {
             IrOp::DrawSprite { sprite_name, .. } => Some(sprite_name.clone()),
             _ => None,
@@ -411,6 +410,19 @@ fn lower_metasprite_draw_expands_to_one_op_per_tile() {
             "expanded ops should target the underlying sprite"
         );
     }
+    // Each tile in the metasprite uses `frame: 0` relative to
+    // the underlying sprite. The single-sprite program has `Tile`
+    // at base index 1 (smiley occupies 0), so the resolved
+    // absolute frame index for every expanded DrawSprite is 1 —
+    // we should see at least one `LoadImm(_, 1)` matching that.
+    let load_imm_1_count = ops
+        .iter()
+        .filter(|op| matches!(op, IrOp::LoadImm(_, 1)))
+        .count();
+    assert!(
+        load_imm_1_count >= 4,
+        "metasprite expansion should LoadImm(_, 1) at least once per tile (sprite Tile sits at base index 1, frame: [0,0,0,0]); got {load_imm_1_count}"
+    );
 }
 
 #[test]

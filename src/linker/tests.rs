@@ -141,7 +141,7 @@ fn link_with_background_chr_places_blob_after_sprites() {
     let linker = Linker::new(Mirroring::Horizontal);
     let user_code = vec![Instruction::implied(NOP)];
     let sprite_bytes: Vec<u8> = vec![0xAA; 16]; // tile 1
-    let bg_chr: Vec<u8> = (0..32).map(|i| i as u8).collect(); // tiles 5, 6
+    let bg_chr: Vec<u8> = (0u8..32u8).collect(); // tiles 5, 6
     let sprites = vec![SpriteData {
         name: "Player".into(),
         tile_index: 1,

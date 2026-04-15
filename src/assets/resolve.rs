@@ -436,7 +436,7 @@ mod tests {
             png_source: None,
             span: Span::dummy(),
         });
-        let resolved = resolve_backgrounds(&program, Path::new("."), 0).unwrap();
+        let resolved = resolve_backgrounds(&program, Path::new("."), 1).unwrap();
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].name, "Stage");
         assert_eq!(resolved[0].tiles.len(), 960);
@@ -478,7 +478,7 @@ mod tests {
             png_source: Some(png_path.file_name().unwrap().to_string_lossy().to_string()),
             span: Span::dummy(),
         });
-        let resolved = resolve_backgrounds(&program, &dir, 0).unwrap();
+        let resolved = resolve_backgrounds(&program, &dir, 1).unwrap();
         let _ = std::fs::remove_file(&png_path);
         assert_eq!(resolved.len(), 1);
         assert_eq!(resolved[0].tiles.len(), 960);
@@ -515,7 +515,7 @@ mod tests {
             png_source: Some(png_path.file_name().unwrap().to_string_lossy().to_string()),
             span: Span::dummy(),
         });
-        let err = resolve_backgrounds(&program, &dir, 0).unwrap_err();
+        let err = resolve_backgrounds(&program, &dir, 1).unwrap_err();
         let _ = std::fs::remove_file(&png_path);
         assert!(
             err.contains("background 'Oops' PNG source"),

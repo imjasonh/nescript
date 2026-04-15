@@ -376,10 +376,14 @@ fn compile_pulse_sfx(decl: &SfxDecl) -> SfxData {
     // it again" behaviour and emits no pitch blob, so existing
     // sfx ROMs are byte-identical. The pitch envelope is padded
     // (or truncated) to match the volume envelope length so the
-    // runtime can walk both pointers in lockstep without a
-    // separate length check; the trailing zero sentinel is added
-    // last so the pitch blob's last byte aligns with the volume
-    // sentinel and the runtime stops both walks at the same NMI.
+    // runtime can walk both pointers in lockstep. The trailing
+    // zero byte is *padding*, not a sentinel the runtime ever
+    // reads — the volume tick `JMP`s to `__audio_sfx_done` on
+    // its own zero sentinel before the pitch update block runs,
+    // so the pitch pointer never advances past the user's last
+    // byte. Keeping the trailing zero costs one ROM byte but
+    // makes the blob length predictable for the linker symbol
+    // dump and matches the `volume` envelope's shape.
     let pitch_envelope = build_pulse_pitch_envelope(&decl.pitch, decl.volume.len());
     SfxData {
         name: decl.name.clone(),

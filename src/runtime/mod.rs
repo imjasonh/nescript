@@ -99,10 +99,13 @@ pub const DEBUG_FRAME_OVERRUN_ADDR: u16 = 0x07FF;
 
 /// Debug-mode "did the previous frame overrun" sticky bit. Set
 /// to 1 by the NMI handler at the same time as it bumps
-/// [`DEBUG_FRAME_OVERRUN_ADDR`], and cleared to 0 by `wait_frame`
-/// once the main loop catches up. Exposed to user code as
+/// [`DEBUG_FRAME_OVERRUN_ADDR`], and cleared to 0 by either an
+/// explicit `wait_frame` IR op *or* the implicit main-loop
+/// flag-clear that runs between every dispatch — so a program
+/// whose `on frame { ... }` body has no explicit `wait_frame`
+/// still sees a fresh value next NMI. Exposed to user code as
 /// `debug.frame_overran()` — a per-frame "did this frame finish
-/// in time" predicate suited for `debug.assert(!debug.frame_overran())`
+/// in time" predicate suited for `debug.assert(not debug.frame_overran())`
 /// guards. Lives one byte below the cumulative counter so the
 /// two can be inspected together in a Mesen memory viewer.
 pub const DEBUG_FRAME_OVERRUN_FLAG_ADDR: u16 = 0x07FE;

@@ -401,6 +401,19 @@ impl Analyzer {
         // must exist, and the metasprite name must be unique
         // (against other metasprites and against sprites — both
         // share the same `draw` lookup namespace).
+        //
+        // We also enforce a more restrictive rule for the v1
+        // metasprite lowering: every sprite that PRECEDES a
+        // metasprite-targeted sprite in declaration order must use
+        // an inline `pixels:` body. The IR lowering at
+        // `ir/lowering.rs::lower_program` walks the sprite list to
+        // compute base tile indices for the metasprite's `frame:`
+        // resolution, but it can't read external `@chr(...)` /
+        // `@binary(...)` files at lowering time and falls back to
+        // a single-tile assumption — that would silently misalign
+        // the metasprite's frame indices. Reject those programs at
+        // analysis time so users get a clear error instead of a
+        // visual glitch at runtime.
         let mut seen_metasprites = HashSet::new();
         let sprite_names: HashSet<String> =
             program.sprites.iter().map(|s| s.name.clone()).collect();
@@ -422,7 +435,36 @@ impl Analyzer {
                     ms.span,
                 ));
             }
-            if !sprite_names.contains(&ms.sprite_name) {
+            if sprite_names.contains(&ms.sprite_name) {
+                // Check that every sprite up to *and including*
+                // the target uses an inline pixels source. Any
+                // earlier non-inline sprite would shift the base
+                // tile of the target by an unknown amount; the
+                // target itself also has to be inline so the
+                // lowering knows how many tiles to consume for it.
+                for sprite in &program.sprites {
+                    let is_inline = matches!(
+                        sprite.chr_source,
+                        crate::parser::ast::AssetSource::Inline(_)
+                    );
+                    if !is_inline {
+                        self.diagnostics.push(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!(
+                                "metasprite '{}' depends on sprite '{}' which uses an external `@chr` or `@binary` source; \
+                                 the v1 metasprite lowering can't compute base tile indices for non-inline sprites — \
+                                 inline the pixel art with a `pixels:` block, or remove the metasprite",
+                                ms.name, sprite.name
+                            ),
+                            ms.span,
+                        ));
+                        break;
+                    }
+                    if sprite.name == ms.sprite_name {
+                        break;
+                    }
+                }
+            } else {
                 self.diagnostics.push(Diagnostic::error(
                     ErrorCode::E0201,
                     format!(
@@ -1038,6 +1080,15 @@ impl Analyzer {
         layout: &StructLayout,
         var_span: Span,
     ) {
+        // Snapshot the per-struct sizes once at the top of the
+        // recursion so deep struct trees don't rebuild the same
+        // map at every leaf — `type_size_with` is the only
+        // consumer and it just needs the size lookup.
+        let struct_sizes: HashMap<String, u16> = self
+            .struct_layouts
+            .iter()
+            .map(|(n, l)| (n.clone(), l.size))
+            .collect();
         for (field_name, field_type, offset) in &layout.fields {
             let full_name = format!("{base_name}.{field_name}");
             let field_addr = base_addr + offset;
@@ -1071,11 +1122,6 @@ impl Analyzer {
                             span: var_span,
                         },
                     );
-                    let struct_sizes: HashMap<String, u16> = self
-                        .struct_layouts
-                        .iter()
-                        .map(|(n, l)| (n.clone(), l.size))
-                        .collect();
                     let field_size = type_size_with(field_type, &struct_sizes);
                     self.var_allocations.push(VarAllocation {
                         name: full_name,

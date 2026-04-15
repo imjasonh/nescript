@@ -702,9 +702,16 @@ impl Linker {
             }
             let offset = bg.chr_base_tile as usize * 16;
             let end = offset + bg.chr_bytes.len();
-            if end <= chr.len() {
-                chr[offset..end].copy_from_slice(&bg.chr_bytes);
-            }
+            assert!(
+                end <= chr.len(),
+                "background '{}' auto-CHR ({} bytes at base tile {}) overflows the {}-byte CHR ROM; \
+                 the resolver should have caught this — file a bug",
+                bg.name,
+                bg.chr_bytes.len(),
+                bg.chr_base_tile,
+                chr.len()
+            );
+            chr[offset..end].copy_from_slice(&bg.chr_bytes);
         }
         builder.set_chr(chr);
 

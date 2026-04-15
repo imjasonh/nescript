@@ -545,6 +545,35 @@ fn analyze_metasprite_unknown_sprite_errors() {
 }
 
 #[test]
+fn analyze_metasprite_with_external_chr_sprite_errors() {
+    // The IR lowering walks `program.sprites` to compute base
+    // tile indices for the metasprite's `frame:` array, but it
+    // can't read external `@chr(...)` files at lowering time
+    // and would fall back to a 1-tile assumption. That would
+    // silently misalign the metasprite, so the analyzer rejects
+    // the combination upfront with a clear "use inline pixels"
+    // hint.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tileset @chr("art/sheet.png")
+        metasprite Hero {
+            sprite: Tileset
+            dx:    [0, 8]
+            dy:    [0, 0]
+            frame: [0, 1]
+        }
+        on frame { wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "metasprite over an external-CHR sprite should emit E0201, got: {errors:?}"
+    );
+}
+
+#[test]
 fn analyze_metasprite_mismatched_array_lengths_errors() {
     let errors = analyze_errors(
         r#"

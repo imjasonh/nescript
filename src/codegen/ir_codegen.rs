@@ -687,9 +687,19 @@ impl<'a> IrCodeGen<'a> {
         self.emit_label(&wait_label);
         self.emit(LDA, AM::ZeroPage(ZP_FRAME_FLAG));
         self.emit(BEQ, AM::LabelRelative(wait_label));
-        // Clear the flag
+        // Clear the flag.
         self.emit(LDA, AM::Immediate(0));
         self.emit(STA, AM::ZeroPage(ZP_FRAME_FLAG));
+        // In debug mode, also clear the per-frame "did this frame
+        // overrun" sticky bit at $07FE so user code sees a fresh
+        // value next NMI even when the program has no explicit
+        // `wait_frame` inside its handler. The IR-level WaitFrame
+        // op clears it too, so explicit-wait programs already get
+        // this for free; mirroring it here makes the implicit
+        // main-loop path consistent.
+        if self.debug_mode {
+            self.emit(STA, AM::Absolute(0x07FE));
+        }
 
         // Dispatch on current_state using CMP + BNE + JMP trampoline
         self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
@@ -2744,6 +2754,36 @@ mod more_tests {
         assert!(
             clears_flag,
             "debug-mode wait_frame should clear the per-frame overrun flag at $07FE"
+        );
+    }
+
+    #[test]
+    fn ir_codegen_main_loop_clears_overrun_flag_in_debug_mode() {
+        // The implicit main-loop wait at the top of the dispatch
+        // loop is the only thing that clears the frame-ready flag
+        // for programs whose `on frame { ... }` body has no
+        // explicit `wait_frame`. Without also clearing $07FE here
+        // the per-frame overrun sticky bit would latch to 1 on
+        // the first miss and never reset, breaking
+        // `debug.assert(not debug.frame_overran())` guards. We
+        // verify by counting STA $07FE writes in a debug build
+        // of a program with NO explicit wait_frame — it should
+        // appear exactly once (the main loop), not zero.
+        let insts = lower_and_gen_debug(
+            r#"
+            game "T" { mapper: NROM }
+            var x: u8 = 0
+            on frame { x = 1 }
+            start Main
+        "#,
+        );
+        let clear_count = insts
+            .iter()
+            .filter(|i| i.opcode == STA && i.mode == AM::Absolute(0x07FE))
+            .count();
+        assert_eq!(
+            clear_count, 1,
+            "main loop should emit exactly one STA $07FE in debug mode (no explicit wait_frame)"
         );
     }
 
