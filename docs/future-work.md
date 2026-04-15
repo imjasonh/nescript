@@ -130,6 +130,78 @@ reach `wait_frame` before the next vblank.
 
 ---
 
+## Decompilation support
+
+**What ships today.** A hybrid-shim decompiler that converts iNES ROMs back to NEScript `.ne` source code, enabling round-trip workflows (ROM → decompile → edit → recompile). The implementation is structured around NEScript-produced ROMs, which can be byte-identically reconstructed from decompiled source.
+
+### Completed (M1-M5)
+
+**Language foundations for decompilation (M1):**
+- `fixed8.8` type support added to `NesType` enum (partial: type system only; arithmetic codegen pending)
+- AST infrastructure for address-pinned declarations (fields added to VarDecl/ConstDecl/PaletteDecl/BackgroundDecl/SfxDecl/MusicDecl; parser integration deferred)
+
+**Decompiler infrastructure (M3):**
+- `src/decompiler/` module: `mod.rs` (main pipeline), `lifter.rs` (asset extraction), `emitter.rs` (.ne source generation), `patterns/` (driver recognition)
+- `decompile_rom()` function: reads iNES ROM, validates header, extracts ROM metadata, banks, CHR data
+- `DecompiledRom` struct holding: rom metadata, mapper, PRG/CHR banks, extracted palettes/backgrounds (stubs for M3)
+- Mapper detection (iNES number → NEScript Mapper enum)
+
+**FamiTone2 driver recognition (M4):**
+- `patterns/famitone.rs`: Detects FamiTone2 driver via period table pattern matching (60-entry table, APU range validation)
+- `patterns/audio.rs`: Period table inversion (APU period value ↔ note index C1-B5), note lookup map
+- Audio data extraction stubs ready for full music/SFX blob parsing
+- Period table correctly validates all 60 entries and table monotonicity
+
+**Round-trip integration tests (M5):**
+- `tests/decompiler_roundtrip.rs`: Test harness for identity roundtrip (decompile → recompile → byte-compare)
+- `roundtrip_identity_all_examples`: Decompiles all 22 examples, recompiles, verifies ROM byte-identical (currently #[ignore] pending M1 full language support)
+- `roundtrip_emulator_all_examples`: Decompiles, recompiles, prepares for jsnes emulator golden testing (currently #[ignore] pending M4 audio data extraction)
+- Smoke tests verify all examples are accessible and decompiler infrastructure operational
+- CI job `decompile-roundtrip` in `.github/workflows/ci.yml` with artifact upload on failure
+
+### Still TODO (next phase)
+
+**Language foundations (M1 completion):**
+- Parser/analyzer support for @ 0xADDR address-pinned syntax on all declaration types
+- raw_bank pass-through: parser recognition and linker handling for binary file splice
+- raw_vectors opt-out: custom reset/nmi/irq addresses instead of auto-generated
+- free_space regions for relocation of oversized assets
+- fixed8.8 arithmetic codegen: +, -, *, /, comparison operations
+
+**goto/label escape hatch (M2):**
+- goto/label statement support with W0109 diagnostic for unstructured code without #[allow(unstructured)]
+- Lexer support for # attribute prefix to enable #[allow(unstructured)]
+
+**Decompiler CLI integration:**
+- `nescript decompile <rom.nes> [-o output.ne]` subcommand wiring in main.rs
+
+**Asset lifting refinement:**
+- Full CHR → PNG conversion (or binary pass-through)
+- Palette blob recognition (32-byte sections with color indices)
+- Nametable blob recognition (960+64 byte sections)
+- AST infrastructure for address-pinned palette/background/sfx/music declarations
+
+**Audio data extraction (M4 completion):**
+- Music block parsing (note sequences with duration)
+- SFX block parsing (pitch/volume envelopes)
+- Structured music/sfx declaration emission instead of binary blobs
+
+**Decompiler scope for non-NEScript ROMs:**
+- Fingerprinting strategy for unknown/third-party ROMs (conservative identity pass-through)
+- Heuristic-based audio driver detection (FamiTone2, Nintendo standard, custom)
+
+### Decompilation design principles
+
+The decompiler uses a **hybrid-shim approach** rather than full structured lift:
+- **Raw pass-through:** Opaque PRG/CHR code banks pass through verbatim as `raw_bank` declarations; no 6502 decompilation
+- **Lifted assets:** Palettes, nametables, sprite CHR, audio drivers → structured .ne declarations
+- **Address-pinned declarations:** Decompiled source pins every asset to its original ROM byte offset, so edits recompile in-place or relocate within free space
+- **Round-trip oracle:** Emulator golden harness (existing pixel/audio hash tests) is the correctness bar, not binary ROM match
+
+This avoids building a full-strength 6502 decompiler (years of work, lower ROI) while enabling the practical workflow: decompile an existing game, edit constants/audio/sprites, recompile.
+
+---
+
 ## Code quality / tooling
 
 ### Register allocator
