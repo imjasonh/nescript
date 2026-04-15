@@ -801,3 +801,157 @@ fn wide_hi_does_not_leak_between_functions() {
         "wide CmpEq16 destination aliased a source operand — wide_hi leaked between functions"
     );
 }
+
+#[test]
+fn inline_fun_expression_body_emits_no_call_at_use_site() {
+    // Regression test for COMPILER_BUGS.md §5: `inline fun`
+    // with a single-return-expression body should be spliced
+    // at every call site instead of emitting a Call op. The
+    // lowered frame handler should contain zero Call ops
+    // targeting the inline function.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        inline fun shift_right_4(c: u8) -> u8 {
+            return c >> 4
+        }
+        var out: u8 = 0
+        on frame { out = shift_right_4(0x90) }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let any_call_to_inline = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::Call(_, name, _) if name == "shift_right_4"));
+    assert!(
+        !any_call_to_inline,
+        "frame handler should not contain a Call to the inlined function; ops: {:?}",
+        frame_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn inline_fun_void_body_statements_are_spliced() {
+    // Void `inline fun` with a multi-statement body (no
+    // control flow) should be spliced at every statement-
+    // context call site. `set_phase(P_FLY_A)` should lower
+    // to two StoreVar ops (phase = P_FLY_A, phase_timer = 0)
+    // rather than a Call op.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        const P_WAIT: u8 = 0
+        const P_FLY:  u8 = 1
+        var phase: u8 = 0
+        var phase_timer: u8 = 0
+        inline fun set_phase(p: u8) {
+            phase = p
+            phase_timer = 0
+        }
+        on frame { set_phase(P_FLY) }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let any_call_to_inline = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::Call(_, name, _) if name == "set_phase"));
+    assert!(
+        !any_call_to_inline,
+        "frame handler should not contain a Call to set_phase; ops: {:?}",
+        frame_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn inline_fun_with_conditional_return_compiles_as_regular_call() {
+    // A conditional early-return body (wrap52-style) is too
+    // complex for the simple inliner. It should gracefully
+    // fall back to a regular Call op — this is the intended
+    // behaviour, not a bug. The important thing is that the
+    // fallback is correct, not that it's inlined.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        inline fun wrap52(v: u8) -> u8 {
+            if v >= 52 { return v - 52 }
+            return v
+        }
+        var out: u8 = 0
+        on frame { out = wrap52(60) }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let calls_wrap52 = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::Call(_, name, _) if name == "wrap52"));
+    assert!(
+        calls_wrap52,
+        "wrap52 has conditional early return — it should fall back to a Call op"
+    );
+}
+
+#[test]
+fn inline_fun_nested_inlines_substitute_correctly() {
+    // Two inline functions where the outer calls the inner
+    // using its own parameter. Both should inline; the
+    // result should have no Call ops in the frame handler
+    // targeting either function.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        inline fun double(x: u8) -> u8 { return x + x }
+        inline fun quad(x: u8) -> u8 { return double(double(x)) }
+        var out: u8 = 0
+        on frame { out = quad(5) }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let any_inline_call = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::Call(_, name, _) if name == "double" || name == "quad"));
+    assert!(
+        !any_inline_call,
+        "nested inline calls should both be expanded; frame ops: {:?}",
+        frame_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .collect::<Vec<_>>()
+    );
+}

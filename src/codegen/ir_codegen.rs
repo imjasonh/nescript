@@ -113,6 +113,18 @@ pub struct IrCodeGen<'a> {
     /// True while generating code inside a state frame handler.
     /// When set, `Return` terminators emit `JMP __ir_main_loop` instead of `RTS`.
     in_frame_handler: bool,
+    /// Scope prefix for the function currently being emitted.
+    /// Mirrors the analyzer and IR lowerer's
+    /// `current_scope_prefix` field and is used by
+    /// `substitute_asm_vars` to resolve `{name}` references in
+    /// inline asm bodies — user source says `{result}` but the
+    /// symbol table stores the variable as
+    /// `__local__times_four__result`, so the resolver has to
+    /// try the scope-qualified key first before falling back
+    /// to the bare key for globals. Empty string while
+    /// emitting runtime / dispatcher code that isn't inside a
+    /// user function body.
+    current_fn_scope_prefix: String,
     /// When true, emit code for `debug.log` / `debug.assert`.
     /// When false, these ops are stripped entirely.
     debug_mode: bool,
@@ -283,6 +295,7 @@ impl<'a> IrCodeGen<'a> {
             state_indices: HashMap::new(),
             function_names,
             in_frame_handler: false,
+            current_fn_scope_prefix: String::new(),
             debug_mode: false,
             audio_used: false,
             noise_used: false,
@@ -819,6 +832,33 @@ impl<'a> IrCodeGen<'a> {
         self.use_counts = build_use_counts(func);
         self.in_frame_handler = func.name.ends_with("_frame");
 
+        // Set the scope prefix used by `substitute_asm_vars`
+        // when resolving `{name}` references in inline asm.
+        // For state handlers (`Title_frame`, `Title_enter`,
+        // `Title_exit`) the prefix is `Title__frame`/etc —
+        // matching how the analyzer and IR lowerer scoped
+        // their locals. For regular user functions it's just
+        // the function name. See the commentary on
+        // `current_fn_scope_prefix` above.
+        self.current_fn_scope_prefix = if let Some(state) = func.name.strip_suffix("_frame") {
+            format!("{state}__frame")
+        } else if let Some(state) = func.name.strip_suffix("_enter") {
+            format!("{state}__enter")
+        } else if let Some(state) = func.name.strip_suffix("_exit") {
+            format!("{state}__exit")
+        } else if let Some(rest) = func.name.strip_prefix("") {
+            // Scanline handlers encode the line number, but
+            // the analyzer's prefix is
+            // `{state}__scanline_{N}` — check the split.
+            if let Some((state, line)) = rest.rsplit_once("_scanline_") {
+                format!("{state}__scanline_{line}")
+            } else {
+                rest.to_string()
+            }
+        } else {
+            func.name.clone()
+        };
+
         self.emit_label(&format!("__ir_fn_{}", func.name));
 
         // Prologue: spill the parameter-transport slots $04-$07
@@ -885,6 +925,7 @@ impl<'a> IrCodeGen<'a> {
         }
 
         self.in_frame_handler = false;
+        self.current_fn_scope_prefix.clear();
     }
 
     fn gen_block(&mut self, block: &IrBasicBlock) {
@@ -1273,11 +1314,27 @@ impl<'a> IrCodeGen<'a> {
                 // `raw asm` block, flagged by the lowering with a
                 // magic prefix), then parse with the shared inline
                 // parser and splice the resulting instructions.
+                //
+                // The resolver tries the current function's
+                // scope-qualified key first
+                // (`__local__{fn}__{name}`) so a reference like
+                // `{result}` inside a function that declares
+                // `var result: u8` resolves to the function's
+                // own local, not to an unrelated global of the
+                // same name. Globals / state-locals / consts
+                // still resolve via the bare-name fallback.
                 let raw = body.strip_prefix(crate::ir::RAW_ASM_PREFIX);
                 let to_parse: std::borrow::Cow<'_, str> = if let Some(raw_body) = raw {
                     std::borrow::Cow::Borrowed(raw_body)
                 } else {
+                    let scope = self.current_fn_scope_prefix.clone();
                     std::borrow::Cow::Owned(substitute_asm_vars(body, |name| {
+                        if !scope.is_empty() {
+                            let qualified = format!("__local__{scope}__{name}");
+                            if let Some(a) = self.allocations.iter().find(|a| a.name == qualified) {
+                                return Some(a.address);
+                            }
+                        }
                         self.allocations
                             .iter()
                             .find(|a| a.name == name)

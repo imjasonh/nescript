@@ -678,6 +678,16 @@ impl Analyzer {
 
         // Check for unreachable states (W0104).
         self.check_unreachable_states(program);
+
+        // Check for literal-coord sprite draws that would
+        // overflow the NES's 8-sprites-per-scanline hardware
+        // limit (W0109). Only on_frame handlers are checked —
+        // on_enter and on_exit fire once per transition and are
+        // much less likely to exceed the budget. Only draws
+        // with `IntLiteral` (x, y) pairs are counted; dynamic
+        // coordinates are skipped because the static analysis
+        // can't know where the sprite will land at runtime.
+        self.check_sprite_scanline_budget(program);
     }
 
     /// Qualify `name` under the current scope prefix. If no prefix
@@ -1021,6 +1031,117 @@ impl Analyzer {
                     note: None,
                 });
             }
+        }
+    }
+
+    /// Static check for the NES's 8-sprites-per-scanline hardware
+    /// limit (W0109). Walks every state's `on_frame` handler,
+    /// collects literal-coordinate `draw` statements (and expands
+    /// metasprites via their per-tile `dx`/`dy` offsets), then
+    /// iterates scanlines 0..240 and emits W0109 for any state
+    /// where more than 8 sprites overlap a single scanline.
+    ///
+    /// Draws with non-literal `x` or `y` are skipped — static
+    /// analysis can't know where those sprites land at runtime.
+    /// Draws inside nested `if`/`while`/`for`/`loop` blocks are
+    /// counted as if they always fire; this over-counts programs
+    /// that stagger draws across mutually exclusive branches, but
+    /// it matches the worst case the hardware sees. Only `on_frame`
+    /// is checked — `on_enter`/`on_exit` run once per transition
+    /// and aren't on the hot sprite path.
+    fn check_sprite_scanline_budget(&mut self, program: &Program) {
+        // Build a name -> MetaspriteDecl lookup so draws that target
+        // a metasprite can expand to one slot per tile offset.
+        let metasprites: HashMap<&str, &MetaspriteDecl> = program
+            .metasprites
+            .iter()
+            .map(|ms| (ms.name.as_str(), ms))
+            .collect();
+
+        for state in &program.states {
+            let Some(block) = &state.on_frame else {
+                continue;
+            };
+
+            // Collect (y, x, span) tuples for every literal-coord
+            // draw in the handler, recursing through nested control
+            // flow and expanding metasprites.
+            let mut draws: Vec<(u8, u8, Span)> = Vec::new();
+            collect_literal_draws(block, &metasprites, &mut draws);
+
+            // Fast path: if there aren't even 9 literal draws total
+            // the overlap check can never trip.
+            if draws.len() <= 8 {
+                continue;
+            }
+
+            // For each scanline, count how many 8×8 sprites cover
+            // it. Sprites at y=Y cover scanlines Y..Y+8 (NES OAM
+            // stores the y one line early, but for the overlap
+            // budget the 8-pixel span is what matters).
+            let mut worst_count: usize = 0;
+            let mut worst_scanline: u16 = 0;
+            for scanline in 0u16..240 {
+                let mut count = 0usize;
+                for (y, _, _) in &draws {
+                    let top = u16::from(*y);
+                    if top <= scanline && scanline < top + 8 {
+                        count += 1;
+                    }
+                }
+                if count > worst_count {
+                    worst_count = count;
+                    worst_scanline = scanline;
+                }
+            }
+
+            if worst_count <= 8 {
+                continue;
+            }
+
+            // Build a diagnostic pointing at the state with labels
+            // on each offending draw. Cap the labels at 9 so the
+            // message doesn't become a wall of text for pathological
+            // programs.
+            let mut diag = Diagnostic::warning(
+                ErrorCode::W0109,
+                format!(
+                    "state '{}' draws {} literal-coordinate sprites overlapping scanline {}; \
+                     the NES renders at most 8 sprites per scanline",
+                    state.name, worst_count, worst_scanline
+                ),
+                state.span,
+            )
+            .with_help(
+                "stagger draws vertically by at least 8 pixels, reduce the number of \
+                 on-screen sprites, or split the draws across `on_scanline` handlers",
+            )
+            .with_note(
+                "the 9th and later sprites on a scanline are dropped by the PPU, \
+                 causing flicker or invisible objects on real hardware",
+            );
+
+            let mut labeled: usize = 0;
+            let mut seen_spans: HashSet<(u16, u32, u32)> = HashSet::new();
+            for (y, _, span) in &draws {
+                let top = u16::from(*y);
+                if top <= worst_scanline && worst_scanline < top + 8 {
+                    // Deduplicate identical spans (metasprite
+                    // expansion produces one tuple per tile but all
+                    // share the original draw-site span).
+                    let key = (span.file_id, span.start, span.end);
+                    if !seen_spans.insert(key) {
+                        continue;
+                    }
+                    diag = diag.with_label(*span, "draws here");
+                    labeled += 1;
+                    if labeled >= 9 {
+                        break;
+                    }
+                }
+            }
+
+            self.diagnostics.push(diag);
         }
     }
 
@@ -2091,6 +2212,78 @@ fn collect_transitions_stmt(stmt: &Statement, queue: &mut Vec<String>) {
         }
         Statement::For { body, .. } => {
             collect_transitions_block(body, queue);
+        }
+        _ => {}
+    }
+}
+
+/// Walk a block and collect `(y, x, span)` tuples for every literal
+/// -coordinate draw it contains. Metasprite draws expand to one
+/// tuple per tile using the metasprite's `dx`/`dy` offsets; plain
+/// sprites contribute exactly one tuple at the literal `(x, y)`.
+/// Draws with a non-literal coordinate are skipped — static
+/// analysis can't know where they land.
+///
+/// Recurses through `if`/`while`/`for`/`loop` bodies and counts
+/// every branch as if it always fires. This conservatively
+/// over-counts programs that stagger draws across mutually
+/// exclusive branches, but it matches the worst case the PPU can
+/// see on any given frame.
+fn collect_literal_draws(
+    block: &Block,
+    metasprites: &HashMap<&str, &MetaspriteDecl>,
+    out: &mut Vec<(u8, u8, Span)>,
+) {
+    for stmt in &block.statements {
+        collect_literal_draws_stmt(stmt, metasprites, out);
+    }
+}
+
+fn collect_literal_draws_stmt(
+    stmt: &Statement,
+    metasprites: &HashMap<&str, &MetaspriteDecl>,
+    out: &mut Vec<(u8, u8, Span)>,
+) {
+    match stmt {
+        Statement::Draw(draw) => {
+            let (Expr::IntLiteral(x, _), Expr::IntLiteral(y, _)) = (&draw.x, &draw.y) else {
+                return;
+            };
+            // Literals that don't fit in u8 would already be caught
+            // by the type checker; bail out here rather than risk
+            // double-reporting.
+            if *x > 255 || *y > 255 {
+                return;
+            }
+            let base_x = *x as u8;
+            let base_y = *y as u8;
+            if let Some(ms) = metasprites.get(draw.sprite_name.as_str()) {
+                // Metasprite: one slot per tile. Share the original
+                // draw-site span so the diagnostic labels point at
+                // user-authored source, not invented offsets.
+                for i in 0..ms.dx.len() {
+                    let tile_x = base_x.wrapping_add(ms.dx[i]);
+                    let tile_y = base_y.wrapping_add(ms.dy[i]);
+                    out.push((tile_y, tile_x, draw.span));
+                }
+            } else {
+                out.push((base_y, base_x, draw.span));
+            }
+        }
+        Statement::If(_, then_b, elifs, else_b, _) => {
+            collect_literal_draws(then_b, metasprites, out);
+            for (_, b) in elifs {
+                collect_literal_draws(b, metasprites, out);
+            }
+            if let Some(b) = else_b {
+                collect_literal_draws(b, metasprites, out);
+            }
+        }
+        Statement::While(_, body, _) | Statement::Loop(body, _) => {
+            collect_literal_draws(body, metasprites, out);
+        }
+        Statement::For { body, .. } => {
+            collect_literal_draws(body, metasprites, out);
         }
         _ => {}
     }

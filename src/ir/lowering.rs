@@ -34,6 +34,26 @@ struct LoweringContext {
     /// function-local vars resolve to the scoped entry the
     /// analyzer registered for them. `None` outside of any body.
     current_scope_prefix: Option<String>,
+    /// Captured inline function bodies. Populated by
+    /// `capture_inline_bodies` before any lowering runs. Each
+    /// entry is keyed by function name and holds the parameter
+    /// list plus the shape of the body (see [`InlineBody`]).
+    /// Call sites targeting a name in this map expand inline:
+    /// each argument is lowered to a temp, the temps are
+    /// registered as substitutions for the parameter names,
+    /// and the body is lowered into the caller's current block
+    /// in place of a `Call` op. See `try_inline_call_expr` /
+    /// `try_inline_call_stmt` below and `COMPILER_BUGS.md` §5.
+    inline_bodies: HashMap<String, CapturedInline>,
+    /// Substitution stack for nested inline expansions. The top
+    /// frame is the active substitution map — `Expr::Ident(name)`
+    /// lookups check it first and, if the name is present, use
+    /// the stored IR temp directly without emitting any load op.
+    /// Nested inlines push a fresh frame on entry and pop it on
+    /// exit so an inline body calling another inline sees the
+    /// inner function's parameter substitutions, not its
+    /// caller's.
+    inline_subs_stack: Vec<HashMap<String, IrTemp>>,
     next_var_id: u32,
     next_temp: u32,
     next_block: u32,
@@ -63,6 +83,38 @@ struct LoweringContext {
     /// here keeps the per-statement lowering simple and avoids
     /// having to thread the program through every helper.
     metasprites: HashMap<String, MetaspriteInfo>,
+}
+
+/// A captured `inline fun` body that the lowerer can splice in
+/// at each call site. Two flavours are recognised:
+///
+/// - **Expression**: the function body is exactly
+///   `{ return <expr> }`. The return expression can be lowered
+///   into either a statement context (result discarded) or an
+///   expression context (result used).
+/// - **Void**: the function has no return type and its body is
+///   a sequence of plain statements (no `return`, no loops, no
+///   conditionals). The statements can only be spliced into
+///   statement contexts. This is the shape of helpers like
+///   `set_phase(p) { phase = p; phase_timer = 0 }`.
+///
+/// Anything more exotic (early returns inside `if`, loops,
+/// nested blocks, recursive inlines, etc.) is not captured and
+/// compiles as a regular `JSR` call, with no warning since
+/// declining to inline is always a correct fallback.
+#[derive(Debug, Clone)]
+enum InlineBody {
+    Expression(Expr),
+    Void(Vec<Statement>),
+}
+
+/// Captured inline function metadata: parameter list plus the
+/// shape of the body. See `InlineBody` and
+/// `LoweringContext::inline_bodies`.
+#[derive(Debug, Clone)]
+struct CapturedInline {
+    params: Vec<Param>,
+    body: InlineBody,
 }
 
 #[derive(Debug, Clone)]
@@ -107,6 +159,8 @@ impl LoweringContext {
             const_values: HashMap::new(),
             var_types,
             current_scope_prefix: None,
+            inline_bodies: HashMap::new(),
+            inline_subs_stack: Vec::new(),
             next_var_id,
             next_temp: 0,
             next_block: 0,
@@ -157,6 +211,139 @@ impl LoweringContext {
         self.next_var_id += 1;
         self.var_map.insert(key, id);
         id
+    }
+
+    /// Walk the program and capture every `inline fun` whose
+    /// body matches one of the shapes the lowerer can splice
+    /// in at call sites. Two shapes are recognised:
+    ///
+    /// 1. **Single-return-expression**: the function has a
+    ///    declared return type and its body is exactly
+    ///    `{ return <expr> }`. Lowered as `InlineBody::Expression`
+    ///    — usable in both expression and statement contexts.
+    /// 2. **Void multi-statement**: the function has no return
+    ///    type and its body is a sequence of plain statements
+    ///    (assigns, calls, draws — no control flow, no
+    ///    `return`). Lowered as `InlineBody::Void` — usable
+    ///    only in statement contexts.
+    ///
+    /// Anything else (conditional early returns, loops,
+    /// block-nested `if`s, etc.) is silently declined and the
+    /// function compiles as a regular `JSR` call. Users who
+    /// want their `inline fun` inlined can check the
+    /// `--asm-dump` output; declining is always correct.
+    fn capture_inline_bodies(&mut self, program: &Program) {
+        for fun in &program.functions {
+            if !fun.is_inline {
+                continue;
+            }
+            // Single-return-expression shape.
+            if fun.return_type.is_some()
+                && fun.body.statements.len() == 1
+                && matches!(fun.body.statements[0], Statement::Return(Some(_), _))
+            {
+                if let Statement::Return(Some(expr), _) = &fun.body.statements[0] {
+                    self.inline_bodies.insert(
+                        fun.name.clone(),
+                        CapturedInline {
+                            params: fun.params.clone(),
+                            body: InlineBody::Expression(expr.clone()),
+                        },
+                    );
+                    continue;
+                }
+            }
+            // Void multi-statement shape: no return type, and
+            // every body statement must be a shape we know how
+            // to splice. Only assigns, statement-context calls,
+            // draws, scroll, set_palette, and load_background
+            // are accepted — anything with nested control flow
+            // is too complex to inline without a full CFG
+            // clone.
+            if fun.return_type.is_none()
+                && !fun.body.statements.is_empty()
+                && fun.body.statements.iter().all(is_splicable_void_stmt)
+            {
+                self.inline_bodies.insert(
+                    fun.name.clone(),
+                    CapturedInline {
+                        params: fun.params.clone(),
+                        body: InlineBody::Void(fun.body.statements.clone()),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Inline a call to `name` in expression context and
+    /// return the result temp. Returns `None` if the target
+    /// isn't in `inline_bodies` or is a void-body inline that
+    /// can't produce a value.
+    fn try_inline_call_expr(&mut self, name: &str, args: &[Expr]) -> Option<IrTemp> {
+        let captured = self.inline_bodies.get(name).cloned()?;
+        let InlineBody::Expression(return_expr) = &captured.body else {
+            return None;
+        };
+        if captured.params.len() != args.len() {
+            return None;
+        }
+        let arg_temps: Vec<IrTemp> = args.iter().map(|a| self.lower_expr(a)).collect();
+        let mut frame = HashMap::new();
+        for (param, temp) in captured.params.iter().zip(arg_temps.iter()) {
+            frame.insert(param.name.clone(), *temp);
+        }
+        self.inline_subs_stack.push(frame);
+        let result = self.lower_expr(return_expr);
+        self.inline_subs_stack.pop();
+        Some(result)
+    }
+
+    /// Inline a call to `name` in statement context. Returns
+    /// `true` on success (i.e. the body was spliced into
+    /// `current_ops`), `false` if the target isn't in
+    /// `inline_bodies`.
+    ///
+    /// A single-return-expression inline used in statement
+    /// context lowers the return expression and discards the
+    /// result — the side effects of argument evaluation still
+    /// happen, which is what a regular `Statement::Call` would
+    /// do.
+    fn try_inline_call_stmt(&mut self, name: &str, args: &[Expr]) -> bool {
+        let Some(captured) = self.inline_bodies.get(name).cloned() else {
+            return false;
+        };
+        if captured.params.len() != args.len() {
+            return false;
+        }
+        let arg_temps: Vec<IrTemp> = args.iter().map(|a| self.lower_expr(a)).collect();
+        let mut frame = HashMap::new();
+        for (param, temp) in captured.params.iter().zip(arg_temps.iter()) {
+            frame.insert(param.name.clone(), *temp);
+        }
+        self.inline_subs_stack.push(frame);
+        match &captured.body {
+            InlineBody::Expression(expr) => {
+                // Evaluate the expression for its side effects;
+                // discard the result temp.
+                let _ = self.lower_expr(expr);
+            }
+            InlineBody::Void(stmts) => {
+                for stmt in stmts {
+                    self.lower_statement(stmt);
+                }
+            }
+        }
+        self.inline_subs_stack.pop();
+        true
+    }
+
+    /// Look up `name` in the active inline substitution frame,
+    /// if any. Returns the IR temp previously computed for that
+    /// parameter (during `try_inline_call_*`'s argument
+    /// lowering). The top of the stack wins so nested inlines
+    /// see their own frame.
+    fn lookup_inline_sub(&self, name: &str) -> Option<IrTemp> {
+        self.inline_subs_stack.last()?.get(name).copied()
     }
 
     /// Recursively expand a struct-literal global initializer into
@@ -398,6 +585,24 @@ impl LoweringContext {
                 self.expand_struct_literal_init(&var.name, fields);
             }
         }
+
+        // Capture `inline fun` bodies that qualify for real
+        // inlining. A function qualifies when it's marked
+        // `inline`, has a declared return type, and its body
+        // consists of exactly one `Statement::Return(Some(expr))`.
+        // Call sites targeting one of these functions will be
+        // expanded in-place in `lower_expr` / `lower_statement`
+        // instead of emitting a `Call` op — the caller's body
+        // gets the return expression spliced in with the
+        // function's parameters substituted for argument temps.
+        //
+        // Functions marked `inline` but with more complex bodies
+        // (multi-statement, void, loops, conditionals) compile
+        // as regular calls with a W0109 "inline declined"
+        // warning emitted by the analyzer. This catches users
+        // who write `inline fun` expecting the keyword to be
+        // enforced.
+        self.capture_inline_bodies(program);
 
         // Lower user functions
         for fun in &program.functions {
@@ -763,6 +968,13 @@ impl LoweringContext {
                         }
                     }
                     _ => {
+                        // Inline expansion at statement context
+                        // splices either the return expression
+                        // (discarding its result) or the body
+                        // statements directly into `current_ops`.
+                        if self.try_inline_call_stmt(name, args) {
+                            return;
+                        }
                         let arg_temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                         self.emit(IrOp::Call(None, name.clone(), arg_temps));
                     }
@@ -1205,6 +1417,17 @@ impl LoweringContext {
                 t
             }
             Expr::Ident(name, _) => {
+                // When we're inside an inline expansion and this
+                // name is a parameter of the function currently
+                // being inlined, return the pre-computed argument
+                // temp directly instead of emitting a load op.
+                // That's how substitution actually happens: the
+                // body expression references the parameter, we
+                // short-circuit the lookup to the temp the caller
+                // already evaluated.
+                if let Some(temp) = self.lookup_inline_sub(name) {
+                    return temp;
+                }
                 // Check constants first
                 if let Some(&val) = self.const_values.get(name) {
                     let t = self.fresh_temp();
@@ -1274,6 +1497,14 @@ impl LoweringContext {
                         self.emit(IrOp::Peek(t, addr));
                         return t;
                     }
+                }
+                // `inline fun` bodies captured by
+                // `capture_inline_bodies` expand in-place here:
+                // no JSR, no parameter transport, no prologue.
+                // The return value is whatever temp the body
+                // expression lowered to.
+                if let Some(t) = self.try_inline_call_expr(name, args) {
+                    return t;
                 }
                 let arg_temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                 let t = self.fresh_temp();
@@ -1569,6 +1800,35 @@ impl LoweringContext {
         self.start_block(&end_label);
         result
     }
+}
+
+/// True if `stmt` is simple enough for the inliner to splice
+/// into a caller without a CFG rewrite. Accepted shapes: plain
+/// assignments, statement-context calls, draws, scroll/set
+/// palette / load background, `wait_frame`, inline asm, and the
+/// `debug.log` / `debug.assert` builtins. Rejected: any shape with
+/// control flow (if/while/loop/for/match/return/break/continue
+/// /transition) because those would require cloning basic
+/// blocks and renumbering labels per call site, which is
+/// more than the simple substitution machinery can handle.
+fn is_splicable_void_stmt(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::Assign(..)
+            | Statement::Call(..)
+            | Statement::Draw(..)
+            | Statement::Scroll(..)
+            | Statement::SetPalette(..)
+            | Statement::LoadBackground(..)
+            | Statement::WaitFrame(..)
+            | Statement::Play(..)
+            | Statement::StartMusic(..)
+            | Statement::StopMusic(..)
+            | Statement::InlineAsm(..)
+            | Statement::RawAsm(..)
+            | Statement::DebugLog(..)
+            | Statement::DebugAssert(..)
+    )
 }
 
 fn type_size(t: &NesType) -> u16 {

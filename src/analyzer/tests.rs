@@ -2200,3 +2200,216 @@ fn analyze_still_rejects_duplicate_local_in_same_function() {
         "expected E0501 for duplicate `var i` in same function, got: {errors:?}"
     );
 }
+
+#[test]
+fn analyze_sprite_scanline_budget_warns_over_eight() {
+    // Nine literal-coord draws all sharing the same `y` stack
+    // vertically on a single scanline. That blows past the NES's
+    // 8-sprites-per-scanline budget and must trip W0109.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        state Main {
+            on frame {
+                draw Blip at: (10, 100)
+                draw Blip at: (20, 100)
+                draw Blip at: (30, 100)
+                draw Blip at: (40, 100)
+                draw Blip at: (50, 100)
+                draw Blip at: (60, 100)
+                draw Blip at: (70, 100)
+                draw Blip at: (80, 100)
+                draw Blip at: (90, 100)
+                wait_frame
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    let w0109: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == ErrorCode::W0109)
+        .collect();
+    assert_eq!(
+        w0109.len(),
+        1,
+        "expected exactly one W0109, got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        w0109[0].message.contains('9') && w0109[0].message.contains("Main"),
+        "W0109 message should mention count 9 and state Main, got: {}",
+        w0109[0].message
+    );
+    assert!(
+        !w0109[0].labels.is_empty(),
+        "W0109 should label the offending draws"
+    );
+}
+
+#[test]
+fn analyze_sprite_scanline_budget_ok_when_staggered() {
+    // Nine draws, but each one is on its own line. No scanline
+    // ever sees more than one sprite. Must NOT trip W0109.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        state Main {
+            on frame {
+                draw Blip at: (10, 0)
+                draw Blip at: (10, 16)
+                draw Blip at: (10, 32)
+                draw Blip at: (10, 48)
+                draw Blip at: (10, 64)
+                draw Blip at: (10, 80)
+                draw Blip at: (10, 96)
+                draw Blip at: (10, 112)
+                draw Blip at: (10, 128)
+                wait_frame
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0109),
+        "did not expect W0109 for staggered draws, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_sprite_scanline_budget_skips_dynamic_coords() {
+    // Nine draws on the same line, but the x coordinate comes from
+    // a variable. Static analysis can't know where these land, so
+    // W0109 must stay silent.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        var px: u8 = 0
+        state Main {
+            on frame {
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                wait_frame
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0109),
+        "did not expect W0109 for dynamic coords, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_sprite_scanline_budget_expands_metasprites() {
+    // A metasprite with four tiles all at `dy = 0` means one
+    // `draw` statement contributes four sprites to the same
+    // scanline. Three such draws = 12 overlapping sprites, which
+    // must trip W0109.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tile8 {
+            pixels: [
+                "........",
+                "........",
+                "........",
+                "........",
+                "........",
+                "........",
+                "........",
+                "........"
+            ]
+        }
+        metasprite Quad {
+            sprite: Tile8
+            dx:    [0, 8, 16, 24]
+            dy:    [0, 0, 0, 0]
+            frame: [0, 0, 0, 0]
+        }
+        state Main {
+            on frame {
+                draw Quad at: (0, 100)
+                draw Quad at: (40, 100)
+                draw Quad at: (80, 100)
+                wait_frame
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0109),
+        "expected W0109 for metasprite overlap, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_sprite_scanline_budget_recurses_into_if() {
+    // Conservative: a branch that always fires when the state
+    // runs still counts. Nine draws inside an `if` block over the
+    // same scanline must trip W0109.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        var flag: u8 = 0
+        state Main {
+            on frame {
+                if flag == 1 {
+                    draw Blip at: (10, 100)
+                    draw Blip at: (20, 100)
+                    draw Blip at: (30, 100)
+                    draw Blip at: (40, 100)
+                    draw Blip at: (50, 100)
+                    draw Blip at: (60, 100)
+                    draw Blip at: (70, 100)
+                    draw Blip at: (80, 100)
+                    draw Blip at: (90, 100)
+                }
+                wait_frame
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0109),
+        "expected W0109 for draws inside if, got: {:?}",
+        result.diagnostics
+    );
+}

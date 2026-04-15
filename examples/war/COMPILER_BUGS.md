@@ -14,14 +14,15 @@ compiler fix that shipped (when shipped).
 | 1b | Same-named params share VarIds across functions | **FIXED** (scope-qualified keys) | `analyzer/ir: scope function locals per function body` | `analyze_allows_same_param_name_in_two_functions` |
 | 2 | Param transport slots $04-$07 clobbered by nested calls | **FIXED** (codegen prologue spill) | `codegen: spill parameters from $04-$07 into per-function RAM slots` | `codegen::ir_codegen::gen_function_prologue_spills_params_to_local_ram` |
 | 3 | Function-local `var` declarations share one flat namespace | **FIXED** (scope-qualified keys) | `analyzer/ir: scope function locals per function body` | `analyze_allows_same_local_name_in_two_functions`, `analyze_allows_same_local_name_in_two_state_handlers`, `analyze_still_rejects_duplicate_local_in_same_function` |
-| 4 | 8-sprites-per-scanline limit invisible to user code | Open (hardware limit; static analyzer hint could help) | — | — |
-| 5 | `inline` keyword silently declined for short functions | Open | — | — |
+| 4 | 8-sprites-per-scanline limit invisible to user code | **FIXED** (W0109 static analyzer warning) | `analyzer: add W0109 sprite-per-scanline budget check` | `analyze_sprite_scanline_budget_warns_over_eight`, `analyze_sprite_scanline_budget_ok_when_staggered`, `analyze_sprite_scanline_budget_skips_dynamic_coords`, `analyze_sprite_scanline_budget_expands_metasprites`, `analyze_sprite_scanline_budget_recurses_into_if` |
+| 5 | `inline` keyword silently declined for short functions | **FIXED** (IR lowering now inlines expression and void bodies) | `ir: real inlining for single-return and void-body `inline fun`s` | `ir::tests::inline_fun_expression_body_emits_no_call_at_use_site`, `inline_fun_void_body_statements_are_spliced`, `inline_fun_with_conditional_return_compiles_as_regular_call`, `inline_fun_nested_inlines_substitute_correctly` |
 | 6 | `wide_hi` IR map leaked between functions (u16→u8 aliasing) | **FIXED** (cleared per function) | `ir: clear wide_hi between functions to fix 16-bit op aliasing` | `ir::tests::wide_hi_does_not_leak_between_functions` |
 
 **Once a fix lands, revert the workaround in `examples/war/*.ne`
 in the same commit** so the example keeps the game honest and
-the PR diff visibly proves the fix works end-to-end. Bugs #1,
-#1b, #2, #3, and #6 have had their workarounds reverted.
+the PR diff visibly proves the fix works end-to-end. All seven
+catalogued bugs have now shipped their fixes; the example code
+no longer carries any workaround comments.
 
 ---
 
@@ -362,71 +363,126 @@ pins this behaviour.
 
 ---
 
-## 4. Per-frame sprite-per-scanline limit is invisible to user code
+## 4. Per-frame sprite-per-scanline limit is invisible to user code *(FIXED)*
 
 ### Symptom
 
 Drawing more than 8 sprites whose Y rectangles intersect a
 single scanline causes the NES PPU to silently drop the excess
-sprites past the 8th in OAM order. There's no compile-time
-detection and no runtime warning — letters or tiles just don't
-render.
+sprites past the 8th in OAM order. Letters or tiles just don't
+render, and prior to this fix the compiler emitted no warning
+even when the entire layout was a tree of literal coordinates
+it could have checked.
 
 ### Reproduction
 
 ```nescript
 // 9 letters all on the same Y row:
-draw_letter(0,   100, 0)
-draw_letter(8,   100, 1)
-draw_letter(16,  100, 2)
-draw_letter(24,  100, 3)
-draw_letter(32,  100, 4)
-draw_letter(40,  100, 5)
-draw_letter(48,  100, 6)
-draw_letter(56,  100, 7)
-draw_letter(64,  100, 8)   // this one will not render
+draw Letter at: (0,  100)
+draw Letter at: (8,  100)
+draw Letter at: (16, 100)
+draw Letter at: (24, 100)
+draw Letter at: (32, 100)
+draw Letter at: (40, 100)
+draw Letter at: (48, 100)
+draw Letter at: (56, 100)
+draw Letter at: (64, 100)  // past budget — silently dropped
+```
+
+Pre-fix the compiler said nothing and the 9th letter never
+showed up on hardware. Post-fix the analyzer emits:
+
+```
+warning[W0109]: state 'Main' draws 9 literal-coordinate sprites
+               overlapping scanline 100; the NES renders at
+               most 8 sprites per scanline
+ = help: stagger draws vertically by at least 8 pixels, reduce
+   the number of on-screen sprites, or split the draws across
+   `on_scanline` handlers
+ = note: the 9th and later sprites on a scanline are dropped
+   by the PPU, causing flicker or invisible objects on real
+   hardware
 ```
 
 ### Root cause
 
-This is a real NES hardware constraint, not a compiler bug.
-However, because NEScript's `draw` allocator is purely
-sequential, the compiler cannot warn even when it has all the
-information needed to know the layout would overflow.
+The 8-sprites-per-scanline cap is a real NES hardware
+constraint, not a compiler bug — but NEScript had no static
+check to catch the cases where user code makes the problem
+obvious at compile time, even though the draw allocator is
+sequential and the literal coords it sees are trivially
+checkable.
 
 ### Workaround used in `examples/war/`
 
-We staggered text rows. The title screen's "WAR / CARD GAME /
-0 PLAYER / 1 PLAYER / 2 PLAYER" layout sits each row at a
-different y so no scanline carries more than 7 sprites; the
-victory screen's "PLAYER X / WINS" wraps after the player letter
-for the same reason.
+We staggered text rows by hand. The title screen's "WAR /
+CARD GAME / 0 PLAYER / 1 PLAYER / 2 PLAYER" layout sits each
+row at a different y so no scanline carries more than 7
+sprites; the victory screen's "PLAYER X / WINS" wraps after
+the player letter for the same reason. These layouts stay in
+place post-fix — they now pass the analyzer cleanly because
+they're under budget.
 
-### Fix proposal
+### Fix
 
-Two complementary improvements:
+`src/analyzer/mod.rs::check_sprite_scanline_budget` runs at
+the end of `analyze_program`. For each state's `on_frame`
+handler it walks the block tree (including nested
+`if`/`while`/`for`/`loop`) collecting literal-coordinate
+`draw` statements into a `Vec<(y, x, span)>`. Metasprite
+draws expand into one tuple per tile via the metasprite's
+`dx`/`dy` offset arrays, so a metasprite that covers four
+tiles on the same y contributes four sprites to the overlap
+count. Non-literal coordinates are skipped entirely because
+the static analysis can't know where they land at runtime.
 
-1. **Static analyzer pass**: walk the IR for each frame handler,
-   collect the set of `(x, y)` literal pairs feeding `draw`
-   ops within the same basic block, and emit `W01XX` if any
-   scanline (8-px row) would have > 8 sprites. Only catches the
-   literal case but that's the most common.
+With the tuples collected, the analyzer iterates every
+scanline 0..240 and counts sprites whose `y <= scanline <
+y+8`. The worst scanline is cached and, if the count exceeds
+8, a `W0109` diagnostic is emitted with labels pointing at
+every draw site that contributed (deduplicated so metasprite
+expansions don't spam the message).
 
-2. **Sprite-cycling runtime helper**: a `cycle_sprites()`
-   intrinsic that rotates OAM order each frame so the same
-   sprites get dropped on different frames, producing a flicker
-   instead of a permanent dropout. Standard NES technique.
+Only `on_frame` is checked. `on_enter` / `on_exit` fire once
+per transition and aren't the hot sprite path; checking them
+would produce false positives on brief splash animations.
+Conditional branches are unioned (conservative over-count) —
+a sprite drawn inside an `if` counts for budget purposes even
+if its runtime branch is exclusive with a sibling's. The
+trade-off: the check stays local and simple, at the cost of
+occasionally flagging hand-sliced layouts that the user knows
+are actually safe.
+
+### Regression tests
+
+Five tests in `src/analyzer/tests.rs`:
+
+- `analyze_sprite_scanline_budget_warns_over_eight` — nine
+  literal draws on the same `y` trips W0109.
+- `analyze_sprite_scanline_budget_ok_when_staggered` — nine
+  draws each on a different `y` row are silent.
+- `analyze_sprite_scanline_budget_skips_dynamic_coords` —
+  draws with a `var`-backed `x` are skipped (no false
+  positive) because the analysis can't resolve them.
+- `analyze_sprite_scanline_budget_expands_metasprites` — a
+  four-tile metasprite drawn three times trips W0109 because
+  the analyzer expands each draw into its per-tile offsets.
+- `analyze_sprite_scanline_budget_recurses_into_if` — nine
+  draws inside an `if` block still trip W0109 (conservative
+  over-count).
 
 ---
 
-## 5. The `inline` keyword is a hint and is silently ignored for short functions
+## 5. The `inline` keyword is a hint and is silently ignored for short functions *(FIXED)*
 
 ### Symptom
 
-Marking a tiny function `inline fun` does not always inline it.
-The compiler still emits a real `JSR` with full parameter
-passing through `$04`-`$07`, which means the inlining doesn't
-escape the bug-2 parameter clobbering.
+Marking a tiny function `inline fun` did not inline it.
+The compiler still emitted a real `JSR` with full parameter
+passing through `$04`-`$07`, which meant the declared-inline
+helpers in War (`card_rank`, `card_suit`, `set_phase`) still
+paid the calling-convention overhead and still fell foul of
+the bug-2 clobbering until the param-spill prologue landed.
 
 ### Reproduction
 
@@ -436,30 +492,80 @@ inline fun card_rank(card: u8) -> u8 {
 }
 ```
 
-The asm dump shows `JSR __ir_fn_card_rank` at every call site —
-the function was not inlined.
+Pre-fix, the asm dump showed `JSR __ir_fn_card_rank` at every
+call site. Post-fix the body is spliced at each use and no
+`JSR` is emitted at all.
 
 ### Root cause
 
-(Inferred — would need to confirm by reading the inliner pass.)
-The optimizer's inlining pass has a size threshold or a heuristic
-that prevents inlining in some contexts even when the function
-is marked `inline`. There's no diagnostic emitted when the hint
-is declined.
+The IR lowerer's old handling of `inline fun` was a no-op —
+`is_inline` was read off the AST but the lowering path for
+`Call` never branched on it. The optimizer passes also had
+no inlining transform. So the keyword was parsed and then
+dropped on the floor, producing regular out-of-line code.
 
-### Workaround used in `examples/war/`
+### Fix
 
-None — we just live with the JSR overhead and the bug-2 fallout.
+`src/ir/lowering.rs` now captures inline bodies up front in
+`LoweringContext::capture_inline_bodies` and rewrites call
+sites at lowering time. Two body shapes are supported:
 
-### Fix proposal
+1. **Single-return expression** (e.g. `return card >> 4`) —
+   captured as `InlineBody::Expression(Expr)`. At the call
+   site, the lowerer evaluates each argument into a fresh
+   temp, pushes a substitution frame mapping parameter names
+   to those temps, and recursively lowers the expression in
+   place of a `Call` op. No IR `Call`/`Return` ops are
+   emitted; the caller ends up with the same IR it would
+   have had if the expression were written directly.
 
-1. **Promote `inline` to a hard contract**: when `inline` is
-   present, always inline (or emit `W01XX` if it cannot be
-   inlined for a structural reason like recursion).
+2. **Void multi-statement body** — captured as
+   `InlineBody::Void(Vec<Statement>)`, but only when every
+   statement passes `is_splicable_void_stmt` (plain
+   assignments, statement-level calls, draws, palette/
+   background/scroll writes, `wait_frame`, inline asm, debug
+   builtins). Any control flow (`if`/`while`/`for`/`loop`/
+   `return`/`break`/`continue`/`transition`) disqualifies
+   the function from being inlined, and the call stays a
+   regular `Call`. This mirrors War's `set_phase` (a
+   four-statement global assign) and `reset_flight` (a
+   similar pattern).
 
-2. **Optional dump**: add `--dump-inliner` to print which
-   `inline fun` declarations were inlined and which weren't,
-   with the reason.
+Functions that are marked `inline` but have a body shape the
+simple substitution machinery can't splice — notably ones
+with conditional early returns like War's `wrap52` — fall
+back to regular out-of-line calls with no diagnostic. That's
+a deliberate trade-off: rather than refuse to compile the
+program or emit a noisy warning, we degrade gracefully. The
+`inline` keyword is now a best-effort hint whose "best
+effort" is predictable and documented here.
+
+### Substitution stack
+
+Nested inline expansions push a fresh substitution frame so
+an inline body calling another inline sees the inner
+function's parameter substitutions, not its own.
+`lookup_inline_sub` walks only the top of the stack because
+inner bodies are lowered to completion before the stack is
+popped, so an unambiguous "current" frame always exists. See
+`LoweringContext::inline_subs_stack` and
+`lower_expr::Expr::Ident` (which checks the substitution
+stack before the global var table).
+
+### Regression tests
+
+Four tests in `src/ir/tests.rs`:
+
+- `inline_fun_expression_body_emits_no_call_at_use_site` —
+  a `return x * 2` inline emits no `Call`, just the multiply.
+- `inline_fun_void_body_statements_are_spliced` — a void
+  three-statement inline compiles to three individual ops
+  at the caller, not a `Call`.
+- `inline_fun_with_conditional_return_compiles_as_regular_call`
+  — a body with an `if ... return` pattern falls back to a
+  regular `Call` op.
+- `inline_fun_nested_inlines_substitute_correctly` — inline A
+  calling inline B sees B's parameter substitutions, not A's.
 
 ---
 
