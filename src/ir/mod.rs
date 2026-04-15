@@ -2,7 +2,7 @@ mod lowering;
 #[cfg(test)]
 mod tests;
 
-pub use lowering::{lower, RAW_ASM_PREFIX};
+pub use lowering::{can_inline_fun, lower, RAW_ASM_PREFIX};
 
 use crate::lexer::Span;
 use std::fmt;
@@ -166,6 +166,12 @@ pub enum IrOp {
     /// Second arg: 0 for player 1, 1 for player 2.
     ReadInput(IrTemp, u8),
     WaitFrame,
+    /// `cycle_sprites` — bump the runtime sprite-cycling offset
+    /// byte at `$07EF` by 4, with natural u8 wrap. Paired with
+    /// the cycling variant of the NMI handler that reads this
+    /// byte into `OAM_ADDR` before the OAM DMA so each frame's DMA
+    /// lands in a different slot of the PPU OAM buffer.
+    CycleSprites,
     Transition(String),
     /// Write PPU scroll registers (two writes to $2005: X then Y).
     Scroll(IrTemp, IrTemp),

@@ -470,6 +470,15 @@ pub enum Statement {
     Draw(DrawStmt),
     Transition(String, Span),
     WaitFrame(Span),
+    /// `cycle_sprites` — advance the runtime sprite-cycling offset
+    /// by one slot (4 bytes). Each call rotates the start position
+    /// of the next OAM DMA so scenes with more than 8 sprites on a
+    /// scanline drop a different one each frame, turning permanent
+    /// dropout into visible flicker. Compiles to `INC $07EF` (with
+    /// natural u8 wrap at 256→0) plus the `__sprite_cycle_used`
+    /// marker label the linker uses to select the cycling variant
+    /// of the NMI handler.
+    CycleSprites(Span),
     Call(String, Vec<Expr>, Span),
     /// `load_background Name` — queue the named background for a
     /// vblank-safe copy into nametable 0. Lowered to
@@ -517,6 +526,7 @@ impl Statement {
             | Self::Return(_, s)
             | Self::Transition(_, s)
             | Self::WaitFrame(s)
+            | Self::CycleSprites(s)
             | Self::Call(_, _, s)
             | Self::LoadBackground(_, s)
             | Self::SetPalette(_, s)

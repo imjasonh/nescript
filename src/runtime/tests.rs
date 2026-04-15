@@ -70,7 +70,7 @@ fn init_assembles_without_error() {
 
 #[test]
 fn nmi_saves_and_restores_registers() {
-    let nmi = gen_nmi(false, false, false);
+    let nmi = gen_nmi(NmiOptions::default());
     // First three instructions should push A, X, Y
     assert_eq!(nmi[0].opcode, PHA);
     assert_eq!(nmi[1].opcode, TXA);
@@ -86,7 +86,7 @@ fn nmi_saves_and_restores_registers() {
 
 #[test]
 fn nmi_triggers_oam_dma() {
-    let nmi = gen_nmi(false, false, false);
+    let nmi = gen_nmi(NmiOptions::default());
     let has_dma = nmi
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4014));
@@ -95,7 +95,7 @@ fn nmi_triggers_oam_dma() {
 
 #[test]
 fn nmi_reads_controller() {
-    let nmi = gen_nmi(false, false, false);
+    let nmi = gen_nmi(NmiOptions::default());
     // Should write strobe to $4016
     let has_strobe = nmi
         .iter()
@@ -105,7 +105,7 @@ fn nmi_reads_controller() {
 
 #[test]
 fn nmi_sets_frame_flag() {
-    let nmi = gen_nmi(false, false, false);
+    let nmi = gen_nmi(NmiOptions::default());
     let has_flag = nmi
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::ZeroPage(ZP_FRAME_FLAG));
@@ -114,7 +114,7 @@ fn nmi_sets_frame_flag() {
 
 #[test]
 fn nmi_assembles_without_error() {
-    let nmi = gen_nmi(false, false, false);
+    let nmi = gen_nmi(NmiOptions::default());
     let result = asm::assemble(&nmi, 0xF000);
     assert!(!result.bytes.is_empty());
     assert!(
@@ -132,7 +132,10 @@ fn nmi_debug_mode_bumps_overrun_counter() {
     // bump when the frame flag was clear. Without `debug_mode`,
     // neither the `INC` nor the guard label appear so release
     // builds keep the top byte of RAM free for user allocation.
-    let nmi = gen_nmi(false, false, true);
+    let nmi = gen_nmi(NmiOptions {
+        debug_mode: true,
+        ..NmiOptions::default()
+    });
     let has_inc = nmi.iter().any(|i| {
         i.opcode == INC && matches!(i.mode, AM::Absolute(a) if a == DEBUG_FRAME_OVERRUN_ADDR)
     });
@@ -141,13 +144,84 @@ fn nmi_debug_mode_bumps_overrun_counter() {
         "debug-mode NMI should INC the overrun counter at $07FF"
     );
 
-    let release_nmi = gen_nmi(false, false, false);
+    let release_nmi = gen_nmi(NmiOptions::default());
     let has_inc_release = release_nmi.iter().any(|i| {
         i.opcode == INC && matches!(i.mode, AM::Absolute(a) if a == DEBUG_FRAME_OVERRUN_ADDR)
     });
     assert!(
         !has_inc_release,
         "release NMI must not touch the debug overrun slot"
+    );
+}
+
+#[test]
+fn nmi_debug_mode_samples_sprite_overflow() {
+    // Debug NMI should read $2002 and INC the sprite overflow
+    // counter at DEBUG_SPRITE_OVERFLOW_COUNT_ADDR when bit 5 is
+    // set. Release NMI must not touch either.
+    let nmi = gen_nmi(NmiOptions {
+        debug_mode: true,
+        ..NmiOptions::default()
+    });
+    let has_status_read = nmi
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::Absolute(0x2002));
+    assert!(
+        has_status_read,
+        "debug-mode NMI should read $2002 to sample sprite overflow"
+    );
+    let has_inc = nmi.iter().any(|i| {
+        i.opcode == INC
+            && matches!(i.mode, AM::Absolute(a) if a == DEBUG_SPRITE_OVERFLOW_COUNT_ADDR)
+    });
+    assert!(
+        has_inc,
+        "debug-mode NMI should INC the sprite overflow counter at $07FD"
+    );
+    let has_sticky = nmi.iter().any(|i| {
+        i.opcode == STA && matches!(i.mode, AM::Absolute(a) if a == DEBUG_SPRITE_OVERFLOW_FLAG_ADDR)
+    });
+    assert!(
+        has_sticky,
+        "debug-mode NMI should set the sprite overflow sticky bit at $07FC"
+    );
+
+    let release_nmi = gen_nmi(NmiOptions::default());
+    let has_inc_release = release_nmi.iter().any(|i| {
+        i.opcode == INC
+            && matches!(i.mode, AM::Absolute(a) if a == DEBUG_SPRITE_OVERFLOW_COUNT_ADDR)
+    });
+    assert!(
+        !has_inc_release,
+        "release NMI must not touch the sprite overflow counter slot"
+    );
+}
+
+#[test]
+fn nmi_sprite_cycle_variant_reads_rotating_offset() {
+    // With `has_sprite_cycle = true`, the NMI handler should
+    // read SPRITE_CYCLE_ADDR and write it to OAM_ADDR ($2003)
+    // before the DMA, instead of the default fixed 0. The
+    // default variant must stay byte-identical to legacy NMI.
+    let cycling = gen_nmi(NmiOptions {
+        has_sprite_cycle: true,
+        ..NmiOptions::default()
+    });
+    let reads_cycle = cycling
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::Absolute(SPRITE_CYCLE_ADDR));
+    assert!(
+        reads_cycle,
+        "sprite-cycling NMI should read SPRITE_CYCLE_ADDR"
+    );
+
+    let default = gen_nmi(NmiOptions::default());
+    let reads_cycle_default = default
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::Absolute(SPRITE_CYCLE_ADDR));
+    assert!(
+        !reads_cycle_default,
+        "default NMI must not touch SPRITE_CYCLE_ADDR"
     );
 }
 

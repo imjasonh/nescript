@@ -33,6 +33,7 @@ pub enum ErrorCode {
     E0503, // undefined function
     E0504, // missing start declaration
     E0505, // multiple start declarations
+    E0506, // function has too many parameters (max 4 in v0.1)
 
     // W01xx: Warnings
     W0101, // expensive multiply/divide operation
@@ -43,6 +44,8 @@ pub enum ErrorCode {
     W0106, // implicit drop of non-void function return value
     W0107, // `fast` variable rarely accessed (wastes zero-page slot)
     W0108, // array elements past byte 255 unreachable via 8-bit X index
+    W0109, // too many literal-coord sprite draws on one scanline (NES 8/scanline limit)
+    W0110, // `inline fun` declined — body shape not splicable, fell back to regular call
 }
 
 impl fmt::Display for ErrorCode {
@@ -62,6 +65,7 @@ impl fmt::Display for ErrorCode {
             Self::E0503 => "E0503",
             Self::E0504 => "E0504",
             Self::E0505 => "E0505",
+            Self::E0506 => "E0506",
             Self::W0101 => "W0101",
             Self::W0102 => "W0102",
             Self::W0103 => "W0103",
@@ -70,6 +74,8 @@ impl fmt::Display for ErrorCode {
             Self::W0106 => "W0106",
             Self::W0107 => "W0107",
             Self::W0108 => "W0108",
+            Self::W0109 => "W0109",
+            Self::W0110 => "W0110",
         };
         write!(f, "{code}")
     }
@@ -85,7 +91,9 @@ impl ErrorCode {
             | Self::W0105
             | Self::W0106
             | Self::W0107
-            | Self::W0108 => Level::Warning,
+            | Self::W0108
+            | Self::W0109
+            | Self::W0110 => Level::Warning,
             _ => Level::Error,
         }
     }

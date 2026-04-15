@@ -2059,3 +2059,565 @@ fn analyze_debug_frame_overrun_count_with_args_errors() {
         "expected E0203 for arg count mismatch, got: {errors:?}"
     );
 }
+
+#[test]
+fn analyze_rejects_function_with_more_than_4_params() {
+    // The v0.1 calling convention only allocates 4 zero-page
+    // parameter slots ($04-$07). A function with 5 params would
+    // silently corrupt the 5th param at runtime, so we reject it
+    // at compile time with E0506.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        fun too_many(a: u8, b: u8, c: u8, d: u8, e: u8) {
+            a = 0
+        }
+        on frame { too_many(1, 2, 3, 4, 5) }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0506),
+        "expected E0506 for function with >4 params, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_accepts_function_with_exactly_4_params() {
+    // 4 params is the maximum and should compile cleanly.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        fun four_args(a: u8, b: u8, c: u8, d: u8) -> u8 {
+            return a + b + c + d
+        }
+        var n: u8 = 0
+        on frame {
+            n = four_args(1, 2, 3, 4)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_allows_same_local_name_in_two_functions() {
+    // Regression test for the function-local scope-qualification
+    // fix on the War bug-cleanup branch (see `git log`): function-
+    // body `var` declarations used to live in a flat global
+    // namespace, so two functions both declaring `var i` collided
+    // on E0501. They now coexist in per-function scopes.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        fun foo() -> u8 {
+            var i: u8 = 0
+            while i < 5 { i += 1 }
+            return i
+        }
+        fun bar() -> u8 {
+            var i: u8 = 0
+            while i < 10 { i += 1 }
+            return i
+        }
+        var total: u8 = 0
+        on frame {
+            total = foo() + bar()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_allows_same_param_name_in_two_functions() {
+    // Regression test for the scope-qualified parameter fix on
+    // the War bug-cleanup branch (see `git log`): parameters
+    // across different functions used to share VarIds because
+    // the IR lowerer's `var_map` was global. Both declaration
+    // (analyzer) and lowering (IR) now give each function's
+    // parameters their own independent entries.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        fun shift_left(x: u8) -> u8 { return x << 1 }
+        fun shift_right(x: u8) -> u8 { return x >> 1 }
+        var n: u8 = 0
+        on frame {
+            n = shift_left(5) + shift_right(20)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_allows_same_local_name_in_two_state_handlers() {
+    // Each state handler gets its own local scope, so both
+    // `Title::on frame` and `Playing::on frame` can declare
+    // `var i` independently.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        state Title {
+            on frame {
+                var i: u8 = 0
+                while i < 3 { i += 1 }
+                if button.start { transition Playing }
+            }
+        }
+        state Playing {
+            on frame {
+                var i: u8 = 0
+                while i < 7 { i += 1 }
+            }
+        }
+        start Title
+    "#,
+    );
+}
+
+#[test]
+fn analyze_still_rejects_duplicate_local_in_same_function() {
+    // Two `var i` declarations inside the SAME function body
+    // should still trip E0501 — we scoped locals per function,
+    // not per statement.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        fun foo() -> u8 {
+            var i: u8 = 0
+            var i: u8 = 1
+            return i
+        }
+        on frame { var r: u8 = foo() wait_frame }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0501),
+        "expected E0501 for duplicate `var i` in same function, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_sprite_scanline_budget_warns_over_eight() {
+    // Nine literal-coord draws all sharing the same `y` stack
+    // vertically on a single scanline. That blows past the NES's
+    // 8-sprites-per-scanline budget and must trip W0109.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        state Main {
+            on frame {
+                draw Blip at: (10, 100)
+                draw Blip at: (20, 100)
+                draw Blip at: (30, 100)
+                draw Blip at: (40, 100)
+                draw Blip at: (50, 100)
+                draw Blip at: (60, 100)
+                draw Blip at: (70, 100)
+                draw Blip at: (80, 100)
+                draw Blip at: (90, 100)
+                wait_frame
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    let w0109: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == ErrorCode::W0109)
+        .collect();
+    assert_eq!(
+        w0109.len(),
+        1,
+        "expected exactly one W0109, got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        w0109[0].message.contains('9') && w0109[0].message.contains("Main"),
+        "W0109 message should mention count 9 and state Main, got: {}",
+        w0109[0].message
+    );
+    assert!(
+        !w0109[0].labels.is_empty(),
+        "W0109 should label the offending draws"
+    );
+}
+
+#[test]
+fn analyze_sprite_scanline_budget_ok_when_staggered() {
+    // Nine draws, but each one is on its own line. No scanline
+    // ever sees more than one sprite. Must NOT trip W0109.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        state Main {
+            on frame {
+                draw Blip at: (10, 0)
+                draw Blip at: (10, 16)
+                draw Blip at: (10, 32)
+                draw Blip at: (10, 48)
+                draw Blip at: (10, 64)
+                draw Blip at: (10, 80)
+                draw Blip at: (10, 96)
+                draw Blip at: (10, 112)
+                draw Blip at: (10, 128)
+                wait_frame
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0109),
+        "did not expect W0109 for staggered draws, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_sprite_scanline_budget_skips_dynamic_coords() {
+    // Nine draws on the same line, but the x coordinate comes from
+    // a variable. Static analysis can't know where these land, so
+    // W0109 must stay silent.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        var px: u8 = 0
+        state Main {
+            on frame {
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                draw Blip at: (px, 100)
+                wait_frame
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0109),
+        "did not expect W0109 for dynamic coords, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_sprite_scanline_budget_expands_metasprites() {
+    // A metasprite with four tiles all at `dy = 0` means one
+    // `draw` statement contributes four sprites to the same
+    // scanline. Three such draws = 12 overlapping sprites, which
+    // must trip W0109.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        sprite Tile8 {
+            pixels: [
+                "........",
+                "........",
+                "........",
+                "........",
+                "........",
+                "........",
+                "........",
+                "........"
+            ]
+        }
+        metasprite Quad {
+            sprite: Tile8
+            dx:    [0, 8, 16, 24]
+            dy:    [0, 0, 0, 0]
+            frame: [0, 0, 0, 0]
+        }
+        state Main {
+            on frame {
+                draw Quad at: (0, 100)
+                draw Quad at: (40, 100)
+                draw Quad at: (80, 100)
+                wait_frame
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0109),
+        "expected W0109 for metasprite overlap, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_sprite_scanline_budget_recurses_into_if() {
+    // Conservative: a branch that always fires when the state
+    // runs still counts. Nine draws inside an `if` block over the
+    // same scanline must trip W0109.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        var flag: u8 = 0
+        state Main {
+            on frame {
+                if flag == 1 {
+                    draw Blip at: (10, 100)
+                    draw Blip at: (20, 100)
+                    draw Blip at: (30, 100)
+                    draw Blip at: (40, 100)
+                    draw Blip at: (50, 100)
+                    draw Blip at: (60, 100)
+                    draw Blip at: (70, 100)
+                    draw Blip at: (80, 100)
+                    draw Blip at: (90, 100)
+                }
+                wait_frame
+            }
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0109),
+        "expected W0109 for draws inside if, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_accepts_debug_sprite_overflow_builtins() {
+    // Both new debug methods should analyze without errors when
+    // called with zero arguments, exactly like
+    // frame_overrun_count / frame_overran.
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        var a: u8 = 0
+        var b: u8 = 0
+        on frame {
+            a = debug.sprite_overflow_count()
+            b = debug.sprite_overflow()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(!result
+        .diagnostics
+        .iter()
+        .any(|d| d.code == ErrorCode::E0201));
+}
+
+#[test]
+fn analyze_rejects_unknown_debug_method_lists_all_four_known_names() {
+    // When the user calls `debug.nope()`, the E0201 message
+    // should list every supported method name so typo fixes are
+    // obvious.
+    let errors = analyze_errors(
+        r#"
+        game "T" { mapper: NROM }
+        var a: u8 = 0
+        on frame {
+            a = debug.nope()
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for unknown debug method, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_accepts_cycle_sprites_statement() {
+    // `cycle_sprites` is a no-arg keyword statement. It should
+    // analyze cleanly in a frame handler without triggering any
+    // errors or warnings.
+    analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        on frame {
+            draw Blip at: (10, 20)
+            cycle_sprites
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_inline_fun_with_conditional_return_trips_w0110() {
+    // A function marked `inline` whose body has an early
+    // conditional return can't be inlined by the simple
+    // substitution machinery — it compiles as a regular
+    // `JSR` call, and W0110 must fire at the declaration.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        inline fun wrap(v: u8) -> u8 {
+            if v >= 52 {
+                return v - 52
+            }
+            return v
+        }
+        var x: u8 = 0
+        on frame {
+            x = wrap(60)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    let w0110: Vec<_> = result
+        .diagnostics
+        .iter()
+        .filter(|d| d.code == ErrorCode::W0110)
+        .collect();
+    assert_eq!(
+        w0110.len(),
+        1,
+        "expected exactly one W0110, got: {:?}",
+        result.diagnostics
+    );
+    assert!(
+        w0110[0].message.contains("wrap"),
+        "W0110 should name the declined function, got: {}",
+        w0110[0].message
+    );
+    assert!(
+        w0110[0].help.is_some() && w0110[0].note.is_some(),
+        "W0110 should carry both help and note text"
+    );
+}
+
+#[test]
+fn analyze_inline_fun_with_single_return_expression_is_accepted() {
+    // A body that is exactly `return <expr>` is the canonical
+    // inlinable shape — no W0110 should fire.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        inline fun card_rank(card: u8) -> u8 {
+            return card >> 4
+        }
+        var x: u8 = 0
+        on frame {
+            x = card_rank(0x93)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0110),
+        "did not expect W0110 for single-return inline, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_inline_void_fun_is_accepted() {
+    // A void body with nothing but assigns is inlinable.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        var a: u8 = 0
+        var b: u8 = 0
+        inline fun set_pair(x: u8, y: u8) {
+            a = x
+            b = y
+        }
+        on frame {
+            set_pair(5, 6)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        !result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0110),
+        "did not expect W0110 for void inline, got: {:?}",
+        result.diagnostics
+    );
+}
+
+#[test]
+fn analyze_inline_fun_with_loop_body_trips_w0110() {
+    // A `while` loop inside a marked-inline body is another
+    // disqualifying shape.
+    let (prog, diags) = parser::parse(
+        r#"
+        game "T" { mapper: NROM }
+        var sum: u8 = 0
+        inline fun accumulate(n: u8) {
+            var i: u8 = 0
+            while i < n {
+                sum += i
+                i += 1
+            }
+        }
+        on frame {
+            accumulate(5)
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let result = analyze(&prog.unwrap());
+    assert!(
+        result
+            .diagnostics
+            .iter()
+            .any(|d| d.code == ErrorCode::W0110),
+        "expected W0110 for loop-body inline, got: {:?}",
+        result.diagnostics
+    );
+}

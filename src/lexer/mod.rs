@@ -482,6 +482,7 @@ impl<'a> Lexer<'a> {
             "bank" => TokenKind::KwBank,
             "loop" => TokenKind::KwLoop,
             "wait_frame" => TokenKind::KwWaitFrame,
+            "cycle_sprites" => TokenKind::KwCycleSprites,
             "u8" => TokenKind::KwU8,
             "i8" => TokenKind::KwI8,
             "u16" => TokenKind::KwU16,

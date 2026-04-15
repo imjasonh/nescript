@@ -119,6 +119,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         function_return_types: HashMap::new(),
         current_return_type: None,
         in_function_body: false,
+        current_scope_prefix: None,
         struct_layouts: HashMap::new(),
     };
     analyzer.analyze_program(program);
@@ -180,6 +181,24 @@ struct Analyzer {
     /// distinguish "void function" from "state handler" when checking
     /// `return value` statements.
     in_function_body: bool,
+    /// Current local scope prefix used to qualify function-body
+    /// `var` declarations. `None` at the top level and during
+    /// state-level declaration registration; set to `Some("foo")`
+    /// while analyzing the body of `fun foo`, and to
+    /// `Some("Title::frame")` (etc.) while analyzing a state
+    /// handler body. When it is `Some(prefix)`, `register_var`
+    /// stores the declaration under a qualified key
+    /// `"__local__{prefix}__{name}"`, and `resolve_*` helpers
+    /// below fall back through the qualified key first and the
+    /// bare key second so identifier reads inside a body resolve
+    /// to the locally-scoped entry when one exists.
+    ///
+    /// This is how functions and handlers get their own local
+    /// namespaces without requiring a full nested-scope stack.
+    /// Top-level globals, consts, state-level vars, function
+    /// names, and enum variants still live at the bare name in
+    /// `self.symbols`.
+    current_scope_prefix: Option<String>,
     /// Struct name to layout. Each field has an offset in bytes from
     /// the base address of the struct.
     struct_layouts: HashMap<String, StructLayout>,
@@ -524,16 +543,27 @@ impl Analyzer {
             ));
         }
 
-        // Type-check all state bodies
+        // Type-check all state bodies. Each handler body is its
+        // own local scope: a `var i` inside `Title::on frame`
+        // does not collide with a `var i` inside `Playing::on
+        // frame`. State-level `var`s (declared at `state Foo { var x
+        // }`) stay in the global scope so every handler in the
+        // state can read and write them across frames.
         for state in &program.states {
             if let Some(block) = &state.on_enter {
+                self.current_scope_prefix = Some(format!("{}__enter", state.name));
                 self.check_block(block, &state_names);
+                self.current_scope_prefix = None;
             }
             if let Some(block) = &state.on_exit {
+                self.current_scope_prefix = Some(format!("{}__exit", state.name));
                 self.check_block(block, &state_names);
+                self.current_scope_prefix = None;
             }
             if let Some(block) = &state.on_frame {
+                self.current_scope_prefix = Some(format!("{}__frame", state.name));
                 self.check_block(block, &state_names);
+                self.current_scope_prefix = None;
             }
             // `on scanline(N)` is only valid with mappers that have a
             // scanline-counting IRQ source (currently only MMC3).
@@ -544,43 +574,64 @@ impl Analyzer {
                     state.span,
                 ));
             }
-            for (_, block) in &state.on_scanline {
+            for (line, block) in &state.on_scanline {
+                self.current_scope_prefix = Some(format!("{}__scanline_{}", state.name, line));
                 self.check_block(block, &state_names);
+                self.current_scope_prefix = None;
             }
         }
 
-        // Type-check function bodies. Parameters are registered as
-        // symbols for the duration of the body check so that identifier
-        // references (and the W0103 used-variable tracker) can resolve
-        // them. They are unregistered afterwards to avoid leaking into
-        // the global scope. Parameters are also pre-marked as "used" so
-        // we do not emit W0103 for unused function arguments (which are
-        // a common and deliberate pattern).
+        // Type-check function bodies. Each function body gets its
+        // own local scope by setting `current_scope_prefix` to
+        // the function's name. Parameters are registered as
+        // function-local symbols under the prefixed key so two
+        // different functions can both declare a parameter named
+        // `x` without the analyzer's duplicate-declaration check
+        // firing. Each parameter also gets its own dedicated RAM
+        // slot allocated via `allocate_ram` — the codegen emits a
+        // prologue that copies the transport slots `$04-$07`
+        // into these RAM slots at function entry, so the param
+        // values survive any nested calls the function body
+        // makes. Parameters are pre-marked as "used" so we do
+        // not emit W0103 for unused function arguments.
         for fun in &program.functions {
-            let mut added_params = Vec::new();
+            self.current_scope_prefix = Some(fun.name.clone());
             for param in &fun.params {
-                if !self.symbols.contains_key(&param.name) {
+                let key = self.scoped_name(&param.name);
+                let size = match param.param_type {
+                    NesType::U8 | NesType::I8 | NesType::Bool => 1,
+                    NesType::U16 => 2,
+                    // Struct/array parameters are not supported
+                    // in v0.1; the parser already rejects them,
+                    // so defaulting to 1 byte here is just a
+                    // fallback to keep the analyzer from
+                    // crashing on malformed ASTs.
+                    _ => 1,
+                };
+                if let Some(address) = self.allocate_ram(size, fun.span) {
                     self.symbols.insert(
-                        param.name.clone(),
+                        key.clone(),
                         Symbol {
-                            name: param.name.clone(),
+                            name: key.clone(),
                             sym_type: param.param_type.clone(),
                             is_const: false,
                             span: fun.span,
                         },
                     );
-                    added_params.push(param.name.clone());
+                    self.var_allocations.push(VarAllocation {
+                        name: key.clone(),
+                        address,
+                        size,
+                    });
+                    self.used_vars.insert(key);
                 }
-                self.mark_var_used(&param.name);
             }
             self.current_return_type.clone_from(&fun.return_type);
             self.in_function_body = true;
             self.check_block(&fun.body, &state_names);
             self.current_return_type = None;
             self.in_function_body = false;
-            for name in &added_params {
-                self.symbols.remove(name);
-            }
+            self.current_scope_prefix = None;
         }
 
         // Build call graph
@@ -627,20 +678,89 @@ impl Analyzer {
 
         // Check for unreachable states (W0104).
         self.check_unreachable_states(program);
+
+        // Check for literal-coord sprite draws that would
+        // overflow the NES's 8-sprites-per-scanline hardware
+        // limit (W0109). Only on_frame handlers are checked —
+        // on_enter and on_exit fire once per transition and are
+        // much less likely to exceed the budget. Only draws
+        // with `IntLiteral` (x, y) pairs are counted; dynamic
+        // coordinates are skipped because the static analysis
+        // can't know where the sprite will land at runtime.
+        self.check_sprite_scanline_budget(program);
+
+        // Check every `inline fun` declaration against the
+        // IR lowerer's inline-eligibility rules. Functions
+        // whose body shape isn't splicable compile as regular
+        // out-of-line calls — which is correct, but silent:
+        // users who mark a helper `inline` to avoid call
+        // overhead might not realize the hint was declined.
+        // W0110 makes the fallback visible.
+        self.check_inline_declinability(program);
+    }
+
+    /// Qualify `name` under the current scope prefix. If no prefix
+    /// is active (top-level analysis, state-level declaration) the
+    /// name is returned unchanged. Inside a function body the
+    /// result is `"__local__{prefix}__{name}"` — the same key the
+    /// IR lowerer and codegen use when walking a function's locals.
+    fn scoped_name(&self, name: &str) -> String {
+        match &self.current_scope_prefix {
+            Some(prefix) => format!("__local__{prefix}__{name}"),
+            None => name.to_string(),
+        }
+    }
+
+    /// Resolve a user-written identifier to the matching symbol
+    /// table key. Tries the current scope's qualified key first
+    /// (so function-local vars shadow same-named globals) and
+    /// falls back to the bare key for globals, consts, enum
+    /// variants, state-locals, and function names.
+    fn resolve_key(&self, name: &str) -> String {
+        if let Some(prefix) = &self.current_scope_prefix {
+            let qualified = format!("__local__{prefix}__{name}");
+            if self.symbols.contains_key(&qualified) {
+                return qualified;
+            }
+        }
+        name.to_string()
+    }
+
+    /// Look up a user-written identifier in the symbol table,
+    /// preferring the current scope's qualified entry (if any)
+    /// and falling back to the bare global entry.
+    fn resolve_symbol(&self, name: &str) -> Option<&Symbol> {
+        if let Some(prefix) = &self.current_scope_prefix {
+            let qualified = format!("__local__{prefix}__{name}");
+            if let Some(sym) = self.symbols.get(&qualified) {
+                return Some(sym);
+            }
+        }
+        self.symbols.get(name)
+    }
+
+    /// True if a symbol exists for `name` in the current scope or
+    /// in the global scope.
+    fn symbol_exists(&self, name: &str) -> bool {
+        self.resolve_symbol(name).is_some()
     }
 
     /// Mark a variable name as having been read somewhere in the program.
-    /// Also bumps the W0107 access counter.
+    /// Also bumps the W0107 access counter. Resolves the name through
+    /// the current scope so the right (qualified-or-bare) key is
+    /// recorded.
     fn mark_var_used(&mut self, name: &str) {
-        self.used_vars.insert(name.to_string());
-        self.bump_var_access(name);
+        let key = self.resolve_key(name);
+        self.used_vars.insert(key.clone());
+        *self.var_access_counts.entry(key).or_insert(0) += 1;
     }
 
     /// Increment the observed access count for `name`. Called for
     /// both reads (via [`Analyzer::mark_var_used`]) and writes (at
     /// `Statement::Assign` handling). Used for W0107.
     fn bump_var_access(&mut self, name: &str) {
-        *self.var_access_counts.entry(name.to_string()).or_insert(0) += 1;
+        let key = self.resolve_key(name);
+        *self.var_access_counts.entry(key).or_insert(0) += 1;
     }
 
     /// Emit W0107 if `var` is declared `fast` but sees fewer than
@@ -712,7 +832,7 @@ impl Analyzer {
     fn walk_expr_reads(&mut self, expr: &Expr) {
         match expr {
             Expr::Ident(name, span) => {
-                if self.symbols.contains_key(name) {
+                if self.symbol_exists(name) {
                     self.mark_var_used(name);
                 } else {
                     self.emit_undefined_var(name, *span);
@@ -720,7 +840,7 @@ impl Analyzer {
             }
             Expr::ArrayIndex(name, idx, span) => {
                 // Array base is a read; index may contain more reads.
-                if self.symbols.contains_key(name) {
+                if self.symbol_exists(name) {
                     self.mark_var_used(name);
                 } else {
                     self.emit_undefined_var(name, *span);
@@ -728,14 +848,15 @@ impl Analyzer {
                 self.walk_expr_reads(idx);
             }
             Expr::FieldAccess(name, field, span) => {
-                // Resolve the struct variable and verify the field
-                // exists. Mark the synthetic `name.field` variable as
-                // used so W0103 doesn't fire.
-                let full_name = format!("{name}.{field}");
+                // Resolve the struct variable through the scope
+                // stack and verify the field exists. Mark both the
+                // base and the synthetic `name.field` entry used.
+                let base_key = self.resolve_key(name);
+                let full_name = format!("{base_key}.{field}");
                 if self.symbols.contains_key(&full_name) {
                     self.mark_var_used(name);
-                    self.mark_var_used(&full_name);
-                } else if !self.symbols.contains_key(name) {
+                    self.used_vars.insert(full_name);
+                } else if !self.symbols.contains_key(&base_key) {
                     self.emit_undefined_var(name, *span);
                 } else {
                     self.diagnostics.push(Diagnostic::error(
@@ -831,7 +952,10 @@ impl Analyzer {
                 // for completeness even though no current method
                 // accepts any.
                 match method.as_str() {
-                    "frame_overrun_count" | "frame_overran" => {
+                    "frame_overrun_count"
+                    | "frame_overran"
+                    | "sprite_overflow_count"
+                    | "sprite_overflow" => {
                         if !args.is_empty() {
                             self.diagnostics.push(Diagnostic::error(
                                 ErrorCode::E0203,
@@ -844,8 +968,8 @@ impl Analyzer {
                         self.diagnostics.push(Diagnostic::error(
                             ErrorCode::E0201,
                             format!(
-                                "unknown debug method '{method}' \
-                                 (expected 'frame_overrun_count' or 'frame_overran')"
+                                "unknown debug method '{method}' (expected 'frame_overrun_count', \
+                                 'frame_overran', 'sprite_overflow_count', or 'sprite_overflow')"
                             ),
                             *span,
                         ));
@@ -919,6 +1043,158 @@ impl Analyzer {
                     note: None,
                 });
             }
+        }
+    }
+
+    /// Static check for the NES's 8-sprites-per-scanline hardware
+    /// limit (W0109). Walks every state's `on_frame` handler,
+    /// collects literal-coordinate `draw` statements (and expands
+    /// metasprites via their per-tile `dx`/`dy` offsets), then
+    /// iterates scanlines 0..240 and emits W0109 for any state
+    /// where more than 8 sprites overlap a single scanline.
+    ///
+    /// Draws with non-literal `x` or `y` are skipped — static
+    /// analysis can't know where those sprites land at runtime.
+    /// Draws inside nested `if`/`while`/`for`/`loop` blocks are
+    /// counted as if they always fire; this over-counts programs
+    /// that stagger draws across mutually exclusive branches, but
+    /// it matches the worst case the hardware sees. Only `on_frame`
+    /// is checked — `on_enter`/`on_exit` run once per transition
+    /// and aren't on the hot sprite path.
+    fn check_sprite_scanline_budget(&mut self, program: &Program) {
+        // Build a name -> MetaspriteDecl lookup so draws that target
+        // a metasprite can expand to one slot per tile offset.
+        let metasprites: HashMap<&str, &MetaspriteDecl> = program
+            .metasprites
+            .iter()
+            .map(|ms| (ms.name.as_str(), ms))
+            .collect();
+
+        for state in &program.states {
+            let Some(block) = &state.on_frame else {
+                continue;
+            };
+
+            // Collect (y, x, span) tuples for every literal-coord
+            // draw in the handler, recursing through nested control
+            // flow and expanding metasprites.
+            let mut draws: Vec<(u8, u8, Span)> = Vec::new();
+            collect_literal_draws(block, &metasprites, &mut draws);
+
+            // Fast path: if there aren't even 9 literal draws total
+            // the overlap check can never trip.
+            if draws.len() <= 8 {
+                continue;
+            }
+
+            // For each scanline, count how many 8×8 sprites cover
+            // it. Sprites at y=Y cover scanlines Y..Y+8 (NES OAM
+            // stores the y one line early, but for the overlap
+            // budget the 8-pixel span is what matters).
+            let mut worst_count: usize = 0;
+            let mut worst_scanline: u16 = 0;
+            for scanline in 0u16..240 {
+                let mut count = 0usize;
+                for (y, _, _) in &draws {
+                    let top = u16::from(*y);
+                    if top <= scanline && scanline < top + 8 {
+                        count += 1;
+                    }
+                }
+                if count > worst_count {
+                    worst_count = count;
+                    worst_scanline = scanline;
+                }
+            }
+
+            if worst_count <= 8 {
+                continue;
+            }
+
+            // Build a diagnostic pointing at the state with labels
+            // on each offending draw. Cap the labels at 9 so the
+            // message doesn't become a wall of text for pathological
+            // programs.
+            let mut diag = Diagnostic::warning(
+                ErrorCode::W0109,
+                format!(
+                    "state '{}' draws {} literal-coordinate sprites overlapping scanline {}; \
+                     the NES renders at most 8 sprites per scanline",
+                    state.name, worst_count, worst_scanline
+                ),
+                state.span,
+            )
+            .with_help(
+                "stagger draws vertically by at least 8 pixels, reduce the number of \
+                 on-screen sprites, or split the draws across `on_scanline` handlers",
+            )
+            .with_note(
+                "the 9th and later sprites on a scanline are dropped by the PPU, \
+                 causing flicker or invisible objects on real hardware",
+            );
+
+            let mut labeled: usize = 0;
+            let mut seen_spans: HashSet<(u16, u32, u32)> = HashSet::new();
+            for (y, _, span) in &draws {
+                let top = u16::from(*y);
+                if top <= worst_scanline && worst_scanline < top + 8 {
+                    // Deduplicate identical spans (metasprite
+                    // expansion produces one tuple per tile but all
+                    // share the original draw-site span).
+                    let key = (span.file_id, span.start, span.end);
+                    if !seen_spans.insert(key) {
+                        continue;
+                    }
+                    diag = diag.with_label(*span, "draws here");
+                    labeled += 1;
+                    if labeled >= 9 {
+                        break;
+                    }
+                }
+            }
+
+            self.diagnostics.push(diag);
+        }
+    }
+
+    /// Walk every `inline fun` declaration and check whether the
+    /// IR lowerer will actually inline its body. Functions that
+    /// won't inline (conditional returns, loops, transitions,
+    /// empty void bodies, etc.) compile as regular out-of-line
+    /// calls — correct but silent. W0110 surfaces the fallback
+    /// at the declaration site with help text pointing at the
+    /// two body shapes the inliner does accept.
+    ///
+    /// Defers to [`crate::ir::lowering::can_inline_fun`] so the
+    /// two sides (warning + actual capture) can never drift.
+    fn check_inline_declinability(&mut self, program: &Program) {
+        for fun in &program.functions {
+            if !fun.is_inline {
+                continue;
+            }
+            if crate::ir::can_inline_fun(fun.return_type.as_ref(), &fun.body) {
+                continue;
+            }
+            self.diagnostics.push(
+                Diagnostic::warning(
+                    ErrorCode::W0110,
+                    format!(
+                        "`inline fun {}` cannot be inlined; falling back to a regular call",
+                        fun.name
+                    ),
+                    fun.span,
+                )
+                .with_help(
+                    "the inliner accepts two body shapes: a single `return <expr>` (for \
+                     functions with a return type) or a sequence of plain statements with no \
+                     control flow (for void functions). Rewrite the body to fit one of those, \
+                     or remove the `inline` keyword if the JSR overhead is acceptable",
+                )
+                .with_note(
+                    "rejected body shapes include conditional early returns, if/while/for/loop \
+                     blocks, transitions, breaks, continues, and nested function definitions",
+                ),
+            );
         }
     }
 
@@ -1134,7 +1410,19 @@ impl Analyzer {
     }
 
     fn register_var(&mut self, var: &VarDecl) {
-        if self.symbols.contains_key(&var.name) {
+        // Scope-qualified storage key. At the top level this is
+        // the bare `var.name`; inside a function or handler body
+        // it is `"__local__{prefix}__{name}"` so two different
+        // functions can each declare a local `var i` without
+        // colliding on the flat symbol table.
+        let key = self.scoped_name(&var.name);
+
+        // Duplicate check runs against the qualified key so
+        // shadowing a global with a function-local var is fine
+        // (the local key is distinct). Two locals with the same
+        // name inside the same scope still collide and report
+        // E0501 correctly.
+        if self.symbols.contains_key(&key) {
             self.diagnostics.push(Diagnostic::error(
                 ErrorCode::E0501,
                 format!("duplicate declaration of '{}'", var.name),
@@ -1194,9 +1482,9 @@ impl Analyzer {
             // symbol so that later references don't cascade into E0502,
             // but don't record a var_allocations entry.
             self.symbols.insert(
-                var.name.clone(),
+                key.clone(),
                 Symbol {
-                    name: var.name.clone(),
+                    name: key,
                     sym_type: var.var_type.clone(),
                     is_const: false,
                     span: var.span,
@@ -1215,15 +1503,21 @@ impl Analyzer {
         // `p.pos.y` leaves. Array fields produce a single
         // synthetic with the array type so the existing
         // `Expr::ArrayIndex` lowering picks them up.
+        //
+        // Struct fields use the qualified key as the base so
+        // function-local struct instances don't collide with
+        // same-named globals. `flatten_struct_fields` builds
+        // `"{key}.{field}"` paths, which inherits the scope
+        // prefix automatically.
         if let NesType::Struct(sname) = &var.var_type {
             let layout = self.struct_layouts[sname].clone();
-            self.flatten_struct_fields(&var.name, address, &layout, var.span);
+            self.flatten_struct_fields(&key, address, &layout, var.span);
             // Also register the struct variable itself (as a symbol
             // only — it doesn't have a single VarAllocation entry).
             self.symbols.insert(
-                var.name.clone(),
+                key.clone(),
                 Symbol {
-                    name: var.name.clone(),
+                    name: key,
                     sym_type: var.var_type.clone(),
                     is_const: false,
                     span: var.span,
@@ -1233,9 +1527,9 @@ impl Analyzer {
         }
 
         self.symbols.insert(
-            var.name.clone(),
+            key.clone(),
             Symbol {
-                name: var.name.clone(),
+                name: key.clone(),
                 sym_type: var.var_type.clone(),
                 is_const: false,
                 span: var.span,
@@ -1243,7 +1537,7 @@ impl Analyzer {
         );
 
         self.var_allocations.push(VarAllocation {
-            name: var.name.clone(),
+            name: key,
             address,
             size,
         });
@@ -1256,6 +1550,30 @@ impl Analyzer {
                 format!("duplicate declaration of '{}'", fun.name),
                 fun.span,
             ));
+            return;
+        }
+        // The v0.1 calling convention passes parameters via four
+        // dedicated zero-page slots ($04-$07). Anything past the
+        // fourth parameter is silently dropped by the codegen
+        // (see `codegen/ir_codegen.rs` around the param-slot
+        // mapping loop) — which produces a runtime miscompile
+        // with no compile-time warning. Catch the over-arity case
+        // here so users get a clear error instead.
+        if fun.params.len() > 4 {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    ErrorCode::E0506,
+                    format!(
+                        "function '{}' has {} parameters; the maximum is 4 in this version",
+                        fun.name,
+                        fun.params.len()
+                    ),
+                    fun.span,
+                )
+                .with_help(
+                    "the v0.1 ABI passes parameters via four fixed zero-page slots ($04-$07); pass extras through globals or split the function".to_string(),
+                ),
+            );
             return;
         }
         let sym_type = fun.return_type.clone().unwrap_or(NesType::U8);
@@ -1417,10 +1735,12 @@ impl Analyzer {
                 }
             }
             Statement::Assign(lvalue, _, expr, span) => {
-                // Check if trying to assign to a constant
+                // Check if trying to assign to a constant. Lookups
+                // go through `resolve_symbol` so a function-local
+                // shadowing a global const/var is handled correctly.
                 match lvalue {
                     LValue::Var(name) => {
-                        if let Some(sym) = self.symbols.get(name) {
+                        if let Some(sym) = self.resolve_symbol(name) {
                             if sym.is_const {
                                 self.diagnostics.push(Diagnostic::error(
                                     ErrorCode::E0203,
@@ -1443,7 +1763,7 @@ impl Analyzer {
                         }
                     }
                     LValue::ArrayIndex(name, idx) => {
-                        if let Some(sym) = self.symbols.get(name) {
+                        if let Some(sym) = self.resolve_symbol(name) {
                             if sym.is_const {
                                 self.diagnostics.push(Diagnostic::error(
                                     ErrorCode::E0203,
@@ -1460,13 +1780,20 @@ impl Analyzer {
                         self.walk_expr_reads(idx);
                     }
                     LValue::Field(name, field) => {
-                        let full_name = format!("{name}.{field}");
+                        // Struct instances are stored under the
+                        // scope-qualified key (see register_var);
+                        // the per-field synthetic keys inherit that
+                        // prefix via `flatten_struct_fields`. Build
+                        // the field path off whichever key actually
+                        // exists — scoped first, bare second.
+                        let base_key = self.resolve_key(name);
+                        let full_name = format!("{base_key}.{field}");
                         if self.symbols.contains_key(&full_name) {
                             // Assigning to a field is a mutation; don't
                             // mark the struct variable as "read" just
                             // because we wrote to one of its fields.
-                            self.mark_var_used(&full_name);
-                        } else if self.symbols.contains_key(name) {
+                            self.used_vars.insert(full_name);
+                        } else if self.symbols.contains_key(&base_key) {
                             self.diagnostics.push(Diagnostic::error(
                                 ErrorCode::E0201,
                                 format!("'{name}' has no field '{field}'"),
@@ -1534,11 +1861,16 @@ impl Analyzer {
                 self.walk_expr_reads(end);
                 self.check_expr_type(start, &NesType::U8);
                 self.check_expr_type(end, &NesType::U8);
-                let was_shadowed = self.symbols.remove(var);
+                // Register the loop variable under the current
+                // scope's qualified key so two `for i in 0..n`
+                // loops in different functions get their own
+                // per-function RAM slot.
+                let loop_key = self.scoped_name(var);
+                let was_shadowed = self.symbols.remove(&loop_key);
                 self.symbols.insert(
-                    var.clone(),
+                    loop_key.clone(),
                     Symbol {
-                        name: var.clone(),
+                        name: loop_key.clone(),
                         sym_type: NesType::U8,
                         is_const: false,
                         span: *span,
@@ -1549,19 +1881,19 @@ impl Analyzer {
                 // other u8 local.
                 let loop_var_addr = self.allocate_ram(1, *span).unwrap_or(0x10);
                 self.var_allocations.push(VarAllocation {
-                    name: var.clone(),
+                    name: loop_key.clone(),
                     address: loop_var_addr,
                     size: 1,
                 });
                 // Loop variable is always "used" in the header.
-                self.mark_var_used(var);
+                self.used_vars.insert(loop_key.clone());
                 let was_in_loop = self.in_loop;
                 self.in_loop = true;
                 self.check_block(body, state_names);
                 self.in_loop = was_in_loop;
-                self.symbols.remove(var);
+                self.symbols.remove(&loop_key);
                 if let Some(old) = was_shadowed {
-                    self.symbols.insert(var.clone(), old);
+                    self.symbols.insert(loop_key, old);
                 }
             }
             Statement::Loop(body, span) => {
@@ -1685,6 +2017,7 @@ impl Analyzer {
                 }
             }
             Statement::WaitFrame(_) => {}
+            Statement::CycleSprites(_) => {}
             Statement::SetPalette(name, span) => {
                 if !self.palette_names.contains(name) {
                     self.diagnostics.push(Diagnostic::error(
@@ -1756,15 +2089,17 @@ impl Analyzer {
 
     fn lvalue_type(&self, lvalue: &LValue, _span: Span) -> Option<NesType> {
         match lvalue {
-            LValue::Var(name) => self.symbols.get(name).map(|s| s.sym_type.clone()),
+            LValue::Var(name) => self.resolve_symbol(name).map(|s| s.sym_type.clone()),
             LValue::ArrayIndex(name, _) => {
-                self.symbols.get(name).and_then(|sym| match &sym.sym_type {
-                    NesType::Array(elem, _) => Some(elem.as_ref().clone()),
-                    _ => None,
-                })
+                self.resolve_symbol(name)
+                    .and_then(|sym| match &sym.sym_type {
+                        NesType::Array(elem, _) => Some(elem.as_ref().clone()),
+                        _ => None,
+                    })
             }
             LValue::Field(name, field) => {
-                let full_name = format!("{name}.{field}");
+                let base_key = self.resolve_key(name);
+                let full_name = format!("{base_key}.{field}");
                 self.symbols.get(&full_name).map(|s| s.sym_type.clone())
             }
         }
@@ -1849,7 +2184,7 @@ impl Analyzer {
                 }
             }
             Expr::BoolLiteral(_, _) => Some(NesType::Bool),
-            Expr::Ident(name, _) => self.symbols.get(name).map(|s| s.sym_type.clone()),
+            Expr::Ident(name, _) => self.resolve_symbol(name).map(|s| s.sym_type.clone()),
             Expr::ButtonRead(_, _, _) => Some(NesType::Bool),
             Expr::BinaryOp(_, op, _, _) => match op {
                 BinOp::Eq
@@ -1866,13 +2201,14 @@ impl Analyzer {
             Expr::UnaryOp(_, _, _) => Some(NesType::U8),
             Expr::Call(_, _, _) => Some(NesType::U8), // Simplified for M1
             Expr::ArrayIndex(name, _, _) => {
-                self.symbols.get(name).and_then(|s| match &s.sym_type {
+                self.resolve_symbol(name).and_then(|s| match &s.sym_type {
                     NesType::Array(elem, _) => Some(elem.as_ref().clone()),
                     _ => None,
                 })
             }
             Expr::FieldAccess(name, field, _) => {
-                let full_name = format!("{name}.{field}");
+                let base_key = self.resolve_key(name);
+                let full_name = format!("{base_key}.{field}");
                 self.symbols.get(&full_name).map(|s| s.sym_type.clone())
             }
             Expr::ArrayLiteral(_, _) => Some(NesType::U8), // element type inferred from context
@@ -1930,6 +2266,78 @@ fn collect_transitions_stmt(stmt: &Statement, queue: &mut Vec<String>) {
         }
         Statement::For { body, .. } => {
             collect_transitions_block(body, queue);
+        }
+        _ => {}
+    }
+}
+
+/// Walk a block and collect `(y, x, span)` tuples for every literal
+/// -coordinate draw it contains. Metasprite draws expand to one
+/// tuple per tile using the metasprite's `dx`/`dy` offsets; plain
+/// sprites contribute exactly one tuple at the literal `(x, y)`.
+/// Draws with a non-literal coordinate are skipped — static
+/// analysis can't know where they land.
+///
+/// Recurses through `if`/`while`/`for`/`loop` bodies and counts
+/// every branch as if it always fires. This conservatively
+/// over-counts programs that stagger draws across mutually
+/// exclusive branches, but it matches the worst case the PPU can
+/// see on any given frame.
+fn collect_literal_draws(
+    block: &Block,
+    metasprites: &HashMap<&str, &MetaspriteDecl>,
+    out: &mut Vec<(u8, u8, Span)>,
+) {
+    for stmt in &block.statements {
+        collect_literal_draws_stmt(stmt, metasprites, out);
+    }
+}
+
+fn collect_literal_draws_stmt(
+    stmt: &Statement,
+    metasprites: &HashMap<&str, &MetaspriteDecl>,
+    out: &mut Vec<(u8, u8, Span)>,
+) {
+    match stmt {
+        Statement::Draw(draw) => {
+            let (Expr::IntLiteral(x, _), Expr::IntLiteral(y, _)) = (&draw.x, &draw.y) else {
+                return;
+            };
+            // Literals that don't fit in u8 would already be caught
+            // by the type checker; bail out here rather than risk
+            // double-reporting.
+            if *x > 255 || *y > 255 {
+                return;
+            }
+            let base_x = *x as u8;
+            let base_y = *y as u8;
+            if let Some(ms) = metasprites.get(draw.sprite_name.as_str()) {
+                // Metasprite: one slot per tile. Share the original
+                // draw-site span so the diagnostic labels point at
+                // user-authored source, not invented offsets.
+                for i in 0..ms.dx.len() {
+                    let tile_x = base_x.wrapping_add(ms.dx[i]);
+                    let tile_y = base_y.wrapping_add(ms.dy[i]);
+                    out.push((tile_y, tile_x, draw.span));
+                }
+            } else {
+                out.push((base_y, base_x, draw.span));
+            }
+        }
+        Statement::If(_, then_b, elifs, else_b, _) => {
+            collect_literal_draws(then_b, metasprites, out);
+            for (_, b) in elifs {
+                collect_literal_draws(b, metasprites, out);
+            }
+            if let Some(b) = else_b {
+                collect_literal_draws(b, metasprites, out);
+            }
+        }
+        Statement::While(_, body, _) | Statement::Loop(body, _) => {
+            collect_literal_draws(body, metasprites, out);
+        }
+        Statement::For { body, .. } => {
+            collect_literal_draws(body, metasprites, out);
         }
         _ => {}
     }
@@ -2010,6 +2418,7 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
         Statement::Return(None, _)
         | Statement::Transition(_, _)
         | Statement::WaitFrame(_)
+        | Statement::CycleSprites(_)
         | Statement::Break(_)
         | Statement::Continue(_)
         | Statement::InlineAsm(_, _)

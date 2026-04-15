@@ -28,7 +28,11 @@ fun clamp(val: u8, max: u8) -> u8 {
 }
 
 // Inline function: absolute difference
-inline fun abs_diff(a: u8, b: u8) -> u8 {
+// Not marked `inline`: the conditional early return is one of
+// the shapes the inliner declines (W0110). Living with the JSR
+// is the correct call here since rewriting as a branchless max
+// wouldn't fit in a single-return expression.
+fun abs_diff(a: u8, b: u8) -> u8 {
     if a > b {
         return a - b
     }

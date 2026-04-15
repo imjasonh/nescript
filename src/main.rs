@@ -380,6 +380,19 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         }
     })?;
 
+    // Render any analyzer warnings that survived a successful
+    // compile. Errors would have taken the `CompileError::Analyze`
+    // path above and returned before we got here, so everything
+    // left in `out.analysis.diagnostics` is a warning (W01xx).
+    // Without this the CLI would silently swallow every warning
+    // on a successful build, making them effectively invisible
+    // — the warning machinery in the analyzer would still run,
+    // but nobody would ever see its output unless they also
+    // invoked `nescript check`.
+    if !out.analysis.diagnostics.is_empty() {
+        render_diagnostics(&source, &filename, &out.analysis.diagnostics);
+    }
+
     // Post-link CLI-only side effects: the various `--dump-*`
     // flags and the two optional file outputs. These are not
     // part of the pipeline because they're stdout / filesystem

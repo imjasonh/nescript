@@ -48,7 +48,7 @@ start Main
 - **Game-aware syntax** -- states, sprites, palettes, backgrounds, and input are first-class constructs
 - **Full type system** -- `u8`, `i8`, `u16`, `bool`, fixed-size arrays (`u8[N]`), `enum`, `struct`
 - **Rich control flow** -- `if`/`else`, `while`, `for i in 0..N`, `loop`, `match`
-- **Functions** -- with parameters, return types, `inline` hint, recursion detection
+- **Functions** -- with parameters, return types, real `inline fun` splicing for single-return and void-body shapes, recursion detection
 - **State machines** -- `state` with `on enter`, `on exit`, `on frame`, `on scanline(N)` handlers
 - **Compile-time safety** -- call depth limits, recursion detection, type checking, unused-var warnings
 - **IR-based optimizer** -- constant folding, dead code elimination, strength reduction (incl. div/mod by power-of-two), copy propagation, peephole passes including INC/DEC fold and live-range slot recycling
@@ -59,7 +59,8 @@ start Main
 - **Asset pipeline** -- PNG-to-CHR conversion, inline tile data, sfx envelopes, music note streams
 - **Inline assembly** -- `asm { ... }` with `{var}` substitution, plus `raw asm { ... }` for verbatim blocks
 - **Hardware intrinsics** -- `poke(addr, value)` / `peek(addr)` for direct register access
-- **Debug support** -- `--debug` flag enables `debug.log` / `debug.assert` writes to the emulator debug port
+- **Debug support** -- `--debug` flag enables `debug.log` / `debug.assert`, runtime array bounds checks, frame-overrun and sprite-overflow counters, and the `debug.frame_overrun_count()` / `debug.frame_overran()` / `debug.sprite_overflow_count()` / `debug.sprite_overflow()` query builtins — all stripped entirely in release builds
+- **Sprite-per-scanline mitigations** -- three layers of defense for the NES's 8-sprites-per-scanline hardware limit: compile-time `W0109` static check for literal layouts, runtime `cycle_sprites` flicker intrinsic for dynamic scenes, and debug-mode telemetry via `debug.sprite_overflow()` for playtest assertions
 - **Compile-time diagnostics** -- `--dump-ir`, `--memory-map`, `--call-graph` flags
 - **Single binary** -- no dependencies on ca65, Python, or any external tools
 
@@ -93,7 +94,9 @@ start Main
 | [`noise_triangle_sfx.ne`](examples/noise_triangle_sfx.ne) | Noise and triangle channel sfx via `channel: noise` / `channel: triangle` on `sfx` blocks |
 | [`sfx_pitch_envelope.ne`](examples/sfx_pitch_envelope.ne) | Per-frame pulse `pitch:` arrays — the audio tick walks the pitch envelope in lockstep with the volume envelope and writes `$4002` on every NMI for a frequency-sweeping siren tone |
 | [`metasprite_demo.ne`](examples/metasprite_demo.ne) | `metasprite Hero { sprite: ..., dx: [...], dy: [...], frame: [...] }` declarative multi-tile groups — `draw Hero at: (x, y)` expands to one OAM slot per tile so 16×16 sprites stop needing four hand-written `draw` statements |
+| [`sprite_flicker_demo.ne`](examples/sprite_flicker_demo.ne) | `cycle_sprites` — rotates the OAM DMA start offset one slot per frame so scenes with more than 8 sprites on a scanline drop a *different* one each frame. Turns the NES's permanent sprite-dropout hardware symptom into visible flicker, which the eye reconstructs from adjacent frames. Pairs with the compile-time `W0109` warning and the debug-mode `debug.sprite_overflow()` / `debug.sprite_overflow_count()` telemetry for a three-layer defense against the 8-sprites-per-scanline limit. |
 | [`platformer.ne`](examples/platformer.ne) | **End-to-end side-scroller** — custom CHR tileset, full background nametable, metasprite player with gravity/jump physics, wrap-around scrolling, stomp-or-die enemy collisions, live stomp-count HUD, pickup coins, user-declared SFX + music, and a Title → Playing → GameOver state machine with a proximity-based autopilot so the headless harness demonstrates the full gameplay loop (stomp, stomp, die, retry) inside six seconds |
+| [`war.ne`](examples/war.ne) | **Production-quality card game** — a complete port of War split across `examples/war/*.ne`: title screen with a 0/1/2-player menu, animated deal, sliding face-up cards, deck-count HUD, "WAR!" tie-break with buried cards, victory screen with a fanfare, and a brisk 4/4 march on pulse 2. Pulls in nearly every NEScript subsystem (custom 88-tile sheet, felt nametable, 8-bit LFSR PRNG, queue-based decks, phase machine inside `Playing`, multiple sfx + music tracks). Building it surfaced seven compiler bugs, all fixed on the same branch — see `git log` for the details. |
 
 ## Compiler Commands
 
@@ -134,7 +137,7 @@ NEScript implements all five planned milestones:
 | M4: Optimization | Done | Strength reduction, ZP promotion, type casting, asm-dump |
 | M5: Bank Switching | Done | MMC1/UxROM/MMC3, bank declarations, software mul/div |
 
-497 tests across the lexer, parser, analyzer, IR, optimizer, codegen, assembler, linker, runtime, ROM, and asset modules, with CI running fmt, clippy, test, and example compilation on every push.
+694 tests across the lexer, parser, analyzer, IR, optimizer, codegen, assembler, linker, runtime, ROM, and asset modules, plus a pixel- and audio-exact emulator harness that captures a golden framebuffer + audio hash for every example. CI runs fmt, clippy, test, example compilation, and the emulator harness on every push.
 
 ## License
 
