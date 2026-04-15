@@ -395,6 +395,17 @@ impl LoweringContext {
 
     fn lower_function(&mut self, fun: &FunDecl) {
         self.next_temp = 0;
+        // Clear the wide-temp tracking map. `wide_hi` records "this
+        // low temp has its high byte at this other temp" entries
+        // produced by `make_wide`; without clearing it, the entries
+        // from previous functions leak into the next function and
+        // get matched against fresh temp IDs (since next_temp resets
+        // to 0). That manifests as `is_wide(t)` spuriously returning
+        // true and, worse, `widen(t)` returning a stale `hi` temp ID
+        // that collides with a later `fresh_temp()` allocation —
+        // producing 16-bit IR ops where the destination temp is
+        // *also* one of the source temps. See COMPILER_BUGS.md §6.
+        self.wide_hi.clear();
         self.current_blocks = Vec::new();
         self.current_locals = Vec::new();
 
@@ -460,6 +471,12 @@ impl LoweringContext {
 
     fn lower_handler(&mut self, name: &str, block: &Block, state: &StateDecl) {
         self.next_temp = 0;
+        // Same per-function reset as `lower_function`. See the
+        // commentary there and COMPILER_BUGS.md §6 for why this is
+        // critical — without it, state-handler bodies pick up wide
+        // temp pairs left over from the previous function and emit
+        // catastrophically wrong 16-bit IR ops.
+        self.wide_hi.clear();
         self.current_blocks = Vec::new();
         // Seed `current_locals` with the state's declared locals so any
         // `VarDecl` inside the handler body — tracked by

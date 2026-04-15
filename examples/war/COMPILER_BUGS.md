@@ -418,6 +418,96 @@ None — we just live with the JSR overhead and the bug-2 fallout.
 
 ---
 
+## 6. `wide_hi` IR-lowering map leaked between functions and corrupted 16-bit ops *(FIXED)*
+
+### Symptom
+
+A function whose body had no 16-bit values whatsoever would
+nonetheless emit `CmpEq16` (and other `Op16` variants) where the
+*destination* temp aliased one of the *source* temps. The
+resulting comparison effectively became "is this byte equal to
+some uninitialised stack memory?", which in War caused the
+phase-machine `match phase { ... }` dispatcher to skip the
+`P_WIN_B` arm forever once the game first reached it — the game
+would freeze with both cards face-up and "PLAYER B WINS" never
+firing.
+
+### Reproduction (pre-fix)
+
+A handful of `u16` `+= 1` operations early in a state handler
+followed by a long `match` chain on a `u8` was enough to trip it.
+The minimum repro is roughly:
+
+```nescript
+var clock: u16 = 0
+var phase: u8 = 0
+on frame {
+    clock += 1                    // wide op leaves wide_hi entries
+    match phase {                 // u8 match — should be 8-bit
+        0 => { phase = 1 }
+        1 => { phase = 2 }
+        2 => { phase = 3 }
+        3 => { phase = 4 }
+        4 => { phase = 5 }
+        5 => { phase = 6 }
+        6 => { phase = 7 }
+        7 => { /* corrupt — never matched */ }
+        _ => {}
+    }
+}
+```
+
+The IR for the `phase == 7` arm came out as
+`CmpEq16 { dest: T147, a_lo: T145, a_hi: T148, b_lo: T146,
+b_hi: T147 }` — note `dest == b_hi`. The codegen happily emits
+the corresponding 16-bit asm, but reads garbage for the `b_hi`
+operand because it points at the same scratch slot the result
+will be written to.
+
+### Root cause
+
+`src/ir/lowering.rs::IrLowerer` carries a `wide_hi: HashMap<IrTemp, IrTemp>`
+that records "this low temp's high byte lives at this other
+temp" pairs whenever a 16-bit value is produced. `lower_function`
+and `lower_handler` both reset `next_temp = 0` at the start of
+each function — but they did *not* clear `wide_hi`. Stale entries
+from earlier functions stuck around and matched against fresh
+temp IDs in subsequent functions (which start counting from 0
+again), causing `is_wide(t)` and `widen(t)` to return spurious
+"wide" results for what should have been narrow `u8` values.
+
+When that happens inside `lower_binop`'s `Eq` path, `widen(r)`
+returns the stale `(r, hi_r)` pair where `hi_r` happens to be the
+*next* temp ID `fresh_temp()` will hand out a moment later — so
+the `dest` temp and `b_hi` end up identical.
+
+### Fix
+
+`src/ir/lowering.rs`: in both `lower_function` and `lower_handler`,
+add `self.wide_hi.clear();` immediately after `self.next_temp = 0;`.
+Done in this PR.
+
+### Why this didn't show up sooner
+
+Every prior example either declared no `u16` globals at all, or
+declared one and used it sparingly enough that the temp IDs
+the leaked entries claimed never collided with the rest of the
+function. War is the first example that combines a `u16`
+free-running counter with a deep state machine that does many
+`u8` comparisons in the same `on frame` body, which is exactly
+the shape the bug needs to manifest.
+
+### Regression test
+
+`src/ir/tests.rs::wide_hi_does_not_leak_between_functions` (added
+in this PR) compiles a two-function program where function A
+uses a `u16 += 1` (creating wide entries) and function B does
+`u8 == const` comparisons in a match. Pre-fix, the IR would emit
+`CmpEq16` with aliased dest/source; post-fix it emits the
+expected 8-bit `CmpEq`.
+
+---
+
 ## Verification path after fixes
 
 Once any of the bugs above are fixed in the compiler, the

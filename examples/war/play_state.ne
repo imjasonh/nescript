@@ -121,191 +121,187 @@ state Playing {
         draw_table()
 
         // ── Phase dispatch ───────────────────────────────
-        // The phases share a simple "timer hits target, advance"
-        // shape. Each arm of the if-chain is self-contained and
-        // ends either with a set_phase call or a fall-through
-        // that waits for more input / time.
-
-        if phase == P_WAIT_A {
-            // Human prompt: hint blink above the deck.
-            if a_is_cpu == 0 {
-                if (phase_timer & 32) == 0 {
-                    draw_word_press(8, 200)
-                }
-                if button.a or button.start {
-                    begin_draw_a()
-                }
-            } else {
-                // CPU draws after a short delay.
-                if phase_timer >= CPU_THINK_FRAMES {
-                    begin_draw_a()
-                }
-            }
-        }
-
-        if phase == P_FLY_A {
-            step_fly_pos()
-            draw_flying_card(fly_x, fly_y)
-            if phase_timer >= FRAMES_FLY {
-                set_phase(P_WAIT_B)
-            }
-        }
-
-        if phase == P_WAIT_B {
-            // A's card is now parked in its play slot.
-            draw_card_face(PLAY_A_X, PLAY_Y, card_a)
-            if b_is_cpu == 0 {
-                if (phase_timer & 32) == 0 {
-                    draw_word_press(208, 200)
-                }
-                if p2.button.a or p2.button.start or button.a or button.start {
-                    begin_draw_b()
-                }
-            } else {
-                if phase_timer >= CPU_THINK_FRAMES {
-                    begin_draw_b()
+        // We use `match` instead of a flat if-chain so each
+        // frame only runs the FIRST matching arm. A naive
+        // chain like `if phase == X { ... } if phase == Y {...}`
+        // would let one phase transition into another (via
+        // `set_phase`) and then run the next phase's body in
+        // the same frame, which advances animation timers twice
+        // and made the card-fly overshoot its endpoint by
+        // FLY_STEP every time.
+        match phase {
+            P_WAIT_A => {
+                // Human prompt: hint blink above the deck.
+                if a_is_cpu == 0 {
+                    if (phase_timer & 32) == 0 {
+                        draw_word_press(8, 200)
+                    }
+                    if button.a or button.start {
+                        begin_draw_a()
+                    }
+                } else {
+                    // CPU draws after a short delay.
+                    if phase_timer >= CPU_THINK_FRAMES {
+                        begin_draw_a()
+                    }
                 }
             }
-        }
-
-        if phase == P_FLY_B {
-            // A is in place; B is flying.
-            draw_card_face(PLAY_A_X, PLAY_Y, card_a)
-            step_fly_pos()
-            draw_flying_card(fly_x, fly_y)
-            if phase_timer >= FRAMES_FLY {
-                set_phase(P_REVEAL)
+            P_FLY_A => {
+                step_fly_pos()
+                draw_flying_card(fly_x, fly_y)
+                if phase_timer >= FRAMES_FLY {
+                    set_phase(P_WAIT_B)
+                }
             }
-        }
-
-        if phase == P_REVEAL {
-            draw_card_face(PLAY_A_X, PLAY_Y, card_a)
-            draw_card_face(PLAY_B_X, PLAY_Y, card_b)
-            if phase_timer >= FRAMES_REVEAL {
-                set_phase(P_RESOLVE)
+            P_WAIT_B => {
+                // A's card is now parked in its play slot.
+                draw_card_face(PLAY_A_X, PLAY_Y, card_a)
+                if b_is_cpu == 0 {
+                    if (phase_timer & 32) == 0 {
+                        draw_word_press(208, 200)
+                    }
+                    if p2.button.a or p2.button.start or button.a or button.start {
+                        begin_draw_b()
+                    }
+                } else {
+                    if phase_timer >= CPU_THINK_FRAMES {
+                        begin_draw_b()
+                    }
+                }
             }
-        }
-
-        if phase == P_RESOLVE {
-            // Both cards go into the pot regardless of outcome.
-            push_back_pot(card_a)
-            push_back_pot(card_b)
-            var pf_r: u8 = compare_cards(card_a, card_b)
-            if pf_r == 1 {
-                play CheerA
-                set_phase(P_WIN_A)
+            P_FLY_B => {
+                // A is in place; B is flying.
+                draw_card_face(PLAY_A_X, PLAY_Y, card_a)
+                step_fly_pos()
+                draw_flying_card(fly_x, fly_y)
+                if phase_timer >= FRAMES_FLY {
+                    set_phase(P_REVEAL)
+                }
             }
-            if pf_r == 2 {
-                play CheerB
-                set_phase(P_WIN_B)
+            P_REVEAL => {
+                draw_card_face(PLAY_A_X, PLAY_Y, card_a)
+                draw_card_face(PLAY_B_X, PLAY_Y, card_b)
+                if phase_timer >= FRAMES_REVEAL {
+                    set_phase(P_RESOLVE)
+                }
             }
-            if pf_r == 0 {
-                // It's a tie — but only enter the war flow if both
-                // sides actually have cards left to bury. If a
-                // player ran out of cards on this very tie, the
-                // OTHER player wins by default and takes the pot.
-                if deck_a_count == 0 {
+            P_RESOLVE => {
+                // Both cards go into the pot regardless of outcome.
+                push_back_pot(card_a)
+                push_back_pot(card_b)
+                pf_result = compare_cards(card_a, card_b)
+                if pf_result == 1 {
+                    play CheerA
+                    set_phase(P_WIN_A)
+                }
+                if pf_result == 2 {
+                    play CheerB
+                    set_phase(P_WIN_B)
+                }
+                if pf_result == 0 {
+                    // It's a tie — but only enter the war flow if both
+                    // sides actually have cards left to bury. If a
+                    // player ran out of cards on this very tie, the
+                    // OTHER player wins by default and takes the pot.
+                    if deck_a_count == 0 {
+                        pot_to_b()
+                        winner = 1
+                        transition Victory
+                    }
+                    if deck_b_count == 0 {
+                        pot_to_a()
+                        winner = 0
+                        transition Victory
+                    }
+                    play WarFlash
+                    set_phase(P_WAR_BANNER)
+                }
+            }
+            P_WIN_A => {
+                draw_card_face(PLAY_A_X, PLAY_Y, card_a)
+                draw_card_face(PLAY_B_X, PLAY_Y, card_b)
+                if phase_timer >= FRAMES_FLY {
+                    pot_to_a()
+                    set_phase(P_CHECK)
+                }
+            }
+            P_WIN_B => {
+                draw_card_face(PLAY_A_X, PLAY_Y, card_a)
+                draw_card_face(PLAY_B_X, PLAY_Y, card_b)
+                if phase_timer >= FRAMES_FLY {
                     pot_to_b()
+                    set_phase(P_CHECK)
+                }
+            }
+            P_WAR_BANNER => {
+                draw_card_face(PLAY_A_X, PLAY_Y, card_a)
+                draw_card_face(PLAY_B_X, PLAY_Y, card_b)
+                // Flashing big "WAR" banner — only drawn on alternate
+                // 8-frame windows so the title strobes for emphasis.
+                if (phase_timer & 8) != 0 {
+                    draw_big_war_banner(96, 80)
+                }
+                if phase_timer >= FRAMES_BANNER {
+                    set_phase(P_WAR_BURY)
+                }
+            }
+            P_WAR_BURY => {
+                // Bury up to 3 face-down cards from each deck, then
+                // draw a new face-up pair. We don't animate each
+                // individual buried card; just play a noise thump
+                // per buried card and advance the counters.
+                if phase_timer == 1 {
+                    if deck_a_count > 0 { bury_from_a() }
+                    if deck_b_count > 0 { bury_from_b() }
+                    play ThudDown
+                }
+                if phase_timer == 4 {
+                    if deck_a_count > 0 { bury_from_a() }
+                    if deck_b_count > 0 { bury_from_b() }
+                    play ThudDown
+                }
+                if phase_timer == 7 {
+                    if deck_a_count > 0 { bury_from_a() }
+                    if deck_b_count > 0 { bury_from_b() }
+                    play ThudDown
+                }
+                if phase_timer == 10 {
+                    // Draw new face-ups for the comparison. If either
+                    // side has run out of cards, the OTHER side wins
+                    // and takes the entire pot — we transition straight
+                    // to Victory.
+                    if deck_a_count == 0 {
+                        pot_to_b()
+                        winner = 1
+                        transition Victory
+                    }
+                    if deck_b_count == 0 {
+                        pot_to_a()
+                        winner = 0
+                        transition Victory
+                    }
+                    card_a = draw_front_a()
+                    card_b = draw_front_b()
+                }
+                if phase_timer >= FRAMES_BURY + 16 {
+                    set_phase(P_REVEAL)
+                }
+            }
+            P_CHECK => {
+                if deck_a_count == 0 {
                     winner = 1
                     transition Victory
                 }
                 if deck_b_count == 0 {
-                    pot_to_a()
                     winner = 0
                     transition Victory
                 }
-                play WarFlash
-                set_phase(P_WAR_BANNER)
+                // No winner yet — start the next round.
+                card_a = 0
+                card_b = 0
+                set_phase(P_WAIT_A)
             }
-        }
-
-        if phase == P_WIN_A {
-            draw_card_face(PLAY_A_X, PLAY_Y, card_a)
-            draw_card_face(PLAY_B_X, PLAY_Y, card_b)
-            if phase_timer >= FRAMES_FLY {
-                pot_to_a()
-                set_phase(P_CHECK)
-            }
-        }
-
-        if phase == P_WIN_B {
-            draw_card_face(PLAY_A_X, PLAY_Y, card_a)
-            draw_card_face(PLAY_B_X, PLAY_Y, card_b)
-            if phase_timer >= FRAMES_FLY {
-                pot_to_b()
-                set_phase(P_CHECK)
-            }
-        }
-
-        if phase == P_WAR_BANNER {
-            draw_card_face(PLAY_A_X, PLAY_Y, card_a)
-            draw_card_face(PLAY_B_X, PLAY_Y, card_b)
-            // Flashing big "WAR" banner — only drawn on alternate
-            // 8-frame windows so the title strobes for emphasis.
-            if (phase_timer & 8) != 0 {
-                draw_big_war_banner(96, 80)
-            }
-            if phase_timer >= FRAMES_BANNER {
-                set_phase(P_WAR_BURY)
-            }
-        }
-
-        if phase == P_WAR_BURY {
-            // Bury up to 3 face-down cards from each deck, then
-            // draw a new face-up pair. We don't animate each
-            // individual buried card; just play a noise thump
-            // per buried card and advance the counters.
-            if phase_timer == 1 {
-                if deck_a_count > 0 { bury_from_a() }
-                if deck_b_count > 0 { bury_from_b() }
-                play ThudDown
-            }
-            if phase_timer == 4 {
-                if deck_a_count > 0 { bury_from_a() }
-                if deck_b_count > 0 { bury_from_b() }
-                play ThudDown
-            }
-            if phase_timer == 7 {
-                if deck_a_count > 0 { bury_from_a() }
-                if deck_b_count > 0 { bury_from_b() }
-                play ThudDown
-            }
-            if phase_timer == 10 {
-                // Draw new face-ups for the comparison. If either
-                // side has run out of cards, the OTHER side wins
-                // and takes the entire pot — we transition straight
-                // to Victory.
-                if deck_a_count == 0 {
-                    pot_to_b()
-                    winner = 1
-                    transition Victory
-                }
-                if deck_b_count == 0 {
-                    pot_to_a()
-                    winner = 0
-                    transition Victory
-                }
-                card_a = draw_front_a()
-                card_b = draw_front_b()
-            }
-            if phase_timer >= FRAMES_BURY + 16 {
-                set_phase(P_REVEAL)
-            }
-        }
-
-        if phase == P_CHECK {
-            if deck_a_count == 0 {
-                winner = 1
-                transition Victory
-            }
-            if deck_b_count == 0 {
-                winner = 0
-                transition Victory
-            }
-            // No winner yet — start the next round.
-            card_a = 0
-            card_b = 0
-            set_phase(P_WAIT_A)
+            _ => {}
         }
     }
 }

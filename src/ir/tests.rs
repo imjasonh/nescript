@@ -740,3 +740,64 @@ fn lower_modulo_emits_mod_op_not_load_imm_zero() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn wide_hi_does_not_leak_between_functions() {
+    // Regression test for COMPILER_BUGS.md §6: the IR lowerer's
+    // `wide_hi` map used to persist across function boundaries
+    // even though `next_temp` resets to 0 per function. A
+    // function whose body had no u16 ops would inherit stale
+    // `(temp_id -> high_byte)` entries from earlier functions
+    // and emit `CmpEq16` (or other 16-bit ops) where the
+    // destination temp aliased one of the source temps.
+    //
+    // The shape that reproduces it: function A bumps a u16
+    // global (creating wide entries); function B does u8 ==
+    // const compares against a u8 global. Pre-fix, function B's
+    // last few comparisons would lower to `CmpEq16`. Post-fix,
+    // they all stay narrow.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var clock: u16 = 0
+        var phase: u8 = 0
+        var hits: u8 = 0
+        fun bump_a() { hits += 1 }
+        fun bump_b() { hits += 2 }
+        fun bump_c() { hits += 3 }
+        fun bump_d() { hits += 4 }
+        on frame {
+            clock += 1
+            if phase == 0 { bump_a() }
+            if phase == 1 { bump_b() }
+            if phase == 2 { bump_c() }
+            if phase == 3 { bump_d() }
+            wait_frame
+        }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let mut wide_eq_dest_aliases = 0;
+    for op in frame_fn.blocks.iter().flat_map(|b| &b.ops) {
+        if let IrOp::CmpEq16 {
+            dest, b_hi, a_hi, ..
+        } = op
+        {
+            // The dest of a 16-bit compare must never alias one
+            // of its operand high bytes — that's the symptom of
+            // bug #6 from war/COMPILER_BUGS.md.
+            if dest == b_hi || dest == a_hi {
+                wide_eq_dest_aliases += 1;
+            }
+        }
+    }
+    assert_eq!(
+        wide_eq_dest_aliases, 0,
+        "wide CmpEq16 destination aliased a source operand — wide_hi leaked between functions"
+    );
+}
