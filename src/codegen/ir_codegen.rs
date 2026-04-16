@@ -965,7 +965,48 @@ impl<'a> IrCodeGen<'a> {
     fn gen_block(&mut self, block: &IrBasicBlock) {
         self.emit_label(&format!("__ir_blk_{}", block.label));
 
-        for op in &block.ops {
+        // Look for the canonical "compare-then-branch" fusion
+        // candidate: the block's last op is an 8-bit `CmpX`, its
+        // destination temp is the same one the terminator
+        // branches on, and that temp has no other uses. When
+        // it's a fit, we can replace the boolean materialization
+        // (LDA #0 / JMP / LDA #1 + BNE) with a direct branch on
+        // the flags `CMP` already set — about 6 cycles + 5 bytes
+        // saved per condition.
+        let fuse_cmp_branch = block
+            .ops
+            .last()
+            .and_then(|op| match (op, &block.terminator) {
+                (
+                    IrOp::CmpEq(d, a, b)
+                    | IrOp::CmpNe(d, a, b)
+                    | IrOp::CmpLt(d, a, b)
+                    | IrOp::CmpGt(d, a, b)
+                    | IrOp::CmpLtEq(d, a, b)
+                    | IrOp::CmpGtEq(d, a, b),
+                    IrTerminator::Branch(cond, true_lbl, false_lbl),
+                ) if cond == d && self.use_counts.get(d).copied().unwrap_or(0) == 1 => {
+                    let kind = match op {
+                        IrOp::CmpEq(..) => CmpKind::Eq,
+                        IrOp::CmpNe(..) => CmpKind::Ne,
+                        IrOp::CmpLt(..) => CmpKind::Lt,
+                        IrOp::CmpGt(..) => CmpKind::Gt,
+                        IrOp::CmpLtEq(..) => CmpKind::LtEq,
+                        IrOp::CmpGtEq(..) => CmpKind::GtEq,
+                        _ => unreachable!(),
+                    };
+                    Some((*a, *b, kind, true_lbl.clone(), false_lbl.clone()))
+                }
+                _ => None,
+            });
+
+        let body_ops = if fuse_cmp_branch.is_some() {
+            &block.ops[..block.ops.len() - 1]
+        } else {
+            &block.ops[..]
+        };
+
+        for op in body_ops {
             self.gen_op(op);
             // After each op runs, decrement use counts for its
             // source temps. When a count hits zero the temp's slot
@@ -976,6 +1017,32 @@ impl<'a> IrCodeGen<'a> {
             self.retire_op_sources(op);
         }
 
+        if let Some((a, b, kind, true_lbl, false_lbl)) = fuse_cmp_branch {
+            // Emit the fused compare + branch *first*. Retiring
+            // a/b before the emit would free their slots while
+            // the values are still live — `load_temp(a)` would
+            // then re-allocate `a` to whatever slot the free
+            // list pops next, which contains stale data.
+            self.gen_cmp_branch(a, b, kind, &true_lbl, &false_lbl);
+            // Now that the CMP has read both operands, drop their
+            // use counts the same way `retire_op_sources` would
+            // for a non-fused Cmp op. The destination temp's
+            // single use was the (skipped) Branch terminator —
+            // retire it too so its slot returns to the free list.
+            self.dec_use(a);
+            self.dec_use(b);
+            if let IrOp::CmpEq(d, ..)
+            | IrOp::CmpNe(d, ..)
+            | IrOp::CmpLt(d, ..)
+            | IrOp::CmpGt(d, ..)
+            | IrOp::CmpLtEq(d, ..)
+            | IrOp::CmpGtEq(d, ..) = block.ops.last().unwrap()
+            {
+                self.dec_use(*d);
+            }
+            return;
+        }
+
         // The terminator may also reference a temp (branch
         // condition, return value). Those temps die after the
         // terminator runs; retire them here so they don't leak
@@ -984,6 +1051,94 @@ impl<'a> IrCodeGen<'a> {
         for t in terminator_source_temps(&block.terminator) {
             self.dec_use(t);
         }
+    }
+
+    /// Emit a fused "compare + direct branch" sequence. Replaces
+    /// the canonical boolean-materialization-then-branch pattern
+    /// the IR emits for `if x < N { ... }`-style conditions, when
+    /// `gen_block` detects the comparison's result feeds straight
+    /// into the block's terminating branch and isn't read again.
+    ///
+    /// 6502 relative branches have a ±128-byte range. The fused
+    /// branch's destination is the next basic block, which in
+    /// larger programs is often farther than that. To stay safe
+    /// regardless of distance we emit the *inverted* predicate
+    /// as a short branch that skips over a `JMP true_target`,
+    /// with the false target reached by a fall-through `JMP`.
+    /// Both `JMP`s are absolute addressing and have no range
+    /// limit; the relative branches only have to clear the next
+    /// 3 bytes (the `JMP`), which always fits.
+    ///
+    /// For the simple cases (`Eq`, `Ne`, `Lt`, `GtEq`) one
+    /// inverted branch does it. For `Gt` and `LtEq` the predicate
+    /// is a disjunction/conjunction of two flag conditions, so
+    /// the inversion needs two branches.
+    fn gen_cmp_branch(
+        &mut self,
+        a: IrTemp,
+        b: IrTemp,
+        kind: CmpKind,
+        true_label: &str,
+        false_label: &str,
+    ) {
+        self.load_temp(a);
+        let b_addr = self.temp_addr(b);
+        self.emit(CMP, AM::ZeroPage(b_addr));
+
+        let suffix = self.local_label_suffix();
+        let skip_label = format!("__ir_cmp_skip_{suffix}");
+        let true_blk = format!("__ir_blk_{true_label}");
+        let false_blk = format!("__ir_blk_{false_label}");
+
+        match kind {
+            CmpKind::Eq => {
+                // Predicate true ↔ Z set; inverted = BNE.
+                self.emit(BNE, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+            CmpKind::Ne => {
+                self.emit(BEQ, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+            CmpKind::Lt => {
+                // Predicate true ↔ C clear; inverted = BCS.
+                self.emit(BCS, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+            CmpKind::GtEq => {
+                self.emit(BCC, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+            CmpKind::Gt => {
+                // Predicate true ↔ (C set AND Z clear). On Z
+                // set, fall through to false. On C clear, fall
+                // through too. Otherwise jump.
+                self.emit(BEQ, AM::LabelRelative(skip_label.clone()));
+                self.emit(BCC, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+            CmpKind::LtEq => {
+                // Predicate true ↔ (C clear OR Z set). On
+                // either, jump to true. Otherwise fall through.
+                let to_true = format!("__ir_cmp_t_{suffix}");
+                self.emit(BEQ, AM::LabelRelative(to_true.clone()));
+                self.emit(BCC, AM::LabelRelative(to_true.clone()));
+                self.emit(JMP, AM::Label(false_blk.clone()));
+                self.emit_label(&to_true);
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+                // Already emitted JMP false_blk in the match
+                // arm; skip the trailing fall-through one below.
+                return;
+            }
+        }
+        // Fall-through path lands here for the false case.
+        self.emit(JMP, AM::Label(false_blk));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -3900,21 +4055,30 @@ mod more_tests {
     #[test]
     fn ir_codegen_local_label_suffix_is_bank_namespaced() {
         // When two banked functions in *different* banks both emit
-        // a local label like `__ir_cmp_e_<n>`, the suffix has to
-        // include the bank name so the linker's discovery pass
-        // (which checks for cross-bank label collisions) doesn't
-        // panic on the second occurrence. Without the namespacing
-        // step, this exact program used to fail at link time with
-        // `duplicate label '__ir_cmp_e_8' across switchable banks`.
+        // a local label, the suffix has to include the bank name
+        // so the linker's discovery pass (which checks for cross-
+        // bank label collisions) doesn't panic on the second
+        // occurrence. Without the namespacing step, this exact
+        // program used to fail at link time with `duplicate label
+        // '__ir_shift_loop_8' across switchable banks`.
+        //
+        // We use a shift-by-variable here instead of an `if`
+        // because the cmp/branch fusion in `gen_block` collapses
+        // most `if` patterns into direct branches without local
+        // labels. Variable-amount shifts always need a loop label
+        // (gen_shift_var emits one), which gives the test a
+        // stable label-emission pattern regardless of future
+        // codegen optimizations.
         let (prog, _) = parser::parse(
             r#"
             game "T" { mapper: UxROM }
             var x: u8 = 0
+            var n: u8 = 0
             bank A {
-                fun a_fn() { if x == 0 { x = 1 } }
+                fun a_fn() { x = x << n }
             }
             bank B {
-                fun b_fn() { if x == 0 { x = 2 } }
+                fun b_fn() { x = x << n }
             }
             on frame { a_fn() b_fn() }
             start Main
@@ -3931,7 +4095,7 @@ mod more_tests {
             .expect("A stream")
             .iter()
             .filter_map(|i| match &i.mode {
-                AM::Label(l) if l.contains("__ir_cmp") => Some(l.clone()),
+                AM::Label(l) if l.contains("__ir_shift") => Some(l.clone()),
                 _ => None,
             })
             .collect();
@@ -3940,17 +4104,17 @@ mod more_tests {
             .expect("B stream")
             .iter()
             .filter_map(|i| match &i.mode {
-                AM::Label(l) if l.contains("__ir_cmp") => Some(l.clone()),
+                AM::Label(l) if l.contains("__ir_shift") => Some(l.clone()),
                 _ => None,
             })
             .collect();
         assert!(
             !a_labels.is_empty(),
-            "bank A should emit at least one cmp label"
+            "bank A should emit at least one shift label"
         );
         assert!(
             !b_labels.is_empty(),
-            "bank B should emit at least one cmp label"
+            "bank B should emit at least one shift label"
         );
         for a in &a_labels {
             assert!(
