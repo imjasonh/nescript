@@ -178,6 +178,14 @@ pub struct IrCodeGen<'a> {
     /// masks; runtime divide only survives for non-constant or
     /// non-power-of-two divisors.
     div_used: bool,
+    /// Set to true the first time we lower an `IrOp::DrawSprite`.
+    /// Drives the `__oam_used` marker label. The linker reads this
+    /// to decide whether to splice the OAM DMA into NMI, emit the
+    /// `$FE`-fill OAM shadow init inside `gen_init`'s RAM clear,
+    /// reserve the default smiley tile at CHR tile 0, and keep the
+    /// default palette load. Programs that never `draw` pay zero
+    /// for any of those paths.
+    oam_used: bool,
     /// Source-location markers produced from [`IrOp::SourceLoc`].
     /// Each entry is a `(label_name, span)` pair — the codegen
     /// emits a unique label-definition pseudo-op at the current
@@ -357,6 +365,7 @@ impl<'a> IrCodeGen<'a> {
             ppu_update_used: false,
             mul_used: false,
             div_used: false,
+            oam_used: false,
             source_locs: Vec::new(),
             next_source_loc: 0,
             emit_source_locs: false,
@@ -1387,6 +1396,14 @@ impl<'a> IrCodeGen<'a> {
                 y,
                 frame,
             } => {
+                // Drop the `__oam_used` marker so the linker knows
+                // to emit the OAM DMA + shadow-init + default-sprite
+                // machinery. Programs that never `draw` skip all of
+                // those paths — no DMA cycles per NMI, no $FE OAM
+                // shadow fill, no built-in smiley reserved in CHR,
+                // and the default palette is suppressed too when the
+                // program has no other visual output.
+                self.emit_oam_marker();
                 // Runtime OAM-cursor-based draw. Each frame handler
                 // resets `ZP_OAM_CURSOR` to 0 after the OAM clear; a
                 // `draw` loads the cursor into Y, writes the four
@@ -2070,6 +2087,18 @@ impl<'a> IrCodeGen<'a> {
         if !self.div_used {
             self.emit_label("__div_used");
             self.div_used = true;
+        }
+    }
+
+    /// Emit the `__oam_used` marker label at most once per program.
+    /// Triggered by `IrOp::DrawSprite`. The linker drops the OAM
+    /// DMA + shadow-init + default-sprite-tile paths when this
+    /// marker is absent, shaving cycles out of every NMI and bytes
+    /// out of PRG/CHR for programs that don't draw sprites.
+    fn emit_oam_marker(&mut self) {
+        if !self.oam_used {
+            self.emit_label("__oam_used");
+            self.oam_used = true;
         }
     }
 

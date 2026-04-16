@@ -411,10 +411,28 @@ impl Linker {
             total_banks,
         ));
 
+        // Whether the program produces any visual output. True if
+        // the user declared a palette / sprite / background, or if
+        // user code contains the `__oam_used` marker (emitted by
+        // `IrOp::DrawSprite`). A purely audio- or compute-only
+        // program is happy to leave the PPU fully silent — no
+        // palette load, no rendering enable, no default-sprite
+        // smiley in CHR — so we gate the reset-time palette
+        // machinery on this flag. See the sprite-chr / OAM-DMA
+        // gates below for the other places it cascades.
+        let has_visual_output = !palettes.is_empty()
+            || !sprites.is_empty()
+            || !backgrounds.is_empty()
+            || has_label(user_code, "__oam_used");
+
         // Load the initial palette. If the program declared any
         // `palette` blocks, use the first one; otherwise fall back
         // to the built-in default palette so sprites show up in a
-        // reasonable colour scheme without any user setup.
+        // reasonable colour scheme without any user setup. Skipped
+        // entirely for programs with no visual output — those leave
+        // palette RAM in its power-on state (undefined on real
+        // hardware, zeros under jsnes / Mesen) which is fine since
+        // nothing gets rendered.
         //
         // IMPORTANT: `gen_init` leaves rendering fully disabled so
         // these $2006/$2007 writes are safe. We re-enable rendering
@@ -425,16 +443,17 @@ impl Linker {
         // about the first 72 bytes of a 1024-byte nametable load.
         if let Some(first_palette) = palettes.first() {
             all_instructions.extend(runtime::gen_initial_palette_load(&first_palette.label()));
-        } else {
-            // No user palette: fall back to a sensible built-in
-            // palette so sprites show up in a reasonable colour
-            // scheme without any user setup. Uses the same indirect
-            // loop loader as the user-palette path (reads a 32-byte
-            // blob through a ZP pointer) — ~20 bytes of code plus a
-            // 32-byte data block that gets spliced in below, versus
-            // the ~170 bytes the old inline-stores path cost. The
-            // data block lives alongside the user palette blobs so
-            // the label resolves in the normal assembly pass.
+        } else if has_visual_output {
+            // No user palette but the program does render something
+            // — fall back to a sensible built-in palette so the
+            // sprites show up in a reasonable colour scheme without
+            // any user setup. Uses the same indirect loop loader as
+            // the user-palette path (reads a 32-byte blob through a
+            // ZP pointer) — ~20 bytes of code plus a 32-byte data
+            // block that gets spliced in below, versus the ~170
+            // bytes the old inline-stores path cost. The data block
+            // lives alongside the user palette blobs so the label
+            // resolves in the normal assembly pass.
             all_instructions.extend(runtime::gen_initial_palette_load(DEFAULT_PALETTE_LABEL));
         }
 
@@ -453,8 +472,13 @@ impl Linker {
         // rendering on. Programs with a declared background get
         // bg+sprites ($1E); programs without get sprites only ($10)
         // to preserve the pre-fix behaviour of example ROMs that
-        // rely on a hidden nametable.
-        all_instructions.extend(runtime::gen_enable_rendering(has_user_background));
+        // rely on a hidden nametable. Programs with no visual
+        // output at all leave PPU_MASK at $00 from `gen_init` —
+        // the PPU stays silent, saves 4 bytes and avoids exposing
+        // an undefined palette on real hardware.
+        if has_visual_output {
+            all_instructions.extend(runtime::gen_enable_rendering(has_user_background));
+        }
 
         // User code (var init + main loop)
         all_instructions.extend(user_code.iter().cloned());
@@ -571,13 +595,13 @@ impl Linker {
         for pal in palettes {
             all_instructions.extend(runtime::gen_data_block(&pal.label(), pal.colors.to_vec()));
         }
-        // When the program has no user palette, splice the built-in
-        // default palette blob under `__default_palette` so the
-        // reset-time loop loader above can resolve it. Programs
-        // that declare a palette fall through the user path and
-        // skip this entirely — saves 32 bytes of ROM data when the
-        // default is unused.
-        if palettes.is_empty() {
+        // When the program needs the built-in default palette (i.e.
+        // it produces visual output but declared no palette of its
+        // own), splice the 32-byte blob under `__default_palette`
+        // so the reset-time loop loader above can resolve it.
+        // Programs that declare a palette OR have no visual output
+        // skip this entirely.
+        if palettes.is_empty() && has_visual_output {
             all_instructions.extend(runtime::gen_data_block(
                 DEFAULT_PALETTE_LABEL,
                 DEFAULT_PALETTE.to_vec(),

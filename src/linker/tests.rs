@@ -634,14 +634,17 @@ fn link_banked_chr_rom_survives_with_switchable_banks() {
 
 #[test]
 fn default_palette_blob_present_when_no_user_palette() {
-    // With no user palette, the linker emits the shared reset-time
-    // loop loader (which writes twice to `$2006` and loops writing
-    // through `$2007`) and splices a 32-byte `__default_palette`
-    // data block into PRG. The end-to-end ROM should contain the
-    // default palette bytes verbatim at some offset in the fixed
-    // bank.
+    // With no user palette but some visual output (the IR codegen
+    // drops an `__oam_used` marker whenever it lowers a `draw`),
+    // the linker emits the shared reset-time loop loader and
+    // splices a 32-byte `__default_palette` data block into PRG.
+    // The end-to-end ROM should contain the default palette bytes
+    // verbatim at some offset in the fixed bank.
     let linker = Linker::new(Mirroring::Horizontal);
-    let user_code = vec![Instruction::new(NOP, AM::Label("__ir_main_loop".into()))];
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__oam_used".into())),
+        Instruction::new(NOP, AM::Label("__ir_main_loop".into())),
+    ];
     let rom = linker.link(&user_code);
 
     // The first four bytes of DEFAULT_PALETTE are {0x0F, 0x00, 0x10,
@@ -652,6 +655,27 @@ fn default_palette_blob_present_when_no_user_palette() {
     let prg = &rom[16..16 + 16_384];
     let found = prg.windows(4).any(|w| w == [0x0F, 0x00, 0x10, 0x20]);
     assert!(found, "default palette bytes should appear in PRG");
+}
+
+#[test]
+fn default_palette_suppressed_when_no_visual_output() {
+    // An audio- or compute-only program (no palette declared, no
+    // sprites, no backgrounds, no `draw`) shouldn't pay for the
+    // built-in default palette: no `__default_palette` label in
+    // the symbol table, and the 32 bytes of palette data must not
+    // appear anywhere in PRG.
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![Instruction::new(NOP, AM::Label("__ir_main_loop".into()))];
+    let result = linker.link_banked_with_ppu_detailed(&user_code, &[], &[], &[], &[], &[], &[]);
+    assert!(
+        !result.labels.contains_key("__default_palette"),
+        "default palette label must not be defined without visual output"
+    );
+    let prg = &result.rom[16..16 + 16_384];
+    assert!(
+        !prg.windows(4).any(|w| w == [0x0F, 0x00, 0x10, 0x20]),
+        "default palette bytes must not appear in PRG when suppressed"
+    );
 }
 
 #[test]
