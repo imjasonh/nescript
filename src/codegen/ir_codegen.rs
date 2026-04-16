@@ -22,7 +22,7 @@
 //! (`0x80-0xFF`) for IR temp storage per function. Functions reset the
 //! temp counter at entry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::analyzer::VarAllocation;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
@@ -214,6 +214,20 @@ pub struct IrCodeGen<'a> {
     /// dispatcher loop, top-level functions).
     current_bank: Option<String>,
     allocations: &'a [VarAllocation],
+    /// Set of function names whose body never `JSR`s any other
+    /// routine. Leaf functions skip the parameter-spill prologue
+    /// (`LDA $04 / STA <local>`) entirely — they can read their
+    /// arguments straight out of the transport slots `$04..$07`
+    /// for the lifetime of the body, since nothing else clobbers
+    /// those slots from inside. Detected by [`function_is_leaf`].
+    leaf_functions: HashSet<String>,
+    /// Per-function-scoped overrides for inline-asm `{name}`
+    /// substitution. Leaf functions point their parameters at the
+    /// transport slots `$04..$07` instead of the analyzer's
+    /// fallback allocation, so any `{param}` reference inside the
+    /// body resolves to the live transport slot rather than the
+    /// stale per-function spill destination.
+    leaf_param_overrides: HashMap<String, u16>,
 }
 
 impl<'a> IrCodeGen<'a> {
@@ -260,6 +274,36 @@ impl<'a> IrCodeGen<'a> {
                 }
             }
         }
+        // Identify leaf functions (no nested `JSR` of any kind),
+        // and rewire their parameters to live straight in the
+        // transport slots `$04..$07` instead of the analyzer's
+        // per-function spill destination. The rewire happens on
+        // both `var_addrs` (so generated code reads/writes the
+        // right slot) and `leaf_param_overrides` (so inline-asm
+        // `{name}` substitution agrees). `gen_function` skips the
+        // spill prologue entirely for these — saving 12 cycles
+        // and 12 bytes of code per leaf-function call site.
+        let mut leaf_functions: HashSet<String> = HashSet::new();
+        let mut leaf_param_overrides: HashMap<String, u16> = HashMap::new();
+        for func in &ir.functions {
+            if !function_is_leaf(func) {
+                continue;
+            }
+            leaf_functions.insert(func.name.clone());
+            let scope = scope_prefix_for_fn(&func.name);
+            for (i, local) in func
+                .locals
+                .iter()
+                .take(func.param_count)
+                .take(4)
+                .enumerate()
+            {
+                let addr = 0x04u16 + i as u16;
+                var_addrs.insert(local.var_id, addr);
+                let qualified = format!("__local__{scope}__{}", local.name);
+                leaf_param_overrides.insert(qualified, addr);
+            }
+        }
         let function_names = ir.functions.iter().map(|f| f.name.clone()).collect();
         // Build the function-name → bank-name map from the IR. Most
         // programs have an empty map (no `bank Foo { fun ... }`
@@ -303,6 +347,8 @@ impl<'a> IrCodeGen<'a> {
             function_banks,
             current_bank: None,
             allocations,
+            leaf_functions,
+            leaf_param_overrides,
         }
     }
 
@@ -852,19 +898,29 @@ impl<'a> IrCodeGen<'a> {
         // more than 4 parameters (E0506), so the `.take(4)`
         // below is a defensive guard — it should never be hit
         // in a well-formed program.
-        for (i, local) in func
-            .locals
-            .iter()
-            .take(func.param_count)
-            .take(4)
-            .enumerate()
-        {
-            if let Some(&addr) = self.var_addrs.get(&local.var_id) {
-                self.emit(LDA, AM::ZeroPage(0x04 + i as u8));
-                if addr < 0x100 {
-                    self.emit(STA, AM::ZeroPage(addr as u8));
-                } else {
-                    self.emit(STA, AM::Absolute(addr));
+        //
+        // Leaf functions skip this entirely: their var_addrs
+        // were already rewired to $04-$07 in `IrCodeGen::new`,
+        // and since they never JSR from inside their body, the
+        // transport slots stay live for the whole function. This
+        // saves 12 cycles per call to every leaf primitive — the
+        // SHA-256 example's `cp_wk`, `xor_wk`, `add_wk`, etc. are
+        // all leaves.
+        if !self.leaf_functions.contains(&func.name) {
+            for (i, local) in func
+                .locals
+                .iter()
+                .take(func.param_count)
+                .take(4)
+                .enumerate()
+            {
+                if let Some(&addr) = self.var_addrs.get(&local.var_id) {
+                    self.emit(LDA, AM::ZeroPage(0x04 + i as u8));
+                    if addr < 0x100 {
+                        self.emit(STA, AM::ZeroPage(addr as u8));
+                    } else {
+                        self.emit(STA, AM::Absolute(addr));
+                    }
                 }
             }
         }
@@ -1330,6 +1386,14 @@ impl<'a> IrCodeGen<'a> {
                     std::borrow::Cow::Owned(substitute_asm_vars(body, |name| {
                         if !scope.is_empty() {
                             let qualified = format!("__local__{scope}__{name}");
+                            // Leaf-function param overrides win over the
+                            // analyzer's allocation: the codegen rewired
+                            // the param to a transport slot in
+                            // `IrCodeGen::new`, and the asm body's
+                            // `{param}` references have to follow.
+                            if let Some(&addr) = self.leaf_param_overrides.get(&qualified) {
+                                return Some(addr);
+                            }
                             if let Some(a) = self.allocations.iter().find(|a| a.name == qualified) {
                                 return Some(a.address);
                             }
@@ -2142,6 +2206,42 @@ fn scope_prefix_for_fn(name: &str) -> String {
     } else {
         name.to_string()
     }
+}
+
+/// True if `func` doesn't `JSR` any other routine from inside its
+/// body. Leaf functions skip the parameter-spill prologue and read
+/// their args straight out of the transport slots `$04..$07`.
+///
+/// Conservatively false for any op that emits a JSR (Call, Mul, Div,
+/// Mod, Transition) or for inline-asm bodies containing a `JSR`
+/// token — the analyzer has no way to look inside hand-written asm,
+/// so anything that mentions `JSR` is treated as a non-leaf.
+fn function_is_leaf(func: &IrFunction) -> bool {
+    for block in &func.blocks {
+        for op in &block.ops {
+            match op {
+                IrOp::Call(..)
+                | IrOp::Mul(..)
+                | IrOp::Div(..)
+                | IrOp::Mod(..)
+                | IrOp::Transition(..) => return false,
+                IrOp::InlineAsm(body) => {
+                    // Strip the raw-asm magic prefix if present so
+                    // we don't catch the marker characters.
+                    let scan = body.strip_prefix(crate::ir::RAW_ASM_PREFIX).unwrap_or(body);
+                    let upper = scan.to_ascii_uppercase();
+                    let contains_jsr = upper
+                        .split(|c: char| !c.is_ascii_alphanumeric())
+                        .any(|tok| tok == "JSR");
+                    if contains_jsr {
+                        return false;
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    true
 }
 
 /// Replace `{name}` tokens in an inline-asm body with the resolved
