@@ -396,13 +396,19 @@ impl Linker {
 
         let mut all_instructions = Vec::new();
 
-        // `__oam_used` marker from IR codegen — set whenever user
-        // code contains at least one `draw` statement. Gates the
-        // `$FE` OAM shadow fill inside `gen_init`, the OAM DMA
-        // inside `gen_nmi`, and (cascaded below) the default palette
-        // / smiley / rendering-enable machinery. Programs that don't
+        // Does this program need the OAM DMA plumbing? True when
+        // either of two markers the IR codegen drops is present:
+        //   - `__oam_used`: user code contains at least one `draw`.
+        //   - `__sprite_cycle_used`: user code calls `cycle_sprites`
+        //     (which rotates the DMA start offset each frame; it
+        //     presupposes the DMA is running).
+        // Gates the `$FE` OAM shadow fill inside `gen_init`, the
+        // OAM DMA inside `gen_nmi`, and — cascaded via the
+        // `has_visual_output` check below — the default palette /
+        // smiley / rendering-enable machinery. Programs that don't
         // draw save ~520 cycles per NMI plus a handful of bytes.
-        let has_oam = has_label(user_code, "__oam_used");
+        let has_oam =
+            has_label(user_code, "__oam_used") || has_label(user_code, "__sprite_cycle_used");
 
         // RESET entry point
         all_instructions.push(Instruction::new(NOP, AM::Label("__reset".into())));

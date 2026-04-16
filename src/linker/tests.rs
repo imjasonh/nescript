@@ -98,6 +98,28 @@ fn link_rom_size_correct() {
 }
 
 #[test]
+fn sprite_cycle_marker_implies_oam_dma() {
+    // `cycle_sprites` rotates the OAM DMA start offset each frame;
+    // without the DMA itself the cycling is a no-op. The linker's
+    // `has_oam` gate therefore ORs `__sprite_cycle_used` with
+    // `__oam_used` so a program that only cycles still gets the
+    // DMA plumbing. The NMI of such a program writes the DMA
+    // trigger at `$4014`.
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__sprite_cycle_used".into())),
+        Instruction::implied(NOP),
+    ];
+    let rom = linker.link(&user_code);
+    // The OAM DMA write is `STA $4014` — `8D 14 40` in bytes.
+    let prg = &rom[16..16 + 16_384];
+    assert!(
+        prg.windows(3).any(|w| w == [0x8D, 0x14, 0x40]),
+        "cycle_sprites should force the OAM DMA even without a draw"
+    );
+}
+
+#[test]
 fn link_with_sprites_places_chr_data() {
     let linker = Linker::new(Mirroring::Horizontal);
     // Seed the `__default_sprite_used` marker so the linker still

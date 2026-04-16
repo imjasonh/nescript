@@ -388,27 +388,17 @@ pub struct NmiOptions {
     pub has_oam: bool,
     /// When false, drop the three instructions that shift `$4017`
     /// (JOY2) into `ZP_INPUT_P2` from the NMI's 8-iteration input
-    /// loop. Single-player programs save ~6 bytes of code and ~30
-    /// cycles per frame (a `LDA abs`, an `LSR A`, and a `ROL zp`
-    /// running 8 times).
+    /// loop. Single-player programs save ~6 bytes of code and ~88
+    /// cycles per frame (LDA abs + LSR A + ROL zp = 11 cycles × 8
+    /// iterations).
     pub has_p2_input: bool,
     /// When false, drop the three instructions that shift `$4016`
     /// (JOY1) into `ZP_INPUT_P1`. If both `has_p1_input` and
     /// `has_p2_input` are false the whole strobe-and-loop block
     /// disappears — programs that never touch `button.*` pay
-    /// zero cycles for input sampling.
+    /// zero cycles for input sampling (~100 cycles: the 88-cycle
+    /// body plus the ~12-cycle strobe and loop scaffold).
     pub has_p1_input: bool,
-}
-
-impl NmiOptions {
-    /// Whether the program reads any controller input — the
-    /// necessary condition for emitting the strobe write to
-    /// `$4016` and the 8-iteration shift loop. Skipped entirely
-    /// when both ports are unused.
-    #[must_use]
-    pub fn any_input(&self) -> bool {
-        self.has_p1_input || self.has_p2_input
-    }
 }
 
 #[must_use]
