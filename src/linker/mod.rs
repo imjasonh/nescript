@@ -157,7 +157,13 @@ const DEFAULT_SPRITE_CHR: [u8; 16] = [
     0b0011_1100,
 ];
 
-/// Default palette data for M1 (writes to PPU $3F00).
+/// Default palette data for M1 (writes to PPU $3F00). Spliced into
+/// PRG under [`DEFAULT_PALETTE_LABEL`] when the program has no
+/// user-declared palette, and loaded by
+/// [`runtime::gen_initial_palette_load`] via the same indirect-loop
+/// path that user palettes use — keeps the reset-time palette
+/// loader small (one code path, ~20 bytes) instead of the old
+/// 170-byte per-entry unrolled store sequence.
 const DEFAULT_PALETTE: [u8; 32] = [
     // Background palettes
     0x0F, 0x00, 0x10, 0x20, // palette 0 (black, dark gray, light gray, white)
@@ -170,6 +176,12 @@ const DEFAULT_PALETTE: [u8; 32] = [
     0x0F, 0x1A, 0x2A, 0x3A, // sprite palette 2
     0x0F, 0x12, 0x22, 0x32, // sprite palette 3
 ];
+
+/// Label under which [`DEFAULT_PALETTE`] is spliced into PRG when
+/// emitted. Prefixed with `__` so it can never collide with a
+/// user-declared palette's label, which the asset pipeline prefixes
+/// with `__palette_`.
+const DEFAULT_PALETTE_LABEL: &str = "__default_palette";
 
 impl Linker {
     pub fn new(mirroring: Mirroring) -> Self {
@@ -384,11 +396,25 @@ impl Linker {
 
         let mut all_instructions = Vec::new();
 
+        // Does this program need the OAM DMA plumbing? True when
+        // either of two markers the IR codegen drops is present:
+        //   - `__oam_used`: user code contains at least one `draw`.
+        //   - `__sprite_cycle_used`: user code calls `cycle_sprites`
+        //     (which rotates the DMA start offset each frame; it
+        //     presupposes the DMA is running).
+        // Gates the `$FE` OAM shadow fill inside `gen_init`, the
+        // OAM DMA inside `gen_nmi`, and — cascaded via the
+        // `has_visual_output` check below — the default palette /
+        // smiley / rendering-enable machinery. Programs that don't
+        // draw save ~520 cycles per NMI plus a handful of bytes.
+        let has_oam =
+            has_label(user_code, "__oam_used") || has_label(user_code, "__sprite_cycle_used");
+
         // RESET entry point
         all_instructions.push(Instruction::new(NOP, AM::Label("__reset".into())));
 
         // Hardware initialization
-        all_instructions.extend(runtime::gen_init());
+        all_instructions.extend(runtime::gen_init(has_oam));
 
         // Mapper configuration: for banked mappers, set up the PRG
         // layout so the fixed bank sits at $C000-$FFFF. NROM is a
@@ -399,10 +425,25 @@ impl Linker {
             total_banks,
         ));
 
+        // Whether the program produces any visual output. True if
+        // the user declared a palette / sprite / background, or if
+        // user code contains the `__oam_used` marker (i.e. draws).
+        // A purely audio- or compute-only program is happy to leave
+        // the PPU fully silent — no palette load, no rendering
+        // enable, no default-sprite smiley in CHR — so we gate the
+        // reset-time palette machinery on this flag. See the
+        // sprite-chr / OAM-DMA gates for the other places it cascades.
+        let has_visual_output =
+            !palettes.is_empty() || !sprites.is_empty() || !backgrounds.is_empty() || has_oam;
+
         // Load the initial palette. If the program declared any
         // `palette` blocks, use the first one; otherwise fall back
         // to the built-in default palette so sprites show up in a
-        // reasonable colour scheme without any user setup.
+        // reasonable colour scheme without any user setup. Skipped
+        // entirely for programs with no visual output — those leave
+        // palette RAM in its power-on state (undefined on real
+        // hardware, zeros under jsnes / Mesen) which is fine since
+        // nothing gets rendered.
         //
         // IMPORTANT: `gen_init` leaves rendering fully disabled so
         // these $2006/$2007 writes are safe. We re-enable rendering
@@ -413,8 +454,18 @@ impl Linker {
         // about the first 72 bytes of a 1024-byte nametable load.
         if let Some(first_palette) = palettes.first() {
             all_instructions.extend(runtime::gen_initial_palette_load(&first_palette.label()));
-        } else {
-            all_instructions.extend(self.gen_palette_load());
+        } else if has_visual_output {
+            // No user palette but the program does render something
+            // — fall back to a sensible built-in palette so the
+            // sprites show up in a reasonable colour scheme without
+            // any user setup. Uses the same indirect loop loader as
+            // the user-palette path (reads a 32-byte blob through a
+            // ZP pointer) — ~20 bytes of code plus a 32-byte data
+            // block that gets spliced in below, versus the ~170
+            // bytes the old inline-stores path cost. The data block
+            // lives alongside the user palette blobs so the label
+            // resolves in the normal assembly pass.
+            all_instructions.extend(runtime::gen_initial_palette_load(DEFAULT_PALETTE_LABEL));
         }
 
         // Load the initial background if the program declared any.
@@ -432,8 +483,13 @@ impl Linker {
         // rendering on. Programs with a declared background get
         // bg+sprites ($1E); programs without get sprites only ($10)
         // to preserve the pre-fix behaviour of example ROMs that
-        // rely on a hidden nametable.
-        all_instructions.extend(runtime::gen_enable_rendering(has_user_background));
+        // rely on a hidden nametable. Programs with no visual
+        // output at all leave PPU_MASK at $00 from `gen_init` —
+        // the PPU stays silent, saves 4 bytes and avoids exposing
+        // an undefined palette on real hardware.
+        if has_visual_output {
+            all_instructions.extend(runtime::gen_enable_rendering(has_user_background));
+        }
 
         // User code (var init + main loop)
         all_instructions.extend(user_code.iter().cloned());
@@ -471,9 +527,22 @@ impl Linker {
             }
         }
 
-        // Math runtime routines (included always for simplicity)
-        all_instructions.extend(runtime::gen_multiply());
-        all_instructions.extend(runtime::gen_divide());
+        // Math runtime routines. Gated on the `__mul_used` /
+        // `__div_used` marker labels that the IR codegen drops at
+        // the first `IrOp::Mul` / `IrOp::Div` / `IrOp::Mod`. The
+        // optimizer rewrites multiplies and divides by constant
+        // powers of two into shifts (and modulo by constant powers
+        // of two into masks) before codegen runs, so these markers
+        // only fire for genuinely runtime-costly math. Programs
+        // without any surviving mul or div pay zero bytes here.
+        let has_mul = has_label(user_code, "__mul_used");
+        let has_div = has_label(user_code, "__div_used");
+        if has_mul {
+            all_instructions.extend(runtime::gen_multiply());
+        }
+        if has_div {
+            all_instructions.extend(runtime::gen_divide());
+        }
 
         // Audio subsystem — linked in whenever user code touched
         // audio (detected via the `__audio_used` marker emitted by
@@ -537,6 +606,18 @@ impl Linker {
         for pal in palettes {
             all_instructions.extend(runtime::gen_data_block(&pal.label(), pal.colors.to_vec()));
         }
+        // When the program needs the built-in default palette (i.e.
+        // it produces visual output but declared no palette of its
+        // own), splice the 32-byte blob under `__default_palette`
+        // so the reset-time loop loader above can resolve it.
+        // Programs that declare a palette OR have no visual output
+        // skip this entirely.
+        if palettes.is_empty() && has_visual_output {
+            all_instructions.extend(runtime::gen_data_block(
+                DEFAULT_PALETTE_LABEL,
+                DEFAULT_PALETTE.to_vec(),
+            ));
+        }
         for bg in backgrounds {
             all_instructions.extend(runtime::gen_data_block(
                 &bg.tiles_label(),
@@ -587,11 +668,16 @@ impl Linker {
         // every frame" hardware symptom into visible flicker that
         // the eye reconstructs across frames.
         let has_sprite_cycle = has_label(user_code, "__sprite_cycle_used");
+        let has_p1_input = has_label(user_code, "__p1_input_used");
+        let has_p2_input = has_label(user_code, "__p2_input_used");
         all_instructions.extend(runtime::gen_nmi(runtime::NmiOptions {
             has_ppu_updates,
             has_audio,
             debug_mode,
             has_sprite_cycle,
+            has_oam,
+            has_p2_input,
+            has_p1_input,
         }));
 
         // IRQ handler
@@ -701,7 +787,35 @@ impl Linker {
         // ranges overlap, but we still bounds-check on copy in
         // case a future change shifts the layout.
         let mut chr = vec![0u8; 8192];
-        chr[..16].copy_from_slice(&DEFAULT_SPRITE_CHR);
+        // Tile 0 is reserved for the built-in smiley *only* when
+        // something in the program depends on it. Three possible
+        // sources of that dependency:
+        //
+        //   1. `__default_sprite_used` marker — user code runs at
+        //      least one `draw` that falls back to tile 0, either
+        //      because the sprite name doesn't resolve or because
+        //      it uses a runtime `frame:` override.
+        //   2. A background nametable references tile 0 directly.
+        //      Some programs use the smiley as a placeholder
+        //      background tile (see `examples/friendly_assets.ne`).
+        //   3. A background's CHR was written at base tile 0 — the
+        //      resolver shouldn't allow this today, but checking
+        //      for `chr_base_tile == 0` keeps the gate honest.
+        //
+        // Programs whose draws all resolve to declared sprites with
+        // static frames and whose backgrounds reference tiles 1+
+        // skip the smiley emit and reclaim 16 CHR bytes.
+        let bg_uses_tile_zero = backgrounds.iter().any(|bg| {
+            // A nametable entry of 0 means "fetch tile 0" — the
+            // PPU can't tell the difference between sprite and
+            // background tiles, so we have to preserve the smiley
+            // when any background map byte reads 0.
+            bg.tiles.contains(&0)
+        });
+        let has_default_sprite = has_label(user_code, "__default_sprite_used") || bg_uses_tile_zero;
+        if has_default_sprite {
+            chr[..16].copy_from_slice(&DEFAULT_SPRITE_CHR);
+        }
         for sprite in sprites {
             let offset = sprite.tile_index as usize * 16;
             let end = offset + sprite.chr_bytes.len();
@@ -739,25 +853,5 @@ impl Linker {
             labels: result.labels,
             fixed_bank_file_offset,
         }
-    }
-
-    /// Generate instructions to load the default palette into the PPU.
-    fn gen_palette_load(&self) -> Vec<Instruction> {
-        let mut out = Vec::new();
-
-        // Set PPU address to $3F00 (palette start)
-        out.push(Instruction::new(LDA, AM::Absolute(0x2002))); // read PPU status to reset latch
-        out.push(Instruction::new(LDA, AM::Immediate(0x3F)));
-        out.push(Instruction::new(STA, AM::Absolute(0x2006))); // PPU addr high byte
-        out.push(Instruction::new(LDA, AM::Immediate(0x00)));
-        out.push(Instruction::new(STA, AM::Absolute(0x2006))); // PPU addr low byte
-
-        // Write all 32 palette bytes
-        for &color in &DEFAULT_PALETTE {
-            out.push(Instruction::new(LDA, AM::Immediate(color)));
-            out.push(Instruction::new(STA, AM::Absolute(0x2007))); // PPU data
-        }
-
-        out
     }
 }

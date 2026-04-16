@@ -50,8 +50,14 @@ fn link_has_correct_vector_table() {
 
 #[test]
 fn link_includes_chr_data() {
+    // When user code signals that it uses the default smiley tile
+    // (fallback for an unresolved `draw` target), the linker should
+    // copy the built-in 16-byte smiley CHR blob into tile 0.
     let linker = Linker::new(Mirroring::Horizontal);
-    let user_code = vec![Instruction::implied(NOP)];
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__default_sprite_used".into())),
+        Instruction::implied(NOP),
+    ];
     let rom_data = linker.link(&user_code);
 
     // CHR starts after PRG
@@ -61,6 +67,23 @@ fn link_includes_chr_data() {
         &rom_data[chr_start..chr_start + 16],
         &[0u8; 16],
         "CHR data should contain sprite tile"
+    );
+}
+
+#[test]
+fn link_omits_default_smiley_without_marker() {
+    // Without the `__default_sprite_used` marker the linker should
+    // leave tile 0 as the all-zero blank tile — programs that draw
+    // only user-declared sprites or never draw at all reclaim the
+    // 16 CHR bytes.
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![Instruction::implied(NOP)];
+    let rom_data = linker.link(&user_code);
+    let chr_start = 16 + 16384;
+    assert_eq!(
+        &rom_data[chr_start..chr_start + 16],
+        &[0u8; 16],
+        "tile 0 should be zero when no program draws fall back to the smiley"
     );
 }
 
@@ -75,9 +98,39 @@ fn link_rom_size_correct() {
 }
 
 #[test]
+fn sprite_cycle_marker_implies_oam_dma() {
+    // `cycle_sprites` rotates the OAM DMA start offset each frame;
+    // without the DMA itself the cycling is a no-op. The linker's
+    // `has_oam` gate therefore ORs `__sprite_cycle_used` with
+    // `__oam_used` so a program that only cycles still gets the
+    // DMA plumbing. The NMI of such a program writes the DMA
+    // trigger at `$4014`.
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__sprite_cycle_used".into())),
+        Instruction::implied(NOP),
+    ];
+    let rom = linker.link(&user_code);
+    // The OAM DMA write is `STA $4014` — `8D 14 40` in bytes.
+    let prg = &rom[16..16 + 16_384];
+    assert!(
+        prg.windows(3).any(|w| w == [0x8D, 0x14, 0x40]),
+        "cycle_sprites should force the OAM DMA even without a draw"
+    );
+}
+
+#[test]
 fn link_with_sprites_places_chr_data() {
     let linker = Linker::new(Mirroring::Horizontal);
-    let user_code = vec![Instruction::implied(NOP)];
+    // Seed the `__default_sprite_used` marker so the linker still
+    // emits the smiley tile alongside the user sprite — this test
+    // asserts the legacy "smiley at tile 0, user sprite at tile 1"
+    // layout that programs doing both fallback and named draws
+    // depend on.
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__default_sprite_used".into())),
+        Instruction::implied(NOP),
+    ];
 
     let sprite_bytes: Vec<u8> = (0x20..0x30).collect(); // 16 bytes, one tile
     let sprites = vec![SpriteData {
@@ -621,9 +674,13 @@ fn link_with_mapper_nrom_produces_single_bank_rom() {
 #[test]
 fn link_banked_chr_rom_survives_with_switchable_banks() {
     // The default smiley + any sprites should still appear in CHR
-    // ROM even when switchable PRG banks are present.
+    // ROM even when switchable PRG banks are present. Seed the
+    // `__default_sprite_used` marker so the smiley gate fires.
     let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::MMC1);
-    let user_code = vec![Instruction::implied(NOP)];
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__default_sprite_used".into())),
+        Instruction::implied(NOP),
+    ];
     let banks = vec![PrgBank::empty("X")];
     let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
     // CHR starts after 2 PRG banks.
@@ -633,30 +690,69 @@ fn link_banked_chr_rom_survives_with_switchable_banks() {
 }
 
 #[test]
-fn palette_load_writes_to_ppu() {
+fn default_palette_blob_present_when_no_user_palette() {
+    // With no user palette but some visual output (the IR codegen
+    // drops an `__oam_used` marker whenever it lowers a `draw`),
+    // the linker emits the shared reset-time loop loader and
+    // splices a 32-byte `__default_palette` data block into PRG.
+    // The end-to-end ROM should contain the default palette bytes
+    // verbatim at some offset in the fixed bank.
     let linker = Linker::new(Mirroring::Horizontal);
-    let palette_insts = linker.gen_palette_load();
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__oam_used".into())),
+        Instruction::new(NOP, AM::Label("__ir_main_loop".into())),
+    ];
+    let rom = linker.link(&user_code);
 
-    // Should write to PPU address register ($2006) twice
-    let ppu_addr_writes: Vec<_> = palette_insts
-        .iter()
-        .filter(|i| i.opcode == STA && i.mode == AM::Absolute(0x2006))
-        .collect();
-    assert_eq!(
-        ppu_addr_writes.len(),
-        2,
-        "should set PPU address (high and low bytes)"
+    // The first four bytes of DEFAULT_PALETTE are {0x0F, 0x00, 0x10,
+    // 0x20}; they should appear verbatim in the PRG portion of the
+    // iNES file (bytes 16..16+16_384). We look for that 4-byte
+    // sequence rather than matching the full 32 bytes so this stays
+    // robust against minor palette tweaks.
+    let prg = &rom[16..16 + 16_384];
+    let found = prg.windows(4).any(|w| w == [0x0F, 0x00, 0x10, 0x20]);
+    assert!(found, "default palette bytes should appear in PRG");
+}
+
+#[test]
+fn default_palette_suppressed_when_no_visual_output() {
+    // An audio- or compute-only program (no palette declared, no
+    // sprites, no backgrounds, no `draw`) shouldn't pay for the
+    // built-in default palette: no `__default_palette` label in
+    // the symbol table, and the 32 bytes of palette data must not
+    // appear anywhere in PRG.
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![Instruction::new(NOP, AM::Label("__ir_main_loop".into()))];
+    let result = linker.link_banked_with_ppu_detailed(&user_code, &[], &[], &[], &[], &[], &[]);
+    assert!(
+        !result.labels.contains_key("__default_palette"),
+        "default palette label must not be defined without visual output"
     );
+    let prg = &result.rom[16..16 + 16_384];
+    assert!(
+        !prg.windows(4).any(|w| w == [0x0F, 0x00, 0x10, 0x20]),
+        "default palette bytes must not appear in PRG when suppressed"
+    );
+}
 
-    // Should write 32 palette bytes to $2007
-    let ppu_data_writes: Vec<_> = palette_insts
-        .iter()
-        .filter(|i| i.opcode == STA && i.mode == AM::Absolute(0x2007))
-        .collect();
-    assert_eq!(
-        ppu_data_writes.len(),
-        32,
-        "should write all 32 palette bytes"
+#[test]
+fn no_default_palette_blob_when_user_palette_present() {
+    // A program that declares its own palette should suppress the
+    // built-in fallback entirely — the `__default_palette` label
+    // never gets emitted, and the assembler's label table doesn't
+    // contain it.
+    use crate::assets::PaletteData;
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![Instruction::new(NOP, AM::Label("__ir_main_loop".into()))];
+    let user_pal = PaletteData {
+        name: "Menu".into(),
+        colors: [0x0F; 32],
+    };
+    let result =
+        linker.link_banked_with_ppu_detailed(&user_code, &[], &[], &[], &[user_pal], &[], &[]);
+    assert!(
+        !result.labels.contains_key("__default_palette"),
+        "default palette must be suppressed when user palette is present"
     );
 }
 

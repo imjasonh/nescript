@@ -4,13 +4,13 @@ use crate::asm::{AddressingMode as AM, Opcode::*};
 
 #[test]
 fn init_disables_irq() {
-    let init = gen_init();
+    let init = gen_init(true);
     assert_eq!(init[0].opcode, SEI);
 }
 
 #[test]
 fn init_sets_stack_pointer() {
-    let init = gen_init();
+    let init = gen_init(true);
     // LDX #$FF, TXS
     let has_ldx = init
         .iter()
@@ -22,7 +22,7 @@ fn init_sets_stack_pointer() {
 
 #[test]
 fn init_disables_ppu() {
-    let init = gen_init();
+    let init = gen_init(true);
     // Should write 0 to $2000 and $2001
     let writes_ppu_ctrl = init
         .iter()
@@ -36,7 +36,7 @@ fn init_disables_ppu() {
 
 #[test]
 fn init_enables_nmi_at_end() {
-    let init = gen_init();
+    let init = gen_init(true);
     // Last STA $2000 should enable NMI (bit 7 set = 0x80)
     let nmi_writes: Vec<_> = init
         .iter()
@@ -56,7 +56,7 @@ fn init_enables_nmi_at_end() {
 
 #[test]
 fn init_assembles_without_error() {
-    let init = gen_init();
+    let init = gen_init(true);
     let result = asm::assemble(&init, 0x8000);
     // Should produce non-empty output
     assert!(!result.bytes.is_empty(), "init should produce bytes");
@@ -85,22 +85,68 @@ fn nmi_saves_and_restores_registers() {
 }
 
 #[test]
-fn nmi_triggers_oam_dma() {
+fn nmi_triggers_oam_dma_when_requested() {
+    let nmi = gen_nmi(NmiOptions {
+        has_oam: true,
+        ..NmiOptions::default()
+    });
+    let has_dma = nmi
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4014));
+    assert!(has_dma, "NMI should trigger OAM DMA when has_oam is set");
+}
+
+#[test]
+fn nmi_skips_oam_dma_by_default() {
+    // With `has_oam = false` (the default) the NMI must not write
+    // the OAM DMA trigger at $4014, saving ~520 cycles per frame
+    // for programs that don't `draw`.
     let nmi = gen_nmi(NmiOptions::default());
     let has_dma = nmi
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4014));
-    assert!(has_dma, "NMI should trigger OAM DMA");
+    assert!(!has_dma, "NMI should skip OAM DMA when has_oam is unset");
 }
 
 #[test]
-fn nmi_reads_controller() {
-    let nmi = gen_nmi(NmiOptions::default());
+fn nmi_reads_controller_when_p1_requested() {
+    let nmi = gen_nmi(NmiOptions {
+        has_p1_input: true,
+        ..NmiOptions::default()
+    });
     // Should write strobe to $4016
     let has_strobe = nmi
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4016));
-    assert!(has_strobe, "NMI should strobe controller");
+    assert!(has_strobe, "NMI should strobe controller when P1 requested");
+    let reads_joy1 = nmi
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::Absolute(0x4016));
+    assert!(reads_joy1, "NMI should read JOY1 when P1 requested");
+}
+
+#[test]
+fn nmi_skips_strobe_when_no_input() {
+    // With both `has_p1_input` and `has_p2_input` unset, the NMI
+    // should emit neither the strobe write to $4016 nor any reads
+    // from the two controller ports — programs that never touch
+    // `button.*` pay zero cycles for input sampling.
+    let nmi = gen_nmi(NmiOptions::default());
+    let has_strobe = nmi
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4016));
+    assert!(
+        !has_strobe,
+        "NMI must not strobe controllers when no input is requested"
+    );
+    let reads_joy1 = nmi
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::Absolute(0x4016));
+    let reads_joy2 = nmi
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::Absolute(0x4017));
+    assert!(!reads_joy1, "NMI must not read JOY1 without P1 input");
+    assert!(!reads_joy2, "NMI must not read JOY2 without P2 input");
 }
 
 #[test]
@@ -203,8 +249,11 @@ fn nmi_sprite_cycle_variant_reads_rotating_offset() {
     // read SPRITE_CYCLE_ADDR and write it to OAM_ADDR ($2003)
     // before the DMA, instead of the default fixed 0. The
     // default variant must stay byte-identical to legacy NMI.
+    // Sprite cycling is always paired with `has_oam = true`
+    // (cycling is pointless without the DMA).
     let cycling = gen_nmi(NmiOptions {
         has_sprite_cycle: true,
+        has_oam: true,
         ..NmiOptions::default()
     });
     let reads_cycle = cycling

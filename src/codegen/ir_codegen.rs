@@ -161,6 +161,53 @@ pub struct IrCodeGen<'a> {
     /// resulting `__ppu_update_used` marker label to decide whether
     /// to splice the in-NMI palette/nametable update helper.
     ppu_update_used: bool,
+    /// Set to true the first time we lower an `IrOp::Mul`. Drives
+    /// the `__mul_used` marker label so the linker can skip
+    /// `gen_multiply` (~50 bytes) for programs that never multiply.
+    /// The optimizer's strength reduction has already turned
+    /// multiplies by constant powers of two into shifts by the time
+    /// codegen runs, so this flag only gets set for real runtime
+    /// multiplications.
+    mul_used: bool,
+    /// Set to true the first time we lower an `IrOp::Div` or
+    /// `IrOp::Mod` (modulo reuses the divide routine). Drives the
+    /// `__div_used` marker label so the linker can skip `gen_divide`
+    /// (~70 bytes) for programs that never divide. Divide by
+    /// constant powers of two has been strength-reduced to shifts
+    /// by the optimizer, and modulo by constant powers of two to
+    /// masks; runtime divide only survives for non-constant or
+    /// non-power-of-two divisors.
+    div_used: bool,
+    /// Set to true the first time we lower an `IrOp::DrawSprite`.
+    /// Drives the `__oam_used` marker label. The linker reads this
+    /// to decide whether to splice the OAM DMA into NMI, emit the
+    /// `$FE`-fill OAM shadow init inside `gen_init`'s RAM clear,
+    /// and keep the default palette load. Programs that never
+    /// `draw` pay zero for any of those paths.
+    oam_used: bool,
+    /// Set to true the first time a `draw` either references a
+    /// sprite name that the resolver didn't turn into a user
+    /// sprite (falling back to tile 0) or uses a runtime `frame:`
+    /// override (which could index any tile, including 0). Drives
+    /// the `__default_sprite_used` marker label — the linker uses
+    /// it to decide whether to reserve CHR tile 0 for the built-in
+    /// smiley. Programs that only draw explicitly-declared sprites
+    /// with static names and no `frame:` override leave this flag
+    /// `false` and reclaim the 16 CHR bytes of tile 0 as a blank
+    /// background tile.
+    default_sprite_used: bool,
+    /// Set to true the first time we lower an `IrOp::ReadInput`
+    /// targeting player 1. Drives the `__p1_input_used` marker
+    /// label — the runtime's NMI skips the three instructions that
+    /// shift `$4016` into `ZP_INPUT_P1` when nobody reads the
+    /// player-1 byte.
+    p1_input_used: bool,
+    /// Set to true the first time we lower an `IrOp::ReadInput`
+    /// targeting player 2. Drives the `__p2_input_used` marker
+    /// label — single-player programs skip the `$4017` read inside
+    /// the NMI's shift loop, saving ~6 bytes of code and ~30 cycles
+    /// per frame.
+    p2_input_used: bool,
     /// Source-location markers produced from [`IrOp::SourceLoc`].
     /// Each entry is a `(label_name, span)` pair — the codegen
     /// emits a unique label-definition pseudo-op at the current
@@ -338,6 +385,12 @@ impl<'a> IrCodeGen<'a> {
             noise_used: false,
             triangle_used: false,
             ppu_update_used: false,
+            mul_used: false,
+            div_used: false,
+            oam_used: false,
+            default_sprite_used: false,
+            p1_input_used: false,
+            p2_input_used: false,
             source_locs: Vec::new(),
             next_source_loc: 0,
             emit_source_locs: false,
@@ -829,6 +882,15 @@ impl<'a> IrCodeGen<'a> {
             self.emit(JMP, AM::Label("__debug_halt".to_string()));
         }
 
+        // Pay-as-you-go marker labels for flags that got set during
+        // the IR walk above. Emitting them here (rather than at the
+        // call sites) keeps the markers out of peephole-sensitive
+        // instruction sequences — a label inside `IrOp::DrawSprite`
+        // or `IrOp::ReadInput`, for instance, would otherwise split
+        // the dead-load-elimination block and leave stale ZP
+        // stores in the stream.
+        self.emit_trailing_markers();
+
         // Snapshot the fixed-bank instruction stream before we
         // start emitting the banked function bodies into their own
         // streams. Programs without any banked functions skip the
@@ -1175,7 +1237,14 @@ impl<'a> IrCodeGen<'a> {
                 self.store_temp(*d);
             }
             IrOp::Mul(d, a, b) => {
-                // Software multiply: multiplicand in A, multiplier in $02
+                // Software multiply: multiplicand in A, multiplier in $02.
+                // Flag the `__mul_used` marker so the linker knows to
+                // link the `__multiply` subroutine in — programs that
+                // don't multiply skip ~50 bytes of runtime. The label
+                // itself is emitted at the end of generate() so it
+                // doesn't disturb peephole-sensitive instruction
+                // sequences here.
+                self.mul_used = true;
                 self.load_temp(*a);
                 self.emit(PHA, AM::Implied); // Save for __multiply contract
                 let b_addr = self.temp_addr(*b);
@@ -1222,7 +1291,11 @@ impl<'a> IrCodeGen<'a> {
             IrOp::Div(d, a, b) => {
                 // Software divide: dividend in A, divisor in $02.
                 // `__divide` returns quotient in A and leaves
-                // remainder in ZP $03.
+                // remainder in ZP $03. Flag the `__div_used` marker
+                // so the linker links the `__divide` subroutine in;
+                // programs that don't divide skip ~70 bytes. The
+                // label is emitted at the end of generate().
+                self.div_used = true;
                 self.load_temp(*a);
                 self.emit(PHA, AM::Implied);
                 let b_addr = self.temp_addr(*b);
@@ -1234,7 +1307,10 @@ impl<'a> IrCodeGen<'a> {
             }
             IrOp::Mod(d, a, b) => {
                 // Modulo reuses __divide and reads the remainder out
-                // of ZP $03 afterwards.
+                // of ZP $03 afterwards. Same `__div_used` marker as
+                // `IrOp::Div` — modulo doesn't have a separate
+                // runtime routine.
+                self.div_used = true;
                 self.load_temp(*a);
                 self.emit(PHA, AM::Implied);
                 let b_addr = self.temp_addr(*b);
@@ -1358,6 +1434,16 @@ impl<'a> IrCodeGen<'a> {
                 y,
                 frame,
             } => {
+                // Flag the `__oam_used` marker so the linker knows
+                // to emit the OAM DMA + shadow-init + default-palette
+                // machinery. Programs that never `draw` skip all of
+                // those paths — no DMA cycles per NMI, no $FE OAM
+                // shadow fill, no built-in smiley reserved in CHR,
+                // and the default palette is suppressed too when the
+                // program has no other visual output. The label is
+                // emitted at the end of generate() so it doesn't
+                // split a peephole block here.
+                self.oam_used = true;
                 // Runtime OAM-cursor-based draw. Each frame handler
                 // resets `ZP_OAM_CURSOR` to 0 after the OAM clear; a
                 // `draw` loads the cursor into Y, writes the four
@@ -1392,12 +1478,25 @@ impl<'a> IrCodeGen<'a> {
                 self.load_temp(*y);
                 self.emit(STA, AM::AbsoluteY(0x0200));
 
-                // Tile index at cursor+1 — frame override, sprite lookup, or 0
+                // Tile index at cursor+1 — frame override, sprite lookup, or 0.
+                //
+                // The `frame: <var>` override indexes into CHR at a
+                // runtime value we can't bound statically, so it
+                // might land on tile 0 and therefore needs the
+                // default smiley. The `sprite_name doesn't resolve`
+                // case falls back to tile 0 explicitly. Both drop
+                // the `__default_sprite_used` marker so the linker
+                // keeps the smiley tile in CHR; draws that resolve
+                // to a user sprite with a static `frame: None` leave
+                // the marker off and tile 0 becomes user-available
+                // as a blank (all-$00) background tile.
                 if let Some(f) = frame {
+                    self.default_sprite_used = true;
                     self.load_temp(*f);
                 } else if let Some(&tile) = self.sprite_tiles.get(sprite_name) {
                     self.emit(LDA, AM::Immediate(tile));
                 } else {
+                    self.default_sprite_used = true;
                     self.emit(LDA, AM::Immediate(0));
                 }
                 self.emit(STA, AM::AbsoluteY(0x0201));
@@ -1420,6 +1519,17 @@ impl<'a> IrCodeGen<'a> {
                 self.emit(INC, AM::ZeroPage(ZP_OAM_CURSOR));
             }
             IrOp::ReadInput(dest, player) => {
+                // Flag the per-player input marker so the linker
+                // can decide whether to keep that port's shift
+                // block inside NMI. IR uses `player_index` 0 = P1
+                // and 1 = P2; the ZP bytes the NMI populates match
+                // the constants at the top of `runtime/mod.rs`.
+                // Labels are emitted at the end of generate().
+                if *player == 1 {
+                    self.p2_input_used = true;
+                } else {
+                    self.p1_input_used = true;
+                }
                 // $01 = P1 input byte, $08 = P2 input byte
                 let addr = if *player == 1 { 0x08 } else { 0x01 };
                 self.emit(LDA, AM::ZeroPage(addr));
@@ -2015,6 +2125,37 @@ impl<'a> IrCodeGen<'a> {
         if !self.ppu_update_used {
             self.emit_label("__ppu_update_used");
             self.ppu_update_used = true;
+        }
+    }
+
+    /// Emit the marker labels for flags that got set somewhere
+    /// during `generate()`'s IR walk. Called once, at the end of
+    /// `generate()`, so the labels land after every instruction
+    /// that could have set a flag — never splitting a
+    /// peephole-sensitive block at the flag's call site.
+    ///
+    /// Each label is a zero-byte pseudo-op. The linker looks them
+    /// up by name via `has_label` and turns on the gated runtime
+    /// feature. Programs that never set a given flag emit nothing
+    /// for it — no label, no lookup hit, no gated code.
+    fn emit_trailing_markers(&mut self) {
+        if self.mul_used {
+            self.emit_label("__mul_used");
+        }
+        if self.div_used {
+            self.emit_label("__div_used");
+        }
+        if self.oam_used {
+            self.emit_label("__oam_used");
+        }
+        if self.default_sprite_used {
+            self.emit_label("__default_sprite_used");
+        }
+        if self.p1_input_used {
+            self.emit_label("__p1_input_used");
+        }
+        if self.p2_input_used {
+            self.emit_label("__p2_input_used");
         }
     }
 

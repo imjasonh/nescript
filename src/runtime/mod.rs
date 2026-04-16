@@ -200,7 +200,17 @@ pub const AUDIO_SFX_PITCH_PTR_HI: u16 = 0x07F7;
 
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
-pub fn gen_init() -> Vec<Instruction> {
+///
+/// `has_oam` controls the $0200 OAM shadow fill inside the RAM
+/// clear loop. When true, the shadow is filled with `$FE` so any
+/// sprite slot not explicitly written by a later `draw` stays
+/// off-screen (Y = $FE is out of the 240-line viewport). When
+/// false — i.e. the program never draws — the shadow stays at $00
+/// alongside the rest of RAM, saving ~4 bytes of init code since
+/// the inner-loop doesn't need the two extra LDA / mid-loop value
+/// swaps to load and restore the `$FE` immediate.
+#[must_use]
+pub fn gen_init(has_oam: bool) -> Vec<Instruction> {
     let mut out = Vec::new();
 
     // Disable IRQs and set decimal mode off
@@ -252,16 +262,24 @@ pub fn gen_init() -> Vec<Instruction> {
         AM::LabelRelative("__vblankwait1".into()),
     ));
 
-    // Clear RAM ($0000-$07FF)
+    // Clear RAM ($0000-$07FF). When the program uses sprites, the
+    // $0200-$02FF OAM shadow gets filled with $FE so unused slots
+    // stay off-screen (Y=$FE puts the sprite below scanline 240);
+    // programs that never draw skip that swap and zero-fill the
+    // whole 2 KB range uniformly.
     out.push(Instruction::new(LDA, AM::Immediate(0x00)));
     out.push(Instruction::new(LDX, AM::Immediate(0x00)));
     out.push(Instruction::new(NOP, AM::Label("__clrmem".into())));
     out.push(Instruction::new(STA, AM::AbsoluteX(0x0000)));
     out.push(Instruction::new(STA, AM::AbsoluteX(0x0100)));
-    // OAM shadow: fill with $FE (hide sprites off-screen)
-    out.push(Instruction::new(LDA, AM::Immediate(0xFE)));
-    out.push(Instruction::new(STA, AM::AbsoluteX(0x0200)));
-    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    if has_oam {
+        // OAM shadow: fill with $FE (hide sprites off-screen).
+        out.push(Instruction::new(LDA, AM::Immediate(0xFE)));
+        out.push(Instruction::new(STA, AM::AbsoluteX(0x0200)));
+        out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    } else {
+        out.push(Instruction::new(STA, AM::AbsoluteX(0x0200)));
+    }
     out.push(Instruction::new(STA, AM::AbsoluteX(0x0300)));
     out.push(Instruction::new(STA, AM::AbsoluteX(0x0400)));
     out.push(Instruction::new(STA, AM::AbsoluteX(0x0500)));
@@ -361,6 +379,26 @@ pub struct NmiOptions {
     pub has_audio: bool,
     pub debug_mode: bool,
     pub has_sprite_cycle: bool,
+    /// When false, skip the OAM DMA (`$2003` address write + `$4014`
+    /// DMA trigger). A program that never `draw`s sprites has
+    /// nothing interesting to transfer — every one of the 256 OAM
+    /// bytes is either the $FE hide sentinel or a zeroed row —
+    /// so the DMA is ~520 wasted cycles per NMI. Skipping it saves
+    /// those cycles plus 9 bytes of NMI code.
+    pub has_oam: bool,
+    /// When false, drop the three instructions that shift `$4017`
+    /// (JOY2) into `ZP_INPUT_P2` from the NMI's 8-iteration input
+    /// loop. Single-player programs save ~6 bytes of code and ~88
+    /// cycles per frame (LDA abs + LSR A + ROL zp = 11 cycles × 8
+    /// iterations).
+    pub has_p2_input: bool,
+    /// When false, drop the three instructions that shift `$4016`
+    /// (JOY1) into `ZP_INPUT_P1`. If both `has_p1_input` and
+    /// `has_p2_input` are false the whole strobe-and-loop block
+    /// disappears — programs that never touch `button.*` pay
+    /// zero cycles for input sampling (~100 cycles: the 88-cycle
+    /// body plus the ~12-cycle strobe and loop scaffold).
+    pub has_p1_input: bool,
 }
 
 #[must_use]
@@ -370,6 +408,9 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
         has_audio,
         debug_mode,
         has_sprite_cycle,
+        has_oam,
+        has_p2_input,
+        has_p1_input,
     } = opts;
     let mut out = Vec::new();
 
@@ -444,19 +485,26 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
         out.push(Instruction::new(JSR, AM::Label("__audio_tick".into())));
     }
 
-    // OAM DMA — transfer sprite data from $0200. Programs that
-    // don't use `cycle_sprites` get the classic fixed-offset
-    // path (LDA #0); programs that opt in get the rotating
-    // offset read from SPRITE_CYCLE_ADDR. Both variants write
-    // the same low byte ($02) for the DMA source page.
-    if has_sprite_cycle {
-        out.push(Instruction::new(LDA, AM::Absolute(SPRITE_CYCLE_ADDR)));
-    } else {
-        out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    // OAM DMA — transfer sprite data from $0200. Skipped entirely
+    // for programs that never `draw`: gated on `has_oam`, which the
+    // linker sets from the `__oam_used` marker the IR codegen drops
+    // at the first `IrOp::DrawSprite`. `has_sprite_cycle` is a
+    // strict subset of `has_oam` so a program that opts into cycling
+    // has definitely also drawn something.
+    //
+    // Programs that *do* draw choose between two paths: the classic
+    // fixed-offset (LDA #0) and the rotating offset read from
+    // SPRITE_CYCLE_ADDR used by `cycle_sprites`.
+    if has_oam {
+        if has_sprite_cycle {
+            out.push(Instruction::new(LDA, AM::Absolute(SPRITE_CYCLE_ADDR)));
+        } else {
+            out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+        }
+        out.push(Instruction::new(STA, AM::Absolute(OAM_ADDR)));
+        out.push(Instruction::new(LDA, AM::Immediate(0x02)));
+        out.push(Instruction::new(STA, AM::Absolute(OAM_DMA)));
     }
-    out.push(Instruction::new(STA, AM::Absolute(OAM_ADDR)));
-    out.push(Instruction::new(LDA, AM::Immediate(0x02)));
-    out.push(Instruction::new(STA, AM::Absolute(OAM_DMA)));
 
     // PPU updates: check the flags byte, apply any pending palette
     // or background write. Runs inside vblank where $2006/$2007
@@ -466,28 +514,40 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
         out.extend(gen_ppu_update_apply());
     }
 
-    // Read controller 1
-    out.push(Instruction::new(LDA, AM::Immediate(0x01)));
-    out.push(Instruction::new(STA, AM::Absolute(JOY1)));
-    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
-    out.push(Instruction::new(STA, AM::Absolute(JOY1)));
+    // Controller sampling. The strobe write to $4016 latches both
+    // controller ports on the same clock, so the 8-iteration shift
+    // loop that follows can read whichever of the two the program
+    // actually uses. Programs that touch no `button.*` at all skip
+    // the whole block.
+    if has_p1_input || has_p2_input {
+        // Strobe: write 1 then 0 to $4016 so both port latches
+        // capture the current button state.
+        out.push(Instruction::new(LDA, AM::Immediate(0x01)));
+        out.push(Instruction::new(STA, AM::Absolute(JOY1)));
+        out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+        out.push(Instruction::new(STA, AM::Absolute(JOY1)));
 
-    // Read 8 button bits from controller 1 ($4016) into ZP_INPUT_P1
-    // and 8 button bits from controller 2 ($4017) into ZP_INPUT_P2
-    // simultaneously — shift each port's carry into its ZP byte.
-    out.push(Instruction::new(LDX, AM::Immediate(0x08)));
-    out.push(Instruction::new(NOP, AM::Label("__read_input".into())));
-    out.push(Instruction::new(LDA, AM::Absolute(JOY1)));
-    out.push(Instruction::new(LSR, AM::Accumulator));
-    out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P1)));
-    out.push(Instruction::new(LDA, AM::Absolute(0x4017))); // JOY2
-    out.push(Instruction::new(LSR, AM::Accumulator));
-    out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P2)));
-    out.push(Instruction::implied(DEX));
-    out.push(Instruction::new(
-        BNE,
-        AM::LabelRelative("__read_input".into()),
-    ));
+        // 8 iterations of read-and-shift. Each active port costs
+        // three instructions (LDA abs, LSR A, ROL zp) inside the
+        // loop; inactive ports emit nothing.
+        out.push(Instruction::new(LDX, AM::Immediate(0x08)));
+        out.push(Instruction::new(NOP, AM::Label("__read_input".into())));
+        if has_p1_input {
+            out.push(Instruction::new(LDA, AM::Absolute(JOY1)));
+            out.push(Instruction::new(LSR, AM::Accumulator));
+            out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P1)));
+        }
+        if has_p2_input {
+            out.push(Instruction::new(LDA, AM::Absolute(0x4017))); // JOY2
+            out.push(Instruction::new(LSR, AM::Accumulator));
+            out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P2)));
+        }
+        out.push(Instruction::implied(DEX));
+        out.push(Instruction::new(
+            BNE,
+            AM::LabelRelative("__read_input".into()),
+        ));
+    }
 
     // Debug frame-overrun check. The frame flag is "set on NMI,
     // cleared by wait_frame". If we see it set at the top of a
