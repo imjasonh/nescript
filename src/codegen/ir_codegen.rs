@@ -182,10 +182,20 @@ pub struct IrCodeGen<'a> {
     /// Drives the `__oam_used` marker label. The linker reads this
     /// to decide whether to splice the OAM DMA into NMI, emit the
     /// `$FE`-fill OAM shadow init inside `gen_init`'s RAM clear,
-    /// reserve the default smiley tile at CHR tile 0, and keep the
-    /// default palette load. Programs that never `draw` pay zero
-    /// for any of those paths.
+    /// and keep the default palette load. Programs that never
+    /// `draw` pay zero for any of those paths.
     oam_used: bool,
+    /// Set to true the first time a `draw` either references a
+    /// sprite name that the resolver didn't turn into a user
+    /// sprite (falling back to tile 0) or uses a runtime `frame:`
+    /// override (which could index any tile, including 0). Drives
+    /// the `__default_sprite_used` marker label — the linker uses
+    /// it to decide whether to reserve CHR tile 0 for the built-in
+    /// smiley. Programs that only draw explicitly-declared sprites
+    /// with static names and no `frame:` override leave this flag
+    /// `false` and reclaim the 16 CHR bytes of tile 0 as a blank
+    /// background tile.
+    default_sprite_used: bool,
     /// Source-location markers produced from [`IrOp::SourceLoc`].
     /// Each entry is a `(label_name, span)` pair — the codegen
     /// emits a unique label-definition pseudo-op at the current
@@ -366,6 +376,7 @@ impl<'a> IrCodeGen<'a> {
             mul_used: false,
             div_used: false,
             oam_used: false,
+            default_sprite_used: false,
             source_locs: Vec::new(),
             next_source_loc: 0,
             emit_source_locs: false,
@@ -1438,12 +1449,25 @@ impl<'a> IrCodeGen<'a> {
                 self.load_temp(*y);
                 self.emit(STA, AM::AbsoluteY(0x0200));
 
-                // Tile index at cursor+1 — frame override, sprite lookup, or 0
+                // Tile index at cursor+1 — frame override, sprite lookup, or 0.
+                //
+                // The `frame: <var>` override indexes into CHR at a
+                // runtime value we can't bound statically, so it
+                // might land on tile 0 and therefore needs the
+                // default smiley. The `sprite_name doesn't resolve`
+                // case falls back to tile 0 explicitly. Both drop
+                // the `__default_sprite_used` marker so the linker
+                // keeps the smiley tile in CHR; draws that resolve
+                // to a user sprite with a static `frame: None` leave
+                // the marker off and tile 0 becomes user-available
+                // as a blank (all-$00) background tile.
                 if let Some(f) = frame {
+                    self.emit_default_sprite_marker();
                     self.load_temp(*f);
                 } else if let Some(&tile) = self.sprite_tiles.get(sprite_name) {
                     self.emit(LDA, AM::Immediate(tile));
                 } else {
+                    self.emit_default_sprite_marker();
                     self.emit(LDA, AM::Immediate(0));
                 }
                 self.emit(STA, AM::AbsoluteY(0x0201));
@@ -2092,13 +2116,28 @@ impl<'a> IrCodeGen<'a> {
 
     /// Emit the `__oam_used` marker label at most once per program.
     /// Triggered by `IrOp::DrawSprite`. The linker drops the OAM
-    /// DMA + shadow-init + default-sprite-tile paths when this
-    /// marker is absent, shaving cycles out of every NMI and bytes
-    /// out of PRG/CHR for programs that don't draw sprites.
+    /// DMA + shadow-init + default-palette paths when this marker
+    /// is absent, shaving cycles out of every NMI and bytes out of
+    /// PRG for programs that don't draw sprites.
     fn emit_oam_marker(&mut self) {
         if !self.oam_used {
             self.emit_label("__oam_used");
             self.oam_used = true;
+        }
+    }
+
+    /// Emit the `__default_sprite_used` marker label at most once
+    /// per program. Triggered by `IrOp::DrawSprite` when the sprite
+    /// name doesn't resolve to a user declaration (fall-back to
+    /// tile 0) or when a runtime `frame:` override could land on
+    /// tile 0. The linker uses this to decide whether to copy the
+    /// built-in smiley into CHR tile 0; programs whose draws all
+    /// resolve to declared sprites with static frames skip the
+    /// emit and get tile 0 back as a blank background tile.
+    fn emit_default_sprite_marker(&mut self) {
+        if !self.default_sprite_used {
+            self.emit_label("__default_sprite_used");
+            self.default_sprite_used = true;
         }
     }
 

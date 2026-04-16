@@ -50,8 +50,14 @@ fn link_has_correct_vector_table() {
 
 #[test]
 fn link_includes_chr_data() {
+    // When user code signals that it uses the default smiley tile
+    // (fallback for an unresolved `draw` target), the linker should
+    // copy the built-in 16-byte smiley CHR blob into tile 0.
     let linker = Linker::new(Mirroring::Horizontal);
-    let user_code = vec![Instruction::implied(NOP)];
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__default_sprite_used".into())),
+        Instruction::implied(NOP),
+    ];
     let rom_data = linker.link(&user_code);
 
     // CHR starts after PRG
@@ -61,6 +67,23 @@ fn link_includes_chr_data() {
         &rom_data[chr_start..chr_start + 16],
         &[0u8; 16],
         "CHR data should contain sprite tile"
+    );
+}
+
+#[test]
+fn link_omits_default_smiley_without_marker() {
+    // Without the `__default_sprite_used` marker the linker should
+    // leave tile 0 as the all-zero blank tile — programs that draw
+    // only user-declared sprites or never draw at all reclaim the
+    // 16 CHR bytes.
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![Instruction::implied(NOP)];
+    let rom_data = linker.link(&user_code);
+    let chr_start = 16 + 16384;
+    assert_eq!(
+        &rom_data[chr_start..chr_start + 16],
+        &[0u8; 16],
+        "tile 0 should be zero when no program draws fall back to the smiley"
     );
 }
 
@@ -77,7 +100,15 @@ fn link_rom_size_correct() {
 #[test]
 fn link_with_sprites_places_chr_data() {
     let linker = Linker::new(Mirroring::Horizontal);
-    let user_code = vec![Instruction::implied(NOP)];
+    // Seed the `__default_sprite_used` marker so the linker still
+    // emits the smiley tile alongside the user sprite — this test
+    // asserts the legacy "smiley at tile 0, user sprite at tile 1"
+    // layout that programs doing both fallback and named draws
+    // depend on.
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__default_sprite_used".into())),
+        Instruction::implied(NOP),
+    ];
 
     let sprite_bytes: Vec<u8> = (0x20..0x30).collect(); // 16 bytes, one tile
     let sprites = vec![SpriteData {
@@ -621,9 +652,13 @@ fn link_with_mapper_nrom_produces_single_bank_rom() {
 #[test]
 fn link_banked_chr_rom_survives_with_switchable_banks() {
     // The default smiley + any sprites should still appear in CHR
-    // ROM even when switchable PRG banks are present.
+    // ROM even when switchable PRG banks are present. Seed the
+    // `__default_sprite_used` marker so the smiley gate fires.
     let linker = Linker::with_mapper(Mirroring::Horizontal, Mapper::MMC1);
-    let user_code = vec![Instruction::implied(NOP)];
+    let user_code = vec![
+        Instruction::new(NOP, AM::Label("__default_sprite_used".into())),
+        Instruction::implied(NOP),
+    ];
     let banks = vec![PrgBank::empty("X")];
     let rom = linker.link_banked(&user_code, &[], &[], &[], &banks);
     // CHR starts after 2 PRG banks.

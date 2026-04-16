@@ -1226,11 +1226,15 @@ fn sprite_resolution_uses_tile_index() {
         "Player sprite CHR bytes should be placed at tile index 1",
     );
 
-    // The default smiley tile at index 0 should still be non-zero (untouched).
+    // The default smiley tile at index 0 should be blank ($00) —
+    // the program's one `draw Player at: (...)` resolves to the
+    // declared Player sprite at tile 1, so the `__default_sprite_used`
+    // marker never fires and the linker doesn't copy the smiley
+    // into tile 0. That frees the 16 bytes for user graphics.
     let tile0 = &rom_data[chr_start..chr_start + 16];
-    assert_ne!(
+    assert_eq!(
         tile0, &[0u8; 16],
-        "tile 0 should still contain the default smiley",
+        "tile 0 should be blank when no draw falls back to the smiley",
     );
 
     // In PRG ROM, look for `LDA #$01 ; STA $0201,Y` which writes
@@ -1882,12 +1886,16 @@ fn e2e_bank_declarations_dont_affect_nrom_prg_size() {
 #[test]
 fn e2e_banked_chr_rom_is_preserved() {
     // CHR ROM should still contain the default smiley sprite at
-    // tile 0 regardless of how many PRG banks the ROM has.
+    // tile 0 regardless of how many PRG banks the ROM has — but
+    // only when the program actually exercises the fallback. A
+    // `draw` of an undeclared sprite name drops the marker; we
+    // rely on that here rather than declaring a sprite so we keep
+    // testing the "banked ROM still emits the smiley" path.
     let source = r#"
         game "CHRCheck" { mapper: MMC1 }
         bank One: prg
         bank Two: prg
-        on frame { wait_frame }
+        on frame { draw Unknown at: (0, 0) }
         start Main
     "#;
     let rom = compile_banked(source);

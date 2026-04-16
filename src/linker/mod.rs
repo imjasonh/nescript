@@ -771,7 +771,35 @@ impl Linker {
         // ranges overlap, but we still bounds-check on copy in
         // case a future change shifts the layout.
         let mut chr = vec![0u8; 8192];
-        chr[..16].copy_from_slice(&DEFAULT_SPRITE_CHR);
+        // Tile 0 is reserved for the built-in smiley *only* when
+        // something in the program depends on it. Three possible
+        // sources of that dependency:
+        //
+        //   1. `__default_sprite_used` marker — user code runs at
+        //      least one `draw` that falls back to tile 0, either
+        //      because the sprite name doesn't resolve or because
+        //      it uses a runtime `frame:` override.
+        //   2. A background nametable references tile 0 directly.
+        //      Some programs use the smiley as a placeholder
+        //      background tile (see `examples/friendly_assets.ne`).
+        //   3. A background's CHR was written at base tile 0 — the
+        //      resolver shouldn't allow this today, but checking
+        //      for `chr_base_tile == 0` keeps the gate honest.
+        //
+        // Programs whose draws all resolve to declared sprites with
+        // static frames and whose backgrounds reference tiles 1+
+        // skip the smiley emit and reclaim 16 CHR bytes.
+        let bg_uses_tile_zero = backgrounds.iter().any(|bg| {
+            // A nametable entry of 0 means "fetch tile 0" — the
+            // PPU can't tell the difference between sprite and
+            // background tiles, so we have to preserve the smiley
+            // when any background map byte reads 0.
+            bg.tiles.contains(&0)
+        });
+        let has_default_sprite = has_label(user_code, "__default_sprite_used") || bg_uses_tile_zero;
+        if has_default_sprite {
+            chr[..16].copy_from_slice(&DEFAULT_SPRITE_CHR);
+        }
         for sprite in sprites {
             let offset = sprite.tile_index as usize * 16;
             let end = offset + sprite.chr_bytes.len();
