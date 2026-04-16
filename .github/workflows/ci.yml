@@ -161,6 +161,21 @@ jobs:
             echo "::error file=docs/platformer.gif::committed docs/platformer.gif is stale; rerun \`node tests/emulator/record_gif.mjs platformer 360 2 docs/platformer.gif\` and commit the new gif"
             exit 1
           fi
+      - name: Verify docs/war.gif is up to date
+        # Same contract as docs/platformer.gif: the README embeds
+        # docs/war.gif as the second project demo, gifenc + jsnes are
+        # deterministic, so any change to the compiler / runtime /
+        # harness / war source that affects the first ~6 seconds of
+        # the war.ne gameplay must be followed by regenerating the
+        # gif. The 5th positional arg (`4`) is the warmup; war's
+        # title menu is the gif thumbnail so we don't skip past it.
+        working-directory: tests/emulator
+        run: |
+          node record_gif.mjs war 360 2 /tmp/war.gif 4
+          if ! cmp -s ../../docs/war.gif /tmp/war.gif; then
+            echo "::error file=docs/war.gif::committed docs/war.gif is stale; rerun \`node tests/emulator/record_gif.mjs war 360 2 docs/war.gif 4\` and commit the new gif"
+            exit 1
+          fi
       - name: Upload actual + diff PNGs on failure
         if: failure()
         uses: actions/upload-artifact@v4

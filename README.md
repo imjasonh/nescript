@@ -8,6 +8,10 @@ NEScript compiles `.ne` source files directly into playable iNES ROM files, with
 
 _Source: [`examples/platformer.ne`](examples/platformer.ne)_
 
+![War demo](docs/war.gif)
+
+_Source: [`examples/war.ne`](examples/war.ne)_
+
 ## Quick Start
 
 ```bash
