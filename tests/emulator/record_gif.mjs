@@ -1,10 +1,11 @@
 // Record a GIF of a .nes ROM running in jsnes.
 //
 // Usage:
-//     node record_gif.mjs <rom-name> [frames] [stride] [output.gif]
+//     node record_gif.mjs <rom-name> [frames] [stride] [output.gif] [warmup]
 //
-// Example:
+// Examples:
 //     node record_gif.mjs platformer 360 2 docs/platformer.gif
+//     node record_gif.mjs war 360 2 docs/war.gif 4
 //
 // The recorder drives `harness.html` via puppeteer, collects one
 // canvas frame every `stride` NES frames for `frames` total, and
@@ -13,15 +14,23 @@
 // other NES frame (NES runs at ~60 fps), which is the right
 // tradeoff between smoothness and file size for a README demo.
 //
-// IMPORTANT: `docs/platformer.gif` is committed and embedded in the
-// README. Any change to the compiler, the runtime, the harness, or
-// `examples/platformer.ne` that alters the gameplay you see in the
-// first ~6 seconds of the demo must be followed by
+// `warmup` is the number of NES frames to advance before the first
+// captured frame. The default of 30 skips past the reset stall and
+// the platformer's auto-Title→Play handoff at frame 20; the war
+// recording uses 4 instead because that demo opens on its menu and
+// we want the title screen to be the gif's thumbnail.
+//
+// IMPORTANT: `docs/platformer.gif` and `docs/war.gif` are committed
+// and embedded in the README. Any change to the compiler, the
+// runtime, the harness, or the underlying `.ne` source that alters
+// the gameplay you see in the first ~6 seconds of either demo must
+// be followed by
 //
 //     node tests/emulator/record_gif.mjs platformer 360 2 docs/platformer.gif
+//     node tests/emulator/record_gif.mjs war        360 2 docs/war.gif        4
 //
 // committed alongside the source change. The CI `emulator` job
-// regenerates the gif and fails if the committed copy is stale —
+// regenerates both gifs and fails if the committed copies are stale —
 // gifenc + jsnes are deterministic, so the freshly-rendered bytes
 // byte-match a valid commit. See `.github/workflows/ci.yml`.
 
@@ -66,11 +75,18 @@ await page.waitForFunction(
 
 await page.evaluate((b) => window.nesHarness.loadRomBase64(b), romB64);
 
-// Warm-up: skip past the reset stall and any title screen so the
-// first captured frame shows real gameplay. 30 frames at 60 fps
-// covers ~0.5 s which is enough for the platformer example's
-// Title → Playing auto-transition at frame 20.
-const warmupFrames = parseInt(process.env.WARMUP ?? "30", 10);
+// Warm-up: skip past the reset stall and (optionally) any title
+// screen so the first captured frame shows what we want as the
+// gif's thumbnail. 30 frames at 60 fps covers ~0.5 s which is
+// enough for the platformer example's Title → Playing auto-
+// transition at frame 20. The war recording overrides this with
+// `4` (positional arg below) so the title menu is the first frame.
+// Positional arg wins; `WARMUP=…` env var is honoured for ad-hoc
+// experimentation.
+const warmupFrames = parseInt(
+  process.argv[6] ?? process.env.WARMUP ?? "30",
+  10,
+);
 await page.evaluate((n) => window.nesHarness.runFrames(n), warmupFrames);
 
 console.log(

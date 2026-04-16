@@ -39,26 +39,51 @@ if [ $stale -ne 0 ]; then
     exit 1
 fi
 
-# Only rebuild docs/platformer.gif when platformer.nes or the gif
-# recorder itself changed — the gif regeneration takes ~20s due to
-# puppeteer's cold start, so we don't want to pay it on every commit.
-# Skipped entirely if node_modules isn't installed in the emulator
-# harness; the CI `emulator` job is the authoritative check.
+# Only rebuild docs/{platformer,war}.gif when the underlying
+# example sources, the gif recorder, or the harness changed — gif
+# regeneration takes ~20s per gif due to puppeteer's cold start,
+# so we don't want to pay it on every commit. Skipped entirely if
+# node_modules isn't installed in the emulator harness; the CI
+# `emulator` job is the authoritative check.
+#
+# `examples/war.ne` pulls in `examples/war/*.ne` via include
+# directives, so any file under `examples/war/` is treated as a
+# trigger for rebuilding the war gif — the parser's preprocess
+# pass sees them as part of the same translation unit.
 changed_files=$(git diff --cached --name-only)
-if echo "$changed_files" | grep -qE '^(examples/platformer\.(ne|nes)|tests/emulator/record_gif\.mjs|tests/emulator/harness\.html)$'; then
-    if [ -d tests/emulator/node_modules ]; then
-        echo "  Rebuilding docs/platformer.gif (platformer.nes or recorder changed)..."
-        (cd tests/emulator && node record_gif.mjs platformer 360 2 /tmp/platformer-precheck.gif >/dev/null)
-        if ! cmp -s docs/platformer.gif /tmp/platformer-precheck.gif; then
-            echo "    STALE: docs/platformer.gif"
-            echo "           rerun: node tests/emulator/record_gif.mjs platformer 360 2 docs/platformer.gif"
-            rm -f /tmp/platformer-precheck.gif
-            exit 1
-        fi
-        rm -f /tmp/platformer-precheck.gif
-    else
-        echo "  (skipping gif freshness check — tests/emulator/node_modules not installed)"
+recorder_or_harness_changed=0
+if echo "$changed_files" | grep -qE '^tests/emulator/(record_gif\.mjs|harness\.html)$'; then
+    recorder_or_harness_changed=1
+fi
+
+check_gif() {
+    name=$1
+    args=$2  # extra args to record_gif.mjs (e.g. "4" for warmup)
+    if [ ! -d tests/emulator/node_modules ]; then
+        echo "  (skipping $name gif freshness check — tests/emulator/node_modules not installed)"
+        return 0
     fi
+    echo "  Rebuilding docs/$name.gif..."
+    # shellcheck disable=SC2086
+    (cd tests/emulator && node record_gif.mjs "$name" 360 2 /tmp/${name}-precheck.gif $args >/dev/null)
+    if ! cmp -s "docs/$name.gif" "/tmp/${name}-precheck.gif"; then
+        echo "    STALE: docs/$name.gif"
+        echo "           rerun: node tests/emulator/record_gif.mjs $name 360 2 docs/$name.gif $args"
+        rm -f "/tmp/${name}-precheck.gif"
+        return 1
+    fi
+    rm -f "/tmp/${name}-precheck.gif"
+    return 0
+}
+
+if [ $recorder_or_harness_changed -eq 1 ] || \
+   echo "$changed_files" | grep -qE '^examples/platformer\.(ne|nes)$'; then
+    check_gif platformer "" || exit 1
+fi
+
+if [ $recorder_or_harness_changed -eq 1 ] || \
+   echo "$changed_files" | grep -qE '^examples/war(\.(ne|nes)|/[^/]+\.ne)$'; then
+    check_gif war 4 || exit 1
 fi
 
 echo "All pre-commit checks passed."
