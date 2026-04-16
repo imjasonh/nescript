@@ -995,7 +995,7 @@ impl<'a> IrCodeGen<'a> {
                         IrOp::CmpGtEq(..) => CmpKind::GtEq,
                         _ => unreachable!(),
                     };
-                    Some((*a, *b, kind, true_lbl.clone(), false_lbl.clone()))
+                    Some((*d, *a, *b, kind, true_lbl.clone(), false_lbl.clone()))
                 }
                 _ => None,
             });
@@ -1017,12 +1017,12 @@ impl<'a> IrCodeGen<'a> {
             self.retire_op_sources(op);
         }
 
-        if let Some((a, b, kind, true_lbl, false_lbl)) = fuse_cmp_branch {
+        if let Some((d, a, b, kind, true_lbl, false_lbl)) = fuse_cmp_branch {
             // Emit the fused compare + branch *first*. Retiring
             // a/b before the emit would free their slots while
             // the values are still live — `load_temp(a)` would
-            // then re-allocate `a` to whatever slot the free
-            // list pops next, which contains stale data.
+            // then re-allocate `a` to whatever stale slot the
+            // free list pops next.
             self.gen_cmp_branch(a, b, kind, &true_lbl, &false_lbl);
             // Now that the CMP has read both operands, drop their
             // use counts the same way `retire_op_sources` would
@@ -1031,15 +1031,7 @@ impl<'a> IrCodeGen<'a> {
             // retire it too so its slot returns to the free list.
             self.dec_use(a);
             self.dec_use(b);
-            if let IrOp::CmpEq(d, ..)
-            | IrOp::CmpNe(d, ..)
-            | IrOp::CmpLt(d, ..)
-            | IrOp::CmpGt(d, ..)
-            | IrOp::CmpLtEq(d, ..)
-            | IrOp::CmpGtEq(d, ..) = block.ops.last().unwrap()
-            {
-                self.dec_use(*d);
-            }
+            self.dec_use(d);
             return;
         }
 
@@ -2367,32 +2359,90 @@ fn scope_prefix_for_fn(name: &str) -> String {
 /// body. Leaf functions skip the parameter-spill prologue and read
 /// their args straight out of the transport slots `$04..$07`.
 ///
-/// Conservatively false for any op that emits a JSR (Call, Mul, Div,
-/// Mod, Transition) or for inline-asm bodies containing a `JSR`
-/// token — the analyzer has no way to look inside hand-written asm,
-/// so anything that mentions `JSR` is treated as a non-leaf.
+/// The match below is exhaustive on `IrOp` so adding a new variant
+/// that secretly emits a `JSR` (e.g. a future `Mul16` calling a
+/// `__multiply16` runtime helper) becomes a compile error here
+/// rather than a silent leaf-detection bug. The current JSR-emitting
+/// ops are: `Call`, `Mul`, `Div`, `Mod`, `Transition`, plus
+/// `InlineAsm` bodies that mention `JSR` as a token.
 fn function_is_leaf(func: &IrFunction) -> bool {
     for block in &func.blocks {
         for op in &block.ops {
-            match op {
+            // Returning `false` from any arm marks the function as
+            // non-leaf. Arms that fall through are explicitly
+            // listed so a new variant won't slip past.
+            #[allow(clippy::match_same_arms)]
+            let is_jsr_emitting = match op {
                 IrOp::Call(..)
                 | IrOp::Mul(..)
                 | IrOp::Div(..)
                 | IrOp::Mod(..)
-                | IrOp::Transition(..) => return false,
+                | IrOp::Transition(..) => true,
                 IrOp::InlineAsm(body) => {
                     // Strip the raw-asm magic prefix if present so
-                    // we don't catch the marker characters.
+                    // we don't false-match the marker characters.
+                    // Tokenise on non-alphanumeric so `JSR` only
+                    // matches as a whole word — `MJSR` or `JSRX`
+                    // don't trip the check.
                     let scan = body.strip_prefix(crate::ir::RAW_ASM_PREFIX).unwrap_or(body);
                     let upper = scan.to_ascii_uppercase();
-                    let contains_jsr = upper
+                    upper
                         .split(|c: char| !c.is_ascii_alphanumeric())
-                        .any(|tok| tok == "JSR");
-                    if contains_jsr {
-                        return false;
-                    }
+                        .any(|tok| tok == "JSR")
                 }
-                _ => {}
+                // None of the following ops emit a JSR. Listed
+                // explicitly so the compiler errors on a new
+                // variant — see fn doc comment.
+                IrOp::LoadImm(..)
+                | IrOp::LoadVar(..)
+                | IrOp::StoreVar(..)
+                | IrOp::Add(..)
+                | IrOp::Sub(..)
+                | IrOp::And(..)
+                | IrOp::Or(..)
+                | IrOp::Xor(..)
+                | IrOp::ShiftLeft(..)
+                | IrOp::ShiftRight(..)
+                | IrOp::ShiftLeftVar(..)
+                | IrOp::ShiftRightVar(..)
+                | IrOp::Negate(..)
+                | IrOp::Complement(..)
+                | IrOp::CmpEq(..)
+                | IrOp::CmpNe(..)
+                | IrOp::CmpLt(..)
+                | IrOp::CmpGt(..)
+                | IrOp::CmpLtEq(..)
+                | IrOp::CmpGtEq(..)
+                | IrOp::ArrayLoad(..)
+                | IrOp::ArrayStore(..)
+                | IrOp::DrawSprite { .. }
+                | IrOp::ReadInput(..)
+                | IrOp::WaitFrame
+                | IrOp::CycleSprites
+                | IrOp::Scroll(..)
+                | IrOp::DebugLog(..)
+                | IrOp::DebugAssert(..)
+                | IrOp::Poke(..)
+                | IrOp::Peek(..)
+                | IrOp::LoadVarHi(..)
+                | IrOp::StoreVarHi(..)
+                | IrOp::Add16 { .. }
+                | IrOp::Sub16 { .. }
+                | IrOp::CmpEq16 { .. }
+                | IrOp::CmpNe16 { .. }
+                | IrOp::CmpLt16 { .. }
+                | IrOp::CmpGt16 { .. }
+                | IrOp::CmpLtEq16 { .. }
+                | IrOp::CmpGtEq16 { .. }
+                | IrOp::SetPalette(..)
+                | IrOp::LoadBackground(..)
+                | IrOp::PlaySfx(..)
+                | IrOp::StartMusic(..)
+                | IrOp::StopMusic
+                | IrOp::SourceLoc(..) => false,
+            };
+            if is_jsr_emitting {
+                return false;
             }
         }
     }
@@ -2413,7 +2463,9 @@ fn substitute_asm_vars<F: Fn(&str) -> Option<u16>>(body: &str, resolver: F) -> S
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
-            // Find the closing `}`.
+            // Find the closing `}`. Brace bytes can't appear inside
+            // a UTF-8 continuation, so the byte-level search is safe
+            // even if the body contains non-ASCII comments.
             if let Some(end) = bytes[i + 1..].iter().position(|&b| b == b'}') {
                 let name_start = i + 1;
                 let name_end = i + 1 + end;
@@ -2439,10 +2491,35 @@ fn substitute_asm_vars<F: Fn(&str) -> Option<u16>>(body: &str, resolver: F) -> S
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Copy the next char through verbatim, preserving any
+        // multi-byte UTF-8 sequence (typically inside a comment).
+        // Casting `bytes[i] as char` would Latin-1-reinterpret each
+        // byte and corrupt non-ASCII characters; copy the whole
+        // char's slice in one go instead.
+        let ch_len = utf8_char_len(bytes[i]);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
     }
     out
+}
+
+/// Length in bytes of the UTF-8 character whose lead byte is
+/// `lead`. UTF-8 lead bytes encode the length in the count of
+/// leading 1-bits: `0xxx_xxxx` = 1, `110x_xxxx` = 2, `1110_xxxx`
+/// = 3, `1111_0xxx` = 4. Continuation bytes (`10xx_xxxx`) shouldn't
+/// appear at a char boundary; if one does we return 1 so iteration
+/// still makes progress.
+fn utf8_char_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xFF => 4,
+        // Continuation byte at a char boundary — defensively
+        // advance one byte so we don't loop forever on malformed
+        // input.
+        _ => 1,
+    }
 }
 
 /// True if the given IR function contains at least one
@@ -4252,4 +4329,79 @@ fn gen_function_prologue_spills_params_to_local_ram() {
          transport slots — the param-clobbering fix is not in \
          effect"
     );
+}
+
+#[test]
+fn function_is_leaf_detects_jsr_emitting_ops() {
+    // `function_is_leaf` decides whether a fun's parameters can
+    // live in the `$04..$07` transport slots for the lifetime of
+    // its body — true only if nothing inside the body JSRs and
+    // re-clobbers them. Each construct below indirectly emits a
+    // JSR and therefore disqualifies leaf status:
+    //
+    //   - `Statement::Call`    → `IrOp::Call`           → JSR <fn>
+    //   - `*` (non-power-of-2) → `IrOp::Mul`            → JSR __multiply
+    //   - `/` (non-power-of-2) → `IrOp::Div`            → JSR __divide
+    //   - `%` (non-power-of-2) → `IrOp::Mod`            → JSR __divide
+    //   - `asm { ... JSR ... }` (the analyzer can't see inside
+    //     hand-written asm, so any "JSR" token disqualifies)
+    //
+    // `Transition` also emits a JSR but lives in state handlers
+    // rather than user-callable funs; the existing `*_enter`
+    // dispatcher tests cover that path. The control case at the
+    // bottom — a function that only does loads/adds/stores — is
+    // the one shape that should be a leaf.
+    use crate::parser;
+    let cases: &[(&str, &str, bool)] = &[
+        // (name, body source, expect_leaf)
+        (
+            "call",
+            "fun helper(a: u8) -> u8 { return a } \
+             fun f(x: u8) { var y: u8 = helper(x) }",
+            false,
+        ),
+        ("mul", "var c: u8 = 0 fun f(x: u8) { c = x * x }", false),
+        ("div", "var c: u8 = 0 fun f(x: u8) { c = x / x }", false),
+        ("mod", "var c: u8 = 0 fun f(x: u8) { c = x % x }", false),
+        (
+            "asm-with-JSR",
+            "fun helper() {} fun f(x: u8) { asm { JSR helper } }",
+            false,
+        ),
+        (
+            "asm-without-JSR",
+            "fun f(x: u8) { asm { LDA $00 STA $01 } }",
+            true,
+        ),
+        ("plain", "var c: u8 = 0 fun f(x: u8) { c = x + 1 }", true),
+    ];
+    for (label, body, expect_leaf) in cases {
+        let src = format!(
+            r#"
+            game "T" {{ mapper: NROM }}
+            {body}
+            on frame {{ f(1) }}
+            start Main
+        "#
+        );
+        let (prog, _) = parser::parse(&src);
+        let prog = prog.unwrap_or_else(|| panic!("[{label}] parse failed"));
+        let analysis = crate::analyzer::analyze(&prog);
+        assert!(
+            analysis.diagnostics.iter().all(|d| !d.is_error()),
+            "[{label}] unexpected analysis errors: {:?}",
+            analysis.diagnostics
+        );
+        let ir = crate::ir::lower(&prog, &analysis);
+        let f = ir
+            .functions
+            .iter()
+            .find(|f| f.name == "f")
+            .unwrap_or_else(|| panic!("[{label}] no fn `f` in IR"));
+        assert_eq!(
+            function_is_leaf(f),
+            *expect_leaf,
+            "[{label}] leaf detection mismatch"
+        );
+    }
 }

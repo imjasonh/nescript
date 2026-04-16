@@ -1015,6 +1015,63 @@ fn inline_fun_with_asm_falls_back_for_runtime_arg() {
 }
 
 #[test]
+fn inline_fun_with_asm_param_cascades_through_nested_inline() {
+    // Outer inline fun calls inner inline fun (with asm) using
+    // its *own* parameter as the inner's argument. The outer's
+    // parameter is bound to a compile-time constant at the
+    // top-level call site, and that constness has to flow
+    // through `eval_const` so the inner — which has an asm body
+    // — sees its arg as constant too.
+    //
+    // Without the `inline_const_args_stack` lookup in
+    // `eval_const`, the inner would treat the outer's param as
+    // runtime and refuse to inline, falling back to a Call.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var sink: u8 = 0
+        inline fun inner(value: u8) {
+            asm {
+                LDA {value}
+                STA {sink}
+            }
+        }
+        inline fun outer(p: u8) { inner(p) }
+        on frame { outer(123) }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let any_call = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::Call(_, name, _) if name == "outer" || name == "inner"));
+    assert!(
+        !any_call,
+        "both inline funs should expand; no Call ops should remain"
+    );
+    let asm_body = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .find_map(|op| match op {
+            IrOp::InlineAsm(body) => Some(body.clone()),
+            _ => None,
+        })
+        .expect("inlined asm block should be present");
+    // 123 = $7B
+    assert!(
+        asm_body.contains("#$7B"),
+        "asm body should contain `#$7B` from the cascaded constant; got: {asm_body}"
+    );
+}
+
+#[test]
 fn inline_fun_nested_inlines_substitute_correctly() {
     // Two inline functions where the outer calls the inner
     // using its own parameter. Both should inline; the

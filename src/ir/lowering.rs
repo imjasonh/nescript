@@ -1946,6 +1946,15 @@ pub fn can_inline_fun(return_type: Option<&NesType>, body: &Block) -> bool {
 /// `inline fun` splicer to decide whether all-constant arguments are
 /// required (asm `{param}` substitution can only synthesise a
 /// `#$<value>` immediate at expansion time, not a runtime address).
+///
+/// We deliberately don't recurse into nested statements: an inline
+/// fun's body is gated by [`is_splicable_void_stmt`], which only
+/// admits flat sequences of `Assign`/`Call`/`Draw`/`InlineAsm`/etc.
+/// — never `If`/`While`/`Loop`/`For` — so any inline-asm statement
+/// that's reachable shows up at the top level. Single-return-
+/// expression bodies can't contain asm at all (asm is a statement,
+/// not an expression). If `is_splicable_void_stmt` ever loosens to
+/// admit nested control flow, this check needs to follow.
 fn body_has_inline_asm(body: &InlineBody) -> bool {
     match body {
         InlineBody::Expression(_) => false,
@@ -1962,6 +1971,12 @@ fn stmt_contains_inline_asm(stmt: &Statement) -> bool {
 /// by `try_inline_call_stmt`. Names not in the map are left alone
 /// so the codegen's `substitute_asm_vars` can still resolve them
 /// (e.g. `{wk}` for a global array's address).
+///
+/// Walks `body` as Unicode chars to preserve any non-ASCII content
+/// (typically comments) verbatim. The `{` / `}` braces and the
+/// identifier characters inside them are all ASCII, so the
+/// byte-level brace search is safe — it can't mis-fire on a UTF-8
+/// continuation byte.
 fn substitute_inline_const_params(body: &str, consts: &HashMap<String, u8>) -> String {
     let mut out = String::with_capacity(body.len());
     let bytes = body.as_bytes();
@@ -1988,10 +2003,30 @@ fn substitute_inline_const_params(body: &str, consts: &HashMap<String, u8>) -> S
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Pass the next char through verbatim, copying all of its
+        // UTF-8 bytes in one go so multi-byte characters in
+        // comments survive intact.
+        let ch_len = utf8_char_len(bytes[i]);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
     }
     out
+}
+
+/// Length in bytes of the UTF-8 character whose lead byte is
+/// `lead`. UTF-8 lead bytes encode the length in the count of
+/// leading 1-bits: `0xxx_xxxx` = 1, `110x_xxxx` = 2, `1110_xxxx`
+/// = 3, `1111_0xxx` = 4. Continuation bytes (`10xx_xxxx`) shouldn't
+/// appear at a char boundary; if one does we return 1 so iteration
+/// still makes progress on malformed input.
+fn utf8_char_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xFF => 4,
+        _ => 1,
+    }
 }
 
 fn type_size(t: &NesType) -> u16 {
