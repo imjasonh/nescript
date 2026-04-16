@@ -2464,26 +2464,22 @@ impl Analyzer {
     /// diagnostics for mismatched arity or non-constant addresses.
     fn check_intrinsic_args(&mut self, name: &str, args: &[Expr], span: Span) {
         match name {
-            "poke" => {
-                if args.len() != 2 {
-                    self.diagnostics.push(Diagnostic::error(
-                        ErrorCode::E0203,
-                        format!(
-                            "`poke` takes exactly 2 arguments (addr, value), got {}",
-                            args.len()
-                        ),
-                        span,
-                    ));
-                }
+            "poke" if args.len() != 2 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`poke` takes exactly 2 arguments (addr, value), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
             }
-            "peek" => {
-                if args.len() != 1 {
-                    self.diagnostics.push(Diagnostic::error(
-                        ErrorCode::E0203,
-                        format!("`peek` takes exactly 1 argument (addr), got {}", args.len()),
-                        span,
-                    ));
-                }
+            "peek" if args.len() != 1 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!("`peek` takes exactly 1 argument (addr), got {}", args.len()),
+                    span,
+                ));
             }
             _ => {}
         }

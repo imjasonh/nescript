@@ -55,6 +55,17 @@ struct LoweringContext {
     /// inner function's parameter substitutions, not its
     /// caller's.
     inline_subs_stack: Vec<HashMap<String, IrTemp>>,
+    /// Parallel to `inline_subs_stack`: maps each parameter
+    /// name to the constant value the call site passed for it,
+    /// when that arg was a compile-time constant. Used by the
+    /// `Statement::InlineAsm` lowering path so that `{param}`
+    /// inside an `inline fun` body can be substituted with
+    /// `#$<value>` at expansion time. Without this, the codegen's
+    /// `substitute_asm_vars` would resolve `{param}` against the
+    /// caller's analyzer scope and never find a match — `LDX
+    /// {dst}` would land in the asm parser as a literal token
+    /// and fail to assemble.
+    inline_const_args_stack: Vec<HashMap<String, u8>>,
     next_var_id: u32,
     next_temp: u32,
     next_block: u32,
@@ -162,6 +173,7 @@ impl LoweringContext {
             current_scope_prefix: None,
             inline_bodies: HashMap::new(),
             inline_subs_stack: Vec::new(),
+            inline_const_args_stack: Vec::new(),
             next_var_id,
             next_temp: 0,
             next_block: 0,
@@ -314,12 +326,37 @@ impl LoweringContext {
         if captured.params.len() != args.len() {
             return false;
         }
+        // If the body contains an `asm { ... }` block, we can
+        // only safely inline when *every* argument is a compile-
+        // time constant. The asm body's `{param}` references get
+        // pre-substituted with `#$<value>` immediates at the
+        // expansion site (see `Statement::InlineAsm` lowering),
+        // and there's no way to do that for a runtime value.
+        // Fall back to a regular Call op for the runtime case;
+        // the caller will JSR the out-of-line definition that
+        // preserves the standard parameter-passing convention.
+        if body_has_inline_asm(&captured.body) {
+            let all_const = args.iter().all(|a| self.eval_const(a).is_some());
+            if !all_const {
+                return false;
+            }
+        }
         let arg_temps: Vec<IrTemp> = args.iter().map(|a| self.lower_expr(a)).collect();
         let mut frame = HashMap::new();
-        for (param, temp) in captured.params.iter().zip(arg_temps.iter()) {
+        let mut const_frame: HashMap<String, u8> = HashMap::new();
+        for ((param, arg), temp) in captured
+            .params
+            .iter()
+            .zip(args.iter())
+            .zip(arg_temps.iter())
+        {
             frame.insert(param.name.clone(), *temp);
+            if let Some(v) = self.eval_const(arg) {
+                const_frame.insert(param.name.clone(), v as u8);
+            }
         }
         self.inline_subs_stack.push(frame);
+        self.inline_const_args_stack.push(const_frame);
         match &captured.body {
             InlineBody::Expression(expr) => {
                 // Evaluate the expression for its side effects;
@@ -333,6 +370,7 @@ impl LoweringContext {
             }
         }
         self.inline_subs_stack.pop();
+        self.inline_const_args_stack.pop();
         true
     }
 
@@ -421,7 +459,21 @@ impl LoweringContext {
         match expr {
             Expr::IntLiteral(v, _) => Some(*v),
             Expr::BoolLiteral(b, _) => Some(u16::from(*b)),
-            Expr::Ident(name, _) => self.const_values.get(name).copied(),
+            Expr::Ident(name, _) => {
+                // Inside an `inline fun` expansion, parameter
+                // names resolve to whatever the call site
+                // passed. If the arg was a compile-time constant
+                // it's stashed in `inline_const_args_stack`'s
+                // top frame — return that so a nested inline
+                // call like `rotr1_wk(dst)` can recognise its
+                // own arg as constant and inline in turn.
+                if let Some(frame) = self.inline_const_args_stack.last() {
+                    if let Some(&v) = frame.get(name) {
+                        return Some(u16::from(v));
+                    }
+                }
+                self.const_values.get(name).copied()
+            }
             Expr::BinaryOp(lhs, op, rhs, _) => {
                 let l = self.eval_const(lhs)?;
                 let r = self.eval_const(rhs)?;
@@ -1004,7 +1056,25 @@ impl LoweringContext {
                 self.emit(IrOp::DebugAssert(t));
             }
             Statement::InlineAsm(body, _) => {
-                self.emit(IrOp::InlineAsm(body.clone()));
+                // When we're expanding an `inline fun` body, the
+                // analyzer's per-function scope no longer matches
+                // the caller's, so the codegen's
+                // `substitute_asm_vars` would fail to resolve
+                // `{param}` references. Pre-substitute every
+                // parameter that the inline frame knows the
+                // constant value of, replacing `{name}` with
+                // `#$<value>` so the inlined asm parses as an
+                // immediate-mode operand.
+                let final_body = if let Some(consts) = self.inline_const_args_stack.last() {
+                    if consts.is_empty() {
+                        body.clone()
+                    } else {
+                        substitute_inline_const_params(body, consts)
+                    }
+                } else {
+                    body.clone()
+                };
+                self.emit(IrOp::InlineAsm(final_body));
             }
             Statement::RawAsm(body, _) => {
                 // Raw asm skips `{var}` substitution. We reuse the
@@ -1870,6 +1940,93 @@ pub fn can_inline_fun(return_type: Option<&NesType>, body: &Block) -> bool {
         return true;
     }
     false
+}
+
+/// True if `body` contains any `Statement::InlineAsm`. Used by the
+/// `inline fun` splicer to decide whether all-constant arguments are
+/// required (asm `{param}` substitution can only synthesise a
+/// `#$<value>` immediate at expansion time, not a runtime address).
+///
+/// We deliberately don't recurse into nested statements: an inline
+/// fun's body is gated by [`is_splicable_void_stmt`], which only
+/// admits flat sequences of `Assign`/`Call`/`Draw`/`InlineAsm`/etc.
+/// — never `If`/`While`/`Loop`/`For` — so any inline-asm statement
+/// that's reachable shows up at the top level. Single-return-
+/// expression bodies can't contain asm at all (asm is a statement,
+/// not an expression). If `is_splicable_void_stmt` ever loosens to
+/// admit nested control flow, this check needs to follow.
+fn body_has_inline_asm(body: &InlineBody) -> bool {
+    match body {
+        InlineBody::Expression(_) => false,
+        InlineBody::Void(stmts) => stmts.iter().any(stmt_contains_inline_asm),
+    }
+}
+
+fn stmt_contains_inline_asm(stmt: &Statement) -> bool {
+    matches!(stmt, Statement::InlineAsm(..))
+}
+
+/// Replace `{name}` tokens in an inline-asm body with `#$<value>`
+/// immediate-mode operands, using the per-frame constant map built
+/// by `try_inline_call_stmt`. Names not in the map are left alone
+/// so the codegen's `substitute_asm_vars` can still resolve them
+/// (e.g. `{wk}` for a global array's address).
+///
+/// Walks `body` as Unicode chars to preserve any non-ASCII content
+/// (typically comments) verbatim. The `{` / `}` braces and the
+/// identifier characters inside them are all ASCII, so the
+/// byte-level brace search is safe — it can't mis-fire on a UTF-8
+/// continuation byte.
+fn substitute_inline_const_params(body: &str, consts: &HashMap<String, u8>) -> String {
+    let mut out = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(end) = bytes[i + 1..].iter().position(|&b| b == b'}') {
+                let name_start = i + 1;
+                let name_end = i + 1 + end;
+                let name = &body[name_start..name_end];
+                let is_ident = !name.is_empty()
+                    && name
+                        .chars()
+                        .next()
+                        .is_some_and(|c| c == '_' || c.is_ascii_alphabetic())
+                    && name.chars().all(|c| c == '_' || c.is_ascii_alphanumeric());
+                if is_ident {
+                    if let Some(&val) = consts.get(name) {
+                        use std::fmt::Write;
+                        let _ = write!(out, "#${val:02X}");
+                        i = name_end + 1;
+                        continue;
+                    }
+                }
+            }
+        }
+        // Pass the next char through verbatim, copying all of its
+        // UTF-8 bytes in one go so multi-byte characters in
+        // comments survive intact.
+        let ch_len = utf8_char_len(bytes[i]);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
+    }
+    out
+}
+
+/// Length in bytes of the UTF-8 character whose lead byte is
+/// `lead`. UTF-8 lead bytes encode the length in the count of
+/// leading 1-bits: `0xxx_xxxx` = 1, `110x_xxxx` = 2, `1110_xxxx`
+/// = 3, `1111_0xxx` = 4. Continuation bytes (`10xx_xxxx`) shouldn't
+/// appear at a char boundary; if one does we return 1 so iteration
+/// still makes progress on malformed input.
+fn utf8_char_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xFF => 4,
+        _ => 1,
+    }
 }
 
 fn type_size(t: &NesType) -> u16 {

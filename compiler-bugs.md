@@ -29,4 +29,4 @@
 //
 // ---
 
-(no bugs logged yet — pong development just started)
+(no bugs logged — the repo is currently clean)

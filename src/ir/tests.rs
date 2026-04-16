@@ -922,6 +922,156 @@ fn inline_fun_with_conditional_return_compiles_as_regular_call() {
 }
 
 #[test]
+fn inline_fun_with_asm_param_substitutes_immediate() {
+    // An `inline fun` whose body contains an `asm { ... }` block
+    // referencing parameters via `{name}` substitution. When the
+    // call site passes compile-time constants, the splicer
+    // pre-substitutes each `{param}` with its `#$<value>`
+    // immediate so the spliced body parses correctly. The end
+    // result should contain no Call op for the inlined fun, and
+    // the frame handler's instruction stream (after lowering) is
+    // expected to contain an `LDA #$2A` (= 42) — the substituted
+    // immediate.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var sink: u8 = 0
+        inline fun stash(value: u8) {
+            asm {
+                LDA {value}
+                STA {sink}
+            }
+        }
+        on frame { stash(42) }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let any_call = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::Call(_, name, _) if name == "stash"));
+    assert!(!any_call, "stash should be inlined, no Call op left");
+    let asm_body = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .find_map(|op| match op {
+            IrOp::InlineAsm(body) => Some(body.clone()),
+            _ => None,
+        })
+        .expect("inlined asm block should be present");
+    assert!(
+        asm_body.contains("#$2A"),
+        "asm body should contain the substituted immediate `#$2A`; got: {asm_body}"
+    );
+    assert!(
+        !asm_body.contains("{value}"),
+        "`{{value}}` should have been pre-substituted; got: {asm_body}"
+    );
+}
+
+#[test]
+fn inline_fun_with_asm_falls_back_for_runtime_arg() {
+    // When the call site passes a runtime value (a variable, not
+    // a literal), there's no way to synthesize an immediate at
+    // expansion time. The splicer should refuse to inline and
+    // emit a regular Call instead — preserving correctness over
+    // performance.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var sink: u8 = 0
+        var src: u8 = 7
+        inline fun stash(value: u8) {
+            asm {
+                LDA {value}
+                STA {sink}
+            }
+        }
+        on frame { stash(src) }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let any_call = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::Call(_, name, _) if name == "stash"));
+    assert!(
+        any_call,
+        "stash should fall back to a Call op when arg is runtime"
+    );
+}
+
+#[test]
+fn inline_fun_with_asm_param_cascades_through_nested_inline() {
+    // Outer inline fun calls inner inline fun (with asm) using
+    // its *own* parameter as the inner's argument. The outer's
+    // parameter is bound to a compile-time constant at the
+    // top-level call site, and that constness has to flow
+    // through `eval_const` so the inner — which has an asm body
+    // — sees its arg as constant too.
+    //
+    // Without the `inline_const_args_stack` lookup in
+    // `eval_const`, the inner would treat the outer's param as
+    // runtime and refuse to inline, falling back to a Call.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var sink: u8 = 0
+        inline fun inner(value: u8) {
+            asm {
+                LDA {value}
+                STA {sink}
+            }
+        }
+        inline fun outer(p: u8) { inner(p) }
+        on frame { outer(123) }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let any_call = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::Call(_, name, _) if name == "outer" || name == "inner"));
+    assert!(
+        !any_call,
+        "both inline funs should expand; no Call ops should remain"
+    );
+    let asm_body = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .find_map(|op| match op {
+            IrOp::InlineAsm(body) => Some(body.clone()),
+            _ => None,
+        })
+        .expect("inlined asm block should be present");
+    // 123 = $7B
+    assert!(
+        asm_body.contains("#$7B"),
+        "asm body should contain `#$7B` from the cascaded constant; got: {asm_body}"
+    );
+}
+
+#[test]
 fn inline_fun_nested_inlines_substitute_correctly() {
     // Two inline functions where the outer calls the inner
     // using its own parameter. Both should inline; the

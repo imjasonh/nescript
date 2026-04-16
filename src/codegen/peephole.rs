@@ -231,11 +231,22 @@ fn invert_branch(op: Opcode) -> Option<Opcode> {
 /// Remove `LDA …` instructions whose value is never read — the next
 /// instruction overwrites A without using the current value.
 ///
-/// The heuristic looks one instruction ahead. If the next instruction
-/// is an A-clobbering load (`LDA`, `LDX`, `LDY`, `PLA`, `TXA`, `TYA`),
-/// the preceding `LDA` is dead. Shifts and arithmetic ops read A, so
-/// they don't qualify. A label or branch in between stops the scan
-/// (we can't prove A's dead across control flow).
+/// The heuristic looks forward, stepping over instructions that
+/// don't touch A (memory `INC`/`DEC`/`STX`/`STY`, labels). If the
+/// first instruction that *does* touch A overwrites it without
+/// reading it (`LDA`, `PLA`, `TXA`, `TYA`), the preceding `LDA` is
+/// dead. Shifts and arithmetic ops read A, so they end the scan
+/// without marking dead.
+///
+/// One unconditional `JMP` is followed: we look up its target label
+/// and resume scanning from the first instruction after it. This
+/// catches `LDA #imm; DEC zp; JMP loop_cond; loop_cond: LDA loop_var`
+/// patterns that the IR codegen leaves behind for `i -= 1`-style
+/// loops, where the `LDA #1` was the constant operand of a `Sub`
+/// the optimizer already strength-reduced into the `DEC`. Conditional
+/// branches and `JSR` still end the scan — JSR could land on a
+/// runtime helper that reads A, and a branch's not-taken path is
+/// unconstrained.
 fn remove_dead_loads(instructions: &mut Vec<Instruction>) {
     let mut keep = vec![true; instructions.len()];
     for i in 0..instructions.len() {
@@ -243,19 +254,9 @@ fn remove_dead_loads(instructions: &mut Vec<Instruction>) {
         if inst.opcode != Opcode::LDA {
             continue;
         }
-        // Walk forward looking for the next instruction that either
-        // reads A or overwrites it. If the first such instruction
-        // overwrites A without reading it, our LDA is dead.
-        //
-        // We can safely step across instructions that neither read
-        // nor write A — INC, DEC, STX, STY on memory, and label
-        // definitions — because they don't observe A and don't
-        // clobber it either. We must NOT step over any branch or
-        // jump: control flow at that point can reach code that
-        // reads A via a different path, and our local analysis
-        // can't see it.
         let mut j = i + 1;
         let mut dead = false;
+        let mut followed_jmp = false;
         while j < instructions.len() {
             let next = &instructions[j];
             // Labels are passive markers.
@@ -263,8 +264,7 @@ fn remove_dead_loads(instructions: &mut Vec<Instruction>) {
                 j += 1;
                 continue;
             }
-            // Instructions that don't touch A — skip over them.
-            // INC/DEC on memory, STX/STY — all leave A alone.
+            // Memory INC/DEC/STX/STY don't touch A.
             if matches!(
                 next.opcode,
                 Opcode::INC | Opcode::DEC | Opcode::STX | Opcode::STY
@@ -272,6 +272,24 @@ fn remove_dead_loads(instructions: &mut Vec<Instruction>) {
             {
                 j += 1;
                 continue;
+            }
+            // Cross one unconditional `JMP <label>` by looking the
+            // target up and resuming scan there. Refuse a second
+            // JMP — the analysis is meant to catch a single
+            // straight-line `loop_body → loop_cond` jump, not an
+            // arbitrary chain.
+            if !followed_jmp && next.opcode == Opcode::JMP {
+                if let AddressingMode::Label(target) = &next.mode {
+                    if let Some(target_idx) = instructions.iter().position(|ins| {
+                        ins.opcode == Opcode::NOP
+                            && matches!(&ins.mode, AddressingMode::Label(name) if name == target)
+                    }) {
+                        followed_jmp = true;
+                        j = target_idx + 1;
+                        continue;
+                    }
+                }
+                break;
             }
             // Instructions that overwrite A without reading it.
             if matches!(
@@ -281,8 +299,8 @@ fn remove_dead_loads(instructions: &mut Vec<Instruction>) {
                 dead = true;
             }
             // Any other instruction — might read A (STA, ADC,
-            // SBC, AND, …) or transfer control (JMP, Bxx, JSR,
-            // RTS) — stop scanning and leave the LDA alone.
+            // SBC, AND, JSR …) or transfer control (Bxx, RTS) —
+            // stop scanning.
             break;
         }
         if dead {

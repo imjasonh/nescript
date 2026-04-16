@@ -22,7 +22,7 @@
 //! (`0x80-0xFF`) for IR temp storage per function. Functions reset the
 //! temp counter at entry.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::analyzer::VarAllocation;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
@@ -214,6 +214,20 @@ pub struct IrCodeGen<'a> {
     /// dispatcher loop, top-level functions).
     current_bank: Option<String>,
     allocations: &'a [VarAllocation],
+    /// Set of function names whose body never `JSR`s any other
+    /// routine. Leaf functions skip the parameter-spill prologue
+    /// (`LDA $04 / STA <local>`) entirely — they can read their
+    /// arguments straight out of the transport slots `$04..$07`
+    /// for the lifetime of the body, since nothing else clobbers
+    /// those slots from inside. Detected by [`function_is_leaf`].
+    leaf_functions: HashSet<String>,
+    /// Per-function-scoped overrides for inline-asm `{name}`
+    /// substitution. Leaf functions point their parameters at the
+    /// transport slots `$04..$07` instead of the analyzer's
+    /// fallback allocation, so any `{param}` reference inside the
+    /// body resolves to the live transport slot rather than the
+    /// stale per-function spill destination.
+    leaf_param_overrides: HashMap<String, u16>,
 }
 
 impl<'a> IrCodeGen<'a> {
@@ -230,51 +244,64 @@ impl<'a> IrCodeGen<'a> {
             }
         }
         // Map every function-local — parameters AND body-declared
-        // vars — into a dedicated RAM slot at `$0300+`. Parameters
-        // are still passed via the zero-page transport slots
+        // vars — into the slot the analyzer already reserved for it.
+        // Parameters arrive via the zero-page transport slots
         // `$04-$07` as the calling convention, but `gen_function`
         // emits a prologue at function entry that copies those
-        // transport slots into these per-function RAM slots. That
-        // way, when a function makes a nested call, the nested
-        // call clobbers `$04-$07` (writing its own arguments into
-        // them) without disturbing the caller's saved parameters.
+        // transport slots into the analyzer's per-function slot so
+        // nested calls don't step on the caller's parameters.
         //
-        // Before this change, parameters lived in `$04-$07` for the
-        // duration of the function body, so any call nested inside
-        // a function's body silently corrupted the caller's
-        // parameters (fixed on the War bug-cleanup branch; see
-        // `git log` for the original reproduction and root cause).
-        // The per-function RAM slots + prologue spill fix that
-        // class of bug at the cost of 4 LDA/STA pairs per function
-        // entry.
+        // NEScript forbids recursion (E0402) and caps call depth
+        // (E0401), so the analyzer's single-slot-per-local layout
+        // can't alias even though two functions may be active on
+        // the 6502 stack at once.
         //
-        // Locals are laid out linearly across every function:
-        // NEScript forbids recursion (E0402) and enforces a
-        // bounded call depth (E0401), so lifetime overlap between
-        // functions is fine and we don't need to pack them.
-        let mut local_ram_next: u16 = 0x0300;
-        // Advance past any RAM global so locals don't clobber them.
-        // Each global occupies `[address, address + size)` — for an
-        // array global at $0308 with size=4 that's $0308..$030C. We
-        // must advance past the END, not the base, otherwise
-        // subsequent locals overlap with the tail of the array.
-        // Globals are looked up by name against the analyzer's
-        // `allocations` (which has per-global sizes) rather than the
-        // `var_addrs` map, which only stores base addresses.
-        let max_ram_global_end = allocations
-            .iter()
-            .filter(|a| a.address >= 0x0100)
-            .map(|a| a.address + a.size.max(1))
-            .max()
-            .unwrap_or(0);
-        if max_ram_global_end > local_ram_next {
-            local_ram_next = max_ram_global_end;
-        }
+        // Using the analyzer's addresses here (instead of minting a
+        // fresh linear `$0300+` range) is critical for inline-asm
+        // `{name}` substitution: `substitute_asm_vars` resolves
+        // `{param}` against `allocations` (= the analyzer's table),
+        // so the codegen has to agree with the analyzer on each
+        // local's address or `LDA {param}` inside `asm { ... }`
+        // would read a slot nothing ever writes to. See
+        // `compiler-bugs.md` entry #1 for the full diagnosis.
         for func in &ir.functions {
+            let scope = scope_prefix_for_fn(&func.name);
             for local in &func.locals {
-                var_addrs.insert(local.var_id, local_ram_next);
-                var_sizes.insert(local.var_id, local.size);
-                local_ram_next += local.size.max(1);
+                let qualified = format!("__local__{scope}__{}", local.name);
+                if let Some(alloc) = allocations.iter().find(|a| a.name == qualified) {
+                    var_addrs.insert(local.var_id, alloc.address);
+                    var_sizes.insert(local.var_id, alloc.size);
+                }
+            }
+        }
+        // Identify leaf functions (no nested `JSR` of any kind),
+        // and rewire their parameters to live straight in the
+        // transport slots `$04..$07` instead of the analyzer's
+        // per-function spill destination. The rewire happens on
+        // both `var_addrs` (so generated code reads/writes the
+        // right slot) and `leaf_param_overrides` (so inline-asm
+        // `{name}` substitution agrees). `gen_function` skips the
+        // spill prologue entirely for these — saving 12 cycles
+        // and 12 bytes of code per leaf-function call site.
+        let mut leaf_functions: HashSet<String> = HashSet::new();
+        let mut leaf_param_overrides: HashMap<String, u16> = HashMap::new();
+        for func in &ir.functions {
+            if !function_is_leaf(func) {
+                continue;
+            }
+            leaf_functions.insert(func.name.clone());
+            let scope = scope_prefix_for_fn(&func.name);
+            for (i, local) in func
+                .locals
+                .iter()
+                .take(func.param_count)
+                .take(4)
+                .enumerate()
+            {
+                let addr = 0x04u16 + i as u16;
+                var_addrs.insert(local.var_id, addr);
+                let qualified = format!("__local__{scope}__{}", local.name);
+                leaf_param_overrides.insert(qualified, addr);
             }
         }
         let function_names = ir.functions.iter().map(|f| f.name.clone()).collect();
@@ -320,6 +347,8 @@ impl<'a> IrCodeGen<'a> {
             function_banks,
             current_bank: None,
             allocations,
+            leaf_functions,
+            leaf_param_overrides,
         }
     }
 
@@ -852,24 +881,7 @@ impl<'a> IrCodeGen<'a> {
         // their locals. For regular user functions it's just
         // the function name. See the commentary on
         // `current_fn_scope_prefix` above.
-        self.current_fn_scope_prefix = if let Some(state) = func.name.strip_suffix("_frame") {
-            format!("{state}__frame")
-        } else if let Some(state) = func.name.strip_suffix("_enter") {
-            format!("{state}__enter")
-        } else if let Some(state) = func.name.strip_suffix("_exit") {
-            format!("{state}__exit")
-        } else if let Some(rest) = func.name.strip_prefix("") {
-            // Scanline handlers encode the line number, but
-            // the analyzer's prefix is
-            // `{state}__scanline_{N}` — check the split.
-            if let Some((state, line)) = rest.rsplit_once("_scanline_") {
-                format!("{state}__scanline_{line}")
-            } else {
-                rest.to_string()
-            }
-        } else {
-            func.name.clone()
-        };
+        self.current_fn_scope_prefix = scope_prefix_for_fn(&func.name);
 
         self.emit_label(&format!("__ir_fn_{}", func.name));
 
@@ -886,19 +898,29 @@ impl<'a> IrCodeGen<'a> {
         // more than 4 parameters (E0506), so the `.take(4)`
         // below is a defensive guard — it should never be hit
         // in a well-formed program.
-        for (i, local) in func
-            .locals
-            .iter()
-            .take(func.param_count)
-            .take(4)
-            .enumerate()
-        {
-            if let Some(&addr) = self.var_addrs.get(&local.var_id) {
-                self.emit(LDA, AM::ZeroPage(0x04 + i as u8));
-                if addr < 0x100 {
-                    self.emit(STA, AM::ZeroPage(addr as u8));
-                } else {
-                    self.emit(STA, AM::Absolute(addr));
+        //
+        // Leaf functions skip this entirely: their var_addrs
+        // were already rewired to $04-$07 in `IrCodeGen::new`,
+        // and since they never JSR from inside their body, the
+        // transport slots stay live for the whole function. This
+        // saves 12 cycles per call to every leaf primitive — the
+        // SHA-256 example's `cp_wk`, `xor_wk`, `add_wk`, etc. are
+        // all leaves.
+        if !self.leaf_functions.contains(&func.name) {
+            for (i, local) in func
+                .locals
+                .iter()
+                .take(func.param_count)
+                .take(4)
+                .enumerate()
+            {
+                if let Some(&addr) = self.var_addrs.get(&local.var_id) {
+                    self.emit(LDA, AM::ZeroPage(0x04 + i as u8));
+                    if addr < 0x100 {
+                        self.emit(STA, AM::ZeroPage(addr as u8));
+                    } else {
+                        self.emit(STA, AM::Absolute(addr));
+                    }
                 }
             }
         }
@@ -943,7 +965,48 @@ impl<'a> IrCodeGen<'a> {
     fn gen_block(&mut self, block: &IrBasicBlock) {
         self.emit_label(&format!("__ir_blk_{}", block.label));
 
-        for op in &block.ops {
+        // Look for the canonical "compare-then-branch" fusion
+        // candidate: the block's last op is an 8-bit `CmpX`, its
+        // destination temp is the same one the terminator
+        // branches on, and that temp has no other uses. When
+        // it's a fit, we can replace the boolean materialization
+        // (LDA #0 / JMP / LDA #1 + BNE) with a direct branch on
+        // the flags `CMP` already set — about 6 cycles + 5 bytes
+        // saved per condition.
+        let fuse_cmp_branch = block
+            .ops
+            .last()
+            .and_then(|op| match (op, &block.terminator) {
+                (
+                    IrOp::CmpEq(d, a, b)
+                    | IrOp::CmpNe(d, a, b)
+                    | IrOp::CmpLt(d, a, b)
+                    | IrOp::CmpGt(d, a, b)
+                    | IrOp::CmpLtEq(d, a, b)
+                    | IrOp::CmpGtEq(d, a, b),
+                    IrTerminator::Branch(cond, true_lbl, false_lbl),
+                ) if cond == d && self.use_counts.get(d).copied().unwrap_or(0) == 1 => {
+                    let kind = match op {
+                        IrOp::CmpEq(..) => CmpKind::Eq,
+                        IrOp::CmpNe(..) => CmpKind::Ne,
+                        IrOp::CmpLt(..) => CmpKind::Lt,
+                        IrOp::CmpGt(..) => CmpKind::Gt,
+                        IrOp::CmpLtEq(..) => CmpKind::LtEq,
+                        IrOp::CmpGtEq(..) => CmpKind::GtEq,
+                        _ => unreachable!(),
+                    };
+                    Some((*d, *a, *b, kind, true_lbl.clone(), false_lbl.clone()))
+                }
+                _ => None,
+            });
+
+        let body_ops = if fuse_cmp_branch.is_some() {
+            &block.ops[..block.ops.len() - 1]
+        } else {
+            &block.ops[..]
+        };
+
+        for op in body_ops {
             self.gen_op(op);
             // After each op runs, decrement use counts for its
             // source temps. When a count hits zero the temp's slot
@@ -954,6 +1017,24 @@ impl<'a> IrCodeGen<'a> {
             self.retire_op_sources(op);
         }
 
+        if let Some((d, a, b, kind, true_lbl, false_lbl)) = fuse_cmp_branch {
+            // Emit the fused compare + branch *first*. Retiring
+            // a/b before the emit would free their slots while
+            // the values are still live — `load_temp(a)` would
+            // then re-allocate `a` to whatever stale slot the
+            // free list pops next.
+            self.gen_cmp_branch(a, b, kind, &true_lbl, &false_lbl);
+            // Now that the CMP has read both operands, drop their
+            // use counts the same way `retire_op_sources` would
+            // for a non-fused Cmp op. The destination temp's
+            // single use was the (skipped) Branch terminator —
+            // retire it too so its slot returns to the free list.
+            self.dec_use(a);
+            self.dec_use(b);
+            self.dec_use(d);
+            return;
+        }
+
         // The terminator may also reference a temp (branch
         // condition, return value). Those temps die after the
         // terminator runs; retire them here so they don't leak
@@ -962,6 +1043,94 @@ impl<'a> IrCodeGen<'a> {
         for t in terminator_source_temps(&block.terminator) {
             self.dec_use(t);
         }
+    }
+
+    /// Emit a fused "compare + direct branch" sequence. Replaces
+    /// the canonical boolean-materialization-then-branch pattern
+    /// the IR emits for `if x < N { ... }`-style conditions, when
+    /// `gen_block` detects the comparison's result feeds straight
+    /// into the block's terminating branch and isn't read again.
+    ///
+    /// 6502 relative branches have a ±128-byte range. The fused
+    /// branch's destination is the next basic block, which in
+    /// larger programs is often farther than that. To stay safe
+    /// regardless of distance we emit the *inverted* predicate
+    /// as a short branch that skips over a `JMP true_target`,
+    /// with the false target reached by a fall-through `JMP`.
+    /// Both `JMP`s are absolute addressing and have no range
+    /// limit; the relative branches only have to clear the next
+    /// 3 bytes (the `JMP`), which always fits.
+    ///
+    /// For the simple cases (`Eq`, `Ne`, `Lt`, `GtEq`) one
+    /// inverted branch does it. For `Gt` and `LtEq` the predicate
+    /// is a disjunction/conjunction of two flag conditions, so
+    /// the inversion needs two branches.
+    fn gen_cmp_branch(
+        &mut self,
+        a: IrTemp,
+        b: IrTemp,
+        kind: CmpKind,
+        true_label: &str,
+        false_label: &str,
+    ) {
+        self.load_temp(a);
+        let b_addr = self.temp_addr(b);
+        self.emit(CMP, AM::ZeroPage(b_addr));
+
+        let suffix = self.local_label_suffix();
+        let skip_label = format!("__ir_cmp_skip_{suffix}");
+        let true_blk = format!("__ir_blk_{true_label}");
+        let false_blk = format!("__ir_blk_{false_label}");
+
+        match kind {
+            CmpKind::Eq => {
+                // Predicate true ↔ Z set; inverted = BNE.
+                self.emit(BNE, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+            CmpKind::Ne => {
+                self.emit(BEQ, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+            CmpKind::Lt => {
+                // Predicate true ↔ C clear; inverted = BCS.
+                self.emit(BCS, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+            CmpKind::GtEq => {
+                self.emit(BCC, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+            CmpKind::Gt => {
+                // Predicate true ↔ (C set AND Z clear). On Z
+                // set, fall through to false. On C clear, fall
+                // through too. Otherwise jump.
+                self.emit(BEQ, AM::LabelRelative(skip_label.clone()));
+                self.emit(BCC, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+            CmpKind::LtEq => {
+                // Predicate true ↔ (C clear OR Z set). On
+                // either, jump to true. Otherwise fall through.
+                let to_true = format!("__ir_cmp_t_{suffix}");
+                self.emit(BEQ, AM::LabelRelative(to_true.clone()));
+                self.emit(BCC, AM::LabelRelative(to_true.clone()));
+                self.emit(JMP, AM::Label(false_blk.clone()));
+                self.emit_label(&to_true);
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+                // Already emitted JMP false_blk in the match
+                // arm; skip the trailing fall-through one below.
+                return;
+            }
+        }
+        // Fall-through path lands here for the false case.
+        self.emit(JMP, AM::Label(false_blk));
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1364,6 +1533,14 @@ impl<'a> IrCodeGen<'a> {
                     std::borrow::Cow::Owned(substitute_asm_vars(body, |name| {
                         if !scope.is_empty() {
                             let qualified = format!("__local__{scope}__{name}");
+                            // Leaf-function param overrides win over the
+                            // analyzer's allocation: the codegen rewired
+                            // the param to a transport slot in
+                            // `IrCodeGen::new`, and the asm body's
+                            // `{param}` references have to follow.
+                            if let Some(&addr) = self.leaf_param_overrides.get(&qualified) {
+                                return Some(addr);
+                            }
                             if let Some(a) = self.allocations.iter().find(|a| a.name == qualified) {
                                 return Some(a.address);
                             }
@@ -2151,6 +2328,127 @@ enum Cmp16Kind {
     GtEq,
 }
 
+/// Map an IR function name to the analyzer's scope prefix for its
+/// locals. The analyzer registers every function-local under
+/// `__local__{prefix}__{name}` — state handlers use
+/// `{state}__{frame|enter|exit}` or `{state}__scanline_{line}`,
+/// regular functions use the bare function name.  Both
+/// `IrCodeGen::new` (when seeding `var_addrs`) and `gen_function`
+/// (when setting `current_fn_scope_prefix` for inline-asm
+/// substitution) have to agree on the string used here, or
+/// `{param}` references would resolve to a different address than
+/// the one generated code reads and writes.
+fn scope_prefix_for_fn(name: &str) -> String {
+    if let Some(state) = name.strip_suffix("_frame") {
+        format!("{state}__frame")
+    } else if let Some(state) = name.strip_suffix("_enter") {
+        format!("{state}__enter")
+    } else if let Some(state) = name.strip_suffix("_exit") {
+        format!("{state}__exit")
+    } else if let Some((state, line)) = name.rsplit_once("_scanline_") {
+        // Scanline handlers encode the line number in the
+        // function name; the analyzer's prefix joins them with
+        // a double underscore.
+        format!("{state}__scanline_{line}")
+    } else {
+        name.to_string()
+    }
+}
+
+/// True if `func` doesn't `JSR` any other routine from inside its
+/// body. Leaf functions skip the parameter-spill prologue and read
+/// their args straight out of the transport slots `$04..$07`.
+///
+/// The match below is exhaustive on `IrOp` so adding a new variant
+/// that secretly emits a `JSR` (e.g. a future `Mul16` calling a
+/// `__multiply16` runtime helper) becomes a compile error here
+/// rather than a silent leaf-detection bug. The current JSR-emitting
+/// ops are: `Call`, `Mul`, `Div`, `Mod`, `Transition`, plus
+/// `InlineAsm` bodies that mention `JSR` as a token.
+fn function_is_leaf(func: &IrFunction) -> bool {
+    for block in &func.blocks {
+        for op in &block.ops {
+            // Returning `false` from any arm marks the function as
+            // non-leaf. Arms that fall through are explicitly
+            // listed so a new variant won't slip past.
+            #[allow(clippy::match_same_arms)]
+            let is_jsr_emitting = match op {
+                IrOp::Call(..)
+                | IrOp::Mul(..)
+                | IrOp::Div(..)
+                | IrOp::Mod(..)
+                | IrOp::Transition(..) => true,
+                IrOp::InlineAsm(body) => {
+                    // Strip the raw-asm magic prefix if present so
+                    // we don't false-match the marker characters.
+                    // Tokenise on non-alphanumeric so `JSR` only
+                    // matches as a whole word — `MJSR` or `JSRX`
+                    // don't trip the check.
+                    let scan = body.strip_prefix(crate::ir::RAW_ASM_PREFIX).unwrap_or(body);
+                    let upper = scan.to_ascii_uppercase();
+                    upper
+                        .split(|c: char| !c.is_ascii_alphanumeric())
+                        .any(|tok| tok == "JSR")
+                }
+                // None of the following ops emit a JSR. Listed
+                // explicitly so the compiler errors on a new
+                // variant — see fn doc comment.
+                IrOp::LoadImm(..)
+                | IrOp::LoadVar(..)
+                | IrOp::StoreVar(..)
+                | IrOp::Add(..)
+                | IrOp::Sub(..)
+                | IrOp::And(..)
+                | IrOp::Or(..)
+                | IrOp::Xor(..)
+                | IrOp::ShiftLeft(..)
+                | IrOp::ShiftRight(..)
+                | IrOp::ShiftLeftVar(..)
+                | IrOp::ShiftRightVar(..)
+                | IrOp::Negate(..)
+                | IrOp::Complement(..)
+                | IrOp::CmpEq(..)
+                | IrOp::CmpNe(..)
+                | IrOp::CmpLt(..)
+                | IrOp::CmpGt(..)
+                | IrOp::CmpLtEq(..)
+                | IrOp::CmpGtEq(..)
+                | IrOp::ArrayLoad(..)
+                | IrOp::ArrayStore(..)
+                | IrOp::DrawSprite { .. }
+                | IrOp::ReadInput(..)
+                | IrOp::WaitFrame
+                | IrOp::CycleSprites
+                | IrOp::Scroll(..)
+                | IrOp::DebugLog(..)
+                | IrOp::DebugAssert(..)
+                | IrOp::Poke(..)
+                | IrOp::Peek(..)
+                | IrOp::LoadVarHi(..)
+                | IrOp::StoreVarHi(..)
+                | IrOp::Add16 { .. }
+                | IrOp::Sub16 { .. }
+                | IrOp::CmpEq16 { .. }
+                | IrOp::CmpNe16 { .. }
+                | IrOp::CmpLt16 { .. }
+                | IrOp::CmpGt16 { .. }
+                | IrOp::CmpLtEq16 { .. }
+                | IrOp::CmpGtEq16 { .. }
+                | IrOp::SetPalette(..)
+                | IrOp::LoadBackground(..)
+                | IrOp::PlaySfx(..)
+                | IrOp::StartMusic(..)
+                | IrOp::StopMusic
+                | IrOp::SourceLoc(..) => false,
+            };
+            if is_jsr_emitting {
+                return false;
+            }
+        }
+    }
+    true
+}
+
 /// Replace `{name}` tokens in an inline-asm body with the resolved
 /// hex address from the given resolver. Unknown names and malformed
 /// placeholders are passed through unchanged (the asm parser will
@@ -2165,7 +2463,9 @@ fn substitute_asm_vars<F: Fn(&str) -> Option<u16>>(body: &str, resolver: F) -> S
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'{' {
-            // Find the closing `}`.
+            // Find the closing `}`. Brace bytes can't appear inside
+            // a UTF-8 continuation, so the byte-level search is safe
+            // even if the body contains non-ASCII comments.
             if let Some(end) = bytes[i + 1..].iter().position(|&b| b == b'}') {
                 let name_start = i + 1;
                 let name_end = i + 1 + end;
@@ -2191,10 +2491,35 @@ fn substitute_asm_vars<F: Fn(&str) -> Option<u16>>(body: &str, resolver: F) -> S
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Copy the next char through verbatim, preserving any
+        // multi-byte UTF-8 sequence (typically inside a comment).
+        // Casting `bytes[i] as char` would Latin-1-reinterpret each
+        // byte and corrupt non-ASCII characters; copy the whole
+        // char's slice in one go instead.
+        let ch_len = utf8_char_len(bytes[i]);
+        out.push_str(&body[i..i + ch_len]);
+        i += ch_len;
     }
     out
+}
+
+/// Length in bytes of the UTF-8 character whose lead byte is
+/// `lead`. UTF-8 lead bytes encode the length in the count of
+/// leading 1-bits: `0xxx_xxxx` = 1, `110x_xxxx` = 2, `1110_xxxx`
+/// = 3, `1111_0xxx` = 4. Continuation bytes (`10xx_xxxx`) shouldn't
+/// appear at a char boundary; if one does we return 1 so iteration
+/// still makes progress.
+fn utf8_char_len(lead: u8) -> usize {
+    match lead {
+        0x00..=0x7F => 1,
+        0xC0..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xFF => 4,
+        // Continuation byte at a char boundary — defensively
+        // advance one byte so we don't loop forever on malformed
+        // input.
+        _ => 1,
+    }
 }
 
 /// True if the given IR function contains at least one
@@ -3807,21 +4132,30 @@ mod more_tests {
     #[test]
     fn ir_codegen_local_label_suffix_is_bank_namespaced() {
         // When two banked functions in *different* banks both emit
-        // a local label like `__ir_cmp_e_<n>`, the suffix has to
-        // include the bank name so the linker's discovery pass
-        // (which checks for cross-bank label collisions) doesn't
-        // panic on the second occurrence. Without the namespacing
-        // step, this exact program used to fail at link time with
-        // `duplicate label '__ir_cmp_e_8' across switchable banks`.
+        // a local label, the suffix has to include the bank name
+        // so the linker's discovery pass (which checks for cross-
+        // bank label collisions) doesn't panic on the second
+        // occurrence. Without the namespacing step, this exact
+        // program used to fail at link time with `duplicate label
+        // '__ir_shift_loop_8' across switchable banks`.
+        //
+        // We use a shift-by-variable here instead of an `if`
+        // because the cmp/branch fusion in `gen_block` collapses
+        // most `if` patterns into direct branches without local
+        // labels. Variable-amount shifts always need a loop label
+        // (gen_shift_var emits one), which gives the test a
+        // stable label-emission pattern regardless of future
+        // codegen optimizations.
         let (prog, _) = parser::parse(
             r#"
             game "T" { mapper: UxROM }
             var x: u8 = 0
+            var n: u8 = 0
             bank A {
-                fun a_fn() { if x == 0 { x = 1 } }
+                fun a_fn() { x = x << n }
             }
             bank B {
-                fun b_fn() { if x == 0 { x = 2 } }
+                fun b_fn() { x = x << n }
             }
             on frame { a_fn() b_fn() }
             start Main
@@ -3838,7 +4172,7 @@ mod more_tests {
             .expect("A stream")
             .iter()
             .filter_map(|i| match &i.mode {
-                AM::Label(l) if l.contains("__ir_cmp") => Some(l.clone()),
+                AM::Label(l) if l.contains("__ir_shift") => Some(l.clone()),
                 _ => None,
             })
             .collect();
@@ -3847,17 +4181,17 @@ mod more_tests {
             .expect("B stream")
             .iter()
             .filter_map(|i| match &i.mode {
-                AM::Label(l) if l.contains("__ir_cmp") => Some(l.clone()),
+                AM::Label(l) if l.contains("__ir_shift") => Some(l.clone()),
                 _ => None,
             })
             .collect();
         assert!(
             !a_labels.is_empty(),
-            "bank A should emit at least one cmp label"
+            "bank A should emit at least one shift label"
         );
         assert!(
             !b_labels.is_empty(),
-            "bank B should emit at least one cmp label"
+            "bank B should emit at least one shift label"
         );
         for a in &a_labels {
             assert!(
@@ -3916,9 +4250,21 @@ fn gen_function_prologue_spills_params_to_local_ram() {
     // own arguments, silently corrupting the caller's params.
     //
     // Compile a function that takes `x: u8`, calls `helper(x)`,
-    // then uses `x` again. Verify the callee reads `x` from a
-    // RAM slot (absolute addressing at $0300+) rather than
-    // directly from `$04`.
+    // then uses `x` again. Verify that immediately after the
+    // `__ir_fn_caller` label, the codegen emits a spill
+    // `LDA $04 / STA <slot>` where `<slot>` is the analyzer's
+    // dedicated address for the param — crucially, not $04
+    // itself (which nested calls would clobber) and not
+    // $05/$06/$07 either.
+    //
+    // Earlier revisions of this test asserted `<slot>` had to
+    // be an absolute address at `$0300+`, reflecting a codegen
+    // that minted a fresh per-function RAM range. After
+    // `compiler-bugs.md` #1 — the inline-asm `{param}`
+    // resolution fix — the codegen reuses the analyzer's
+    // allocation, which can land in zero page when there's
+    // room. The invariant that matters is "separate from the
+    // transport slots", not "must be main RAM".
     use crate::parser;
     let src = r#"
         game "Test" { mapper: NROM }
@@ -3943,14 +4289,17 @@ fn gen_function_prologue_spills_params_to_local_ram() {
     let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir);
     let insts = codegen.generate(&ir);
 
-    // Find the __ir_fn_caller label. Immediately after it, look
-    // for the spill pattern: `LDA $04 / STA <absolute $0300+>`.
+    // Walk the instructions emitted for `caller` (up until the
+    // next function label) looking for the spill `LDA $04` /
+    // `STA <slot>` pair. `<slot>` is accepted as either
+    // `ZeroPage(addr)` or `Absolute(addr)`, as long as `addr`
+    // is outside the `$04-$07` transport range.
     let caller_idx = insts
         .iter()
         .position(|i| i.mode == AM::Label("__ir_fn_caller".into()))
         .expect("caller function should be emitted");
     let mut saw_lda_zp4 = false;
-    let mut saw_sta_abs = false;
+    let mut saw_sta_separate = false;
     for inst in &insts[caller_idx + 1..] {
         if let AM::Label(l) = &inst.mode {
             if l.starts_with("__ir_fn_") && l != "__ir_fn_caller" {
@@ -3959,20 +4308,100 @@ fn gen_function_prologue_spills_params_to_local_ram() {
         }
         if inst.opcode == LDA && inst.mode == AM::ZeroPage(0x04) {
             saw_lda_zp4 = true;
+            continue;
         }
         if saw_lda_zp4 && inst.opcode == STA {
-            if let AM::Absolute(a) = inst.mode {
-                if a >= 0x0300 {
-                    saw_sta_abs = true;
-                    break;
-                }
+            let addr: u16 = match inst.mode {
+                AM::ZeroPage(a) => u16::from(a),
+                AM::Absolute(a) => a,
+                _ => continue,
+            };
+            if !(0x04..=0x07).contains(&addr) {
+                saw_sta_separate = true;
+                break;
             }
         }
     }
     assert!(
-        saw_lda_zp4 && saw_sta_abs,
-        "caller function should open with `LDA $04 / STA <absolute>` \
-         as the param-spill prologue — the param-clobbering fix is \
-         not in effect"
+        saw_lda_zp4 && saw_sta_separate,
+        "caller function should open with `LDA $04` followed by \
+         a `STA <slot>` that spills the param out of the \
+         transport slots — the param-clobbering fix is not in \
+         effect"
     );
+}
+
+#[test]
+fn function_is_leaf_detects_jsr_emitting_ops() {
+    // `function_is_leaf` decides whether a fun's parameters can
+    // live in the `$04..$07` transport slots for the lifetime of
+    // its body — true only if nothing inside the body JSRs and
+    // re-clobbers them. Each construct below indirectly emits a
+    // JSR and therefore disqualifies leaf status:
+    //
+    //   - `Statement::Call`    → `IrOp::Call`           → JSR <fn>
+    //   - `*` (non-power-of-2) → `IrOp::Mul`            → JSR __multiply
+    //   - `/` (non-power-of-2) → `IrOp::Div`            → JSR __divide
+    //   - `%` (non-power-of-2) → `IrOp::Mod`            → JSR __divide
+    //   - `asm { ... JSR ... }` (the analyzer can't see inside
+    //     hand-written asm, so any "JSR" token disqualifies)
+    //
+    // `Transition` also emits a JSR but lives in state handlers
+    // rather than user-callable funs; the existing `*_enter`
+    // dispatcher tests cover that path. The control case at the
+    // bottom — a function that only does loads/adds/stores — is
+    // the one shape that should be a leaf.
+    use crate::parser;
+    let cases: &[(&str, &str, bool)] = &[
+        // (name, body source, expect_leaf)
+        (
+            "call",
+            "fun helper(a: u8) -> u8 { return a } \
+             fun f(x: u8) { var y: u8 = helper(x) }",
+            false,
+        ),
+        ("mul", "var c: u8 = 0 fun f(x: u8) { c = x * x }", false),
+        ("div", "var c: u8 = 0 fun f(x: u8) { c = x / x }", false),
+        ("mod", "var c: u8 = 0 fun f(x: u8) { c = x % x }", false),
+        (
+            "asm-with-JSR",
+            "fun helper() {} fun f(x: u8) { asm { JSR helper } }",
+            false,
+        ),
+        (
+            "asm-without-JSR",
+            "fun f(x: u8) { asm { LDA $00 STA $01 } }",
+            true,
+        ),
+        ("plain", "var c: u8 = 0 fun f(x: u8) { c = x + 1 }", true),
+    ];
+    for (label, body, expect_leaf) in cases {
+        let src = format!(
+            r#"
+            game "T" {{ mapper: NROM }}
+            {body}
+            on frame {{ f(1) }}
+            start Main
+        "#
+        );
+        let (prog, _) = parser::parse(&src);
+        let prog = prog.unwrap_or_else(|| panic!("[{label}] parse failed"));
+        let analysis = crate::analyzer::analyze(&prog);
+        assert!(
+            analysis.diagnostics.iter().all(|d| !d.is_error()),
+            "[{label}] unexpected analysis errors: {:?}",
+            analysis.diagnostics
+        );
+        let ir = crate::ir::lower(&prog, &analysis);
+        let f = ir
+            .functions
+            .iter()
+            .find(|f| f.name == "f")
+            .unwrap_or_else(|| panic!("[{label}] no fn `f` in IR"));
+        assert_eq!(
+            function_is_leaf(f),
+            *expect_leaf,
+            "[{label}] leaf detection mismatch"
+        );
+    }
 }
