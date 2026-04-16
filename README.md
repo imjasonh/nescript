@@ -12,6 +12,10 @@ _Source: [`examples/platformer.ne`](examples/platformer.ne)_
 
 _Source: [`examples/war.ne`](examples/war.ne)_
 
+![Pong demo](docs/pong.gif)
+
+_Source: [`examples/pong.ne`](examples/pong.ne)_
+
 ## Quick Start
 
 ```bash
