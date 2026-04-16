@@ -21,28 +21,21 @@
 //
 // K[i] and H_INIT[i] live in RAM as `var` arrays loaded from
 // the init_array initialiser at reset time (see constants.ne).
-//
-// ── Parameter convention ────────────────────────────────────
-//
-// NEScript passes the first two function parameters via
-// zero-page slots $04 and $05 before the JSR. The compiler's
-// standard prologue immediately spills those slots into a
-// per-function local in high RAM so nested calls don't step on
-// them — but the inline-asm `{name}` resolver looks parameters
-// up in the analyzer's allocation table, which doesn't see the
-// codegen's spill. Rather than double-copy through a global,
-// every primitive below reads its parameters straight out of
-// the transport slots with `LDX $04` / `LDY $05`. Our
-// primitives never JSR from inside the `asm` block, so the
-// transport slots are still live when we read them.
 
 // ── 32-bit byte primitives ──────────────────────────────────
+//
+// Every primitive reads its destination and source offsets
+// via `{dst}` / `{src}` / `{w_ofs}` / … substitutions, which
+// resolve to the analyzer's per-function local slots. The
+// codegen's function prologue spills the `$04`/`$05` transport
+// slots into those same addresses on entry, so the values are
+// already live by the time the asm block runs.
 
 // wk[dst..dst+4] = wk[src..src+4]
 fun cp_wk(dst: u8, src: u8) {
     asm {
-        LDX $04
-        LDY $05
+        LDX {dst}
+        LDY {src}
         LDA {wk},Y
         STA {wk},X
         INX
@@ -63,8 +56,8 @@ fun cp_wk(dst: u8, src: u8) {
 // wk[dst..dst+4] ^= wk[src..src+4]
 fun xor_wk(dst: u8, src: u8) {
     asm {
-        LDX $04
-        LDY $05
+        LDX {dst}
+        LDY {src}
         LDA {wk},X
         EOR {wk},Y
         STA {wk},X
@@ -89,8 +82,8 @@ fun xor_wk(dst: u8, src: u8) {
 // wk[dst..dst+4] &= wk[src..src+4]
 fun and_wk(dst: u8, src: u8) {
     asm {
-        LDX $04
-        LDY $05
+        LDX {dst}
+        LDY {src}
         LDA {wk},X
         AND {wk},Y
         STA {wk},X
@@ -115,8 +108,8 @@ fun and_wk(dst: u8, src: u8) {
 // wk[dst..dst+4] += wk[src..src+4]  (chained ADC for carry)
 fun add_wk(dst: u8, src: u8) {
     asm {
-        LDX $04
-        LDY $05
+        LDX {dst}
+        LDY {src}
         CLC
         LDA {wk},X
         ADC {wk},Y
@@ -142,7 +135,7 @@ fun add_wk(dst: u8, src: u8) {
 // wk[dst..dst+4] = ~wk[dst..dst+4]  (bitwise NOT, in place)
 fun not_wk(dst: u8) {
     asm {
-        LDX $04
+        LDX {dst}
         LDA {wk},X
         EOR #$FF
         STA {wk},X
@@ -170,7 +163,7 @@ fun not_wk(dst: u8) {
 // previous byte's bit 0 into the next byte's bit 7.
 fun rotr1_wk(dst: u8) {
     asm {
-        LDX $04
+        LDX {dst}
         LDA {wk},X
         LSR A
         INX
@@ -191,7 +184,7 @@ fun rotr1_wk(dst: u8) {
 //     new[2] = old[3], new[3] = old[0]
 fun byte_rotr_wk(dst: u8) {
     asm {
-        LDX $04
+        LDX {dst}
         LDY {wk},X
         INX
         LDA {wk},X
@@ -233,7 +226,7 @@ fun rotr_wk(dst: u8, n: u8) {
 // becomes 0).
 fun shr1_wk(dst: u8) {
     asm {
-        LDX $04
+        LDX {dst}
         INX
         INX
         INX
@@ -251,7 +244,7 @@ fun shr1_wk(dst: u8) {
 // byte becomes 0.
 fun byte_shr_wk(dst: u8) {
     asm {
-        LDX $04
+        LDX {dst}
         INX
         LDA {wk},X
         DEX
@@ -290,8 +283,8 @@ fun shr_wk(dst: u8, n: u8) {
 // wk[dst..dst+4] = w[w_ofs..w_ofs+4]
 fun cp_w_to_wk(dst: u8, w_ofs: u8) {
     asm {
-        LDX $04
-        LDY $05
+        LDX {dst}
+        LDY {w_ofs}
         LDA {w},Y
         STA {wk},X
         INX
@@ -312,8 +305,8 @@ fun cp_w_to_wk(dst: u8, w_ofs: u8) {
 // wk[dst..dst+4] += w[w_ofs..w_ofs+4]
 fun add_w_to_wk(dst: u8, w_ofs: u8) {
     asm {
-        LDX $04
-        LDY $05
+        LDX {dst}
+        LDY {w_ofs}
         CLC
         LDA {wk},X
         ADC {w},Y
@@ -339,8 +332,8 @@ fun add_w_to_wk(dst: u8, w_ofs: u8) {
 // w[w_ofs..w_ofs+4] = wk[src..src+4]
 fun cp_wk_to_w(w_ofs: u8, src: u8) {
     asm {
-        LDX $05
-        LDY $04
+        LDX {src}
+        LDY {w_ofs}
         LDA {wk},X
         STA {w},Y
         INX
@@ -361,8 +354,8 @@ fun cp_wk_to_w(w_ofs: u8, src: u8) {
 // h_state[h_ofs..h_ofs+4] += wk[src..src+4]
 fun add_wk_to_h(h_ofs: u8, src: u8) {
     asm {
-        LDX $04
-        LDY $05
+        LDX {h_ofs}
+        LDY {src}
         CLC
         LDA {h_state},X
         ADC {wk},Y
@@ -388,8 +381,8 @@ fun add_wk_to_h(h_ofs: u8, src: u8) {
 // wk[dst..dst+4] += _K_BYTES[k_ofs..k_ofs+4]
 fun add_k_to_wk(dst: u8, k_ofs: u8) {
     asm {
-        LDX $04
-        LDY $05
+        LDX {dst}
+        LDY {k_ofs}
         CLC
         LDA {wk},X
         ADC {_K_BYTES},Y

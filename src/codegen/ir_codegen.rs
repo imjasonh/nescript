@@ -230,51 +230,34 @@ impl<'a> IrCodeGen<'a> {
             }
         }
         // Map every function-local — parameters AND body-declared
-        // vars — into a dedicated RAM slot at `$0300+`. Parameters
-        // are still passed via the zero-page transport slots
+        // vars — into the slot the analyzer already reserved for it.
+        // Parameters arrive via the zero-page transport slots
         // `$04-$07` as the calling convention, but `gen_function`
         // emits a prologue at function entry that copies those
-        // transport slots into these per-function RAM slots. That
-        // way, when a function makes a nested call, the nested
-        // call clobbers `$04-$07` (writing its own arguments into
-        // them) without disturbing the caller's saved parameters.
+        // transport slots into the analyzer's per-function slot so
+        // nested calls don't step on the caller's parameters.
         //
-        // Before this change, parameters lived in `$04-$07` for the
-        // duration of the function body, so any call nested inside
-        // a function's body silently corrupted the caller's
-        // parameters (fixed on the War bug-cleanup branch; see
-        // `git log` for the original reproduction and root cause).
-        // The per-function RAM slots + prologue spill fix that
-        // class of bug at the cost of 4 LDA/STA pairs per function
-        // entry.
+        // NEScript forbids recursion (E0402) and caps call depth
+        // (E0401), so the analyzer's single-slot-per-local layout
+        // can't alias even though two functions may be active on
+        // the 6502 stack at once.
         //
-        // Locals are laid out linearly across every function:
-        // NEScript forbids recursion (E0402) and enforces a
-        // bounded call depth (E0401), so lifetime overlap between
-        // functions is fine and we don't need to pack them.
-        let mut local_ram_next: u16 = 0x0300;
-        // Advance past any RAM global so locals don't clobber them.
-        // Each global occupies `[address, address + size)` — for an
-        // array global at $0308 with size=4 that's $0308..$030C. We
-        // must advance past the END, not the base, otherwise
-        // subsequent locals overlap with the tail of the array.
-        // Globals are looked up by name against the analyzer's
-        // `allocations` (which has per-global sizes) rather than the
-        // `var_addrs` map, which only stores base addresses.
-        let max_ram_global_end = allocations
-            .iter()
-            .filter(|a| a.address >= 0x0100)
-            .map(|a| a.address + a.size.max(1))
-            .max()
-            .unwrap_or(0);
-        if max_ram_global_end > local_ram_next {
-            local_ram_next = max_ram_global_end;
-        }
+        // Using the analyzer's addresses here (instead of minting a
+        // fresh linear `$0300+` range) is critical for inline-asm
+        // `{name}` substitution: `substitute_asm_vars` resolves
+        // `{param}` against `allocations` (= the analyzer's table),
+        // so the codegen has to agree with the analyzer on each
+        // local's address or `LDA {param}` inside `asm { ... }`
+        // would read a slot nothing ever writes to. See
+        // `compiler-bugs.md` entry #1 for the full diagnosis.
         for func in &ir.functions {
+            let scope = scope_prefix_for_fn(&func.name);
             for local in &func.locals {
-                var_addrs.insert(local.var_id, local_ram_next);
-                var_sizes.insert(local.var_id, local.size);
-                local_ram_next += local.size.max(1);
+                let qualified = format!("__local__{scope}__{}", local.name);
+                if let Some(alloc) = allocations.iter().find(|a| a.name == qualified) {
+                    var_addrs.insert(local.var_id, alloc.address);
+                    var_sizes.insert(local.var_id, alloc.size);
+                }
             }
         }
         let function_names = ir.functions.iter().map(|f| f.name.clone()).collect();
@@ -852,24 +835,7 @@ impl<'a> IrCodeGen<'a> {
         // their locals. For regular user functions it's just
         // the function name. See the commentary on
         // `current_fn_scope_prefix` above.
-        self.current_fn_scope_prefix = if let Some(state) = func.name.strip_suffix("_frame") {
-            format!("{state}__frame")
-        } else if let Some(state) = func.name.strip_suffix("_enter") {
-            format!("{state}__enter")
-        } else if let Some(state) = func.name.strip_suffix("_exit") {
-            format!("{state}__exit")
-        } else if let Some(rest) = func.name.strip_prefix("") {
-            // Scanline handlers encode the line number, but
-            // the analyzer's prefix is
-            // `{state}__scanline_{N}` — check the split.
-            if let Some((state, line)) = rest.rsplit_once("_scanline_") {
-                format!("{state}__scanline_{line}")
-            } else {
-                rest.to_string()
-            }
-        } else {
-            func.name.clone()
-        };
+        self.current_fn_scope_prefix = scope_prefix_for_fn(&func.name);
 
         self.emit_label(&format!("__ir_fn_{}", func.name));
 
@@ -2149,6 +2115,33 @@ enum Cmp16Kind {
     Gt,
     LtEq,
     GtEq,
+}
+
+/// Map an IR function name to the analyzer's scope prefix for its
+/// locals. The analyzer registers every function-local under
+/// `__local__{prefix}__{name}` — state handlers use
+/// `{state}__{frame|enter|exit}` or `{state}__scanline_{line}`,
+/// regular functions use the bare function name.  Both
+/// `IrCodeGen::new` (when seeding `var_addrs`) and `gen_function`
+/// (when setting `current_fn_scope_prefix` for inline-asm
+/// substitution) have to agree on the string used here, or
+/// `{param}` references would resolve to a different address than
+/// the one generated code reads and writes.
+fn scope_prefix_for_fn(name: &str) -> String {
+    if let Some(state) = name.strip_suffix("_frame") {
+        format!("{state}__frame")
+    } else if let Some(state) = name.strip_suffix("_enter") {
+        format!("{state}__enter")
+    } else if let Some(state) = name.strip_suffix("_exit") {
+        format!("{state}__exit")
+    } else if let Some((state, line)) = name.rsplit_once("_scanline_") {
+        // Scanline handlers encode the line number in the
+        // function name; the analyzer's prefix joins them with
+        // a double underscore.
+        format!("{state}__scanline_{line}")
+    } else {
+        name.to_string()
+    }
 }
 
 /// Replace `{name}` tokens in an inline-asm body with the resolved
@@ -3916,9 +3909,21 @@ fn gen_function_prologue_spills_params_to_local_ram() {
     // own arguments, silently corrupting the caller's params.
     //
     // Compile a function that takes `x: u8`, calls `helper(x)`,
-    // then uses `x` again. Verify the callee reads `x` from a
-    // RAM slot (absolute addressing at $0300+) rather than
-    // directly from `$04`.
+    // then uses `x` again. Verify that immediately after the
+    // `__ir_fn_caller` label, the codegen emits a spill
+    // `LDA $04 / STA <slot>` where `<slot>` is the analyzer's
+    // dedicated address for the param — crucially, not $04
+    // itself (which nested calls would clobber) and not
+    // $05/$06/$07 either.
+    //
+    // Earlier revisions of this test asserted `<slot>` had to
+    // be an absolute address at `$0300+`, reflecting a codegen
+    // that minted a fresh per-function RAM range. After
+    // `compiler-bugs.md` #1 — the inline-asm `{param}`
+    // resolution fix — the codegen reuses the analyzer's
+    // allocation, which can land in zero page when there's
+    // room. The invariant that matters is "separate from the
+    // transport slots", not "must be main RAM".
     use crate::parser;
     let src = r#"
         game "Test" { mapper: NROM }
@@ -3943,14 +3948,17 @@ fn gen_function_prologue_spills_params_to_local_ram() {
     let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir);
     let insts = codegen.generate(&ir);
 
-    // Find the __ir_fn_caller label. Immediately after it, look
-    // for the spill pattern: `LDA $04 / STA <absolute $0300+>`.
+    // Walk the instructions emitted for `caller` (up until the
+    // next function label) looking for the spill `LDA $04` /
+    // `STA <slot>` pair. `<slot>` is accepted as either
+    // `ZeroPage(addr)` or `Absolute(addr)`, as long as `addr`
+    // is outside the `$04-$07` transport range.
     let caller_idx = insts
         .iter()
         .position(|i| i.mode == AM::Label("__ir_fn_caller".into()))
         .expect("caller function should be emitted");
     let mut saw_lda_zp4 = false;
-    let mut saw_sta_abs = false;
+    let mut saw_sta_separate = false;
     for inst in &insts[caller_idx + 1..] {
         if let AM::Label(l) = &inst.mode {
             if l.starts_with("__ir_fn_") && l != "__ir_fn_caller" {
@@ -3959,20 +3967,25 @@ fn gen_function_prologue_spills_params_to_local_ram() {
         }
         if inst.opcode == LDA && inst.mode == AM::ZeroPage(0x04) {
             saw_lda_zp4 = true;
+            continue;
         }
         if saw_lda_zp4 && inst.opcode == STA {
-            if let AM::Absolute(a) = inst.mode {
-                if a >= 0x0300 {
-                    saw_sta_abs = true;
-                    break;
-                }
+            let addr: u16 = match inst.mode {
+                AM::ZeroPage(a) => u16::from(a),
+                AM::Absolute(a) => a,
+                _ => continue,
+            };
+            if !(0x04..=0x07).contains(&addr) {
+                saw_sta_separate = true;
+                break;
             }
         }
     }
     assert!(
-        saw_lda_zp4 && saw_sta_abs,
-        "caller function should open with `LDA $04 / STA <absolute>` \
-         as the param-spill prologue — the param-clobbering fix is \
-         not in effect"
+        saw_lda_zp4 && saw_sta_separate,
+        "caller function should open with `LDA $04` followed by \
+         a `STA <slot>` that spills the param out of the \
+         transport slots — the param-clobbering fix is not in \
+         effect"
     );
 }

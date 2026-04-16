@@ -35,10 +35,13 @@
 
 ## #1 — inline `asm { {param} }` resolves to an address nothing writes to
 
-**Status**: WORKED-AROUND (every SHA-256 primitive in
-`examples/sha256/sha_core.ne` reads parameters straight out of the
-caller's `$04`/`$05` transport slots instead of using `{dst}` /
-`{src}`)
+**Status**: FIXED in `src/codegen/ir_codegen.rs::IrCodeGen::new`
+(the codegen now reads each function-local's address out of the
+analyzer's `VarAllocation` table instead of minting its own
+parallel `$0300+` range). The workaround in
+`examples/sha256/sha_core.ne` — reading parameters directly from
+the `$04`/`$05` transport slots — has been reverted in the same
+commit.
 **Phase**: codegen (prologue spill vs. inline-asm resolver
 disagree on local addresses)
 **Surfaced in**: `examples/sha256/sha_core.ne` — the 20-odd
@@ -206,96 +209,75 @@ So `times_four(x)` actually returns `x`, not `x * 4`. The
 committed golden for that example reflects the bug rather than
 the intended `×4` behaviour.
 
-### Workaround (applied in `examples/sha256/`)
+### How it was fixed
 
-Every primitive in `sha_core.ne` reads its parameters straight
-out of the transport slots `$04` / `$05` with the raw literal:
-
-```ne
-fun cp_wk(dst: u8, src: u8) {
-    asm {
-        LDX $04          ; == dst on entry
-        LDY $05          ; == src on entry
-        LDA {wk},Y
-        STA {wk},X
-        ; ... 3 more 4-byte iterations ...
-    }
-}
-```
-
-This works because:
-
-1. The analyzer's function prologue at the AST level doesn't do
-   anything with the inline-asm block's contents — it's a raw
-   text token.
-2. The codegen's spill prologue copies `$04`/`$05` → the codegen
-   local but **leaves the originals alone**. So the transport
-   slots still hold the argument when the first instruction of
-   the asm block executes.
-3. None of the primitives `JSR` from inside the `asm { ... }`
-   block, so nothing else re-enters the function's body (or any
-   other function) while the inline block is running, which
-   would re-populate `$04`/`$05` with different arguments.
-
-The file has a big comment (`── Parameter convention ──`)
-explaining exactly this. Every primitive in that file starts
-with `LDX $04` (and if it has two params, `LDY $05`) instead of
-`LDX {dst}` / `LDY {src}`.
-
-### Once the compiler is fixed
-
-Revert every `LDX $04` / `LDY $05` in `examples/sha256/sha_core.ne`
-back to `LDX {dst}` / `LDY {src}` / `LDX {h_ofs}` / …, and delete
-the "Parameter convention" comment. Also consider whether
-`examples/inline_asm_demo.ne` should be updated so `times_four`
-actually produces the documented `×4`, and regenerate
-`tests/emulator/goldens/inline_asm_demo.png` in the same commit —
-the current golden encodes the buggy behaviour.
-
-### Guess at the fix
-
-Two equivalent options, each about 10 lines of code:
-
-**(a) Make the codegen use the analyzer's allocation for
-locals.** Drop the `local_ram_next` loop at the top of
-`Emitter::new` and, instead of minting new addresses, look up
-each local's analyzer key and copy its address into
-`var_addrs`:
+Option (a) from the original writeup: `IrCodeGen::new` now looks
+each function-local's address up in the analyzer's
+`VarAllocation` table instead of minting a parallel `$0300+`
+range. The codegen and the inline-asm resolver consequently
+agree on every local's address, so `{dst}` / `{src}` / … inside
+`asm { ... }` blocks resolve to the same slot the NEScript-level
+code reads and writes.
 
 ```rust
+// Was:
+let mut local_ram_next: u16 = 0x0300;
+// ...
 for func in &ir.functions {
     for local in &func.locals {
-        let qualified = /* __local__<scope>__<local.name> */;
-        if let Some(a) = allocations.iter().find(|a| a.name == qualified) {
-            var_addrs.insert(local.var_id, a.address);
-            var_sizes.insert(local.var_id, a.size);
+        var_addrs.insert(local.var_id, local_ram_next);
+        var_sizes.insert(local.var_id, local.size);
+        local_ram_next += local.size.max(1);
+    }
+}
+
+// Is now:
+for func in &ir.functions {
+    let scope = scope_prefix_for_fn(&func.name);
+    for local in &func.locals {
+        let qualified = format!("__local__{scope}__{}", local.name);
+        if let Some(alloc) = allocations.iter().find(|a| a.name == qualified) {
+            var_addrs.insert(local.var_id, alloc.address);
+            var_sizes.insert(local.var_id, alloc.size);
         }
     }
 }
 ```
 
-The analyzer already picks slots that are stable across
-functions (the `__local__fn__name` prefix avoids collisions and
-it allocates from zero page first, which is faster anyway), so
-the codegen's "grow linearly from $0300" policy isn't actually
-buying anything — and the comment in `ir_codegen.rs` explaining
-why it's safe to stack locals was already relying on the same
-"no recursion, bounded call depth" guarantees the analyzer
-enforces. The analyzer's allocations already satisfy them.
+The same commit:
 
-**(b) Make `substitute_asm_vars` use the codegen's
-`var_addrs`.** Pass `self.var_addrs` (plus the VarId map) into
-the resolver instead of `self.allocations`. Same effect — both
-maps agree after this — and arguably more local to the bug. The
-analyzer's allocations stay as they are.
+- factors the "function name → analyzer scope prefix" mapping
+  (`_frame` / `_enter` / `_exit` / `_scanline_N` / bare name)
+  into a `scope_prefix_for_fn(&str) -> String` helper and
+  reuses it in `gen_function` so the two sites can't drift;
+- updates `gen_function_prologue_spills_params_to_local_ram`
+  (the regression test originally guarding the War-era param
+  clobbering bug) to assert the spill's destination is *any*
+  address outside `$04-$07`, not specifically `$0300+`. The
+  invariant that matters is "separate from the transport slots",
+  which holds for the analyzer's zero-page allocations too;
+- reverts the `LDX $04` / `LDY $05` workaround across every
+  primitive in `examples/sha256/sha_core.ne` back to the
+  intended `LDX {dst}` / `LDY {src}` substitution form, and
+  drops the "Parameter convention" note from the top of the
+  file;
+- regenerates `tests/emulator/goldens/inline_asm_demo.png`:
+  that example's `times_four` previously returned its input
+  verbatim (the inline asm operated on an unrelated zero-page
+  byte that was always `0`), so the golden's smiley position
+  drifted by exactly the expected `x * 4 mod 256` delta at
+  frame 180.
 
-Preferred: (a) — it deletes code instead of rerouting it, and
-it makes the memory map dumped by `--memory-map` truthful again
-(the codegen's override was invisible to `--memory-map`, which
-is why the discrepancy above looks puzzling without this writeup).
+Verified after the fix:
 
-Once either change is in, re-run the full emulator harness. The
-`inline_asm_demo` and `sha256` goldens will need fresh captures
-because both change observable output.
+- `cargo test --all-targets` — 616 + 3 + 75 tests pass on
+  both rustc 1.94.1 and 1.95.0.
+- `cargo clippy --all-targets -- -D warnings` clean on both.
+- Full emulator harness — 34/34 ROMs match their goldens
+  (only `inline_asm_demo.png` changed, and the new capture
+  reflects the corrected `×4` behaviour).
+- The SHA-256 example still computes `AE9145DB…4E0D` for the
+  auto-demo input `"NES"`, matching `shasum` byte-for-byte,
+  with the inline-asm-pretty `{dst}` / `{src}` primitives.
 
 ---
