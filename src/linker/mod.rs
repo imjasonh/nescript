@@ -157,7 +157,13 @@ const DEFAULT_SPRITE_CHR: [u8; 16] = [
     0b0011_1100,
 ];
 
-/// Default palette data for M1 (writes to PPU $3F00).
+/// Default palette data for M1 (writes to PPU $3F00). Spliced into
+/// PRG under [`DEFAULT_PALETTE_LABEL`] when the program has no
+/// user-declared palette, and loaded by
+/// [`runtime::gen_initial_palette_load`] via the same indirect-loop
+/// path that user palettes use — keeps the reset-time palette
+/// loader small (one code path, ~20 bytes) instead of the old
+/// 170-byte per-entry unrolled store sequence.
 const DEFAULT_PALETTE: [u8; 32] = [
     // Background palettes
     0x0F, 0x00, 0x10, 0x20, // palette 0 (black, dark gray, light gray, white)
@@ -170,6 +176,12 @@ const DEFAULT_PALETTE: [u8; 32] = [
     0x0F, 0x1A, 0x2A, 0x3A, // sprite palette 2
     0x0F, 0x12, 0x22, 0x32, // sprite palette 3
 ];
+
+/// Label under which [`DEFAULT_PALETTE`] is spliced into PRG when
+/// emitted. Prefixed with `__` so it can never collide with a
+/// user-declared palette's label, which the asset pipeline prefixes
+/// with `__palette_`.
+const DEFAULT_PALETTE_LABEL: &str = "__default_palette";
 
 impl Linker {
     pub fn new(mirroring: Mirroring) -> Self {
@@ -414,7 +426,16 @@ impl Linker {
         if let Some(first_palette) = palettes.first() {
             all_instructions.extend(runtime::gen_initial_palette_load(&first_palette.label()));
         } else {
-            all_instructions.extend(self.gen_palette_load());
+            // No user palette: fall back to a sensible built-in
+            // palette so sprites show up in a reasonable colour
+            // scheme without any user setup. Uses the same indirect
+            // loop loader as the user-palette path (reads a 32-byte
+            // blob through a ZP pointer) — ~20 bytes of code plus a
+            // 32-byte data block that gets spliced in below, versus
+            // the ~170 bytes the old inline-stores path cost. The
+            // data block lives alongside the user palette blobs so
+            // the label resolves in the normal assembly pass.
+            all_instructions.extend(runtime::gen_initial_palette_load(DEFAULT_PALETTE_LABEL));
         }
 
         // Load the initial background if the program declared any.
@@ -549,6 +570,18 @@ impl Linker {
         // its bytes in ROM (the reset loader reads them).
         for pal in palettes {
             all_instructions.extend(runtime::gen_data_block(&pal.label(), pal.colors.to_vec()));
+        }
+        // When the program has no user palette, splice the built-in
+        // default palette blob under `__default_palette` so the
+        // reset-time loop loader above can resolve it. Programs
+        // that declare a palette fall through the user path and
+        // skip this entirely — saves 32 bytes of ROM data when the
+        // default is unused.
+        if palettes.is_empty() {
+            all_instructions.extend(runtime::gen_data_block(
+                DEFAULT_PALETTE_LABEL,
+                DEFAULT_PALETTE.to_vec(),
+            ));
         }
         for bg in backgrounds {
             all_instructions.extend(runtime::gen_data_block(
@@ -752,25 +785,5 @@ impl Linker {
             labels: result.labels,
             fixed_bank_file_offset,
         }
-    }
-
-    /// Generate instructions to load the default palette into the PPU.
-    fn gen_palette_load(&self) -> Vec<Instruction> {
-        let mut out = Vec::new();
-
-        // Set PPU address to $3F00 (palette start)
-        out.push(Instruction::new(LDA, AM::Absolute(0x2002))); // read PPU status to reset latch
-        out.push(Instruction::new(LDA, AM::Immediate(0x3F)));
-        out.push(Instruction::new(STA, AM::Absolute(0x2006))); // PPU addr high byte
-        out.push(Instruction::new(LDA, AM::Immediate(0x00)));
-        out.push(Instruction::new(STA, AM::Absolute(0x2006))); // PPU addr low byte
-
-        // Write all 32 palette bytes
-        for &color in &DEFAULT_PALETTE {
-            out.push(Instruction::new(LDA, AM::Immediate(color)));
-            out.push(Instruction::new(STA, AM::Absolute(0x2007))); // PPU data
-        }
-
-        out
     }
 }

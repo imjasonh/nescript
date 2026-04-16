@@ -633,30 +633,45 @@ fn link_banked_chr_rom_survives_with_switchable_banks() {
 }
 
 #[test]
-fn palette_load_writes_to_ppu() {
+fn default_palette_blob_present_when_no_user_palette() {
+    // With no user palette, the linker emits the shared reset-time
+    // loop loader (which writes twice to `$2006` and loops writing
+    // through `$2007`) and splices a 32-byte `__default_palette`
+    // data block into PRG. The end-to-end ROM should contain the
+    // default palette bytes verbatim at some offset in the fixed
+    // bank.
     let linker = Linker::new(Mirroring::Horizontal);
-    let palette_insts = linker.gen_palette_load();
+    let user_code = vec![Instruction::new(NOP, AM::Label("__ir_main_loop".into()))];
+    let rom = linker.link(&user_code);
 
-    // Should write to PPU address register ($2006) twice
-    let ppu_addr_writes: Vec<_> = palette_insts
-        .iter()
-        .filter(|i| i.opcode == STA && i.mode == AM::Absolute(0x2006))
-        .collect();
-    assert_eq!(
-        ppu_addr_writes.len(),
-        2,
-        "should set PPU address (high and low bytes)"
-    );
+    // The first four bytes of DEFAULT_PALETTE are {0x0F, 0x00, 0x10,
+    // 0x20}; they should appear verbatim in the PRG portion of the
+    // iNES file (bytes 16..16+16_384). We look for that 4-byte
+    // sequence rather than matching the full 32 bytes so this stays
+    // robust against minor palette tweaks.
+    let prg = &rom[16..16 + 16_384];
+    let found = prg.windows(4).any(|w| w == [0x0F, 0x00, 0x10, 0x20]);
+    assert!(found, "default palette bytes should appear in PRG");
+}
 
-    // Should write 32 palette bytes to $2007
-    let ppu_data_writes: Vec<_> = palette_insts
-        .iter()
-        .filter(|i| i.opcode == STA && i.mode == AM::Absolute(0x2007))
-        .collect();
-    assert_eq!(
-        ppu_data_writes.len(),
-        32,
-        "should write all 32 palette bytes"
+#[test]
+fn no_default_palette_blob_when_user_palette_present() {
+    // A program that declares its own palette should suppress the
+    // built-in fallback entirely — the `__default_palette` label
+    // never gets emitted, and the assembler's label table doesn't
+    // contain it.
+    use crate::assets::PaletteData;
+    let linker = Linker::new(Mirroring::Horizontal);
+    let user_code = vec![Instruction::new(NOP, AM::Label("__ir_main_loop".into()))];
+    let user_pal = PaletteData {
+        name: "Menu".into(),
+        colors: [0x0F; 32],
+    };
+    let result =
+        linker.link_banked_with_ppu_detailed(&user_code, &[], &[], &[], &[user_pal], &[], &[]);
+    assert!(
+        !result.labels.contains_key("__default_palette"),
+        "default palette must be suppressed when user palette is present"
     );
 }
 
