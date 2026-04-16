@@ -471,9 +471,22 @@ impl Linker {
             }
         }
 
-        // Math runtime routines (included always for simplicity)
-        all_instructions.extend(runtime::gen_multiply());
-        all_instructions.extend(runtime::gen_divide());
+        // Math runtime routines. Gated on the `__mul_used` /
+        // `__div_used` marker labels that the IR codegen drops at
+        // the first `IrOp::Mul` / `IrOp::Div` / `IrOp::Mod`. The
+        // optimizer rewrites multiplies and divides by constant
+        // powers of two into shifts (and modulo by constant powers
+        // of two into masks) before codegen runs, so these markers
+        // only fire for genuinely runtime-costly math. Programs
+        // without any surviving mul or div pay zero bytes here.
+        let has_mul = has_label(user_code, "__mul_used");
+        let has_div = has_label(user_code, "__div_used");
+        if has_mul {
+            all_instructions.extend(runtime::gen_multiply());
+        }
+        if has_div {
+            all_instructions.extend(runtime::gen_divide());
+        }
 
         // Audio subsystem — linked in whenever user code touched
         // audio (detected via the `__audio_used` marker emitted by

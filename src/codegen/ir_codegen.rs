@@ -161,6 +161,23 @@ pub struct IrCodeGen<'a> {
     /// resulting `__ppu_update_used` marker label to decide whether
     /// to splice the in-NMI palette/nametable update helper.
     ppu_update_used: bool,
+    /// Set to true the first time we lower an `IrOp::Mul`. Drives
+    /// the `__mul_used` marker label so the linker can skip
+    /// `gen_multiply` (~50 bytes) for programs that never multiply.
+    /// The optimizer's strength reduction has already turned
+    /// multiplies by constant powers of two into shifts by the time
+    /// codegen runs, so this flag only gets set for real runtime
+    /// multiplications.
+    mul_used: bool,
+    /// Set to true the first time we lower an `IrOp::Div` or
+    /// `IrOp::Mod` (modulo reuses the divide routine). Drives the
+    /// `__div_used` marker label so the linker can skip `gen_divide`
+    /// (~70 bytes) for programs that never divide. Divide by
+    /// constant powers of two has been strength-reduced to shifts
+    /// by the optimizer, and modulo by constant powers of two to
+    /// masks; runtime divide only survives for non-constant or
+    /// non-power-of-two divisors.
+    div_used: bool,
     /// Source-location markers produced from [`IrOp::SourceLoc`].
     /// Each entry is a `(label_name, span)` pair — the codegen
     /// emits a unique label-definition pseudo-op at the current
@@ -338,6 +355,8 @@ impl<'a> IrCodeGen<'a> {
             noise_used: false,
             triangle_used: false,
             ppu_update_used: false,
+            mul_used: false,
+            div_used: false,
             source_locs: Vec::new(),
             next_source_loc: 0,
             emit_source_locs: false,
@@ -1175,7 +1194,11 @@ impl<'a> IrCodeGen<'a> {
                 self.store_temp(*d);
             }
             IrOp::Mul(d, a, b) => {
-                // Software multiply: multiplicand in A, multiplier in $02
+                // Software multiply: multiplicand in A, multiplier in $02.
+                // Drop the `__mul_used` marker so the linker knows to
+                // link the `__multiply` subroutine in — programs that
+                // don't multiply skip ~50 bytes of runtime.
+                self.emit_mul_marker();
                 self.load_temp(*a);
                 self.emit(PHA, AM::Implied); // Save for __multiply contract
                 let b_addr = self.temp_addr(*b);
@@ -1222,7 +1245,10 @@ impl<'a> IrCodeGen<'a> {
             IrOp::Div(d, a, b) => {
                 // Software divide: dividend in A, divisor in $02.
                 // `__divide` returns quotient in A and leaves
-                // remainder in ZP $03.
+                // remainder in ZP $03. Emit the `__div_used` marker
+                // so the linker links the `__divide` subroutine in;
+                // programs that don't divide skip ~70 bytes.
+                self.emit_div_marker();
                 self.load_temp(*a);
                 self.emit(PHA, AM::Implied);
                 let b_addr = self.temp_addr(*b);
@@ -1234,7 +1260,10 @@ impl<'a> IrCodeGen<'a> {
             }
             IrOp::Mod(d, a, b) => {
                 // Modulo reuses __divide and reads the remainder out
-                // of ZP $03 afterwards.
+                // of ZP $03 afterwards. Same `__div_used` marker as
+                // `IrOp::Div` — modulo doesn't have a separate
+                // runtime routine.
+                self.emit_div_marker();
                 self.load_temp(*a);
                 self.emit(PHA, AM::Implied);
                 let b_addr = self.temp_addr(*b);
@@ -2015,6 +2044,32 @@ impl<'a> IrCodeGen<'a> {
         if !self.ppu_update_used {
             self.emit_label("__ppu_update_used");
             self.ppu_update_used = true;
+        }
+    }
+
+    /// Emit the `__mul_used` marker label at most once per program.
+    /// The linker uses this to decide whether to link in the
+    /// `gen_multiply` subroutine. Programs that never multiply (or
+    /// that only multiply by constant powers of two — those are
+    /// strength-reduced to shifts) skip the runtime entirely.
+    fn emit_mul_marker(&mut self) {
+        if !self.mul_used {
+            self.emit_label("__mul_used");
+            self.mul_used = true;
+        }
+    }
+
+    /// Emit the `__div_used` marker label at most once per program.
+    /// The linker uses this to decide whether to link in the
+    /// `gen_divide` subroutine. Both `IrOp::Div` and `IrOp::Mod`
+    /// trigger this marker because modulo reuses the divide
+    /// routine. Programs whose divide/modulo operations all use
+    /// constant power-of-two divisors have already been rewritten
+    /// to shifts / masks by the optimizer and never reach here.
+    fn emit_div_marker(&mut self) {
+        if !self.div_used {
+            self.emit_label("__div_used");
+            self.div_used = true;
         }
     }
 
