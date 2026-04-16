@@ -32,24 +32,32 @@ state Computing {
 
     on frame {
         if cp_phase < SCHED_PHASES {
-            // Each schedule phase handles BATCH_SIZE words.
-            // First word index for this phase: 16 + phase * 4.
-            var first_idx: u8 = 16 + (cp_phase << 2)
+            // Each schedule phase handles BATCH_SIZE words. The
+            // schedule_one / round_one APIs both want a byte
+            // offset (= word_index * 4), so track that directly
+            // instead of recomputing `index << 2` per iteration:
+            // the byte offset is just incremented by 4 in lieu
+            // of the index by 1.
+            //
+            // First byte offset for this phase: (16 + phase*4)*4
+            // = 64 + phase * 16.
+            var w_byte: u8 = 64 + (cp_phase << 4)
             var step: u8 = 0
             while step < BATCH_SIZE {
-                var i: u8 = first_idx + step
-                schedule_one(i << 2)        // byte offset into w[]
+                schedule_one(w_byte)
+                w_byte += 4
                 step += 1
             }
             cp_phase += 1
         } else if cp_phase < FOLD_PHASE {
-            // Round batch. First round for this phase:
-            // (phase - SCHED_PHASES) * 4.
-            var first_r: u8 = (cp_phase - SCHED_PHASES) << 2
+            // Round batch. First byte offset for this phase:
+            // (phase - SCHED_PHASES) * 4 * 4
+            // = (phase - SCHED_PHASES) << 4.
+            var kw_byte: u8 = (cp_phase - SCHED_PHASES) << 4
             var step2: u8 = 0
             while step2 < BATCH_SIZE {
-                var r: u8 = first_r + step2
-                round_one(r << 2)           // K/W share byte 4*i
+                round_one(kw_byte)
+                kw_byte += 4
                 step2 += 1
             }
             cp_phase += 1
