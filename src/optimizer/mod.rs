@@ -39,7 +39,7 @@ pub fn analyze_zp_candidates(program: &IrProgram) -> Vec<(VarId, u32)> {
     }
 
     let mut result: Vec<(VarId, u32)> = counts.into_iter().collect();
-    result.sort_by(|a, b| b.1.cmp(&a.1));
+    result.sort_by_key(|(_, count)| std::cmp::Reverse(*count));
     result
 }
 
@@ -328,7 +328,11 @@ fn const_fold_block(block: &mut IrBasicBlock, func_used: &HashSet<IrTemp>) {
             }
             IrOp::Div(dest, a, b) => {
                 if let (Some(&va), Some(&vb)) = (constants.get(&a), constants.get(&b)) {
-                    let result = if vb == 0 { 0 } else { va / vb };
+                    // `checked_div` returns None on `vb == 0`; the
+                    // division-by-zero fallback stays `0` so folded
+                    // `x / 0` matches the runtime semantics elsewhere
+                    // in the compiler.
+                    let result = va.checked_div(vb).unwrap_or(0);
                     *op = IrOp::LoadImm(dest, result);
                     constants.insert(dest, result);
                 }

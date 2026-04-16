@@ -110,7 +110,7 @@ fn main() {
                         "compiled {} -> {} ({} bytes)",
                         input.display(),
                         output.display(),
-                        std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0)
+                        std::fs::metadata(&output).map_or(0, |m| m.len())
                     );
                 }
                 Err(()) => std::process::exit(1),
