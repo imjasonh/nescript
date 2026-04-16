@@ -396,11 +396,19 @@ impl Linker {
 
         let mut all_instructions = Vec::new();
 
+        // `__oam_used` marker from IR codegen — set whenever user
+        // code contains at least one `draw` statement. Gates the
+        // `$FE` OAM shadow fill inside `gen_init`, the OAM DMA
+        // inside `gen_nmi`, and (cascaded below) the default palette
+        // / smiley / rendering-enable machinery. Programs that don't
+        // draw save ~520 cycles per NMI plus a handful of bytes.
+        let has_oam = has_label(user_code, "__oam_used");
+
         // RESET entry point
         all_instructions.push(Instruction::new(NOP, AM::Label("__reset".into())));
 
         // Hardware initialization
-        all_instructions.extend(runtime::gen_init());
+        all_instructions.extend(runtime::gen_init(has_oam));
 
         // Mapper configuration: for banked mappers, set up the PRG
         // layout so the fixed bank sits at $C000-$FFFF. NROM is a
@@ -413,17 +421,14 @@ impl Linker {
 
         // Whether the program produces any visual output. True if
         // the user declared a palette / sprite / background, or if
-        // user code contains the `__oam_used` marker (emitted by
-        // `IrOp::DrawSprite`). A purely audio- or compute-only
-        // program is happy to leave the PPU fully silent — no
-        // palette load, no rendering enable, no default-sprite
-        // smiley in CHR — so we gate the reset-time palette
-        // machinery on this flag. See the sprite-chr / OAM-DMA
-        // gates below for the other places it cascades.
-        let has_visual_output = !palettes.is_empty()
-            || !sprites.is_empty()
-            || !backgrounds.is_empty()
-            || has_label(user_code, "__oam_used");
+        // user code contains the `__oam_used` marker (i.e. draws).
+        // A purely audio- or compute-only program is happy to leave
+        // the PPU fully silent — no palette load, no rendering
+        // enable, no default-sprite smiley in CHR — so we gate the
+        // reset-time palette machinery on this flag. See the
+        // sprite-chr / OAM-DMA gates for the other places it cascades.
+        let has_visual_output =
+            !palettes.is_empty() || !sprites.is_empty() || !backgrounds.is_empty() || has_oam;
 
         // Load the initial palette. If the program declared any
         // `palette` blocks, use the first one; otherwise fall back
@@ -662,6 +667,7 @@ impl Linker {
             has_audio,
             debug_mode,
             has_sprite_cycle,
+            has_oam,
         }));
 
         // IRQ handler

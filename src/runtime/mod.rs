@@ -200,7 +200,17 @@ pub const AUDIO_SFX_PITCH_PTR_HI: u16 = 0x07F7;
 
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
-pub fn gen_init() -> Vec<Instruction> {
+///
+/// `has_oam` controls the $0200 OAM shadow fill inside the RAM
+/// clear loop. When true, the shadow is filled with `$FE` so any
+/// sprite slot not explicitly written by a later `draw` stays
+/// off-screen (Y = $FE is out of the 240-line viewport). When
+/// false — i.e. the program never draws — the shadow stays at $00
+/// alongside the rest of RAM, saving ~4 bytes of init code since
+/// the inner-loop doesn't need the two extra LDA / mid-loop value
+/// swaps to load and restore the `$FE` immediate.
+#[must_use]
+pub fn gen_init(has_oam: bool) -> Vec<Instruction> {
     let mut out = Vec::new();
 
     // Disable IRQs and set decimal mode off
@@ -252,16 +262,24 @@ pub fn gen_init() -> Vec<Instruction> {
         AM::LabelRelative("__vblankwait1".into()),
     ));
 
-    // Clear RAM ($0000-$07FF)
+    // Clear RAM ($0000-$07FF). When the program uses sprites, the
+    // $0200-$02FF OAM shadow gets filled with $FE so unused slots
+    // stay off-screen (Y=$FE puts the sprite below scanline 240);
+    // programs that never draw skip that swap and zero-fill the
+    // whole 2 KB range uniformly.
     out.push(Instruction::new(LDA, AM::Immediate(0x00)));
     out.push(Instruction::new(LDX, AM::Immediate(0x00)));
     out.push(Instruction::new(NOP, AM::Label("__clrmem".into())));
     out.push(Instruction::new(STA, AM::AbsoluteX(0x0000)));
     out.push(Instruction::new(STA, AM::AbsoluteX(0x0100)));
-    // OAM shadow: fill with $FE (hide sprites off-screen)
-    out.push(Instruction::new(LDA, AM::Immediate(0xFE)));
-    out.push(Instruction::new(STA, AM::AbsoluteX(0x0200)));
-    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    if has_oam {
+        // OAM shadow: fill with $FE (hide sprites off-screen).
+        out.push(Instruction::new(LDA, AM::Immediate(0xFE)));
+        out.push(Instruction::new(STA, AM::AbsoluteX(0x0200)));
+        out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    } else {
+        out.push(Instruction::new(STA, AM::AbsoluteX(0x0200)));
+    }
     out.push(Instruction::new(STA, AM::AbsoluteX(0x0300)));
     out.push(Instruction::new(STA, AM::AbsoluteX(0x0400)));
     out.push(Instruction::new(STA, AM::AbsoluteX(0x0500)));
@@ -361,6 +379,13 @@ pub struct NmiOptions {
     pub has_audio: bool,
     pub debug_mode: bool,
     pub has_sprite_cycle: bool,
+    /// When false, skip the OAM DMA (`$2003` address write + `$4014`
+    /// DMA trigger). A program that never `draw`s sprites has
+    /// nothing interesting to transfer — every one of the 256 OAM
+    /// bytes is either the $FE hide sentinel or a zeroed row —
+    /// so the DMA is ~520 wasted cycles per NMI. Skipping it saves
+    /// those cycles plus 9 bytes of NMI code.
+    pub has_oam: bool,
 }
 
 #[must_use]
@@ -370,6 +395,7 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
         has_audio,
         debug_mode,
         has_sprite_cycle,
+        has_oam,
     } = opts;
     let mut out = Vec::new();
 
@@ -444,19 +470,26 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
         out.push(Instruction::new(JSR, AM::Label("__audio_tick".into())));
     }
 
-    // OAM DMA — transfer sprite data from $0200. Programs that
-    // don't use `cycle_sprites` get the classic fixed-offset
-    // path (LDA #0); programs that opt in get the rotating
-    // offset read from SPRITE_CYCLE_ADDR. Both variants write
-    // the same low byte ($02) for the DMA source page.
-    if has_sprite_cycle {
-        out.push(Instruction::new(LDA, AM::Absolute(SPRITE_CYCLE_ADDR)));
-    } else {
-        out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    // OAM DMA — transfer sprite data from $0200. Skipped entirely
+    // for programs that never `draw`: gated on `has_oam`, which the
+    // linker sets from the `__oam_used` marker the IR codegen drops
+    // at the first `IrOp::DrawSprite`. `has_sprite_cycle` is a
+    // strict subset of `has_oam` so a program that opts into cycling
+    // has definitely also drawn something.
+    //
+    // Programs that *do* draw choose between two paths: the classic
+    // fixed-offset (LDA #0) and the rotating offset read from
+    // SPRITE_CYCLE_ADDR used by `cycle_sprites`.
+    if has_oam {
+        if has_sprite_cycle {
+            out.push(Instruction::new(LDA, AM::Absolute(SPRITE_CYCLE_ADDR)));
+        } else {
+            out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+        }
+        out.push(Instruction::new(STA, AM::Absolute(OAM_ADDR)));
+        out.push(Instruction::new(LDA, AM::Immediate(0x02)));
+        out.push(Instruction::new(STA, AM::Absolute(OAM_DMA)));
     }
-    out.push(Instruction::new(STA, AM::Absolute(OAM_ADDR)));
-    out.push(Instruction::new(LDA, AM::Immediate(0x02)));
-    out.push(Instruction::new(STA, AM::Absolute(OAM_DMA)));
 
     // PPU updates: check the flags byte, apply any pending palette
     // or background write. Runs inside vblank where $2006/$2007
