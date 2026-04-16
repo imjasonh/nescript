@@ -6,6 +6,7 @@
 // Examples:
 //     node record_gif.mjs platformer 360 2 docs/platformer.gif
 //     node record_gif.mjs war 360 2 docs/war.gif 4
+//     node record_gif.mjs pong 360 2 docs/pong.gif 4
 //
 // The recorder drives `harness.html` via puppeteer, collects one
 // canvas frame every `stride` NES frames for `frames` total, and
@@ -20,14 +21,15 @@
 // recording uses 4 instead because that demo opens on its menu and
 // we want the title screen to be the gif's thumbnail.
 //
-// IMPORTANT: `docs/platformer.gif` and `docs/war.gif` are committed
-// and embedded in the README. Any change to the compiler, the
-// runtime, the harness, or the underlying `.ne` source that alters
-// the gameplay you see in the first ~6 seconds of either demo must
-// be followed by
+// IMPORTANT: `docs/platformer.gif`, `docs/war.gif`, and
+// `docs/pong.gif` are committed and embedded in the README. Any
+// change to the compiler, the runtime, the harness, or the
+// underlying `.ne` source that alters the gameplay you see in the
+// first ~6 seconds of any of the three demos must be followed by
 //
 //     node tests/emulator/record_gif.mjs platformer 360 2 docs/platformer.gif
 //     node tests/emulator/record_gif.mjs war        360 2 docs/war.gif        4
+//     node tests/emulator/record_gif.mjs pong       360 2 docs/pong.gif       4
 //
 // committed alongside the source change. The CI `emulator` job
 // regenerates both gifs and fails if the committed copies are stale —

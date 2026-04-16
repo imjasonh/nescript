@@ -22,28 +22,31 @@ re-derive the project conventions from scratch.
   tmp path and fails if the committed version differs, pointing at
   the exact `cargo run -- build examples/<name>.ne` to run. The
   pre-commit hook under `scripts/pre-commit` catches this locally.
-- **`docs/platformer.gif` and `docs/war.gif` are committed** and
-  embedded in the top-level README as the project demos. `gifenc` +
-  `jsnes` are deterministic, so each gif's bytes are a function of
-  the compiler, the runtime, the harness, and the underlying `.ne`
-  source(s). Any change to those that affects the first ~6 seconds
-  of observable gameplay must be followed by regenerating the
-  affected gif:
+- **`docs/platformer.gif`, `docs/war.gif`, and `docs/pong.gif` are
+  committed** and embedded in the top-level README as the project
+  demos. `gifenc` + `jsnes` are deterministic, so each gif's bytes
+  are a function of the compiler, the runtime, the harness, and
+  the underlying `.ne` source(s). Any change to those that affects
+  the first ~6 seconds of observable gameplay must be followed by
+  regenerating the affected gif:
 
   ```bash
   node tests/emulator/record_gif.mjs platformer 360 2 docs/platformer.gif
   node tests/emulator/record_gif.mjs war        360 2 docs/war.gif        4
+  node tests/emulator/record_gif.mjs pong       360 2 docs/pong.gif       4
   ```
 
-  (The trailing `4` on the war command is the warmup-frames
-  override — war's title menu is the gif thumbnail, so we don't
-  skip past it the way the platformer recording does.) Commit the
-  regenerated gif in the same change. CI's `emulator` job renders
-  fresh gifs and fails if either committed copy doesn't byte-match.
-  The pre-commit hook rebuilds whichever gif is affected when
-  `platformer.ne`, `platformer.nes`, any file under `examples/war/`,
-  `war.ne`, `war.nes`, `record_gif.mjs`, or `harness.html` is
-  staged (and `tests/emulator/node_modules` is installed).
+  (The trailing `4` on the war and pong commands is the
+  warmup-frames override — both open on a title menu that we want
+  as the gif thumbnail, so we don't skip past it the way the
+  platformer recording does.) Commit the regenerated gif in the
+  same change. CI's `emulator` job renders fresh gifs and fails if
+  any committed copy doesn't byte-match. The pre-commit hook
+  rebuilds whichever gif is affected when `platformer.ne`,
+  `platformer.nes`, any file under `examples/war/`, `war.ne`,
+  `war.nes`, any file under `examples/pong/`, `pong.ne`,
+  `pong.nes`, `record_gif.mjs`, or `harness.html` is staged (and
+  `tests/emulator/node_modules` is installed).
 - `docs/future-work.md` lists the remaining gaps. If you implement
   something from that file, update the doc in the same PR.
 

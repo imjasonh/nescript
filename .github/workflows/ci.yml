@@ -176,6 +176,19 @@ jobs:
             echo "::error file=docs/war.gif::committed docs/war.gif is stale; rerun \`node tests/emulator/record_gif.mjs war 360 2 docs/war.gif 4\` and commit the new gif"
             exit 1
           fi
+      - name: Verify docs/pong.gif is up to date
+        # Same contract as the platformer and war gifs: the README
+        # embeds docs/pong.gif as the third project demo. Pong's
+        # title screen (CPU VS CPU / 1 PLAYER / 2 PLAYERS menu) is
+        # the gif thumbnail, so warmup = 4 keeps it in frame before
+        # the autopilot advances to gameplay.
+        working-directory: tests/emulator
+        run: |
+          node record_gif.mjs pong 360 2 /tmp/pong.gif 4
+          if ! cmp -s ../../docs/pong.gif /tmp/pong.gif; then
+            echo "::error file=docs/pong.gif::committed docs/pong.gif is stale; rerun \`node tests/emulator/record_gif.mjs pong 360 2 docs/pong.gif 4\` and commit the new gif"
+            exit 1
+          fi
       - name: Upload actual + diff PNGs on failure
         if: failure()
         uses: actions/upload-artifact@v4

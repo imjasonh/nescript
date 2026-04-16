@@ -86,4 +86,9 @@ if [ $recorder_or_harness_changed -eq 1 ] || \
     check_gif war 4 || exit 1
 fi
 
+if [ $recorder_or_harness_changed -eq 1 ] || \
+   echo "$changed_files" | grep -qE '^examples/pong(\.(ne|nes)|/[^/]+\.ne)$'; then
+    check_gif pong 4 || exit 1
+fi
+
 echo "All pre-commit checks passed."
