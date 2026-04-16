@@ -109,13 +109,44 @@ fn nmi_skips_oam_dma_by_default() {
 }
 
 #[test]
-fn nmi_reads_controller() {
-    let nmi = gen_nmi(NmiOptions::default());
+fn nmi_reads_controller_when_p1_requested() {
+    let nmi = gen_nmi(NmiOptions {
+        has_p1_input: true,
+        ..NmiOptions::default()
+    });
     // Should write strobe to $4016
     let has_strobe = nmi
         .iter()
         .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4016));
-    assert!(has_strobe, "NMI should strobe controller");
+    assert!(has_strobe, "NMI should strobe controller when P1 requested");
+    let reads_joy1 = nmi
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::Absolute(0x4016));
+    assert!(reads_joy1, "NMI should read JOY1 when P1 requested");
+}
+
+#[test]
+fn nmi_skips_strobe_when_no_input() {
+    // With both `has_p1_input` and `has_p2_input` unset, the NMI
+    // should emit neither the strobe write to $4016 nor any reads
+    // from the two controller ports — programs that never touch
+    // `button.*` pay zero cycles for input sampling.
+    let nmi = gen_nmi(NmiOptions::default());
+    let has_strobe = nmi
+        .iter()
+        .any(|i| i.opcode == STA && i.mode == AM::Absolute(0x4016));
+    assert!(
+        !has_strobe,
+        "NMI must not strobe controllers when no input is requested"
+    );
+    let reads_joy1 = nmi
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::Absolute(0x4016));
+    let reads_joy2 = nmi
+        .iter()
+        .any(|i| i.opcode == LDA && i.mode == AM::Absolute(0x4017));
+    assert!(!reads_joy1, "NMI must not read JOY1 without P1 input");
+    assert!(!reads_joy2, "NMI must not read JOY2 without P2 input");
 }
 
 #[test]

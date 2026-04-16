@@ -392,6 +392,23 @@ pub struct NmiOptions {
     /// cycles per frame (a `LDA abs`, an `LSR A`, and a `ROL zp`
     /// running 8 times).
     pub has_p2_input: bool,
+    /// When false, drop the three instructions that shift `$4016`
+    /// (JOY1) into `ZP_INPUT_P1`. If both `has_p1_input` and
+    /// `has_p2_input` are false the whole strobe-and-loop block
+    /// disappears — programs that never touch `button.*` pay
+    /// zero cycles for input sampling.
+    pub has_p1_input: bool,
+}
+
+impl NmiOptions {
+    /// Whether the program reads any controller input — the
+    /// necessary condition for emitting the strobe write to
+    /// `$4016` and the 8-iteration shift loop. Skipped entirely
+    /// when both ports are unused.
+    #[must_use]
+    pub fn any_input(&self) -> bool {
+        self.has_p1_input || self.has_p2_input
+    }
 }
 
 #[must_use]
@@ -403,6 +420,7 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
         has_sprite_cycle,
         has_oam,
         has_p2_input,
+        has_p1_input,
     } = opts;
     let mut out = Vec::new();
 
@@ -506,32 +524,40 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
         out.extend(gen_ppu_update_apply());
     }
 
-    // Read controller 1
-    out.push(Instruction::new(LDA, AM::Immediate(0x01)));
-    out.push(Instruction::new(STA, AM::Absolute(JOY1)));
-    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
-    out.push(Instruction::new(STA, AM::Absolute(JOY1)));
+    // Controller sampling. The strobe write to $4016 latches both
+    // controller ports on the same clock, so the 8-iteration shift
+    // loop that follows can read whichever of the two the program
+    // actually uses. Programs that touch no `button.*` at all skip
+    // the whole block.
+    if has_p1_input || has_p2_input {
+        // Strobe: write 1 then 0 to $4016 so both port latches
+        // capture the current button state.
+        out.push(Instruction::new(LDA, AM::Immediate(0x01)));
+        out.push(Instruction::new(STA, AM::Absolute(JOY1)));
+        out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+        out.push(Instruction::new(STA, AM::Absolute(JOY1)));
 
-    // Read 8 button bits from controller 1 ($4016) into ZP_INPUT_P1
-    // — and, when `has_p2_input` is set, 8 bits from controller 2
-    // ($4017) into ZP_INPUT_P2 in the same loop. Single-player
-    // programs drop the three P2 instructions (LDA abs, LSR A, ROL
-    // zp) and shave ~6 bytes plus ~30 cycles/frame off the NMI.
-    out.push(Instruction::new(LDX, AM::Immediate(0x08)));
-    out.push(Instruction::new(NOP, AM::Label("__read_input".into())));
-    out.push(Instruction::new(LDA, AM::Absolute(JOY1)));
-    out.push(Instruction::new(LSR, AM::Accumulator));
-    out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P1)));
-    if has_p2_input {
-        out.push(Instruction::new(LDA, AM::Absolute(0x4017))); // JOY2
-        out.push(Instruction::new(LSR, AM::Accumulator));
-        out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P2)));
+        // 8 iterations of read-and-shift. Each active port costs
+        // three instructions (LDA abs, LSR A, ROL zp) inside the
+        // loop; inactive ports emit nothing.
+        out.push(Instruction::new(LDX, AM::Immediate(0x08)));
+        out.push(Instruction::new(NOP, AM::Label("__read_input".into())));
+        if has_p1_input {
+            out.push(Instruction::new(LDA, AM::Absolute(JOY1)));
+            out.push(Instruction::new(LSR, AM::Accumulator));
+            out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P1)));
+        }
+        if has_p2_input {
+            out.push(Instruction::new(LDA, AM::Absolute(0x4017))); // JOY2
+            out.push(Instruction::new(LSR, AM::Accumulator));
+            out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P2)));
+        }
+        out.push(Instruction::implied(DEX));
+        out.push(Instruction::new(
+            BNE,
+            AM::LabelRelative("__read_input".into()),
+        ));
     }
-    out.push(Instruction::implied(DEX));
-    out.push(Instruction::new(
-        BNE,
-        AM::LabelRelative("__read_input".into()),
-    ));
 
     // Debug frame-overrun check. The frame flag is "set on NMI,
     // cleared by wait_frame". If we see it set at the top of a
