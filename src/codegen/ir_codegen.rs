@@ -196,6 +196,18 @@ pub struct IrCodeGen<'a> {
     /// `false` and reclaim the 16 CHR bytes of tile 0 as a blank
     /// background tile.
     default_sprite_used: bool,
+    /// Set to true the first time we lower an `IrOp::ReadInput`
+    /// targeting player 1. Drives the `__p1_input_used` marker
+    /// label — the runtime's NMI skips the three instructions that
+    /// shift `$4016` into `ZP_INPUT_P1` when nobody reads the
+    /// player-1 byte.
+    p1_input_used: bool,
+    /// Set to true the first time we lower an `IrOp::ReadInput`
+    /// targeting player 2. Drives the `__p2_input_used` marker
+    /// label — single-player programs skip the `$4017` read inside
+    /// the NMI's shift loop, saving ~6 bytes of code and ~30 cycles
+    /// per frame.
+    p2_input_used: bool,
     /// Source-location markers produced from [`IrOp::SourceLoc`].
     /// Each entry is a `(label_name, span)` pair — the codegen
     /// emits a unique label-definition pseudo-op at the current
@@ -377,6 +389,8 @@ impl<'a> IrCodeGen<'a> {
             div_used: false,
             oam_used: false,
             default_sprite_used: false,
+            p1_input_used: false,
+            p2_input_used: false,
             source_locs: Vec::new(),
             next_source_loc: 0,
             emit_source_locs: false,
@@ -1490,6 +1504,16 @@ impl<'a> IrCodeGen<'a> {
                 self.emit(INC, AM::ZeroPage(ZP_OAM_CURSOR));
             }
             IrOp::ReadInput(dest, player) => {
+                // Drop the per-player input marker so the linker
+                // can decide whether to keep that port's shift
+                // block inside NMI. IR uses `player_index` 0 = P1
+                // and 1 = P2; the ZP bytes the NMI populates match
+                // the constants at the top of `runtime/mod.rs`.
+                if *player == 1 {
+                    self.emit_p2_input_marker();
+                } else {
+                    self.emit_p1_input_marker();
+                }
                 // $01 = P1 input byte, $08 = P2 input byte
                 let addr = if *player == 1 { 0x08 } else { 0x01 };
                 self.emit(LDA, AM::ZeroPage(addr));
@@ -2138,6 +2162,28 @@ impl<'a> IrCodeGen<'a> {
         if !self.default_sprite_used {
             self.emit_label("__default_sprite_used");
             self.default_sprite_used = true;
+        }
+    }
+
+    /// Emit the `__p1_input_used` marker label at most once per
+    /// program. Triggered by `IrOp::ReadInput` with `player == 0`.
+    /// Programs that never read controller 1 skip the three NMI
+    /// instructions that shift `$4016` into `ZP_INPUT_P1`.
+    fn emit_p1_input_marker(&mut self) {
+        if !self.p1_input_used {
+            self.emit_label("__p1_input_used");
+            self.p1_input_used = true;
+        }
+    }
+
+    /// Emit the `__p2_input_used` marker label at most once per
+    /// program. Triggered by `IrOp::ReadInput` with `player == 1`.
+    /// Single-player programs skip the three NMI instructions that
+    /// shift `$4017` into `ZP_INPUT_P2`.
+    fn emit_p2_input_marker(&mut self) {
+        if !self.p2_input_used {
+            self.emit_label("__p2_input_used");
+            self.p2_input_used = true;
         }
     }
 

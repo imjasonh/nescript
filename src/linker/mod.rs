@@ -662,12 +662,14 @@ impl Linker {
         // every frame" hardware symptom into visible flicker that
         // the eye reconstructs across frames.
         let has_sprite_cycle = has_label(user_code, "__sprite_cycle_used");
+        let has_p2_input = has_label(user_code, "__p2_input_used");
         all_instructions.extend(runtime::gen_nmi(runtime::NmiOptions {
             has_ppu_updates,
             has_audio,
             debug_mode,
             has_sprite_cycle,
             has_oam,
+            has_p2_input,
         }));
 
         // IRQ handler

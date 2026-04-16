@@ -386,6 +386,12 @@ pub struct NmiOptions {
     /// so the DMA is ~520 wasted cycles per NMI. Skipping it saves
     /// those cycles plus 9 bytes of NMI code.
     pub has_oam: bool,
+    /// When false, drop the three instructions that shift `$4017`
+    /// (JOY2) into `ZP_INPUT_P2` from the NMI's 8-iteration input
+    /// loop. Single-player programs save ~6 bytes of code and ~30
+    /// cycles per frame (a `LDA abs`, an `LSR A`, and a `ROL zp`
+    /// running 8 times).
+    pub has_p2_input: bool,
 }
 
 #[must_use]
@@ -396,6 +402,7 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
         debug_mode,
         has_sprite_cycle,
         has_oam,
+        has_p2_input,
     } = opts;
     let mut out = Vec::new();
 
@@ -506,16 +513,20 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
     out.push(Instruction::new(STA, AM::Absolute(JOY1)));
 
     // Read 8 button bits from controller 1 ($4016) into ZP_INPUT_P1
-    // and 8 button bits from controller 2 ($4017) into ZP_INPUT_P2
-    // simultaneously — shift each port's carry into its ZP byte.
+    // — and, when `has_p2_input` is set, 8 bits from controller 2
+    // ($4017) into ZP_INPUT_P2 in the same loop. Single-player
+    // programs drop the three P2 instructions (LDA abs, LSR A, ROL
+    // zp) and shave ~6 bytes plus ~30 cycles/frame off the NMI.
     out.push(Instruction::new(LDX, AM::Immediate(0x08)));
     out.push(Instruction::new(NOP, AM::Label("__read_input".into())));
     out.push(Instruction::new(LDA, AM::Absolute(JOY1)));
     out.push(Instruction::new(LSR, AM::Accumulator));
     out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P1)));
-    out.push(Instruction::new(LDA, AM::Absolute(0x4017))); // JOY2
-    out.push(Instruction::new(LSR, AM::Accumulator));
-    out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P2)));
+    if has_p2_input {
+        out.push(Instruction::new(LDA, AM::Absolute(0x4017))); // JOY2
+        out.push(Instruction::new(LSR, AM::Accumulator));
+        out.push(Instruction::new(ROL, AM::ZeroPage(ZP_INPUT_P2)));
+    }
     out.push(Instruction::implied(DEX));
     out.push(Instruction::new(
         BNE,
