@@ -2129,6 +2129,22 @@ fn compile_with_debug_artifacts(source: &str, debug: bool) -> (Vec<u8>, String, 
     (out.rom, mlb, map)
 }
 
+/// Parse a single `key=value` out of a ca65 `.dbg` record. Records
+/// are tab-separated kind/fields (`span\tid=0,seg=0,start=...`),
+/// so we strip the leading kind and then scan the comma-separated
+/// body for the requested key.
+fn dbg_field<'a>(rec: &'a str, key: &str) -> Option<&'a str> {
+    let (_, body) = rec.split_once('\t')?;
+    for kv in body.split(',') {
+        if let Some(rest) = kv.strip_prefix(key) {
+            if let Some(v) = rest.strip_prefix('=') {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
 #[test]
 fn symbol_export_lists_user_functions_states_and_vars() {
     // Compile a small program that exercises the symbol-export
@@ -2185,6 +2201,100 @@ fn symbol_export_lists_user_functions_states_and_vars() {
             "P: offset {offset:#06X} should be inside the 16 KB fixed bank"
         );
     }
+}
+
+#[test]
+fn dbg_file_reflects_source_lines_symbols_and_segment() {
+    // End-to-end check that `render_dbg` stitches together the
+    // linker's label table, the IR codegen's source-loc markers,
+    // and the analyzer's variable allocations into a valid ca65
+    // `.dbg` file. Mesen and related debuggers consume this
+    // format; the important invariants are that line records
+    // point into spans, spans point into the CODE segment, and
+    // sym records include user-named functions + variables.
+    use nescript::pipeline::{compile_source, CompileOptions};
+    let source = r#"
+        game "DbgCheck" { mapper: NROM }
+        var score: u8 = 0
+        fun bump() -> u8 { return score + 1 }
+        state Main {
+            on frame {
+                score = bump()
+                wait_frame
+            }
+        }
+        start Main
+    "#;
+    let opts = CompileOptions {
+        debug: false,
+        no_opt: false,
+        emit_source_map: true,
+    };
+    let out = compile_source(source, Path::new("."), &opts).expect("compile");
+    let dbg = nescript::linker::render_dbg(
+        &out.link_result,
+        &out.source_locs,
+        &out.analysis.var_allocations,
+        source,
+        Path::new("dbgcheck.ne"),
+        Path::new("dbgcheck.nes"),
+    );
+
+    // Header + required record kinds.
+    assert!(dbg.starts_with("version\tmajor=2,minor=0\n"));
+    assert!(dbg.lines().any(|l| l.starts_with("info\t")));
+    assert!(dbg.lines().any(|l| l.starts_with("file\tid=0")));
+    assert!(dbg.lines().any(|l| l.starts_with(
+        "seg\tid=0,name=\"CODE\",start=0xC000,size=0x4000,addrsize=absolute,type=ro"
+    )));
+    assert!(dbg.contains("oname=\"dbgcheck.nes\""));
+
+    // Every line record must reference a span that actually exists.
+    let span_ids: std::collections::HashSet<&str> = dbg
+        .lines()
+        .filter(|l| l.starts_with("span\t"))
+        .filter_map(|l| dbg_field(l, "id"))
+        .collect();
+    assert!(
+        !span_ids.is_empty(),
+        "at least one span record should be emitted; got:\n{dbg}"
+    );
+    for line in dbg.lines().filter(|l| l.starts_with("line\t")) {
+        let span_id = dbg_field(line, "span").unwrap_or("");
+        assert!(
+            span_ids.contains(span_id),
+            "line record references unknown span id {span_id}:\n  {line}"
+        );
+    }
+
+    // User function + state handler + variable all appear as syms.
+    assert!(dbg.contains("name=\"bump\""));
+    assert!(dbg.contains("name=\"Main_frame\""));
+    assert!(
+        dbg.contains("name=\"score\",addrsize=zeropage"),
+        "zero-page user var should carry addrsize=zeropage:\n{dbg}"
+    );
+
+    // The info record's counts must match what we emitted.
+    let info_line = dbg
+        .lines()
+        .find(|l| l.starts_with("info\t"))
+        .expect("info record");
+    let span_count = dbg.lines().filter(|l| l.starts_with("span\t")).count();
+    let line_count = dbg.lines().filter(|l| l.starts_with("line\t")).count();
+    let sym_count = dbg.lines().filter(|l| l.starts_with("sym\t")).count();
+    assert!(
+        info_line.contains(&format!("span={span_count}")),
+        "info.span mismatches body:\n  {info_line}"
+    );
+    assert!(
+        info_line.contains(&format!("line={line_count}")),
+        "info.line mismatches body:\n  {info_line}"
+    );
+    assert!(
+        info_line.contains(&format!("sym={sym_count}")),
+        "info.sym mismatches body:\n  {info_line}"
+    );
 }
 
 #[test]

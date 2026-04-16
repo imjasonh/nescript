@@ -148,7 +148,16 @@ writes when `--debug` is passed, and are stripped entirely in release builds.
 state-handler, and variable addresses (with PRG ROM offsets for code and
 CPU addresses for RAM). `--source-map <path>` consumes the `SourceLoc` IR
 op and writes a plain-text map of `<rom_offset> <file_id> <line> <col>`
-entries for every lowered statement. Debug builds emit array bounds checks
+entries for every lowered statement. **`--dbg <path>` writes a
+ca65-compatible `.dbg` debug-info file** that Mesen / Mesen2 / fceuX pick
+up automatically for source-level stepping, labelled variable inspection,
+and symbol-based breakpoints. The file stitches together the linker's
+label table, the `__src_<N>` IR markers, and the analyzer's variable
+allocations into the `file`/`mod`/`seg`/`scope`/`span`/`line`/`sym`
+records documented at
+<https://cc65.github.io/doc/debugfile.html>. `ooffs` on the segment
+record tracks the fixed bank's PRG-relative start, so banked ROMs
+(MMC1/UxROM/MMC3) also map cleanly inside the debugger. Debug builds emit array bounds checks
 (CMP against size, BCC past a `JMP __debug_halt` wedge) and bump an
 overrun counter at `$07FF` in the NMI handler when the main loop didn't
 reach `wait_frame` before the next vblank.
