@@ -2,7 +2,7 @@ mod debug_symbols;
 #[cfg(test)]
 mod tests;
 
-pub use debug_symbols::{render_mlb, render_source_map};
+pub use debug_symbols::{render_dbg, render_mlb, render_source_map};
 
 use std::collections::HashMap;
 

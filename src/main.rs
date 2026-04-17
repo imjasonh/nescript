@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use nescript::analyzer;
 use nescript::assets::{BackgroundData, PaletteData};
 use nescript::errors::render_diagnostics;
-use nescript::linker::{render_mlb, render_source_map, LinkedRom};
+use nescript::linker::{render_dbg, render_mlb, render_source_map, LinkedRom};
 use nescript::pipeline::{compile_source, CompileError, CompileOptions as PipelineOptions};
 
 #[derive(Parser)]
@@ -63,6 +63,16 @@ enum Cli {
         /// reverse-mapping a crash address back to the source.
         #[arg(long, value_name = "PATH")]
         source_map: Option<PathBuf>,
+
+        /// Write a ca65-compatible debug-info file (`.dbg`) next
+        /// to the ROM. The format is the same one `ld65` emits,
+        /// so Mesen / Mesen2 / fceuX pick it up automatically and
+        /// enable source-level stepping, labelled variable
+        /// inspection, and symbol-based breakpoints. Implies
+        /// `--source-map`-style `__src_<N>` marker emission so
+        /// line records have something to point at.
+        #[arg(long, value_name = "PATH")]
+        dbg: Option<PathBuf>,
     },
     /// Type-check a source file without building
     Check {
@@ -86,10 +96,12 @@ fn main() {
             no_opt,
             symbols,
             source_map,
+            dbg,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
             match compile(
                 &input,
+                &output,
                 &CompileOptions {
                     debug,
                     asm_dump,
@@ -99,6 +111,7 @@ fn main() {
                     no_opt,
                     symbols: symbols.clone(),
                     source_map: source_map.clone(),
+                    dbg: dbg.clone(),
                 },
             ) {
                 Ok(rom) => {
@@ -334,9 +347,10 @@ struct CompileOptions {
     no_opt: bool,
     symbols: Option<PathBuf>,
     source_map: Option<PathBuf>,
+    dbg: Option<PathBuf>,
 }
 
-fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
+fn compile(input: &PathBuf, output: &Path, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     // File I/O + preprocessing lives here so the pipeline module
     // itself doesn't need to touch `std::fs`. That keeps the
     // pipeline usable from a future WASM host that routes asset
@@ -356,10 +370,14 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
     // needs a new feature (new flag, new output, whatever), the
     // change lands in `pipeline::compile_source` and every
     // caller picks it up automatically.
+    //
+    // `--dbg` reuses the same `__src_<N>` markers that
+    // `--source-map` emits, so either flag flips on source-loc
+    // emission in the codegen.
     let pipeline_opts = PipelineOptions {
         debug: opts.debug,
         no_opt: opts.no_opt,
-        emit_source_map: opts.source_map.is_some(),
+        emit_source_map: opts.source_map.is_some() || opts.dbg.is_some(),
     };
     let out = compile_source(&source, source_dir, &pipeline_opts).map_err(|e| match e {
         CompileError::Parse(diags) => {
@@ -424,6 +442,19 @@ fn compile(input: &PathBuf, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
         let map = render_source_map(&out.link_result, &out.source_locs, &source);
         std::fs::write(path, map).map_err(|e| {
             eprintln!("error: failed to write source map {}: {e}", path.display());
+        })?;
+    }
+    if let Some(path) = opts.dbg.as_ref() {
+        let dbg = render_dbg(
+            &out.link_result,
+            &out.source_locs,
+            &out.analysis.var_allocations,
+            &source,
+            input,
+            output,
+        );
+        std::fs::write(path, dbg).map_err(|e| {
+            eprintln!("error: failed to write dbg file {}: {e}", path.display());
         })?;
     }
 

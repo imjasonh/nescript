@@ -53,7 +53,7 @@ Each module has a `mod.rs` (implementation) and a co-located `tests.rs` with uni
 `mod.rs`, `opcodes.rs`, `inline_parser.rs`, `tests.rs`. The built-in assembler and the inline-asm parser. `opcodes.rs` defines the 6502 opcode table with addressing modes. `inline_parser.rs` parses the body of `asm { ... }` blocks so codegen can splice real instructions in-line.
 
 ### `linker/`
-`mod.rs`, `tests.rs`. Assigns addresses to code and data segments, resolves label/symbol fixups, lays out banks for banked mappers (MMC1/UxROM/MMC3), and emits the final iNES byte stream via `rom::RomBuilder`.
+`mod.rs`, `debug_symbols.rs`, `tests.rs`. Assigns addresses to code and data segments, resolves label/symbol fixups, lays out banks for banked mappers (MMC1/UxROM/MMC3), and emits the final iNES byte stream via `rom::RomBuilder`. `debug_symbols.rs` owns the three debug-info writers — `render_mlb` (Mesen `.mlb`), `render_source_map` (plain-text ROM→source line map), and `render_dbg` (ca65-compatible `.dbg` debug-info file for Mesen source-level debugging).
 
 ### `rom/`
 `mod.rs`, `tests.rs`. Builds the final iNES ROM file. Generates the 16-byte iNES header and places the NMI/RESET/IRQ vector table.
