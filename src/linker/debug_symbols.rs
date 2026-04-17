@@ -237,10 +237,19 @@ pub fn render_dbg(
 ) -> String {
     let base_cpu_addr: u16 = 0xC000;
     let fixed_bank_size: u32 = 0x4000;
-    // PRG-relative byte offset of the first byte of the fixed bank.
-    // `fixed_bank_file_offset` is measured from the iNES file start;
-    // subtracting the 16-byte header gives the offset Mesen wants.
-    let ooffs: usize = linked.fixed_bank_file_offset.saturating_sub(16);
+    // Output-file byte offset of the first byte of the fixed bank.
+    // `fixed_bank_file_offset` is measured from the iNES file start
+    // (i.e., including the 16-byte iNES header), which is exactly
+    // what ca65's `ooffs=` field wants. Mesen's DbgImporter computes
+    // the final label address as `val - seg.start + ooffs - 16`
+    // (the iNES header size), so passing the header-inclusive file
+    // offset makes labels resolve to PRG-relative byte offsets —
+    // matching the `.mlb` symbol-file convention the rest of the
+    // toolchain uses. An earlier version of this code subtracted 16
+    // here; that shifted every `.dbg` label 16 bytes past its real
+    // PRG offset, which confused Mesen's source-line mapping for
+    // the first few bytes of each function.
+    let ooffs: usize = linked.fixed_bank_file_offset;
 
     // -------- spans + lines from source_locs --------
     //
@@ -546,8 +555,13 @@ mod tests {
         );
         assert!(out.contains("file\tid=0,name=\"demo.ne\""));
         assert!(out.contains("mod\tid=0,name=\"demo\",file=0"));
+        // `ooffs=16` is the NROM case: fixed bank starts right after
+        // the 16-byte iNES header. Mesen applies its own header-size
+        // subtraction when resolving labels, so a raw file offset
+        // here produces PRG-relative label addresses out the other
+        // side — see the `ooffs` assignment in `render_dbg`.
         assert!(out.contains(
-            "seg\tid=0,name=\"CODE\",start=0xC000,size=0x4000,addrsize=absolute,type=ro,oname=\"demo.nes\",ooffs=0"
+            "seg\tid=0,name=\"CODE\",start=0xC000,size=0x4000,addrsize=absolute,type=ro,oname=\"demo.nes\",ooffs=16"
         ));
         assert!(out.contains("scope\tid=0,name=\"\",mod=0,size=0x4000"));
         // Single span: bank offset 16, stretches to end of bank
@@ -636,10 +650,12 @@ mod tests {
     #[test]
     fn dbg_ooffs_reflects_banked_rom_layout() {
         // On UxROM/MMC1 the fixed bank sits past the switchable
-        // banks, so `fixed_bank_file_offset` is post-header
-        // (16 + 16 KB per switchable bank). The segment record's
-        // `ooffs` should use the PRG-relative value so Mesen
-        // locates the fixed bank inside the ROM file correctly.
+        // banks. The segment record's `ooffs` is the fixed bank's
+        // file offset from the iNES header start (i.e., header +
+        // switchable banks), so Mesen locates the fixed bank inside
+        // the ROM file correctly and the header-size subtraction it
+        // applies when resolving labels (see `render_dbg`) still
+        // produces PRG-relative offsets.
         let mut labels = HashMap::new();
         labels.insert("__reset".to_string(), 0xC000);
         let linked = LinkedRom {
@@ -655,8 +671,9 @@ mod tests {
             Path::new("a.ne"),
             Path::new("a.nes"),
         );
+        let expected = 16 + 16_384 * 3; // iNES header + 3 switchable banks
         assert!(
-            out.contains(&format!("ooffs={}", 16_384 * 3)),
+            out.contains(&format!("ooffs={expected}")),
             "banked layout should move ooffs past the switchable banks; got:\n{out}"
         );
     }
