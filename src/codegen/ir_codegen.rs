@@ -290,6 +290,19 @@ impl<'a> IrCodeGen<'a> {
                 var_sizes.insert(global.var_id, alloc.size);
             }
         }
+        // Pick up every *other* allocation the analyzer made that the
+        // IR lowerer synthesized a `VarId` for but didn't push as an
+        // `IrGlobal` — flattened struct fields (`"pos.x"`) are the
+        // biggest class, but this also catches any future synthesized
+        // name. Without this, `pos.x = 100` resolves its `VarId`
+        // against a `var_addrs` that never learned the address, and
+        // the codegen silently drops the write (the PR #31 shape).
+        for alloc in allocations {
+            if let Some(&var_id) = ir.var_map.get(&alloc.name) {
+                var_addrs.entry(var_id).or_insert(alloc.address);
+                var_sizes.entry(var_id).or_insert(alloc.size);
+            }
+        }
         // Map every function-local — parameters AND body-declared
         // vars — into the slot the analyzer already reserved for it.
         // Parameters arrive via the zero-page transport slots
@@ -510,6 +523,22 @@ impl<'a> IrCodeGen<'a> {
             .push(Instruction::new(NOP, AM::Label(name.to_string())));
     }
 
+    /// Resolve a variable's allocated address. Any IR op referencing a
+    /// `VarId` must have been allocated by the analyzer — a miss here
+    /// is a compiler bug, not valid input (this is the shape of the
+    /// state-local silent-drop from PR #31). Crash loudly rather than
+    /// emit zero bytes and let a golden capture the broken behaviour.
+    fn var_addr(&self, var: VarId) -> u16 {
+        *self.var_addrs.get(&var).unwrap_or_else(|| {
+            panic!(
+                "internal compiler error: IR op references {var:?} with no \
+                 allocated address (did the analyzer forget to allocate it, \
+                 or did the IR lowerer synthesize a VarId it didn't register \
+                 as a global/local?)"
+            )
+        })
+    }
+
     /// Return the zero-page address for an IR temp, allocating a new slot
     /// if needed. Recycles slots from `free_slots` (temps whose use
     /// count has hit zero) before growing the monotonic counter, so
@@ -705,11 +734,17 @@ impl<'a> IrCodeGen<'a> {
         // literals write N bytes from `init_array` at successive
         // offsets from the global's base address. Uninitialized
         // globals (neither set) stay at the $00 the RAM-clear left
-        // them.
+        // them — and since struct-literal parents only exist to
+        // parent their expanded field globals, they land here with
+        // no init data and no allocated address (only the fields
+        // have addresses). Skip before calling `var_addr` so we
+        // don't mis-diagnose a legitimate container as a silent
+        // drop.
         for global in &ir.globals {
-            let Some(&base) = self.var_addrs.get(&global.var_id) else {
+            if global.init_array.is_empty() && global.init_value.is_none() {
                 continue;
-            };
+            }
+            let base = self.var_addr(global.var_id);
             if !global.init_array.is_empty() {
                 for (offset, &byte) in global.init_array.iter().enumerate() {
                     let addr = base.wrapping_add(offset as u16);
@@ -976,13 +1011,12 @@ impl<'a> IrCodeGen<'a> {
                 .take(4)
                 .enumerate()
             {
-                if let Some(&addr) = self.var_addrs.get(&local.var_id) {
-                    self.emit(LDA, AM::ZeroPage(0x04 + i as u8));
-                    if addr < 0x100 {
-                        self.emit(STA, AM::ZeroPage(addr as u8));
-                    } else {
-                        self.emit(STA, AM::Absolute(addr));
-                    }
+                let addr = self.var_addr(local.var_id);
+                self.emit(LDA, AM::ZeroPage(0x04 + i as u8));
+                if addr < 0x100 {
+                    self.emit(STA, AM::ZeroPage(addr as u8));
+                } else {
+                    self.emit(STA, AM::Absolute(addr));
                 }
             }
         }
@@ -1203,23 +1237,21 @@ impl<'a> IrCodeGen<'a> {
                 self.store_temp(*dest);
             }
             IrOp::LoadVar(dest, var) => {
-                if let Some(&addr) = self.var_addrs.get(var) {
-                    if addr < 0x100 {
-                        self.emit(LDA, AM::ZeroPage(addr as u8));
-                    } else {
-                        self.emit(LDA, AM::Absolute(addr));
-                    }
-                    self.store_temp(*dest);
+                let addr = self.var_addr(*var);
+                if addr < 0x100 {
+                    self.emit(LDA, AM::ZeroPage(addr as u8));
+                } else {
+                    self.emit(LDA, AM::Absolute(addr));
                 }
+                self.store_temp(*dest);
             }
             IrOp::StoreVar(var, src) => {
-                if let Some(&addr) = self.var_addrs.get(var) {
-                    self.load_temp(*src);
-                    if addr < 0x100 {
-                        self.emit(STA, AM::ZeroPage(addr as u8));
-                    } else {
-                        self.emit(STA, AM::Absolute(addr));
-                    }
+                let addr = self.var_addr(*var);
+                self.load_temp(*src);
+                if addr < 0x100 {
+                    self.emit(STA, AM::ZeroPage(addr as u8));
+                } else {
+                    self.emit(STA, AM::Absolute(addr));
                 }
             }
             IrOp::Add(d, a, b) => {
@@ -1340,29 +1372,27 @@ impl<'a> IrCodeGen<'a> {
             IrOp::CmpLtEq(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::LtEq),
             IrOp::CmpGtEq(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::GtEq),
             IrOp::ArrayLoad(dest, var, idx) => {
-                if let Some(&base_addr) = self.var_addrs.get(var) {
-                    self.load_temp(*idx);
-                    self.emit_bounds_check(*var);
-                    self.emit(TAX, AM::Implied);
-                    if base_addr < 0x100 {
-                        self.emit(LDA, AM::ZeroPageX(base_addr as u8));
-                    } else {
-                        self.emit(LDA, AM::AbsoluteX(base_addr));
-                    }
-                    self.store_temp(*dest);
+                let base_addr = self.var_addr(*var);
+                self.load_temp(*idx);
+                self.emit_bounds_check(*var);
+                self.emit(TAX, AM::Implied);
+                if base_addr < 0x100 {
+                    self.emit(LDA, AM::ZeroPageX(base_addr as u8));
+                } else {
+                    self.emit(LDA, AM::AbsoluteX(base_addr));
                 }
+                self.store_temp(*dest);
             }
             IrOp::ArrayStore(var, idx, val) => {
-                if let Some(&base_addr) = self.var_addrs.get(var) {
-                    self.load_temp(*idx);
-                    self.emit_bounds_check(*var);
-                    self.emit(TAX, AM::Implied);
-                    self.load_temp(*val);
-                    if base_addr < 0x100 {
-                        self.emit(STA, AM::ZeroPageX(base_addr as u8));
-                    } else {
-                        self.emit(STA, AM::AbsoluteX(base_addr));
-                    }
+                let base_addr = self.var_addr(*var);
+                self.load_temp(*idx);
+                self.emit_bounds_check(*var);
+                self.emit(TAX, AM::Implied);
+                self.load_temp(*val);
+                if base_addr < 0x100 {
+                    self.emit(STA, AM::ZeroPageX(base_addr as u8));
+                } else {
+                    self.emit(STA, AM::AbsoluteX(base_addr));
                 }
             }
             IrOp::Call(dest, name, args) => {
@@ -1691,25 +1721,23 @@ impl<'a> IrCodeGen<'a> {
             IrOp::SetPalette(name) => self.gen_set_palette(name),
             IrOp::LoadBackground(name) => self.gen_load_background(name),
             IrOp::LoadVarHi(dest, var) => {
-                if let Some(&base) = self.var_addrs.get(var) {
-                    let addr = base.wrapping_add(1);
-                    if addr < 0x100 {
-                        self.emit(LDA, AM::ZeroPage(addr as u8));
-                    } else {
-                        self.emit(LDA, AM::Absolute(addr));
-                    }
-                    self.store_temp(*dest);
+                let base = self.var_addr(*var);
+                let addr = base.wrapping_add(1);
+                if addr < 0x100 {
+                    self.emit(LDA, AM::ZeroPage(addr as u8));
+                } else {
+                    self.emit(LDA, AM::Absolute(addr));
                 }
+                self.store_temp(*dest);
             }
             IrOp::StoreVarHi(var, src) => {
-                if let Some(&base) = self.var_addrs.get(var) {
-                    let addr = base.wrapping_add(1);
-                    self.load_temp(*src);
-                    if addr < 0x100 {
-                        self.emit(STA, AM::ZeroPage(addr as u8));
-                    } else {
-                        self.emit(STA, AM::Absolute(addr));
-                    }
+                let base = self.var_addr(*var);
+                let addr = base.wrapping_add(1);
+                self.load_temp(*src);
+                if addr < 0x100 {
+                    self.emit(STA, AM::ZeroPage(addr as u8));
+                } else {
+                    self.emit(STA, AM::Absolute(addr));
                 }
             }
             IrOp::Add16 {

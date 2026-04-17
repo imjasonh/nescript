@@ -22,6 +22,7 @@ fn make_program(ops: Vec<IrOp>, terminator: IrTerminator) -> IrProgram {
         rom_data: vec![],
         states: vec![],
         start_state: String::new(),
+        var_map: std::collections::HashMap::new(),
     }
 }
 
@@ -420,6 +421,7 @@ fn inline_removes_trivial() {
         rom_data: vec![],
         states: vec![],
         start_state: String::new(),
+        var_map: std::collections::HashMap::new(),
     };
 
     inline_small_functions(&mut prog);
@@ -502,6 +504,7 @@ fn const_fold_preserves_loadimm_used_by_sibling_branch() {
         rom_data: vec![],
         states: vec![],
         start_state: String::new(),
+        var_map: std::collections::HashMap::new(),
     };
 
     optimize(&mut prog);

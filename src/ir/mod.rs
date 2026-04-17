@@ -37,6 +37,15 @@ pub struct IrProgram {
     pub states: Vec<String>,
     /// Name of the initial state when the ROM boots.
     pub start_state: String,
+    /// Name → `VarId` for every variable the lowerer synthesized,
+    /// including flattened struct fields (`"pos.x"`), function-scoped
+    /// locals, and state-local variables. The codegen joins this with
+    /// the analyzer's `var_allocations` list to populate `var_addrs`
+    /// for every allocated byte — without it, assignments to
+    /// synthesized field names (e.g. `pos.x = 100`) silently emit no
+    /// code because the field's `VarId` never lands in the address
+    /// map. This is the PR #31 state-local bug generalized.
+    pub var_map: std::collections::HashMap<String, VarId>,
 }
 
 /// A global variable in the IR.

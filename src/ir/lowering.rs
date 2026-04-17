@@ -534,6 +534,7 @@ impl LoweringContext {
             rom_data: self.rom_data,
             states: self.state_names,
             start_state: self.start_state,
+            var_map: self.var_map,
         }
     }
 

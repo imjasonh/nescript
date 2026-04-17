@@ -336,6 +336,49 @@ fn program_with_u16_struct_field() {
 }
 
 #[test]
+fn uninitialized_struct_field_store_emits_sta_to_allocated_address() {
+    // Regression guard for the silent-drop bug uncovered while
+    // hardening the `var_addrs` lookup in `IrCodeGen`. Before the
+    // fix, field `VarId`s synthesized by the IR lowerer (e.g.
+    // `"pos.x"`) were only registered in `var_addrs` when their
+    // parent struct global had a literal initializer. An
+    // uninitialized `var pos: Point` produced no field globals, so
+    // `pos.x = 100` emitted `IrOp::StoreVar(VarId(for pos.x), ...)`
+    // — and the codegen's `if let Some(&addr) = var_addrs.get(..)`
+    // guard skipped it, silently dropping the write with no
+    // diagnostic.
+    //
+    // We verify by compiling a program whose entire frame handler
+    // is a write with a distinctive immediate constant, then
+    // search the PRG for the corresponding `LDA #$7B ; STA zp/abs`
+    // pair. `123 = $7B` is chosen because it can't appear as an
+    // incidental constant in the runtime prelude.
+    let source = r#"
+        game "StructStore" { mapper: NROM }
+        struct Point { x: u8, y: u8 }
+        var p: Point
+        on frame {
+            p.x = 123
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    let prg = &rom_data[16..16 + 16384];
+    let mut found = false;
+    for i in 0..prg.len().saturating_sub(3) {
+        if prg[i] == 0xA9 && prg[i + 1] == 0x7B && (prg[i + 2] == 0x85 || prg[i + 2] == 0x8D) {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "expected an LDA #$7B / STA <addr> pair for `p.x = 123` — if this \
+         fails, struct-field writes are being silently dropped again"
+    );
+}
+
+#[test]
 fn u16_struct_field_initializer_writes_both_bytes_to_rom() {
     // Struct literal initializer with a u16 field > 255 — the
     // compiler runs the global-init path at reset time, which
