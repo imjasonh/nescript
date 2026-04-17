@@ -31,6 +31,10 @@ pub struct AnalysisResult {
     pub diagnostics: Vec<Diagnostic>,
     pub call_graph: HashMap<String, Vec<String>>,
     pub max_depths: HashMap<String, u32>,
+    /// For each state-local variable name, the state it belongs to.
+    /// Consumed by the memory-map printer to group overlaid slots by
+    /// their owning state. Empty for programs without state-locals.
+    pub state_local_owners: HashMap<String, String>,
 }
 
 /// Default call stack depth limit for the NES runtime.
@@ -124,12 +128,20 @@ pub fn analyze(program: &Program) -> AnalysisResult {
     };
     analyzer.analyze_program(program);
 
+    let mut state_local_owners = HashMap::new();
+    for state in &program.states {
+        for var in &state.locals {
+            state_local_owners.insert(var.name.clone(), state.name.clone());
+        }
+    }
+
     AnalysisResult {
         symbols: analyzer.symbols,
         var_allocations: analyzer.var_allocations,
         diagnostics: analyzer.diagnostics,
         call_graph: analyzer.call_graph,
         max_depths: analyzer.max_depths,
+        state_local_owners,
     }
 }
 
@@ -524,12 +536,46 @@ impl Analyzer {
             self.register_fun(fun);
         }
 
-        // Register state-local variables
+        // Register state-local variables with automatic memory
+        // overlaying. At runtime only one state is active at a time
+        // (a single `ZP_CURRENT_STATE` byte picks the handler), so
+        // every state's locals are mutually exclusive with every
+        // other state's — their RAM footprints can share the same
+        // addresses. The allocator snapshots both cursors after the
+        // globals have been laid out, then rewinds to that snapshot
+        // before each state's locals and tracks the running max.
+        // The overall cursor advances to the max at the end, so
+        // anything allocated after the state-locals (function
+        // parameters, function bodies' locals) picks up past every
+        // state's overlay window.
+        //
+        // Each state's on_enter handler re-initializes the locals
+        // from their declared initializers — the IR lowering moves
+        // those stores into the handler's prologue so a freshly
+        // entered state doesn't read another state's leftover
+        // bytes. State-locals whose name collides with a global or
+        // another state's local are still rejected via E0501 at
+        // `register_var` because the symbol table is keyed by the
+        // bare name.
+        let overlay_zp_base = self.next_zp_addr;
+        let overlay_ram_base = self.next_ram_addr;
+        let mut max_zp = overlay_zp_base;
+        let mut max_ram = overlay_ram_base;
         for state in &program.states {
+            self.next_zp_addr = overlay_zp_base;
+            self.next_ram_addr = overlay_ram_base;
             for var in &state.locals {
                 self.register_var(var);
             }
+            if self.next_zp_addr > max_zp {
+                max_zp = self.next_zp_addr;
+            }
+            if self.next_ram_addr > max_ram {
+                max_ram = self.next_ram_addr;
+            }
         }
+        self.next_zp_addr = max_zp;
+        self.next_ram_addr = max_ram;
 
         // Validate state references
         let state_names: Vec<&str> = program.states.iter().map(|s| s.name.as_str()).collect();

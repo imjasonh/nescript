@@ -23,12 +23,7 @@ const COIN_X: u8 = 180
 const COIN_Y: u8 = 100
 
 // Global variables
-var player_x: u8 = 40
-var player_y: u8 = 200
-var player_vy: u8 = 0
-var on_ground: u8 = 1
 var score: u8 = 0
-var coins_left: u8 = 3
 
 // Helper function: clamp a value to screen bounds
 fun clamp_x(val: u8) -> u8 {
@@ -53,11 +48,20 @@ state Title {
 
 // Main gameplay state
 state Playing {
+    // Physics and position live with the state: they're only
+    // meaningful while Playing is active, and the analyzer
+    // overlays them with the locals of the Title and GameOver
+    // states so the idle scenes don't reserve bytes they never
+    // touch. Initializers re-run on every entry, so dying and
+    // retrying starts the player back on the ground.
+    var player_x: u8 = 40
+    var player_y: u8 = 200
+    var player_vy: u8 = 0
+    var on_ground: u8 = 1
+    var coins_left: u8 = 3
+
     on enter {
-        player_x = 40
-        player_y = 200
         score = 0
-        coins_left = 3
     }
 
     on frame {

@@ -367,21 +367,17 @@ const AUTOPILOT_JUMPS: u8 = 2
 
 // ── Game state ──────────────────────────────────────────────
 
-// Player physics
-var player_y:   u8 = 160
-var on_ground:  u8 = 1
-var rise_count: u8 = 0     // frames of upward motion remaining
-var fall_vy:    u8 = 0     // gravity accumulator
+// `frame_tick` is shared: Title reads it to auto-advance, Playing
+// reads it for animation phasing. `stomp_count` bridges
+// Playing → GameOver so the death screen can tally coins. The
+// rest — player physics, camera, liveness, autopilot budget —
+// are only meaningful while Playing is running, so they live on
+// Playing's state block and overlay with the Title / GameOver
+// locals (`blink`, `linger`) at the same bytes.
 
-// World/camera
-var camera_x:   u8 = 0
+// Cross-state scratch
 var frame_tick: u8 = 0     // free-running frame counter
-var anim_tick:  u8 = 0     // visual animation phase
-
-// Gameplay
-var alive:       u8 = 1    // 0 = dying/dead, 1 = playable
 var stomp_count: u8 = 0    // successful enemy stomps this life
-var auto_jumps:  u8 = 0    // proximity pre-jumps used this life
 
 // ── Helper functions ────────────────────────────────────────
 
@@ -520,17 +516,24 @@ state Title {
 }
 
 state Playing {
+    // Physics, camera, liveness, and autopilot budget — all of
+    // this is Playing-only. Declaring them inside the state block
+    // lets the analyzer overlay them with Title.blink and
+    // GameOver.linger; each variable's initializer re-runs on
+    // entry, so the retry loop starts each life on the ground
+    // with a fresh autopilot budget without any manual reset.
+    var player_y:   u8 = GROUND_Y
+    var on_ground:  u8 = 1
+    var rise_count: u8 = 0
+    var fall_vy:    u8 = 0
+    var camera_x:   u8 = 0
+    var anim_tick:  u8 = 0
+    var alive:      u8 = 1
+    var auto_jumps: u8 = 0
+
     on enter {
-        player_y = GROUND_Y
-        on_ground = 1
-        rise_count = 0
-        fall_vy = 0
-        camera_x = 0
         frame_tick = 0
-        anim_tick = 0
-        alive = 1
         stomp_count = 0
-        auto_jumps = 0
         start_music Theme
     }
 

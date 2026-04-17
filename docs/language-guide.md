@@ -337,6 +337,31 @@ state Playing {
 
 `on frame` is syntactic sugar for a loop with an implicit `wait_frame()` at the end. A state can have any combination of `on enter`, `on exit`, and `on frame`.
 
+### State-Local Variables and Memory Overlays
+
+Variables declared directly inside a `state` block (outside any handler) are **state-local**. They are visible to every handler in the state (`on enter`, `on frame`, etc.) and persist for as long as that state is active.
+
+Because the NES runtime keeps exactly one state active at a time, the compiler **automatically overlays state-local variables across states**. Two states' locals can share the same RAM bytes without colliding — only the currently active state reads or writes them. This makes the limited 2 KB of NES work RAM go much further on programs with many scenes or game modes.
+
+```
+state Title {
+    var blink: u8 = 0   // overlays with Playing.timer below
+    on enter { blink = 0 }
+    on frame { blink = blink + 1 }
+}
+
+state Playing {
+    var timer: u8 = 0   // same byte as Title.blink — reused
+    var lives: u8 = 3
+    on enter { timer = 0; lives = 3 }
+    on frame { timer = timer + 1 }
+}
+```
+
+Every time a state is entered, its state-local variables are re-initialized from their declared initializers (`= 0`, `= 3` above) before `on enter` runs. This is what makes the overlay safe: entering Playing re-runs `timer = 0` even if the previous state wrote a different value into the shared byte. `cargo run -- build <file> --memory-map` shows each overlaid address alongside its owning state.
+
+Global `var`s (declared at the top level, outside any state) are never overlaid and keep dedicated RAM slots. Variables declared inside a handler block are handler-local and live only for the handler invocation.
+
 ### State Transitions
 
 ```

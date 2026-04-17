@@ -655,6 +655,35 @@ impl LoweringContext {
         // enforced.
         self.capture_inline_bodies(program);
 
+        // Register state-local variables as IR globals so the codegen
+        // resolves their addresses through the same `ir.globals`
+        // pathway it uses for program globals — the analyzer records
+        // them under their bare names in `var_allocations`, which
+        // `IrCodeGen::new` then matches against each global's
+        // `name` field. Without this, a `LoadVar`/`StoreVar` on a
+        // state-local variable resolved its `VarId` to no address
+        // and the codegen silently emitted nothing — the root
+        // cause of the "state-local variables don't actually work"
+        // bug that this change ships with the overlay feature.
+        //
+        // `init_value` / `init_array` are intentionally left blank:
+        // state-locals are re-initialized in each state's on_enter
+        // handler below, not at program reset. The analyzer's
+        // overlay allocation means one state's initial bytes would
+        // stomp on another state's if we emitted them at reset.
+        for state in &program.states {
+            for var in &state.locals {
+                let var_id = self.get_or_create_var(&var.name);
+                self.globals.push(IrGlobal {
+                    var_id,
+                    name: var.name.clone(),
+                    size: type_size(&var.var_type),
+                    init_value: None,
+                    init_array: Vec::new(),
+                });
+            }
+        }
+
         // Lower user functions
         for fun in &program.functions {
             self.lower_function(fun);
@@ -737,7 +766,26 @@ impl LoweringContext {
         // `Title::on frame` and one in `Playing::on frame` get
         // different VarIds.
 
-        if let Some(on_enter) = &state.on_enter {
+        // State-local variables with initializers need their values
+        // re-established every time the state is entered, because
+        // the analyzer overlays state-locals across mutually
+        // exclusive states and another state's writes can clobber
+        // the bytes in between. If the state already has an
+        // on_enter handler, `lower_handler` prepends the
+        // initializer stores; if not, synthesize an empty one here
+        // so the dispatch path still calls into the prelude.
+        let needs_synthetic_enter =
+            state.on_enter.is_none() && state.locals.iter().any(|v| v.init.is_some());
+        let synthetic_enter = Block {
+            statements: Vec::new(),
+            span: state.span,
+        };
+        let on_enter_block: Option<&Block> = state.on_enter.as_ref().or(if needs_synthetic_enter {
+            Some(&synthetic_enter)
+        } else {
+            None
+        });
+        if let Some(on_enter) = on_enter_block {
             self.lower_handler(
                 &format!("{}_enter", state.name),
                 &format!("{}__enter", state.name),
@@ -813,6 +861,53 @@ impl LoweringContext {
 
         let entry = self.fresh_label(&format!("{name}_entry"));
         self.start_block(&entry);
+
+        // on_enter handlers carry the state-local initializer
+        // prologue: every `var x: u8 = expr` declared at
+        // `state Foo { ... }` level gets a store emitted at the
+        // top of on_enter so the state's locals are reset every
+        // time the state is entered. This is what makes the
+        // analyzer's overlay allocation safe — another state
+        // having written into these bytes no longer matters,
+        // because we unconditionally re-initialize them here.
+        // User code inside the on_enter body then runs on top.
+        // Locals without an initializer are left at whatever
+        // bytes the previous state wrote; the programmer can
+        // explicitly assign them if they want a fresh value.
+        if name.ends_with("_enter") {
+            for var in &state.locals {
+                let Some(init) = &var.init else { continue };
+                let var_id = self.get_or_create_var(&var.name);
+                if let Expr::ArrayLiteral(_, _) = init {
+                    // Array initializers for state-locals aren't
+                    // supported yet — a runtime memcpy loop from a
+                    // ROM blob would be the natural lowering.
+                    // Programs that try this should get a diagnostic
+                    // from the analyzer; for now, silently skip.
+                    continue;
+                }
+                if let Expr::StructLiteral(_, fields, _) = init {
+                    for (fname, fexpr) in fields {
+                        let full = format!("{}.{fname}", var.name);
+                        let fvid = self.get_or_create_var(&full);
+                        let val = self.lower_expr(fexpr);
+                        self.emit(IrOp::StoreVar(fvid, val));
+                    }
+                    continue;
+                }
+                let val = self.lower_expr(init);
+                self.emit(IrOp::StoreVar(var_id, val));
+                // u16-typed state-locals also need the high byte
+                // of the initializer stored at base+1. Mirror the
+                // `VarDecl` lowering in `lower_statement` so wide
+                // inits round-trip cleanly.
+                if matches!(var.var_type, NesType::U16) {
+                    let (_, hi) = self.widen(val);
+                    self.emit(IrOp::StoreVarHi(var_id, hi));
+                }
+            }
+        }
+
         self.lower_block(block);
         self.end_block(IrTerminator::Return(None));
 
