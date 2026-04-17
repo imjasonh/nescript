@@ -155,7 +155,24 @@ fn write_memory_map(
     backgrounds: &[BackgroundData],
 ) -> std::io::Result<()> {
     let mut allocs: Vec<_> = analysis.var_allocations.iter().collect();
-    allocs.sort_by_key(|a| a.address);
+    // Sort by address, then by state-local owner (None before Some),
+    // so the memory map groups overlaid state-locals together under
+    // their shared base address.
+    allocs.sort_by(|a, b| {
+        a.address.cmp(&b.address).then_with(|| {
+            analysis
+                .state_local_owners
+                .get(&a.name)
+                .cmp(&analysis.state_local_owners.get(&b.name))
+        })
+    });
+
+    let fmt_tag = |name: &str| -> String {
+        match analysis.state_local_owners.get(name) {
+            Some(state) => format!("[@{state}]"),
+            None => "[USER]   ".to_string(),
+        }
+    };
 
     writeln!(w, "=== NEScript Memory Map ===")?;
     writeln!(w, "Zero Page ($00-$FF):")?;
@@ -164,14 +181,16 @@ fn write_memory_map(
         "  $00-$0F  [SYSTEM]  reserved (frame flag, input, state, params, scratch)"
     )?;
     for a in allocs.iter().filter(|a| a.address < 0x100) {
+        let tag = fmt_tag(&a.name);
         if a.size == 1 {
-            writeln!(w, "  ${:04X}    [USER]    {} (u8)", a.address, a.name)?;
+            writeln!(w, "  ${:04X}    {} {} (u8)", a.address, tag, a.name)?;
         } else {
             writeln!(
                 w,
-                "  ${:04X}-${:04X}  [USER]  {} ({} bytes)",
+                "  ${:04X}-${:04X}  {} {} ({} bytes)",
                 a.address,
                 a.address + a.size - 1,
+                tag,
                 a.name,
                 a.size
             )?;
@@ -183,14 +202,16 @@ fn write_memory_map(
         writeln!(w, "\nRAM ($0200-$07FF):")?;
         writeln!(w, "  $0200-$02FF  [SYSTEM]  OAM shadow buffer")?;
         for a in &ram_allocs {
+            let tag = fmt_tag(&a.name);
             if a.size == 1 {
-                writeln!(w, "  ${:04X}        [USER]    {} (u8)", a.address, a.name)?;
+                writeln!(w, "  ${:04X}        {} {} (u8)", a.address, tag, a.name)?;
             } else {
                 writeln!(
                     w,
-                    "  ${:04X}-${:04X}  [USER]  {} ({} bytes)",
+                    "  ${:04X}-${:04X}  {} {} ({} bytes)",
                     a.address,
                     a.address + a.size - 1,
+                    tag,
                     a.name,
                     a.size
                 )?;
@@ -198,17 +219,24 @@ fn write_memory_map(
         }
     }
 
-    // Summary line.
-    let zp_used: u16 = allocs
-        .iter()
-        .filter(|a| a.address < 0x80)
-        .map(|a| a.size)
-        .sum();
-    let ram_used: u16 = allocs
-        .iter()
-        .filter(|a| a.address >= 0x300)
-        .map(|a| a.size)
-        .sum();
+    // Summary counts distinct byte addresses in use, not the sum of
+    // allocation sizes, so overlaid state-locals are only counted
+    // once per shared byte. Non-state-local allocations and the
+    // per-state allocations each contribute their own bytes.
+    let mut zp_bytes_used: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    let mut ram_bytes_used: std::collections::HashSet<u16> = std::collections::HashSet::new();
+    for a in &allocs {
+        for offset in 0..a.size {
+            let byte = a.address + offset;
+            if byte < 0x80 {
+                zp_bytes_used.insert(byte);
+            } else if byte >= 0x300 {
+                ram_bytes_used.insert(byte);
+            }
+        }
+    }
+    let zp_used = zp_bytes_used.len();
+    let ram_used = ram_bytes_used.len();
     writeln!(w)?;
     writeln!(w, "Zero Page: {zp_used}/128 bytes used")?;
     writeln!(w, "Main RAM:  {ram_used}/1280 bytes used")?;
@@ -513,6 +541,7 @@ mod tests {
             diagnostics: Vec::new(),
             call_graph: HashMap::new(),
             max_depths: HashMap::new(),
+            state_local_owners: HashMap::new(),
         }
     }
 

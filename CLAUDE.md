@@ -210,6 +210,18 @@ change needs a manual update + review.
   case — programs without palette/bg keep the old `$10` layout to
   preserve their goldens). User vars go at `$10+` or `$18+`; IR temps
   land at `$80+`.
+- State-local variables (declared at `state Foo { var x }`) are
+  automatically **overlaid** across states. The analyzer snapshots
+  the ZP/RAM cursors after the globals are laid out, rewinds to the
+  snapshot before each state's locals, and advances to the running
+  max at the end. Because `ZP_CURRENT_STATE` makes at most one state
+  active at runtime, two states' locals can share the same bytes —
+  the IR lowerer re-emits each state's declared initializers at the
+  top of its `on_enter` handler (synthesizing one if needed) so a
+  freshly entered state doesn't inherit the previous state's writes.
+  `--memory-map` annotates each allocation with its owning state
+  (`[@Title]`, `[@Playing]`, ...) so the overlay shows up in the
+  report.
 - `docs/future-work.md` is the authoritative roadmap. If you finish an
   item, delete its section; if you add a new gap, write one.
 

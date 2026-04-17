@@ -186,6 +186,33 @@ peephole pass mops up the most obvious waste, but a real CFG-aware allocator
 that holds short-lived temps in `A`/`X`/`Y` would cut a noticeable number of
 LDA/STA pairs.
 
+### State-local memory overlay follow-ups
+
+State-local variables are now overlaid across mutually-exclusive states
+(see the analyzer's per-state allocation cursor rewind and the IR
+lowerer's `on_enter` initializer prologue), but a few pieces are still
+missing:
+
+- **Same-named locals across different states.** `register_var` stores
+  state-locals under their bare name, so two states each declaring
+  `var timer: u8` collide with E0501. A per-state symbol-table scope
+  prefix would let each state carve its own namespace while keeping
+  the overlay.
+- **Struct-literal and array-literal initializers on state-locals.**
+  The on-enter prologue lowers scalar initializers cleanly, and
+  struct-literal initializers fall back to per-field stores, but
+  array-literal initializers (`var xs: u8[4] = [1,2,3,4]`) are
+  skipped. A runtime `memcpy` from a ROM blob into the overlay
+  slot (mirroring the reset-time global path) is the natural
+  lowering.
+- **Handler-local overlay.** Handler-local `var`s declared inside
+  `on_frame { ... }` are already per-handler scoped via
+  `current_scope_prefix`, but they get a dedicated RAM slot for the
+  program's lifetime. Overlaying them inside each handler's stack
+  frame — using a per-handler bump allocator that resets on each
+  call — would shave a few bytes more on programs with many deep
+  handlers.
+
 ### Cross-block temp live-range analysis
 
 The slot recycler is function-local per-block. Temps that flow across block

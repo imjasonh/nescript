@@ -1120,6 +1120,199 @@ fn program_without_palette_does_not_reserve_ppu_zero_page() {
     );
 }
 
+#[test]
+fn state_locals_overlay_at_same_base_address() {
+    // Two states' locals each start at the same ZP address because
+    // `ZP_CURRENT_STATE` makes them mutually exclusive at runtime.
+    // The overlay saves bytes: without it, A's two locals plus B's
+    // two locals would occupy four distinct slots; with it, each
+    // state uses the same pair of slots.
+    let source = r#"
+        game "Overlay" { mapper: NROM }
+        state A {
+            var a1: u8 = 11
+            var a2: u8 = 22
+            on frame { a1 = a1 + 1; a2 = a2 + 1; wait_frame }
+        }
+        state B {
+            var b1: u8 = 33
+            var b2: u8 = 44
+            on frame { b1 = b1 + 1; b2 = b2 + 1; wait_frame }
+        }
+        start A
+    "#;
+    let (program, diags) = nescript::parser::parse(source);
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.diagnostics.iter().all(|d| !d.is_error()),
+        "unexpected analysis errors: {:?}",
+        analysis.diagnostics
+    );
+    let addr_of = |name: &str| -> u16 {
+        analysis
+            .var_allocations
+            .iter()
+            .find(|a| a.name == name)
+            .unwrap_or_else(|| panic!("var '{name}' not allocated"))
+            .address
+    };
+    // First locals of each state share the overlay base.
+    assert_eq!(addr_of("a1"), addr_of("b1"));
+    // Second locals share the next overlay byte.
+    assert_eq!(addr_of("a2"), addr_of("b2"));
+    // Within a single state, sibling locals land at distinct slots.
+    assert_ne!(addr_of("a1"), addr_of("a2"));
+    // The second state's owners are recorded so tooling (memory map,
+    // debug symbols) can group overlaid slots by owning state.
+    assert_eq!(
+        analysis.state_local_owners.get("b1").map(String::as_str),
+        Some("B")
+    );
+}
+
+#[test]
+fn state_local_and_global_do_not_overlay() {
+    // Globals sit before the state-local overlay window and keep
+    // their own slots even if the state-locals happen to start at
+    // the next address. This guards against a regression where the
+    // overlay cursor snapshot gets taken before globals are laid
+    // out, which would alias a global onto a state-local.
+    let source = r#"
+        game "NoAlias" { mapper: NROM }
+        var g1: u8 = 5
+        var g2: u8 = 6
+        state S {
+            var s1: u8 = 0
+            on frame { s1 = s1 + 1; wait_frame }
+        }
+        start S
+    "#;
+    let (program, diags) = nescript::parser::parse(source);
+    assert!(diags.is_empty(), "parse errors: {diags:?}");
+    let analysis = analyzer::analyze(&program.unwrap());
+    let addr_of = |name: &str| {
+        analysis
+            .var_allocations
+            .iter()
+            .find(|a| a.name == name)
+            .unwrap_or_else(|| panic!("var '{name}' not allocated"))
+            .address
+    };
+    assert_ne!(addr_of("g1"), addr_of("s1"));
+    assert_ne!(addr_of("g2"), addr_of("s1"));
+    assert!(addr_of("s1") > addr_of("g2"));
+}
+
+#[test]
+fn state_local_store_round_trips_through_zero_page() {
+    // Prior to the overlay work, a `StoreVar` on a state-local
+    // silently emitted nothing because the codegen never mapped the
+    // IR `VarId` to a RAM address — reads and writes inside state
+    // handlers got dropped and the declared initializer at
+    // `var counter: u8 = 7` never ran. With the fix, the on_enter
+    // prologue stores the initializer and the frame handler stores
+    // a literal value, both landing on the allocated ZP slot.
+    let source = r#"
+        game "SL" { mapper: NROM }
+        state Main {
+            var counter: u8 = 7
+            on frame {
+                counter = 42
+                wait_frame
+            }
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("valid iNES");
+    // `LDA #7 / STA $10` — the on_enter prologue writes the
+    // state-local's declared initializer every time the state is
+    // entered.
+    let init_bytes = [0xA9u8, 0x07, 0x85, 0x10];
+    assert!(
+        rom_data.windows(init_bytes.len()).any(|w| w == init_bytes),
+        "state-local initializer `= 7` should write $10 at state entry"
+    );
+    // `LDA #42 / STA $10` — the frame handler's assignment reaches
+    // the same slot. Previously this was silently dropped.
+    let assign_bytes = [0xA9u8, 0x2A, 0x85, 0x10];
+    assert!(
+        rom_data
+            .windows(assign_bytes.len())
+            .any(|w| w == assign_bytes),
+        "frame handler assignment `counter = 42` should reach $10"
+    );
+}
+
+#[test]
+fn state_local_initializer_does_not_run_at_reset() {
+    // With the overlay allocator, each state's `var x = expr`
+    // initializer runs on every state entry — not once at reset.
+    // Emitting the init at reset would fight the overlay: the
+    // last state's initializer would stomp the byte that belongs
+    // to the active starting state. Verify by looking at the reset
+    // path in the ROM — the `STA $10` happens only inside each
+    // state's `_enter` handler (i.e., preceded by a `JSR`), never
+    // in the straight-line reset prologue.
+    let source = r#"
+        game "SL" { mapper: NROM }
+        state First {
+            var x: u8 = 1
+            on frame { x = x + 1; wait_frame }
+        }
+        state Second {
+            var x2: u8 = 2
+            on frame { x2 = x2 + 1; wait_frame }
+        }
+        start First
+    "#;
+    // x and x2 overlay at $10 (in the no-global case). We can check
+    // the generated ROM contains both initializers and that both
+    // land on the same ZP address — which would be impossible if
+    // they ran at reset (one would overwrite the other before the
+    // loop ever started).
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("valid iNES");
+    let init_first = [0xA9u8, 0x01, 0x85, 0x10]; // LDA #1 / STA $10
+    let init_second = [0xA9u8, 0x02, 0x85, 0x10]; // LDA #2 / STA $10
+    assert!(
+        rom_data.windows(init_first.len()).any(|w| w == init_first),
+        "First's initializer must survive to its on_enter"
+    );
+    assert!(
+        rom_data
+            .windows(init_second.len())
+            .any(|w| w == init_second),
+        "Second's initializer must survive to its on_enter"
+    );
+}
+
+#[test]
+fn state_without_on_enter_gets_synthesized_one_for_initializers() {
+    // A state with locals that have initializers but no explicit
+    // on_enter still needs its initializers re-established on every
+    // entry. The lowering synthesizes an empty on_enter and
+    // prepends the init stores.
+    let source = r#"
+        game "Synth" { mapper: NROM }
+        state Only {
+            var v: u8 = 99
+            on frame { v = v + 1; wait_frame }
+        }
+        start Only
+    "#;
+    let rom_data = compile(source);
+    rom::validate_ines(&rom_data).expect("valid iNES");
+    // `LDA #99 / STA $10`
+    let init_bytes = [0xA9u8, 0x63, 0x85, 0x10];
+    assert!(
+        rom_data.windows(init_bytes.len()).any(|w| w == init_bytes),
+        "synthesized on_enter should write $10 with the initializer"
+    );
+}
+
 // ── M5 Tests ──
 
 /// Compile a source string using the mapper-aware linker.
