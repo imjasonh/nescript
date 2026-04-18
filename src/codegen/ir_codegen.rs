@@ -51,10 +51,14 @@ const ZP_CURRENT_STATE: u8 = 0x03;
 /// with only a single scanline handler ignore the counter.
 const ZP_SCANLINE_STEP: u8 = 0x0C;
 
-/// Emulator debug output port. Writes to this address are logged by
-/// Mesen / fceux when the debugger is attached. Used by `debug.log`
-/// and `debug.assert` when compiled with `--debug`.
-const DEBUG_PORT: u16 = 0x4800;
+/// Default emulator debug output port. Writes to this address are
+/// logged by FCEUX (which defaults to `$4800`) when the debugger is
+/// attached. Programs can override via `game { debug_port: mesen }`
+/// (which selects `$4018`, Mesen's documented tracing port) or
+/// `debug_port: 0xXXXX` for a custom address. Used by `debug.log`,
+/// `debug.assert`, and the `__debug_halt` bounds-check sentinel
+/// when compiled with `--debug`.
+const DEFAULT_DEBUG_PORT: u16 = 0x4800;
 
 /// IR codegen that produces 6502 instructions from an `IrProgram`.
 #[allow(clippy::struct_excessive_bools)]
@@ -208,6 +212,36 @@ pub struct IrCodeGen<'a> {
     /// the NMI's shift loop, saving ~6 bytes of code and ~30 cycles
     /// per frame.
     p2_input_used: bool,
+    /// Set to true the first time we lower `rand8()`/`rand16()`/
+    /// `seed_rand()`. Drives the `__rand_used` marker label —
+    /// the linker uses it to splice `runtime::gen_prng` into PRG
+    /// ROM and seed the state at reset.
+    rand_used: bool,
+    /// Set to true the first time we lower `set_palette_brightness`.
+    /// Drives the `__palette_bright_used` marker label — the
+    /// linker uses it to splice `runtime::gen_palette_brightness`
+    /// into PRG ROM.
+    palette_bright_used: bool,
+    /// Set to true the first time we lower `fade_out` / `fade_in`.
+    /// Drives the `__fade_used` marker label — the linker uses it
+    /// to splice `runtime::gen_fade` into PRG ROM. Fade routines
+    /// call `__set_palette_brightness`, so this flag also forces
+    /// `palette_bright_used` so the brightness routine is always
+    /// linked in whenever fade is.
+    fade_used: bool,
+    /// Set to true the first time we lower `IrOp::ReadInputEdge`
+    /// (`p1.a.pressed` / `p1.a.released`). Drives the
+    /// `__edge_input_used` marker label — the linker uses it to
+    /// splice the prev-input snapshot after the NMI's shift loop
+    /// so edge detection sees stable current/previous bytes.
+    edge_input_used: bool,
+    /// Set to true the first time we lower a VRAM-buffer
+    /// intrinsic (`nt_set`, `nt_attr`, `nt_fill_h`). Drives the
+    /// `__vram_buf_used` marker label — the linker uses it to
+    /// splice `runtime::gen_vram_buf_drain` into PRG, call it
+    /// from NMI, and reserve the 256-byte buffer at `$0400-$04FF`
+    /// from the analyzer's RAM allocator.
+    vram_buf_used: bool,
     /// Source-location markers produced from [`IrOp::SourceLoc`].
     /// Each entry is a `(label_name, span)` pair — the codegen
     /// emits a unique label-definition pseudo-op at the current
@@ -228,6 +262,14 @@ pub struct IrCodeGen<'a> {
     /// the final ROM. Enabled by the CLI when `--source-map` is
     /// passed.
     emit_source_locs: bool,
+    /// Absolute address the runtime writes to for `debug.log`
+    /// output, `debug.assert` failures, and the `__debug_halt`
+    /// bounds-check sentinel. Defaults to [`DEFAULT_DEBUG_PORT`]
+    /// (`$4800`, the FCEUX convention); programs can override via
+    /// `game { debug_port: mesen }` (selects `$4018`) or
+    /// `debug_port: 0xXXXX` for an arbitrary address. Threaded in
+    /// from the analyzer via [`Self::with_debug_port`].
+    debug_port: u16,
     /// Byte size of each named global / local variable. Keyed by
     /// IR `VarId`, mirrors [`Self::var_addrs`]. Used by the
     /// debug-mode array bounds checker to emit an `idx >= size`
@@ -426,9 +468,15 @@ impl<'a> IrCodeGen<'a> {
             default_sprite_used: false,
             p1_input_used: false,
             p2_input_used: false,
+            rand_used: false,
+            palette_bright_used: false,
+            fade_used: false,
+            edge_input_used: false,
+            vram_buf_used: false,
             source_locs: Vec::new(),
             next_source_loc: 0,
             emit_source_locs: false,
+            debug_port: DEFAULT_DEBUG_PORT,
             var_sizes,
             bounds_halt_used: false,
             banked_streams: HashMap::new(),
@@ -478,6 +526,19 @@ impl<'a> IrCodeGen<'a> {
     #[must_use]
     pub fn with_source_map(mut self, enabled: bool) -> Self {
         self.emit_source_locs = enabled;
+        self
+    }
+
+    /// Install the absolute address that `debug.log`,
+    /// `debug.assert`, and the `__debug_halt` sentinel should
+    /// target. The analyzer threads the program's
+    /// `game { debug_port: ... }` value through; callers that
+    /// build an `IrCodeGen` directly (unit tests, integration
+    /// tests) can skip this and inherit the FCEUX-convention
+    /// default `$4800`.
+    #[must_use]
+    pub fn with_debug_port(mut self, port: u16) -> Self {
+        self.debug_port = port;
         self
     }
 
@@ -935,7 +996,8 @@ impl<'a> IrCodeGen<'a> {
             // port before wedging, so the log shows a bounds-check
             // failure as a distinct event from a plain halt.
             self.emit(LDA, AM::Immediate(0xBC));
-            self.emit(STA, AM::Absolute(DEBUG_PORT));
+            let port = self.debug_port;
+            self.emit(STA, AM::Absolute(port));
             self.emit(JMP, AM::Label("__debug_halt".to_string()));
         }
 
@@ -1715,9 +1777,10 @@ impl<'a> IrCodeGen<'a> {
             }
             IrOp::DebugLog(args) => {
                 if self.debug_mode {
+                    let port = self.debug_port;
                     for arg in args {
                         self.load_temp(*arg);
-                        self.emit(STA, AM::Absolute(DEBUG_PORT));
+                        self.emit(STA, AM::Absolute(port));
                     }
                 }
                 // In release mode, stripped entirely
@@ -1730,7 +1793,8 @@ impl<'a> IrCodeGen<'a> {
                     self.emit(BNE, AM::LabelRelative(pass_label.clone()));
                     // Assertion failed: write marker to debug port and BRK
                     self.emit(LDA, AM::Immediate(0xFF));
-                    self.emit(STA, AM::Absolute(DEBUG_PORT));
+                    let port = self.debug_port;
+                    self.emit(STA, AM::Absolute(port));
                     self.emit(BRK, AM::Implied);
                     self.emit_label(&pass_label);
                 }
@@ -1775,7 +1839,16 @@ impl<'a> IrCodeGen<'a> {
                             .map(|a| a.address)
                     }))
                 };
-                match crate::asm::parse_inline(&to_parse) {
+                // Rewrite ca65-style local labels (`.foo:` /
+                // `BNE .foo`) into unique per-block identifiers so
+                // two inline-asm blocks in the same function can
+                // use overlapping local names without colliding in
+                // the linker's label table. `.foo` → `__ilab_N_foo`
+                // where N comes from the same monotonic suffix
+                // source our other local labels use.
+                let suffix = self.local_label_suffix();
+                let mangled = mangle_dot_labels(&to_parse, &suffix);
+                match crate::asm::parse_inline(&mangled) {
                     Ok(parsed) => self.instructions.extend(parsed),
                     Err(msg) => {
                         eprintln!("inline asm error: {msg}");
@@ -1908,6 +1981,131 @@ impl<'a> IrCodeGen<'a> {
                 b_lo,
                 b_hi,
             } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::GtEq),
+            IrOp::Rand8(dest) => {
+                self.emit_rand_marker();
+                self.emit(JSR, AM::Label("__rand8".into()));
+                // A now holds the new low byte.
+                self.store_temp(*dest);
+            }
+            IrOp::Rand16(dest_lo, dest_hi) => {
+                self.emit_rand_marker();
+                self.emit(JSR, AM::Label("__rand16".into()));
+                // A = lo, X = hi.
+                self.store_temp(*dest_lo);
+                self.emit(TXA, AM::Implied);
+                self.store_temp(*dest_hi);
+            }
+            IrOp::SeedRand(lo, hi) => {
+                self.emit_rand_marker();
+                // Load hi into X first (since the seed routine
+                // expects A=lo, X=hi and loading A last leaves it
+                // in the right register).
+                let hi_addr = self.temp_addr(*hi);
+                self.emit(LDX, AM::ZeroPage(hi_addr));
+                self.load_temp(*lo);
+                self.emit(JSR, AM::Label("__rand_seed".into()));
+            }
+            IrOp::SetPaletteBrightness(level) => {
+                self.emit_palette_bright_marker();
+                self.load_temp(*level);
+                self.emit(JSR, AM::Label("__set_palette_brightness".into()));
+            }
+            IrOp::FadeOut(step_frames) | IrOp::FadeIn(step_frames) => {
+                self.emit_fade_marker();
+                self.load_temp(*step_frames);
+                let target = if matches!(op, IrOp::FadeOut(_)) {
+                    "__fade_out"
+                } else {
+                    "__fade_in"
+                };
+                self.emit(JSR, AM::Label(target.into()));
+            }
+            IrOp::Sprite0Split { scroll_x, scroll_y } => {
+                // Two-phase busy-wait on PPU `$2002` bit 6 (sprite-0
+                // hit flag), then write the requested scroll values
+                // to `$2005`. Phase 1 waits for the flag to clear
+                // (the previous frame's hit is still latched at
+                // NMI time and doesn't clear until the pre-render
+                // scanline); phase 2 waits for it to set again on
+                // the current frame's sprite-0 overlap. Emitted
+                // inline — no runtime routine — so each call site
+                // gets its own pair of local labels.
+                let suffix = self.local_label_suffix();
+                let clear_label = format!("__ir_spr0_clear_{suffix}");
+                let set_label = format!("__ir_spr0_set_{suffix}");
+                // Phase 1: wait for flag clear.
+                self.emit_label(&clear_label);
+                self.emit(LDA, AM::Absolute(0x2002));
+                self.emit(AND, AM::Immediate(0x40));
+                self.emit(BNE, AM::LabelRelative(clear_label));
+                // Phase 2: wait for flag set.
+                self.emit_label(&set_label);
+                self.emit(LDA, AM::Absolute(0x2002));
+                self.emit(AND, AM::Immediate(0x40));
+                self.emit(BEQ, AM::LabelRelative(set_label));
+                // Write new scroll: `$2005` takes two writes, X then Y.
+                self.load_temp(*scroll_x);
+                self.emit(STA, AM::Absolute(0x2005));
+                self.load_temp(*scroll_y);
+                self.emit(STA, AM::Absolute(0x2005));
+            }
+            IrOp::NtSet { x, y, tile } => {
+                self.emit_vram_buf_marker();
+                self.gen_nt_buf_append_single(*x, *y, *tile, /* attr= */ false);
+            }
+            IrOp::NtAttr { x, y, value } => {
+                self.emit_vram_buf_marker();
+                self.gen_nt_buf_append_single(*x, *y, *value, /* attr= */ true);
+            }
+            IrOp::NtFillH { x, y, len, tile } => {
+                self.emit_vram_buf_marker();
+                self.gen_nt_buf_append_fill_h(*x, *y, *len, *tile);
+            }
+            IrOp::ReadInputEdge {
+                dest,
+                player,
+                mask,
+                released,
+            } => {
+                // Mark input usage so the NMI strobe loop gets spliced.
+                if *player == 0 {
+                    self.p1_input_used = true;
+                } else {
+                    self.p2_input_used = true;
+                }
+                // Mark edge-input usage so the NMI emits the prev-state
+                // snapshot after the shift loop.
+                self.edge_input_used = true;
+                // Current input byte:
+                let curr_addr = if *player == 0 {
+                    crate::runtime::ZP_INPUT_P1
+                } else {
+                    crate::runtime::ZP_INPUT_P2
+                };
+                // Previous-frame input byte. Parked in main RAM below
+                // the debug/audio/prng block so it doesn't collide
+                // with ZP; the analyzer never allocates there.
+                let prev_addr: u16 = if *player == 0 {
+                    crate::runtime::PREV_INPUT_P1
+                } else {
+                    crate::runtime::PREV_INPUT_P2
+                };
+                // For `pressed`: curr & ~prev  = curr AND (prev XOR $FF) — simpler:
+                //   LDA prev ; EOR #$FF ; AND curr ; AND #mask
+                // For `released`: ~curr & prev = prev AND (curr XOR $FF):
+                //   LDA curr ; EOR #$FF ; AND prev ; AND #mask
+                if *released {
+                    self.emit(LDA, AM::ZeroPage(curr_addr));
+                    self.emit(EOR, AM::Immediate(0xFF));
+                    self.emit(AND, AM::Absolute(prev_addr));
+                } else {
+                    self.emit(LDA, AM::Absolute(prev_addr));
+                    self.emit(EOR, AM::Immediate(0xFF));
+                    self.emit(AND, AM::ZeroPage(curr_addr));
+                }
+                self.emit(AND, AM::Immediate(*mask));
+                self.store_temp(*dest);
+            }
             IrOp::SourceLoc(span) => {
                 // Emit a uniquely-named label-definition pseudo-op
                 // at the current codegen position — but only when
@@ -2269,6 +2467,184 @@ impl<'a> IrCodeGen<'a> {
         if self.p2_input_used {
             self.emit_label("__p2_input_used");
         }
+        if self.rand_used {
+            self.emit_label("__rand_used");
+        }
+        if self.palette_bright_used {
+            self.emit_label("__palette_bright_used");
+        }
+        if self.fade_used {
+            self.emit_label("__fade_used");
+        }
+        if self.edge_input_used {
+            self.emit_label("__edge_input_used");
+        }
+        if self.vram_buf_used {
+            self.emit_label("__vram_buf_used");
+        }
+    }
+
+    /// Emit the `__rand_used` marker label at most once per
+    /// program. The linker scans for this label to decide whether
+    /// to splice `runtime::gen_prng` into PRG ROM and seed the
+    /// state at reset.
+    fn emit_rand_marker(&mut self) {
+        self.rand_used = true;
+    }
+
+    /// Emit the `__palette_bright_used` marker at most once per
+    /// program. The linker uses it to splice
+    /// `runtime::gen_palette_brightness` into PRG ROM.
+    fn emit_palette_bright_marker(&mut self) {
+        self.palette_bright_used = true;
+    }
+
+    /// Emit the `__fade_used` marker at most once per program.
+    /// `gen_fade` also calls `__set_palette_brightness`, so fade
+    /// use forces the palette-brightness marker too.
+    fn emit_fade_marker(&mut self) {
+        self.fade_used = true;
+        self.palette_bright_used = true;
+    }
+
+    /// Emit the `__vram_buf_used` marker. The linker uses it to
+    /// splice `runtime::gen_vram_buf_drain` and call it from the
+    /// NMI handler; the analyzer (separately, by scanning the AST
+    /// for any of the buffer intrinsics) bumps the user RAM start
+    /// past the 256-byte buffer at `$0400-$04FF`.
+    fn emit_vram_buf_marker(&mut self) {
+        self.vram_buf_used = true;
+    }
+
+    /// Append a single-byte VRAM-buffer entry. Used by both `nt_set`
+    /// and `nt_attr` — the only difference is which PPU base
+    /// address the `(x, y)` cell maps to. With `attr=false` the
+    /// target is the nametable at `$2000 + y*32 + x`; with
+    /// `attr=true` it's the attribute table at
+    /// `$23C0 + (y/4)*8 + (x/4)`.
+    ///
+    /// Layout written to the buffer at `VRAM_BUF_HEAD`:
+    /// `[len=1][addr_hi][addr_lo][data]`. After the append we
+    /// bump the head by 4 and store a fresh `0` sentinel so the
+    /// next NMI drain sees a well-formed buffer regardless of
+    /// whether more entries get appended later in the frame.
+    ///
+    /// The address arithmetic stays in the accumulator end-to-end
+    /// (no extra ZP scratch needed): `addr_hi` is `$20 + (y >> 3)`
+    /// for nametables or just `$23` for the attribute table; and
+    /// `addr_lo` is `(y << 5) | x` for nametables or
+    /// `$C0 + (y / 4) * 8 + (x / 4)` for the attribute table.
+    fn gen_nt_buf_append_single(&mut self, x: IrTemp, y: IrTemp, data: IrTemp, attr: bool) {
+        let x_addr = self.temp_addr(x);
+        let y_addr = self.temp_addr(y);
+        let data_addr = self.temp_addr(data);
+        // X = head offset.
+        self.emit(LDX, AM::Absolute(crate::runtime::VRAM_BUF_HEAD));
+        // Write `len = 1`.
+        self.emit(LDA, AM::Immediate(1));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // Write `addr_hi`.
+        if attr {
+            self.emit(LDA, AM::Immediate(0x23));
+        } else {
+            self.emit(LDA, AM::ZeroPage(y_addr));
+            self.emit(LSR, AM::Accumulator);
+            self.emit(LSR, AM::Accumulator);
+            self.emit(LSR, AM::Accumulator);
+            self.emit(CLC, AM::Implied);
+            self.emit(ADC, AM::Immediate(0x20));
+        }
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // Write `addr_lo`.
+        if attr {
+            // (y / 4) * 8 = (y & ~3) << 1
+            self.emit(LDA, AM::ZeroPage(y_addr));
+            self.emit(AND, AM::Immediate(0x1C));
+            self.emit(ASL, AM::Accumulator);
+            // + (x >> 2)
+            self.emit(STA, AM::ZeroPage(0x02)); // safe scratch outside NMI / mul
+            self.emit(LDA, AM::ZeroPage(x_addr));
+            self.emit(LSR, AM::Accumulator);
+            self.emit(LSR, AM::Accumulator);
+            self.emit(CLC, AM::Implied);
+            self.emit(ADC, AM::ZeroPage(0x02));
+            // + $C0
+            self.emit(CLC, AM::Implied);
+            self.emit(ADC, AM::Immediate(0xC0));
+        } else {
+            // (y << 5) + x
+            self.emit(LDA, AM::ZeroPage(y_addr));
+            self.emit(ASL, AM::Accumulator);
+            self.emit(ASL, AM::Accumulator);
+            self.emit(ASL, AM::Accumulator);
+            self.emit(ASL, AM::Accumulator);
+            self.emit(ASL, AM::Accumulator);
+            self.emit(CLC, AM::Implied);
+            self.emit(ADC, AM::ZeroPage(x_addr));
+        }
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // Write the single data byte.
+        self.emit(LDA, AM::ZeroPage(data_addr));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // Update head and lay down a fresh sentinel.
+        self.emit(STX, AM::Absolute(crate::runtime::VRAM_BUF_HEAD));
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+    }
+
+    /// Append a horizontal-fill VRAM-buffer entry. Layout:
+    /// `[len][addr_hi][addr_lo][tile][tile]...[tile]` where the
+    /// tile byte is repeated `len` times. The PPU's auto-increment
+    /// (1 by default) advances the VRAM cursor one cell per byte.
+    fn gen_nt_buf_append_fill_h(&mut self, x: IrTemp, y: IrTemp, len: IrTemp, tile: IrTemp) {
+        let x_addr = self.temp_addr(x);
+        let y_addr = self.temp_addr(y);
+        let len_addr = self.temp_addr(len);
+        let tile_addr = self.temp_addr(tile);
+        self.emit(LDX, AM::Absolute(crate::runtime::VRAM_BUF_HEAD));
+        // len
+        self.emit(LDA, AM::ZeroPage(len_addr));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // addr_hi = $20 + (y >> 3)
+        self.emit(LDA, AM::ZeroPage(y_addr));
+        self.emit(LSR, AM::Accumulator);
+        self.emit(LSR, AM::Accumulator);
+        self.emit(LSR, AM::Accumulator);
+        self.emit(CLC, AM::Implied);
+        self.emit(ADC, AM::Immediate(0x20));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // addr_lo = (y << 5) + x
+        self.emit(LDA, AM::ZeroPage(y_addr));
+        self.emit(ASL, AM::Accumulator);
+        self.emit(ASL, AM::Accumulator);
+        self.emit(ASL, AM::Accumulator);
+        self.emit(ASL, AM::Accumulator);
+        self.emit(ASL, AM::Accumulator);
+        self.emit(CLC, AM::Implied);
+        self.emit(ADC, AM::ZeroPage(x_addr));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // Inner loop: write `len` copies of `tile`. We use Y as the
+        // fill counter so X stays as the buffer offset.
+        let suffix = self.local_label_suffix();
+        let fill_label = format!("__ir_nt_fill_{suffix}");
+        self.emit(LDY, AM::ZeroPage(len_addr));
+        self.emit_label(&fill_label);
+        self.emit(LDA, AM::ZeroPage(tile_addr));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        self.emit(DEY, AM::Implied);
+        self.emit(BNE, AM::LabelRelative(fill_label));
+        // Update head + sentinel.
+        self.emit(STX, AM::Absolute(crate::runtime::VRAM_BUF_HEAD));
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
     }
 
     /// Emit the MMC3 `__irq_user` handler that dispatches on the
@@ -2659,7 +3035,13 @@ fn function_is_leaf(func: &IrFunction) -> bool {
                 | IrOp::Mul(..)
                 | IrOp::Div(..)
                 | IrOp::Mod(..)
-                | IrOp::Transition(..) => true,
+                | IrOp::Transition(..)
+                | IrOp::Rand8(..)
+                | IrOp::Rand16(..)
+                | IrOp::SeedRand(..)
+                | IrOp::SetPaletteBrightness(..)
+                | IrOp::FadeOut(..)
+                | IrOp::FadeIn(..) => true,
                 IrOp::InlineAsm(body) => {
                     // Strip the raw-asm magic prefix if present so
                     // we don't false-match the marker characters.
@@ -2721,6 +3103,11 @@ fn function_is_leaf(func: &IrFunction) -> bool {
                 | IrOp::PlaySfx(..)
                 | IrOp::StartMusic(..)
                 | IrOp::StopMusic
+                | IrOp::ReadInputEdge { .. }
+                | IrOp::Sprite0Split { .. }
+                | IrOp::NtSet { .. }
+                | IrOp::NtAttr { .. }
+                | IrOp::NtFillH { .. }
                 | IrOp::SourceLoc(..) => false,
             };
             if is_jsr_emitting {
@@ -2739,6 +3126,69 @@ fn function_is_leaf(func: &IrFunction) -> bool {
 /// Addresses that fit in a byte become zero-page syntax (`$XX`),
 /// otherwise absolute (`$XXXX`). This lets users write
 /// `lda {score}` and have it resolve to `lda $10` or similar.
+///
+/// Rewrite ca65-style local labels (`.label`) into globally unique
+/// names scoped to a single inline-asm block. The parser doesn't
+/// accept `.` as a label character, so we replace every `.IDENT`
+/// occurrence — both `.foo:` definitions and `BNE .foo` references —
+/// with `__ilab_<suffix>_IDENT`. `suffix` is the caller's
+/// local-label counter so two inline-asm blocks in the same
+/// function can both use `.loop:` without colliding in the
+/// linker's label table.
+///
+/// The dollar-prefixed hex literals (`$10`, `$FFFC`) and the
+/// dot-prefixed assembler directives we don't yet accept (`.byte`,
+/// `.word`, …) both survive: the substitution looks specifically
+/// for `.` followed by an ident start character that the label
+/// validator would accept (letter or underscore), so `$10` isn't
+/// affected and directives don't match because their first letter
+/// is immediately followed by more letters without a colon /
+/// reference context.
+fn mangle_dot_labels(body: &str, suffix: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Trip on a `.` that precedes an identifier-start character
+        // (letter or underscore). Anything else (whitespace, dollar
+        // signs, punctuation, digits) flows through unchanged.
+        if c == b'.' && i + 1 < bytes.len() && is_ident_start(bytes[i + 1]) {
+            // Make sure the `.` isn't itself preceded by an
+            // identifier character (would be `name.field`, not a
+            // label). Leading position at the start of the buffer,
+            // start of a line, or after whitespace / punctuation is
+            // fine.
+            let is_label_ctx = i == 0 || !is_ident_continue(bytes[i - 1]);
+            if is_label_ctx {
+                // Consume the identifier after the dot.
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len() && is_ident_continue(bytes[end]) {
+                    end += 1;
+                }
+                // Append the mangled form without the leading dot.
+                let _ = write!(out, "__ilab_{suffix}_");
+                out.push_str(&body[start..end]);
+                i = end;
+                continue;
+            }
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphabetic()
+}
+
+fn is_ident_continue(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
+}
+
 fn substitute_asm_vars<F: Fn(&str) -> Option<u16>>(body: &str, resolver: F) -> String {
     let mut out = String::with_capacity(body.len());
     let bytes = body.as_bytes();
@@ -2913,6 +3363,7 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
             ..
         } => vec![*a_lo, *a_hi, *b_lo, *b_hi],
         IrOp::ReadInput(_, _)
+        | IrOp::ReadInputEdge { .. }
         | IrOp::WaitFrame
         | IrOp::CycleSprites
         | IrOp::Transition(_)
@@ -2921,9 +3372,18 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
         | IrOp::PlaySfx(_)
         | IrOp::StartMusic(_)
         | IrOp::StopMusic
+        | IrOp::Rand8(_)
+        | IrOp::Rand16(_, _)
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
         | IrOp::SourceLoc(_) => Vec::new(),
+        IrOp::SeedRand(lo, hi) => vec![*lo, *hi],
+        IrOp::SetPaletteBrightness(level) => vec![*level],
+        IrOp::FadeOut(n) | IrOp::FadeIn(n) => vec![*n],
+        IrOp::Sprite0Split { scroll_x, scroll_y } => vec![*scroll_x, *scroll_y],
+        IrOp::NtSet { x, y, tile } => vec![*x, *y, *tile],
+        IrOp::NtAttr { x, y, value } => vec![*x, *y, *value],
+        IrOp::NtFillH { x, y, len, tile } => vec![*x, *y, *len, *tile],
     }
 }
 

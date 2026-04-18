@@ -95,6 +95,12 @@ struct LoweringContext {
     /// here keeps the per-statement lowering simple and avoids
     /// having to thread the program through every helper.
     metasprites: HashMap<String, MetaspriteInfo>,
+    /// When true (driven by `game { sprite_flicker: true }`), the
+    /// lowerer injects an `IrOp::CycleSprites` op at the top of
+    /// every `on frame` handler, giving the runtime the same
+    /// rotating-OAM effect as an explicit `cycle_sprites` call
+    /// without requiring user code to opt in at every site.
+    auto_sprite_flicker: bool,
 }
 
 /// A captured `inline fun` body that the lowerer can splice in
@@ -186,6 +192,7 @@ impl LoweringContext {
             start_state: String::new(),
             wide_hi: HashMap::new(),
             metasprites: HashMap::new(),
+            auto_sprite_flicker: false,
         }
     }
 
@@ -434,7 +441,7 @@ impl LoweringContext {
                 _ => {
                     let fval = self.eval_const(fexpr);
                     let size = match field_type {
-                        Some(NesType::U16) => 2,
+                        Some(NesType::U16 | NesType::I16) => 2,
                         _ => 1,
                     };
                     self.globals.push(IrGlobal {
@@ -542,6 +549,10 @@ impl LoweringContext {
         // Capture state metadata before lowering
         self.state_names = program.states.iter().map(|s| s.name.clone()).collect();
         program.start_state.clone_into(&mut self.start_state);
+        // Pick up the `sprite_flicker` game attribute so each
+        // on-frame handler's prologue can inject a CycleSprites
+        // op without threading the flag through per-handler calls.
+        self.auto_sprite_flicker = program.game.sprite_flicker;
 
         // Capture metasprite declarations so the per-statement
         // Draw lowering can expand `draw Hero` into one
@@ -902,11 +913,23 @@ impl LoweringContext {
                 // of the initializer stored at base+1. Mirror the
                 // `VarDecl` lowering in `lower_statement` so wide
                 // inits round-trip cleanly.
-                if matches!(var.var_type, NesType::U16) {
+                if matches!(var.var_type, NesType::U16 | NesType::I16) {
                     let (_, hi) = self.widen(val);
                     self.emit(IrOp::StoreVarHi(var_id, hi));
                 }
             }
+        }
+
+        // When `game { sprite_flicker: true }` is set, implicitly
+        // call `cycle_sprites` at the top of every `on frame`
+        // handler. Detected via the handler name suffix —
+        // `{state}_frame` — so `on_enter` / `on_exit` / scanline
+        // handlers don't pay the extra ~10 bytes. The existing
+        // `IrOp::CycleSprites` lowering emits the `__sprite_cycle_used`
+        // marker on its first hit, which is all the linker needs to
+        // switch the NMI over to the rotating-OAM variant.
+        if self.auto_sprite_flicker && name.ends_with("_frame") {
+            self.emit(IrOp::CycleSprites);
         }
 
         self.lower_block(block);
@@ -973,9 +996,15 @@ impl LoweringContext {
                     } else {
                         let val = self.lower_expr(init);
                         self.emit(IrOp::StoreVar(var_id, val));
-                        // u16 var: write the high byte too, zero-
-                        // extending narrow initializers.
-                        if matches!(var.var_type, NesType::U16) {
+                        // u16 / i16 var: write the high byte too,
+                        // zero-extending narrow initializers. For
+                        // `i16` negative literals, the IR lowering
+                        // of integer literals already packs both
+                        // bytes via the IntLiteral path, so `widen`
+                        // produces the correct sign/zero-extension
+                        // — narrow-to-wide stores here still do the
+                        // right thing for both signednesses.
+                        if matches!(var.var_type, NesType::U16 | NesType::I16) {
                             let (_, hi) = self.widen(val);
                             self.emit(IrOp::StoreVarHi(var_id, hi));
                         }
@@ -1119,6 +1148,82 @@ impl LoweringContext {
                             self.emit(IrOp::Poke(addr, val));
                         }
                     }
+                    // `seed_rand(x)` — install `x` as the new PRNG
+                    // state. `x` is widened to u16 so a narrow seed
+                    // still lands in both bytes of the state.
+                    "seed_rand" if args.len() == 1 => {
+                        let seed = self.lower_expr(&args[0]);
+                        let (lo, hi) = self.widen(seed);
+                        self.emit(IrOp::SeedRand(lo, hi));
+                    }
+                    // `set_palette_brightness(level)` — translate a
+                    // 0..8 level into $2001 mask bits.
+                    "set_palette_brightness" if args.len() == 1 => {
+                        let level = self.lower_expr(&args[0]);
+                        self.emit(IrOp::SetPaletteBrightness(level));
+                    }
+                    // `fade_out(step_frames)` / `fade_in(step_frames)` —
+                    // blocking fades that walk brightness 4 → 0 and
+                    // 0 → 4 respectively, calling
+                    // `__set_palette_brightness` per step with
+                    // `step_frames` frames of wait between steps.
+                    "fade_out" if args.len() == 1 => {
+                        let n = self.lower_expr(&args[0]);
+                        self.emit(IrOp::FadeOut(n));
+                    }
+                    "fade_in" if args.len() == 1 => {
+                        let n = self.lower_expr(&args[0]);
+                        self.emit(IrOp::FadeIn(n));
+                    }
+                    // `sprite_0_split(scroll_x, scroll_y)` — busy-wait
+                    // for the PPU's sprite-0 hit flag, then write
+                    // the new scroll values to `$2005`. Works on
+                    // any mapper (NROM/UxROM/MMC1 included), unlike
+                    // `on_scanline(N)` which requires MMC3's IRQ.
+                    "sprite_0_split" if args.len() == 2 => {
+                        let x = self.lower_expr(&args[0]);
+                        let y = self.lower_expr(&args[1]);
+                        self.emit(IrOp::Sprite0Split {
+                            scroll_x: x,
+                            scroll_y: y,
+                        });
+                    }
+                    // VRAM update buffer intrinsics. Each call appends
+                    // one entry to the runtime ring at $0400 that the
+                    // NMI handler drains during vblank.
+                    "nt_set" if args.len() == 3 => {
+                        let x = self.lower_expr(&args[0]);
+                        let y = self.lower_expr(&args[1]);
+                        let tile = self.lower_expr(&args[2]);
+                        self.emit(IrOp::NtSet { x, y, tile });
+                    }
+                    "nt_attr" if args.len() == 3 => {
+                        let x = self.lower_expr(&args[0]);
+                        let y = self.lower_expr(&args[1]);
+                        let value = self.lower_expr(&args[2]);
+                        self.emit(IrOp::NtAttr { x, y, value });
+                    }
+                    "nt_fill_h" if args.len() == 4 => {
+                        let x = self.lower_expr(&args[0]);
+                        let y = self.lower_expr(&args[1]);
+                        let len = self.lower_expr(&args[2]);
+                        let tile = self.lower_expr(&args[3]);
+                        self.emit(IrOp::NtFillH { x, y, len, tile });
+                    }
+                    // `rand8()` / `rand16()` at statement position —
+                    // valid because they have side effects (advancing
+                    // the PRNG state). The returned value is discarded
+                    // by routing through a fresh temp that nothing
+                    // reads; the JSR still runs so the state advances.
+                    "rand8" if args.is_empty() => {
+                        let t = self.fresh_temp();
+                        self.emit(IrOp::Rand8(t));
+                    }
+                    "rand16" if args.is_empty() => {
+                        let lo = self.fresh_temp();
+                        let hi = self.fresh_temp();
+                        self.emit(IrOp::Rand16(lo, hi));
+                    }
                     _ => {
                         // Inline expansion at statement context
                         // splices either the return expression
@@ -1206,7 +1311,7 @@ impl LoweringContext {
                 // u16 fields need the high byte written too — the
                 // `widen` helper yields a zero-extended high temp
                 // when the RHS is narrow.
-                if matches!(self.var_types.get(&full), Some(NesType::U16)) {
+                if matches!(self.var_types.get(&full), Some(NesType::U16 | NesType::I16)) {
                     let (_, val_hi) = self.widen(val);
                     self.emit(IrOp::StoreVarHi(field_var, val_hi));
                 }
@@ -1219,8 +1324,10 @@ impl LoweringContext {
                 let var_id = self.get_or_create_var(name);
                 // Is the destination a u16 variable? Wide vars need
                 // both bytes written on every assignment, otherwise
-                // the high byte silently stays stale.
-                let dest_is_u16 = matches!(self.var_types.get(name), Some(NesType::U16));
+                // the high byte silently stays stale. Both `u16`
+                // and `i16` use this wide-store path.
+                let dest_is_u16 =
+                    matches!(self.var_types.get(name), Some(NesType::U16 | NesType::I16));
                 match op {
                     AssignOp::Assign => {
                         let val = self.lower_expr(expr);
@@ -1311,7 +1418,10 @@ impl LoweringContext {
                 // follow the same two-byte path as u16 globals.
                 let full_name = format!("{name}.{field}");
                 let var_id = self.get_or_create_var(&full_name);
-                let dest_is_u16 = matches!(self.var_types.get(&full_name), Some(NesType::U16));
+                let dest_is_u16 = matches!(
+                    self.var_types.get(&full_name),
+                    Some(NesType::U16 | NesType::I16)
+                );
                 match op {
                     AssignOp::Assign => {
                         let val = self.lower_expr(expr);
@@ -1607,10 +1717,10 @@ impl LoweringContext {
                 let var_id = self.get_or_create_var(name);
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadVar(t, var_id));
-                // For u16 variables, also load the high byte and
-                // register the temp pair as wide so downstream ops
-                // can emit 16-bit IR when appropriate.
-                if matches!(self.var_types.get(name), Some(NesType::U16)) {
+                // For u16 / i16 variables, also load the high byte
+                // and register the temp pair as wide so downstream
+                // ops can emit 16-bit IR when appropriate.
+                if matches!(self.var_types.get(name), Some(NesType::U16 | NesType::I16)) {
                     let hi = self.fresh_temp();
                     self.emit(IrOp::LoadVarHi(hi, var_id));
                     self.make_wide(t, hi);
@@ -1635,7 +1745,10 @@ impl LoweringContext {
                 let var_id = self.get_or_create_var(&full_name);
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadVar(t, var_id));
-                if matches!(self.var_types.get(&full_name), Some(NesType::U16)) {
+                if matches!(
+                    self.var_types.get(&full_name),
+                    Some(NesType::U16 | NesType::I16)
+                ) {
                     let hi = self.fresh_temp();
                     self.emit(IrOp::LoadVarHi(hi, var_id));
                     self.make_wide(t, hi);
@@ -1644,6 +1757,24 @@ impl LoweringContext {
             }
             Expr::BinaryOp(left, op, right, _) => self.lower_binop(left, *op, right),
             Expr::UnaryOp(op, inner, _) => {
+                // Constant-fold `-<literal>` into a wide two's-
+                // complement literal so a negative source like
+                // `-10` assigned to an `i16` stores $FFF6 (sign-
+                // extended) rather than the zero-extended $00F6
+                // that a byte-level negate + widen would produce.
+                // Without this fold, `var vy: i16 = -10` would
+                // silently land at $00F6 = 246 in the target.
+                if let (UnaryOp::Negate, Expr::IntLiteral(v, _)) = (op, inner.as_ref()) {
+                    let negated = (*v).wrapping_neg();
+                    let t = self.fresh_temp();
+                    self.emit(IrOp::LoadImm(t, negated as u8));
+                    if *v != 0 {
+                        let hi = self.fresh_temp();
+                        self.emit(IrOp::LoadImm(hi, (negated >> 8) as u8));
+                        self.make_wide(t, hi);
+                    }
+                    return t;
+                }
                 let val = self.lower_expr(inner);
                 let t = self.fresh_temp();
                 match op {
@@ -1668,6 +1799,21 @@ impl LoweringContext {
                         return t;
                     }
                 }
+                // `rand8()` — draw the next 8 bits from the PRNG.
+                if name == "rand8" && args.is_empty() {
+                    let t = self.fresh_temp();
+                    self.emit(IrOp::Rand8(t));
+                    return t;
+                }
+                // `rand16()` — draw the next 16 bits. Return a
+                // wide-marked low temp so callers get u16 semantics.
+                if name == "rand16" && args.is_empty() {
+                    let lo = self.fresh_temp();
+                    let hi = self.fresh_temp();
+                    self.emit(IrOp::Rand16(lo, hi));
+                    self.make_wide(lo, hi);
+                    return lo;
+                }
                 // `inline fun` bodies captured by
                 // `capture_inline_bodies` expand in-place here:
                 // no JSR, no parameter transport, no prologue.
@@ -1680,6 +1826,21 @@ impl LoweringContext {
                 let t = self.fresh_temp();
                 self.emit(IrOp::Call(Some(t), name.clone(), arg_temps));
                 t
+            }
+            Expr::ButtonEdge(player, button, released, _) => {
+                let player_index = match player {
+                    Some(Player::P2) => 1u8,
+                    _ => 0u8,
+                };
+                let mask = button_mask(button);
+                let dest = self.fresh_temp();
+                self.emit(IrOp::ReadInputEdge {
+                    dest,
+                    player: player_index,
+                    mask,
+                    released: *released,
+                });
+                dest
             }
             Expr::ButtonRead(player, button, _) => {
                 // Button reads: read the input byte, mask with the button bit.
@@ -2128,7 +2289,7 @@ fn utf8_char_len(lead: u8) -> usize {
 fn type_size(t: &NesType) -> u16 {
     match t {
         NesType::U8 | NesType::I8 | NesType::Bool => 1,
-        NesType::U16 => 2,
+        NesType::U16 | NesType::I16 => 2,
         NesType::Array(elem, count) => type_size(elem) * count,
         // Struct sizes are resolved in the analyzer. IR lowering only
         // sees struct types on `var` declarations, which are skipped

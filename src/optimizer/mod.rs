@@ -574,6 +574,7 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         }
         IrOp::LoadVarHi(_, _)
         | IrOp::ReadInput(_, _)
+        | IrOp::ReadInputEdge { .. }
         | IrOp::WaitFrame
         | IrOp::CycleSprites
         | IrOp::Transition(_)
@@ -582,9 +583,41 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         | IrOp::PlaySfx(_)
         | IrOp::StartMusic(_)
         | IrOp::StopMusic
+        | IrOp::Rand8(_)
+        | IrOp::Rand16(_, _)
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
         | IrOp::SourceLoc(_) => {}
+        IrOp::SeedRand(lo, hi) => {
+            used.insert(*lo);
+            used.insert(*hi);
+        }
+        IrOp::SetPaletteBrightness(level) => {
+            used.insert(*level);
+        }
+        IrOp::FadeOut(step_frames) | IrOp::FadeIn(step_frames) => {
+            used.insert(*step_frames);
+        }
+        IrOp::Sprite0Split { scroll_x, scroll_y } => {
+            used.insert(*scroll_x);
+            used.insert(*scroll_y);
+        }
+        IrOp::NtSet { x, y, tile } => {
+            used.insert(*x);
+            used.insert(*y);
+            used.insert(*tile);
+        }
+        IrOp::NtAttr { x, y, value } => {
+            used.insert(*x);
+            used.insert(*y);
+            used.insert(*value);
+        }
+        IrOp::NtFillH { x, y, len, tile } => {
+            used.insert(*x);
+            used.insert(*y);
+            used.insert(*len);
+            used.insert(*tile);
+        }
     }
 }
 
@@ -616,7 +649,16 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::ArrayLoad(d, _, _) => Some(*d),
         IrOp::Call(dest, _, _) => *dest,
         IrOp::ReadInput(d, _) => Some(*d),
+        IrOp::ReadInputEdge { dest, .. } => Some(*dest),
         IrOp::Peek(d, _) => Some(*d),
+        // Rand8 / Rand16 have an observable side effect — advancing
+        // the PRNG state — so a statement-level call like
+        // `rand8()` (result discarded) must NOT be dropped by DCE.
+        // Returning `None` here keeps the JSR regardless of whether
+        // the dest temp is live; the dest is still referenced by
+        // `op_source_temps` so live expression-position uses still
+        // track correctly.
+        IrOp::Rand8(_) | IrOp::Rand16(_, _) => None,
         IrOp::StoreVar(_, _)
         | IrOp::StoreVarHi(_, _)
         | IrOp::ArrayStore(_, _, _)
@@ -632,6 +674,14 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::PlaySfx(_)
         | IrOp::StartMusic(_)
         | IrOp::StopMusic
+        | IrOp::SeedRand(_, _)
+        | IrOp::SetPaletteBrightness(_)
+        | IrOp::FadeOut(_)
+        | IrOp::FadeIn(_)
+        | IrOp::Sprite0Split { .. }
+        | IrOp::NtSet { .. }
+        | IrOp::NtAttr { .. }
+        | IrOp::NtFillH { .. }
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
         | IrOp::SourceLoc(_) => None,

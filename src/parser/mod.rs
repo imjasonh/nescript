@@ -132,6 +132,7 @@ impl Parser {
         let mut metasprites = Vec::new();
         let mut sfx = Vec::new();
         let mut music = Vec::new();
+        let mut saves: Vec<crate::parser::ast::VarDecl> = Vec::new();
         let mut banks = Vec::new();
         let mut start_state = None;
         let mut on_frame = None;
@@ -180,6 +181,34 @@ impl Parser {
                 }
                 TokenKind::KwMusic => {
                     music.push(self.parse_music_decl()?);
+                }
+                TokenKind::KwSave => {
+                    // `save { var x: u8 = 0  var y: u16 = 100 }` —
+                    // a block of variable declarations that the
+                    // analyzer allocates at $6000+ (cartridge SRAM
+                    // window) instead of main RAM. Parsed as a
+                    // sequence of plain `VarDecl`s; the analyzer
+                    // and ROM builder are what make them battery-
+                    // backed.
+                    self.advance();
+                    self.expect(&TokenKind::LBrace)?;
+                    while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+                        match self.peek().clone() {
+                            TokenKind::KwVar | TokenKind::KwFast | TokenKind::KwSlow => {
+                                saves.push(self.parse_var_decl()?);
+                            }
+                            other => {
+                                return Err(Diagnostic::error(
+                                    ErrorCode::E0201,
+                                    format!(
+                                        "expected `var` declaration inside `save {{ }}`, got `{other}`"
+                                    ),
+                                    self.current_span(),
+                                ));
+                            }
+                        }
+                    }
+                    self.expect(&TokenKind::RBrace)?;
                 }
                 TokenKind::KwBank => {
                     let (bank, nested_funs) = self.parse_bank_decl()?;
@@ -249,6 +278,7 @@ impl Parser {
         Ok(Program {
             game,
             globals,
+            saves,
             constants,
             enums,
             structs,
@@ -357,6 +387,11 @@ impl Parser {
         let mut mapper = Mapper::NROM;
         let mut mirroring = Mirroring::Horizontal;
         let mut header = HeaderFormat::Ines1;
+        // Default to the FCEUX `$4800` convention; programs
+        // targeting Mesen can override to `$4018` via
+        // `debug_port: mesen`.
+        let mut debug_port: u16 = 0x4800;
+        let mut sprite_flicker: bool = false;
 
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             let (key, _) = self.expect_ident()?;
@@ -369,13 +404,18 @@ impl Parser {
                         "MMC1" => Mapper::MMC1,
                         "UxROM" => Mapper::UxROM,
                         "MMC3" => Mapper::MMC3,
+                        "AxROM" => Mapper::AxROM,
+                        "CNROM" => Mapper::CNROM,
+                        "GNROM" => Mapper::GNROM,
                         _ => {
                             return Err(Diagnostic::error(
                                 ErrorCode::E0201,
                                 format!("unknown mapper '{val}'"),
                                 self.current_span(),
                             )
-                            .with_help("supported mappers: NROM, MMC1, UxROM, MMC3"));
+                            .with_help(
+                                "supported mappers: NROM, MMC1, UxROM, MMC3, AxROM, CNROM, GNROM",
+                            ));
                         }
                     };
                 }
@@ -408,6 +448,66 @@ impl Parser {
                         }
                     };
                 }
+                "sprite_flicker" => {
+                    // The lexer emits `true` / `false` as
+                    // `TokenKind::BoolLiteral` (not `Ident`), so
+                    // match on the token rather than going through
+                    // `expect_ident`.
+                    match self.peek().clone() {
+                        TokenKind::BoolLiteral(b) => {
+                            self.advance();
+                            sprite_flicker = b;
+                        }
+                        _ => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                "expected `true` or `false` for sprite_flicker",
+                                self.current_span(),
+                            ));
+                        }
+                    }
+                }
+                "debug_port" => {
+                    // Accept either a named alias (`fceux`, `mesen`)
+                    // or an integer literal for custom ports. The
+                    // numeric path routes through the normal int
+                    // literal parser so both decimal and `0x…`
+                    // hex work.
+                    match self.peek().clone() {
+                        TokenKind::Ident(alias) => {
+                            self.advance();
+                            debug_port = match alias.as_str() {
+                                "fceux" => 0x4800,
+                                "mesen" => 0x4018,
+                                _ => {
+                                    return Err(Diagnostic::error(
+                                        ErrorCode::E0201,
+                                        format!("unknown debug port alias '{alias}'"),
+                                        self.current_span(),
+                                    )
+                                    .with_help(
+                                        "supported aliases: fceux ($4800), mesen ($4018); \
+                                         or pass a numeric literal (e.g. `0x2FFF`)",
+                                    ));
+                                }
+                            };
+                        }
+                        TokenKind::IntLiteral(n) => {
+                            // IntLiteral is already a u16, so it
+                            // can't exceed the 6502 address space —
+                            // no range check needed.
+                            self.advance();
+                            debug_port = n;
+                        }
+                        _ => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                "expected an alias (`fceux`, `mesen`) or a numeric address",
+                                self.current_span(),
+                            ));
+                        }
+                    }
+                }
                 _ => {
                     return Err(Diagnostic::error(
                         ErrorCode::E0201,
@@ -424,6 +524,8 @@ impl Parser {
             mapper,
             mirroring,
             header,
+            debug_port,
+            sprite_flicker,
             span: Span::new(
                 start_span.file_id,
                 start_span.start,
@@ -2918,6 +3020,10 @@ impl Parser {
                 self.advance();
                 NesType::U16
             }
+            TokenKind::KwI16 => {
+                self.advance();
+                NesType::I16
+            }
             TokenKind::KwBool => {
                 self.advance();
                 NesType::Bool
@@ -3152,14 +3258,34 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
 
-                // Check for button.X (player 1 default)
+                // Check for button.X or button.X.pressed/.released
                 if name == "button" && *self.peek() == TokenKind::Dot {
                     self.advance();
                     let (button, _) = self.expect_name()?;
+                    if *self.peek() == TokenKind::Dot {
+                        self.advance();
+                        if let TokenKind::Ident(edge) = self.peek().clone() {
+                            if edge == "pressed" || edge == "released" {
+                                self.advance();
+                                return Ok(Expr::ButtonEdge(
+                                    None,
+                                    button,
+                                    edge == "released",
+                                    span,
+                                ));
+                            }
+                        }
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            "expected 'pressed' or 'released' after button name",
+                            self.current_span(),
+                        ));
+                    }
                     return Ok(Expr::ButtonRead(None, button, span));
                 }
 
-                // Check for p1.button.X / p2.button.X
+                // Check for p1.button.X / p2.button.X, optionally
+                // followed by .pressed / .released for edge-triggered.
                 if (name == "p1" || name == "p2") && *self.peek() == TokenKind::Dot {
                     self.advance();
                     // Expect 'button'
@@ -3173,6 +3299,25 @@ impl Parser {
                             } else {
                                 Some(Player::P2)
                             };
+                            if *self.peek() == TokenKind::Dot {
+                                self.advance();
+                                if let TokenKind::Ident(edge) = self.peek().clone() {
+                                    if edge == "pressed" || edge == "released" {
+                                        self.advance();
+                                        return Ok(Expr::ButtonEdge(
+                                            player,
+                                            button,
+                                            edge == "released",
+                                            span,
+                                        ));
+                                    }
+                                }
+                                return Err(Diagnostic::error(
+                                    ErrorCode::E0201,
+                                    "expected 'pressed' or 'released' after button name",
+                                    self.current_span(),
+                                ));
+                            }
                             return Ok(Expr::ButtonRead(player, button, span));
                         }
                     }

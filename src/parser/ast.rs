@@ -4,6 +4,16 @@ use crate::lexer::Span;
 pub struct Program {
     pub game: GameDecl,
     pub globals: Vec<VarDecl>,
+    /// Battery-backed save variables, declared inside a top-level
+    /// `save { var ... }` block. The analyzer allocates these at
+    /// `$6000+` (the iNES SRAM region) instead of main RAM, and the
+    /// ROM builder flips byte-6 bit-1 of the iNES header so
+    /// emulators and cartridge boards persist this region across
+    /// power cycles. SRAM is uninitialized at first power-on, so
+    /// users should checksum or use a magic-byte sentinel to detect
+    /// a fresh battery — the compiler does not auto-initialize
+    /// save fields.
+    pub saves: Vec<VarDecl>,
     pub constants: Vec<ConstDecl>,
     pub enums: Vec<EnumDecl>,
     pub structs: Vec<StructDecl>,
@@ -226,6 +236,24 @@ pub struct GameDecl {
     /// iNES header flavor to emit. Defaults to [`HeaderFormat::Ines1`];
     /// programs can opt into NES 2.0 via `game Foo { header: nes2 }`.
     pub header: HeaderFormat,
+    /// Absolute address the runtime should write to for `debug.log`
+    /// output and `__debug_halt` sentinels. Defaults to `$4800`
+    /// (the FCEUX convention). Programs targeting Mesen/Mesen2 can
+    /// set `debug_port: mesen` in the `game { }` block, which
+    /// selects `$4018` — Mesen's documented tracing port. Custom
+    /// addresses (`debug_port: 0x2FFF`) are also accepted so ROMs
+    /// for unusual debuggers can retarget the port.
+    pub debug_port: u16,
+    /// When true, every `on frame { }` handler automatically bumps
+    /// the OAM cycle offset by 4 at the top — the same effect as
+    /// calling `cycle_sprites` as the first statement. Paired with
+    /// the `__sprite_cycle_used` runtime path this turns the NES's
+    /// 8-sprites-per-scanline hardware dropout into per-frame
+    /// flicker, which the eye reconstructs into a full sprite
+    /// count across frames. Opt-in because it adds ~10 bytes per
+    /// handler and the flicker only looks correct if user code
+    /// isn't already managing priorities manually.
+    pub sprite_flicker: bool,
     pub span: Span,
 }
 
@@ -235,6 +263,26 @@ pub enum Mapper {
     MMC1,
     UxROM,
     MMC3,
+    /// `AxROM` (mapper 7). Single-screen mirroring, up to 256 KB PRG
+    /// bankswitched in 32 KB pages via one write to `$8000-$FFFF`.
+    /// Register layout: bits 0-2 select the 32 KB PRG bank, bit 4
+    /// selects single-screen nametable (0 = lower, 1 = upper).
+    /// `Mirroring::Horizontal` → lower-screen, `Mirroring::Vertical`
+    /// → upper-screen in the initial write at reset.
+    AxROM,
+    /// `CNROM` (mapper 3). Fixed 32 KB PRG, 8 KB CHR bankswitching
+    /// via one write to `$8000-$FFFF`. Supports up to ~2 MB of CHR
+    /// ROM though most commercial carts stopped at 32 KB. Useful
+    /// for games that want static PRG but swap entire tile sheets
+    /// per screen / level.
+    CNROM,
+    /// `GNROM` / `MHROM` (mapper 66). Combines `AxROM`-style 32 KB
+    /// PRG pages with `CNROM`-style 8 KB CHR bankswitching in one
+    /// register at `$8000-$FFFF`. Bits 4-5 select the PRG page,
+    /// bits 0-1 select the CHR bank. Useful for small-to-medium
+    /// homebrew games that outgrow NROM but don't need MMC1's
+    /// mirroring control or MMC3's scanline IRQ.
+    GNROM,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -338,6 +386,14 @@ pub enum NesType {
     U8,
     I8,
     U16,
+    /// Signed 16-bit integer. Same two-byte layout as `U16` but the
+    /// analyzer tracks the signedness on literals, casts, and
+    /// assignments. Arithmetic emits the same carry-propagating
+    /// paired operations as `U16`; comparisons are currently
+    /// lowered through the same unsigned 16-bit compare path that
+    /// `U16` uses (matching the existing `I8` behaviour). A proper
+    /// signed-compare lowering would be a separate follow-up.
+    I16,
     Bool,
     Array(Box<NesType>, u16),
     /// A user-declared struct, identified by its name. The analyzer
@@ -351,6 +407,7 @@ impl std::fmt::Display for NesType {
             Self::U8 => write!(f, "u8"),
             Self::I8 => write!(f, "i8"),
             Self::U16 => write!(f, "u16"),
+            Self::I16 => write!(f, "i16"),
             Self::Bool => write!(f, "bool"),
             Self::Array(t, n) => write!(f, "{t}[{n}]"),
             Self::Struct(name) => write!(f, "{name}"),
@@ -376,6 +433,13 @@ pub enum Expr {
     UnaryOp(UnaryOp, Box<Expr>, Span),
     Call(String, Vec<Expr>, Span),
     ButtonRead(Option<Player>, String, Span),
+    /// Edge-triggered button read: `p1.button.a.pressed` or
+    /// `p1.button.a.released`. The final boolean says which edge
+    /// (true = released, false = pressed) so a single variant
+    /// covers both cases. The analyzer and lowering read
+    /// `PREV_INPUT_P1` / `PREV_INPUT_P2` at the read site and
+    /// XOR against the current byte to compute the edge.
+    ButtonEdge(Option<Player>, String, bool, Span),
     ArrayLiteral(Vec<Expr>, Span),
     Cast(Box<Expr>, NesType, Span),
     /// Struct literal: `Name { field1: expr, field2: expr, ... }`.
@@ -405,6 +469,7 @@ impl Expr {
             | Self::UnaryOp(_, _, s)
             | Self::Call(_, _, s)
             | Self::ButtonRead(_, _, s)
+            | Self::ButtonEdge(_, _, _, s)
             | Self::ArrayLiteral(_, s)
             | Self::Cast(_, _, s)
             | Self::StructLiteral(_, _, s)

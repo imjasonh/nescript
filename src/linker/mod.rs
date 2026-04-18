@@ -2,7 +2,9 @@ mod debug_symbols;
 #[cfg(test)]
 mod tests;
 
-pub use debug_symbols::{render_dbg, render_mlb, render_source_map};
+pub use debug_symbols::{
+    render_dbg, render_fceux_nl, render_fceux_ram_nl, render_mlb, render_source_map,
+};
 
 use std::collections::HashMap;
 
@@ -43,6 +45,11 @@ pub struct Linker {
     mirroring: Mirroring,
     mapper: Mapper,
     header_format: HeaderFormat,
+    /// True when the program declared a `save { var ... }` block.
+    /// Threaded through to [`RomBuilder::set_battery`] so the iNES
+    /// header byte 6 bit 1 is set; emulators that respect it persist
+    /// the `$6000-$7FFF` SRAM region across power cycles.
+    has_battery: bool,
 }
 
 /// CHR data for a sprite, placed at a specific tile index in CHR ROM.
@@ -189,6 +196,7 @@ impl Linker {
             mirroring,
             mapper: Mapper::NROM,
             header_format: HeaderFormat::Ines1,
+            has_battery: false,
         }
     }
 
@@ -197,6 +205,7 @@ impl Linker {
             mirroring,
             mapper,
             header_format: HeaderFormat::Ines1,
+            has_battery: false,
         }
     }
 
@@ -206,6 +215,14 @@ impl Linker {
     #[must_use]
     pub fn with_header(mut self, header: HeaderFormat) -> Self {
         self.header_format = header;
+        self
+    }
+
+    /// Mark the ROM as battery-backed. Threaded through from
+    /// `analysis.has_battery_saves`; flips iNES byte-6 bit-1.
+    #[must_use]
+    pub fn with_battery(mut self, has_battery: bool) -> Self {
+        self.has_battery = has_battery;
         self
     }
 
@@ -318,6 +335,20 @@ impl Linker {
             "NROM does not support switchable PRG banks (got {} banks)",
             switchable_banks.len()
         );
+        // CNROM has a fixed 32 KB PRG — user-declared switchable PRG
+        // banks are meaningless. AxROM and GNROM switch 32 KB pages
+        // as a unit, which the current 16 KB-per-bank trampoline
+        // model doesn't support cleanly. Reject all three up front
+        // so a silent layout mismatch doesn't produce a subtly
+        // broken ROM.
+        assert!(
+            switchable_banks.is_empty()
+                || !matches!(self.mapper, Mapper::CNROM | Mapper::AxROM | Mapper::GNROM),
+            "{:?} does not yet support switchable PRG banks (got {} banks); \
+             use MMC1/UxROM/MMC3 for per-function banking",
+            self.mapper,
+            switchable_banks.len()
+        );
         self.link_banked_inner(
             user_code,
             sprites,
@@ -424,6 +455,13 @@ impl Linker {
             self.mirroring,
             total_banks,
         ));
+
+        // Seed the PRNG state. Only emitted when the IR codegen
+        // dropped the `__rand_used` marker — programs without PRNG
+        // keep their reset path byte-identical.
+        if has_label(user_code, "__rand_used") {
+            all_instructions.extend(runtime::gen_prng_init());
+        }
 
         // Whether the program produces any visual output. True if
         // the user declared a palette / sprite / background, or if
@@ -542,6 +580,42 @@ impl Linker {
         }
         if has_div {
             all_instructions.extend(runtime::gen_divide());
+        }
+
+        // PRNG: splice the three entry points (`__rand8`, `__rand16`,
+        // `__rand_seed`) whenever the codegen dropped the `__rand_used`
+        // marker. Programs that never call `rand8()` / `rand16()` /
+        // `seed_rand()` skip this entirely.
+        let has_rand = has_label(user_code, "__rand_used");
+        if has_rand {
+            all_instructions.extend(runtime::gen_prng());
+        }
+
+        // Palette brightness: splice `__set_palette_brightness`
+        // whenever `set_palette_brightness(level)` was called.
+        // Fade builtins (`fade_out` / `fade_in`) also require the
+        // brightness routine — the codegen's `emit_fade_marker`
+        // forces `__palette_bright_used` whenever fade is used, so
+        // this path picks up fade as a side effect.
+        let has_palette_bright = has_label(user_code, "__palette_bright_used");
+        if has_palette_bright {
+            all_instructions.extend(runtime::gen_palette_brightness());
+        }
+
+        // Fade helpers (`__fade_out` / `__fade_in` plus the shared
+        // `__wait_frame_rt` subroutine). Splices when user code
+        // called `fade_out(n)` or `fade_in(n)`.
+        let has_fade = has_label(user_code, "__fade_used");
+        if has_fade {
+            all_instructions.extend(runtime::gen_fade());
+        }
+
+        // VRAM update buffer drain. Splices the `__vram_buf_drain`
+        // routine when any `nt_set` / `nt_attr` / `nt_fill_h`
+        // intrinsic was lowered. The NMI handler JSRs it during
+        // vblank.
+        if has_label(user_code, "__vram_buf_used") {
+            all_instructions.extend(runtime::gen_vram_buf_drain());
         }
 
         // Audio subsystem — linked in whenever user code touched
@@ -670,6 +744,15 @@ impl Linker {
         let has_sprite_cycle = has_label(user_code, "__sprite_cycle_used");
         let has_p1_input = has_label(user_code, "__p1_input_used");
         let has_p2_input = has_label(user_code, "__p2_input_used");
+        // `__edge_input_used` is dropped whenever any `p1.a.pressed` /
+        // `p1.a.released` site lowers. Tells the NMI to snapshot the
+        // previous-frame input byte before the new strobe.
+        let has_edge_input = has_label(user_code, "__edge_input_used");
+        // `__vram_buf_used` is dropped by the IR codegen for any
+        // `nt_set` / `nt_attr` / `nt_fill_h` call site. Brings in
+        // both the `__vram_buf_drain` runtime routine and the
+        // NMI-side JSR that calls it during vblank.
+        let has_vram_buf = has_label(user_code, "__vram_buf_used");
         all_instructions.extend(runtime::gen_nmi(runtime::NmiOptions {
             has_ppu_updates,
             has_audio,
@@ -678,6 +761,8 @@ impl Linker {
             has_oam,
             has_p2_input,
             has_p1_input,
+            has_edge_input,
+            has_vram_buf,
         }));
 
         // IRQ handler
@@ -731,6 +816,7 @@ impl Linker {
         if self.header_format == HeaderFormat::Nes2 {
             builder.enable_nes2();
         }
+        builder.set_battery(self.has_battery);
 
         // Multi-bank layout: each switchable bank is an independent
         // 16 KB slot whose contents are either the assembled
@@ -747,7 +833,22 @@ impl Linker {
         // the fixed bank — math runtime, audio tick, other state
         // handlers, etc.
         if switchable_banks.is_empty() {
-            builder.set_prg(prg);
+            // AxROM (mapper 7) and GNROM (mapper 66) both map a
+            // single 32 KB PRG page at $8000-$FFFF, so emulators
+            // expect PRG size in multiples of 32 KB. For single-page
+            // AxROM/GNROM we emit two 16 KB iNES banks: the first
+            // is 0xFF fill (maps at $8000-$BFFF when bank 0 is
+            // selected), and the second is our assembled fixed-bank
+            // code (maps at $C000-$FFFF). Bank-select writes still
+            // work — the mapper's register picks the 32 KB page —
+            // but with a single PRG page the upper-half code is
+            // always visible.
+            if matches!(self.mapper, Mapper::AxROM | Mapper::GNROM) {
+                let filler = vec![0xFF_u8; 16384];
+                builder.set_prg_banks(vec![filler, prg]);
+            } else {
+                builder.set_prg(prg);
+            }
         } else {
             // Build the merged label table the bank assembler
             // needs. Includes both the cross-bank labels gathered

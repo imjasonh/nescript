@@ -43,7 +43,7 @@ fn compile(source: &str) -> Vec<u8> {
     let mut instructions = codegen.generate(&ir_program);
     nescript::codegen::peephole::optimize(&mut instructions);
 
-    let linker = Linker::new(program.game.mirroring);
+    let linker = Linker::new(program.game.mirroring).with_battery(analysis.has_battery_saves);
     linker.link_with_all_assets(&instructions, &sprites, &sfx, &music)
 }
 
@@ -2968,5 +2968,1274 @@ fn debug_build_emits_bounds_check_halt_routine() {
     assert!(
         !mlb_debug.contains("__debug_halt"),
         "debug halt label is internal; should not leak into .mlb"
+    );
+}
+
+// ── PRNG / edge input / palette brightness / new mappers ──
+
+/// Locate the four-byte sequence `JSR label` within a ROM's assembled
+/// fixed bank. The search walks the bytes rather than trusting the
+/// linker label table so a miscompile that drops the JSR fails this
+/// test even if the label is still resolved.
+fn contains_jsr_to(rom: &[u8], target_cpu_addr: u16) -> bool {
+    let bytes = target_cpu_addr.to_le_bytes();
+    rom.windows(3)
+        .any(|w| w[0] == 0x20 && w[1] == bytes[0] && w[2] == bytes[1])
+}
+
+#[test]
+fn rand8_lowers_to_jsr_to_rand8() {
+    let source = r#"
+game "RandDemo" { mapper: NROM }
+var x: u8 = 0
+on frame {
+    x = rand8()
+}
+start Main
+"#;
+    let rom = compile(source);
+    // The `__rand8` runtime routine is now linked into the ROM.
+    // Its label lands inside the fixed PRG bank at $C000-$FFFF.
+    // Build a fresh linker-level compile so we can scan the label
+    // table too, but the byte-level test is the authoritative one.
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 0);
+    // Rebuild with the linker to read the label table and verify
+    // our byte scan hits the right JSR.
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    let rand8_addr = *linked
+        .labels
+        .get("__rand8")
+        .expect("__rand_used marker should cause __rand8 to be linked in");
+    assert!(
+        contains_jsr_to(&linked.rom, rand8_addr),
+        "rand8() should emit JSR __rand8 at its call site"
+    );
+}
+
+#[test]
+fn rand_routines_omitted_without_use() {
+    // Sanity: a program that never calls rand8/rand16/seed_rand
+    // should not pay any bytes for the PRNG.
+    let source = r#"
+game "NoRand" { mapper: NROM }
+var x: u8 = 0
+on frame { x = x + 1 }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        !linked.labels.contains_key("__rand8"),
+        "PRNG routine should not be linked in when unused"
+    );
+}
+
+#[test]
+fn rand8_statement_survives_dce() {
+    // `rand8()` at statement position (result discarded) has a
+    // side effect — advancing the PRNG state — so DCE must not
+    // eliminate the JSR. Regression test: earlier the op_dest
+    // helper returned Some(dest) for Rand8, which let DCE drop
+    // statement-level draws where the temp was unused.
+    let source = r#"
+game "StmtRand" { mapper: NROM }
+on frame {
+    rand8()
+    rand16()
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    let rand8_addr = *linked
+        .labels
+        .get("__rand8")
+        .expect("statement-level rand8() should still link in the PRNG routine");
+    assert!(
+        contains_jsr_to(&linked.rom, rand8_addr),
+        "rand8() statement should keep its JSR through the optimizer"
+    );
+}
+
+#[test]
+fn set_palette_brightness_lowers_to_jsr() {
+    let source = r#"
+game "FadeDemo" { mapper: NROM }
+on frame {
+    set_palette_brightness(4)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    let addr = *linked
+        .labels
+        .get("__set_palette_brightness")
+        .expect("set_palette_brightness should link __set_palette_brightness");
+    assert!(
+        contains_jsr_to(&linked.rom, addr),
+        "set_palette_brightness should emit JSR __set_palette_brightness"
+    );
+}
+
+#[test]
+fn edge_input_pressed_emits_prev_snapshot() {
+    // A program that reads `p1.button.a.pressed` should have the
+    // runtime snapshot the previous-frame input byte into
+    // `$07E6` inside the NMI. We verify the store sequence lands.
+    let source = r#"
+game "EdgeDemo" { mapper: NROM }
+var hit: u8 = 0
+on frame {
+    if p1.button.a.pressed {
+        hit += 1
+    }
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    // The NMI handler should STA `$07E6` (PREV_INPUT_P1). Scan
+    // the ROM bytes for the `STA abs $07E6` opcode sequence
+    // (0x8D 0xE6 0x07).
+    assert!(
+        linked
+            .rom
+            .windows(3)
+            .any(|w| w[0] == 0x8D && w[1] == 0xE6 && w[2] == 0x07),
+        "edge input should cause the NMI to save the previous-frame P1 byte to $07E6"
+    );
+}
+
+#[test]
+fn axrom_rom_has_correct_header_and_size() {
+    let source = r#"
+game "AxDemo" { mapper: AxROM }
+var x: u8 = 0
+on frame { x += 1 }
+start Main
+"#;
+    let rom = compile_with_mapper(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 7, "AxROM is iNES mapper 7");
+    // Two PRG banks = 32 KB = mapper 7's page size.
+    assert_eq!(info.prg_banks, 2, "AxROM should be 32 KB PRG");
+}
+
+#[test]
+fn gnrom_rom_has_correct_header_and_size() {
+    let source = r#"
+game "GnDemo" { mapper: GNROM }
+var x: u8 = 0
+on frame { x += 1 }
+start Main
+"#;
+    let rom = compile_with_mapper(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 66, "GNROM is iNES mapper 66");
+    // GNROM (like AxROM) ships in 32 KB PRG pages.
+    assert_eq!(info.prg_banks, 2, "GNROM should be 32 KB PRG");
+}
+
+#[test]
+fn cnrom_rom_has_correct_header() {
+    let source = r#"
+game "CnDemo" { mapper: CNROM }
+var x: u8 = 0
+on frame { x += 1 }
+start Main
+"#;
+    let rom = compile_with_mapper(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 3, "CNROM is iNES mapper 3");
+    assert_eq!(info.prg_banks, 1, "CNROM demo uses a single 16 KB PRG bank");
+}
+
+#[test]
+fn unknown_button_edge_emits_diagnostic() {
+    // The analyzer should reject `p1.button.foo.pressed` with an
+    // error — silently compiling to "always false" would make
+    // typos invisible at runtime.
+    let source = r#"
+game "BadEdge" { mapper: NROM }
+on frame {
+    if p1.button.asdf.pressed { }
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.is_error() && d.message.contains("unknown button")),
+        "unknown button name inside edge-trigger should error; got {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn sprite_0_split_emits_two_phase_busy_wait_and_scroll() {
+    // `sprite_0_split(x, y)` should emit the classic two-phase
+    // wait on `$2002` bit 6, followed by two writes to `$2005`
+    // (the PPU scroll register takes X then Y). We verify the
+    // byte-level sequence appears in the fixed bank — the
+    // `LDA $2002 / AND #$40 / BEQ` pattern is the phase-2 wait,
+    // and the `STA $2005 / STA $2005` pair comes right after.
+    let source = r#"
+game "Spr0" { mapper: NROM }
+var sx: u8 = 5
+var sy: u8 = 9
+on frame {
+    sprite_0_split(sx, sy)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    // `LDA $2002` = `AD 02 20` (little-endian).
+    let lda_2002 = [0xAD_u8, 0x02, 0x20];
+    // `AND #$40` = `29 40`.
+    let and_40 = [0x29_u8, 0x40];
+    // `STA $2005` = `8D 05 20`.
+    let sta_2005 = [0x8D_u8, 0x05, 0x20];
+    assert!(
+        linked.rom.windows(3).any(|w| w == lda_2002),
+        "sprite_0_split should read `$2002` to poll bit 6"
+    );
+    assert!(
+        linked.rom.windows(2).any(|w| w == and_40),
+        "sprite_0_split should mask with `#$40` for bit 6"
+    );
+    // Two `STA $2005` writes for the X/Y scroll pair.
+    let scroll_writes = linked.rom.windows(3).filter(|w| *w == sta_2005).count();
+    assert!(
+        scroll_writes >= 2,
+        "sprite_0_split should emit at least two `STA $2005` writes (X, Y); got {scroll_writes}"
+    );
+}
+
+#[test]
+fn sprite_0_split_arity_enforced() {
+    // Wrong arity must fail at compile time, not later.
+    let source = r#"
+game "BadSpr0" { mapper: NROM }
+on frame {
+    sprite_0_split(1)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.is_error() && d.message.contains("sprite_0_split")),
+        "sprite_0_split with 1 arg should error; got {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn sprite_0_split_omitted_without_use() {
+    // Programs that never call sprite_0_split must not have the
+    // phase-2 BEQ busy-wait pattern anywhere in their ROM.
+    let source = r#"
+game "NoSpr0" { mapper: NROM }
+var x: u8 = 0
+on frame { x = x + 1 }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    // Programs without sprite_0_split shouldn't have the
+    // `LDA $2002 / AND #$40` pattern on a busy-wait. $2002 reads
+    // do happen elsewhere (sprite-overflow sampling in debug
+    // mode), but the AND #$40 mask is specific to sprite-0-hit.
+    let lda_2002 = [0xAD_u8, 0x02, 0x20];
+    let and_40 = [0x29_u8, 0x40];
+    // Find any place where `LDA $2002` is immediately followed
+    // by `AND #$40`. That's the sprite-0-hit poll signature.
+    let has_poll_pattern = linked
+        .rom
+        .windows(5)
+        .any(|w| w[0..3] == lda_2002 && w[3..5] == and_40);
+    assert!(
+        !has_poll_pattern,
+        "program without sprite_0_split should not emit the sprite-0 busy-wait"
+    );
+}
+
+#[test]
+fn inline_asm_dot_labels_are_per_block_unique() {
+    // Two inline-asm blocks in the same function can both use
+    // `.loop:` without colliding in the linker's label table.
+    // The codegen mangles `.X` to `__ilab_<N>_X` where `<N>` is
+    // the per-call-site monotonic suffix.
+    let source = r#"
+game "DotLabelCollide" { mapper: NROM }
+var counter: u8 = 0
+fun double_loop() {
+    asm {
+        LDX #5
+    .loop:
+        DEX
+        BNE .loop
+        STX {counter}
+    }
+    asm {
+        LDX #3
+    .loop:
+        DEX
+        BNE .loop
+        STX {counter}
+    }
+}
+on frame { double_loop() }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    // Both `.loop:` definitions should be present, mangled to
+    // distinct `__ilab_<N>_loop` labels.
+    let mangled: Vec<&String> = linked
+        .labels
+        .keys()
+        .filter(|k| k.starts_with("__ilab_") && k.ends_with("_loop"))
+        .collect();
+    assert!(
+        mangled.len() >= 2,
+        "expected at least two mangled `.loop` labels, found {}: {:?}",
+        mangled.len(),
+        mangled
+    );
+}
+
+#[test]
+fn inline_asm_dot_label_does_not_match_dollar_hex() {
+    // `STA $2002` writes to PPU status; the substituter must NOT
+    // mangle the `$2002` operand — only `.IDENT` patterns. This is
+    // a regression check for the dot-vs-dollar disambiguation.
+    let source = r#"
+game "DollarOk" { mapper: NROM }
+fun touch_ppu() {
+    asm {
+        LDA $2002
+    }
+}
+on frame { touch_ppu() }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.diagnostics.iter().all(|d| !d.is_error()),
+        "$2002 in inline asm should compile cleanly; got {:?}",
+        analysis.diagnostics
+    );
+    // Compile to a ROM — if the mangler corrupted the operand,
+    // the asm parser would error and the linker would emit BRK.
+    let _rom = compile(source);
+}
+
+#[test]
+fn nt_set_emits_buffer_append_and_drain_marker() {
+    // `nt_set(x, y, tile)` should:
+    //   1. Mark `__vram_buf_used` so the linker splices the
+    //      drain routine and gates the NMI JSR.
+    //   2. Emit a 4-byte append: write `[1][addr_hi][addr_lo][tile]`
+    //      starting at VRAM_BUF_BASE+head, bump the head, write a
+    //      fresh `0` sentinel after.
+    let source = r#"
+game "VramSet" { mapper: NROM }
+on frame {
+    nt_set(2, 1, 7)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    // The drain routine must be linked in.
+    assert!(
+        linked.labels.contains_key("__vram_buf_drain"),
+        "nt_set should pull __vram_buf_drain into the ROM"
+    );
+    // The NMI must JSR the drain. JSR opcode is 0x20; target
+    // address is the drain label resolved by the linker.
+    let drain_addr = *linked.labels.get("__vram_buf_drain").unwrap();
+    let lo = (drain_addr & 0xFF) as u8;
+    let hi = (drain_addr >> 8) as u8;
+    assert!(
+        linked
+            .rom
+            .windows(3)
+            .any(|w| w[0] == 0x20 && w[1] == lo && w[2] == hi),
+        "NMI should JSR __vram_buf_drain"
+    );
+}
+
+#[test]
+fn vram_buf_omitted_without_use() {
+    // Programs that never call any of the buffer intrinsics should
+    // not link in the drain routine and should keep main RAM
+    // starting at $0300.
+    let source = r#"
+game "NoVram" { mapper: NROM }
+var x: u8 = 0
+on frame { x = x + 1 }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let x_alloc = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "x")
+        .expect("x should be allocated");
+    // Without the buffer, `x` lives in zero page (the default
+    // for u8 globals); pre-buffer programs never had main-RAM
+    // allocations bumped to $0500.
+    assert!(
+        x_alloc.address < 0x100,
+        "u8 global should still land in zero page when buffer unused"
+    );
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        !linked.labels.contains_key("__vram_buf_drain"),
+        "drain routine must not be linked when no buffer intrinsic was used"
+    );
+}
+
+#[test]
+fn vram_buf_bumps_user_ram_past_buffer_when_used() {
+    // When user code touches the buffer, the analyzer should bump
+    // the main-RAM allocator to $0500 so user globals don't alias
+    // the buffer at $0400-$04FF. Force a main-RAM allocation by
+    // declaring a large array (too big for ZP).
+    let source = r#"
+game "VramBigVar" { mapper: NROM }
+var big: u8[200]
+on frame {
+    nt_set(0, 0, 1)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    let big_alloc = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "big")
+        .expect("big should be allocated");
+    assert!(
+        big_alloc.address >= 0x0500,
+        "user array should land at $0500+ when VRAM buffer is in use, got ${:04X}",
+        big_alloc.address
+    );
+    assert!(
+        big_alloc.address + big_alloc.size <= 0x0800,
+        "and should fit in main RAM"
+    );
+}
+
+#[test]
+fn nt_set_arity_enforced() {
+    let source = r#"
+game "BadVram" { mapper: NROM }
+on frame {
+    nt_set(1, 2)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.is_error() && d.message.contains("nt_set")),
+        "wrong-arity nt_set should error; got {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn save_block_allocates_at_sram_window_and_sets_battery_bit() {
+    // `save { var x: u16 = 0 }` should land at $6000+ (iNES SRAM
+    // window) and flip iNES header byte-6 bit-1 so emulators
+    // persist the region across power cycles.
+    let source = r#"
+game "SaveProg" { mapper: NROM }
+save {
+    var hi: u16 = 0
+    var coins: u8 = 0
+}
+on frame {
+    coins += 1
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.has_battery_saves,
+        "save block should set has_battery_saves"
+    );
+    let hi_alloc = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "hi")
+        .expect("hi should have a VarAllocation");
+    assert_eq!(hi_alloc.address, 0x6000, "hi should land at $6000");
+    assert_eq!(hi_alloc.size, 2, "u16 hi should be 2 bytes");
+    let coins_alloc = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "coins")
+        .expect("coins should have a VarAllocation");
+    assert_eq!(
+        coins_alloc.address, 0x6002,
+        "coins should land right after hi"
+    );
+    // Build the ROM and verify the iNES header bit.
+    let rom = compile(source);
+    assert_eq!(
+        rom[6] & 0x02,
+        0x02,
+        "iNES byte 6 bit 1 should be set for battery"
+    );
+}
+
+#[test]
+fn no_save_block_leaves_battery_bit_clear() {
+    // Sanity: a program with no save block must NOT set the
+    // battery bit.
+    let source = r#"
+game "NoSave" { mapper: NROM }
+on frame { }
+start Main
+"#;
+    let rom = compile(source);
+    assert_eq!(rom[6] & 0x02, 0, "no save block → no battery bit");
+}
+
+#[test]
+fn save_block_initializer_warns() {
+    // Initializers on save vars are silently dropped at codegen
+    // time (globals init at reset, save vars don't). Warn so the
+    // user knows their default isn't taking effect.
+    let source = r#"
+game "SaveInit" { mapper: NROM }
+save {
+    var hi: u16 = 12345
+}
+on frame { }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| !d.is_error() && matches!(d.code, nescript::errors::ErrorCode::W0111)),
+        "save-block initializer should emit W0111; got {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn save_block_struct_field_errors() {
+    // Struct types in save blocks aren't supported yet — must error,
+    // not silently allocate the struct fields back in main RAM.
+    let source = r#"
+game "BadSave" { mapper: NROM }
+struct Stats { hp: u8, mp: u8 }
+save {
+    var stats: Stats
+}
+on frame { }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.is_error() && d.message.contains("struct types are not supported")),
+        "struct in save block should error; got {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn i16_negative_literal_sign_extends_to_wide_store() {
+    // `var vy: i16 = -10` should store $F6 in the low byte and
+    // $FF in the high byte — sign-extended two's complement.
+    // A pre-fix lowering would byte-negate to $F6 and then
+    // zero-extend, producing $00F6 (= 246) which is wrong for
+    // signed semantics. Regression assert: scan the assembled
+    // ROM for `LDA #$F6 / STA <addr> / LDA #$FF / STA <addr+1>`.
+    let source = r#"
+game "I16Neg" { mapper: NROM }
+var vy: i16 = -10
+on frame {
+    vy = vy + 1
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    // `LDA #$F6` = `A9 F6`; `LDA #$FF` = `A9 FF`. Find them
+    // adjacent to the var's address, accounting for the STA
+    // instructions in between.
+    //
+    // We scan for the byte-pair pattern `A9 F6` followed within
+    // ~10 bytes by `A9 FF`. That's tight enough to catch the
+    // neg-literal store sequence and loose enough to survive
+    // any peephole reordering.
+    let rom = &linked.rom;
+    let lda_f6 = rom
+        .windows(2)
+        .position(|w| w == [0xA9_u8, 0xF6])
+        .expect("should emit LDA #$F6 for the i16 negative-literal low byte");
+    let near = &rom[lda_f6..(lda_f6 + 16).min(rom.len())];
+    assert!(
+        near.windows(2).any(|w| w == [0xA9_u8, 0xFF]),
+        "should emit LDA #$FF (sign-extended high byte) within 16 bytes of LDA #$F6"
+    );
+}
+
+#[test]
+fn i16_compiles_with_arithmetic_and_compare() {
+    // End-to-end compile of an i16 program with `+`, `-`, `>=`,
+    // and `as u8` cast. Just makes sure the type lowering path
+    // doesn't panic; the ROM-shape correctness is covered by
+    // `i16_demo.nes` and its emulator golden.
+    let source = include_str!("../examples/i16_demo.ne");
+    let rom = compile(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 0);
+}
+
+#[test]
+fn fade_out_emits_jsr_and_forces_palette_bright() {
+    // `fade_out(n)` should emit a JSR to `__fade_out` and also
+    // force the palette-brightness routine to be linked in,
+    // since the fade body JSRs into it.
+    let source = r#"
+game "FadeOutProg" { mapper: NROM }
+on frame {
+    fade_out(6)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    let fade_addr = *linked
+        .labels
+        .get("__fade_out")
+        .expect("fade_out should link in __fade_out");
+    assert!(
+        contains_jsr_to(&linked.rom, fade_addr),
+        "fade_out(6) should emit JSR __fade_out"
+    );
+    // The fade routine internally JSRs __set_palette_brightness,
+    // so that routine must also be present even though user code
+    // never called `set_palette_brightness` directly.
+    assert!(
+        linked.labels.contains_key("__set_palette_brightness"),
+        "fade_out forces __set_palette_brightness into the ROM"
+    );
+    // And the __wait_frame_rt helper must be present, since
+    // gen_fade JSRs it between steps.
+    assert!(
+        linked.labels.contains_key("__wait_frame_rt"),
+        "fade_out must link in __wait_frame_rt"
+    );
+}
+
+#[test]
+fn fade_omitted_without_use() {
+    // Programs that never touch fade should not pay for it.
+    let source = r#"
+game "NoFade" { mapper: NROM }
+var x: u8 = 0
+on frame { x = x + 1 }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    for sym in ["__fade_out", "__fade_in", "__wait_frame_rt"] {
+        assert!(
+            !linked.labels.contains_key(sym),
+            "{sym} should not be linked into a program that never uses fade"
+        );
+    }
+}
+
+#[test]
+fn fade_void_in_expression_position_errors() {
+    // Like the other void intrinsics, fade must be rejected at
+    // expression position.
+    let source = r#"
+game "BadFade" { mapper: NROM }
+on frame {
+    var _x: u8 = fade_out(6)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.is_error() && d.message.contains("does not return a value")),
+        "fade_out in expression position should error; got {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn sprite_flicker_attribute_emits_cycle_marker() {
+    // `game { sprite_flicker: true }` should cause the IR
+    // lowerer to inject an `IrOp::CycleSprites` at the top of
+    // every on_frame handler. The marker is what flips the NMI
+    // into the rotating-OAM variant, so we check that the
+    // linker's label table contains it.
+    let source = r#"
+game "Flicker" {
+    mapper: NROM
+    sprite_flicker: true
+}
+on frame {
+    draw Ball at: (10, 20)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        linked.labels.contains_key("__sprite_cycle_used"),
+        "sprite_flicker: true should emit the __sprite_cycle_used marker"
+    );
+}
+
+#[test]
+fn sprite_flicker_attribute_defaults_off() {
+    // A program that doesn't opt in must produce byte-identical
+    // output to the same program on any pre-flicker-attribute
+    // codegen: no `__sprite_cycle_used` marker, no NMI rotation.
+    let source = r#"
+game "NoFlicker" { mapper: NROM }
+on frame {
+    draw Ball at: (10, 20)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        !linked.labels.contains_key("__sprite_cycle_used"),
+        "sprite_flicker defaults to false and must emit no marker"
+    );
+}
+
+#[test]
+fn sprite_flicker_bad_value_errors() {
+    // Non-bool values on sprite_flicker are rejected by the
+    // parser, not silently coerced.
+    let source = r#"
+game "BadFlicker" {
+    mapper: NROM
+    sprite_flicker: yes
+}
+start Main
+"#;
+    let (_, diags) = nescript::parser::parse(source);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.is_error() && d.message.contains("true")),
+        "non-bool on sprite_flicker should error; got {diags:?}"
+    );
+}
+
+#[test]
+fn debug_log_targets_configured_port() {
+    // `debug.log` should write to whatever port the `game { }`
+    // block selected. Covers the alias shortcuts (`fceux`,
+    // `mesen`) and an explicit hex override. `game { }` fields
+    // are newline-separated; commas are not a separator there.
+    for (source, expected_addr) in [
+        (
+            r#"
+game "FceuxDefault" {
+    mapper: NROM
+    debug_port: fceux
+}
+on frame { debug.log(7) }
+start Main
+"#,
+            0x4800_u16,
+        ),
+        (
+            r#"
+game "MesenDebug" {
+    mapper: NROM
+    debug_port: mesen
+}
+on frame { debug.log(7) }
+start Main
+"#,
+            0x4018_u16,
+        ),
+        (
+            r#"
+game "CustomDebug" {
+    mapper: NROM
+    debug_port: 0x2FFF
+}
+on frame { debug.log(7) }
+start Main
+"#,
+            0x2FFF_u16,
+        ),
+    ] {
+        let (program, diags) = nescript::parser::parse(source);
+        assert!(
+            diags.iter().all(|d| !d.is_error()),
+            "parse errors for `{source}`: {diags:?}"
+        );
+        let program = program.expect("parse should succeed");
+
+        let analysis = analyzer::analyze(&program);
+        let mut ir_program = ir::lower(&program, &analysis);
+        optimizer::optimize(&mut ir_program);
+        let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+        let sfx = assets::resolve_sfx(&program).unwrap();
+        let music = assets::resolve_music(&program).unwrap();
+        let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+            .with_sprites(&sprites)
+            .with_audio(&sfx, &music)
+            .with_debug(true)
+            .with_debug_port(program.game.debug_port);
+        let mut instructions = codegen.generate(&ir_program);
+        nescript::codegen::peephole::optimize(&mut instructions);
+        let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+            &instructions,
+            &sprites,
+            &sfx,
+            &music,
+            &[],
+            &[],
+            &[],
+        );
+        // Scan the ROM for `STA abs <expected_addr>` = opcode 0x8D
+        // followed by the little-endian address bytes. This is the
+        // same authoritative byte-level assertion as the edge-input
+        // test — byte-identical wording.
+        let lo = (expected_addr & 0xFF) as u8;
+        let hi = (expected_addr >> 8) as u8;
+        assert!(
+            linked
+                .rom
+                .windows(3)
+                .any(|w| w[0] == 0x8D && w[1] == lo && w[2] == hi),
+            "debug.log should target {expected_addr:#06X} (got a ROM without `STA ${expected_addr:04X}`)"
+        );
+    }
+}
+
+#[test]
+fn debug_port_unknown_alias_errors() {
+    let source = r#"
+game "BadPort" {
+    mapper: NROM
+    debug_port: notarealemulator
+}
+start Main
+"#;
+    let (_, diags) = nescript::parser::parse(source);
+    assert!(
+        diags
+            .iter()
+            .any(|d| d.is_error() && d.message.contains("unknown debug port alias")),
+        "unknown alias should parse-error; got {diags:?}"
+    );
+}
+
+#[test]
+fn void_intrinsic_in_expression_position_errors() {
+    // Every void intrinsic — `seed_rand`, `set_palette_brightness`,
+    // `poke`, `fade_out`, `fade_in`, `sprite_0_split` — should
+    // refuse expression position at compile time rather than
+    // panicking the linker with an unresolved `__ir_fn_X` label.
+    let cases = [
+        "var x: u8 = seed_rand(42)",
+        "var x: u8 = set_palette_brightness(4)",
+        "var x: u8 = poke(0x0200, 1)",
+        "var x: u8 = fade_out(6)",
+        "var x: u8 = fade_in(6)",
+        "var x: u8 = sprite_0_split(0, 0)",
+    ];
+    for frag in cases {
+        let source = format!(
+            r#"
+game "BadVoid" {{ mapper: NROM }}
+on frame {{
+    {frag}
+}}
+start Main
+"#
+        );
+        let (program, _) = nescript::parser::parse(&source);
+        let program = program.expect("parse should succeed");
+        let analysis = analyzer::analyze(&program);
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .any(|d| d.is_error() && d.message.contains("does not return a value")),
+            "void-intrinsic in expr position should be an error; fragment was `{frag}`, got {:?}",
+            analysis.diagnostics
+        );
+    }
+}
+
+#[test]
+fn rand8_no_args_mismatch_errors() {
+    let source = r#"
+game "BadRand" { mapper: NROM }
+on frame {
+    var _x: u8 = rand8(1, 2)
+}
+start Main
+"#;
+    let (program, diags) = nescript::parser::parse(source);
+    // Parser accepts; analyzer should reject.
+    assert!(diags.iter().all(|d| !d.is_error()));
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(nescript::errors::Diagnostic::is_error),
+        "rand8 with arguments should error"
     );
 }

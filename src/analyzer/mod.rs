@@ -35,6 +35,11 @@ pub struct AnalysisResult {
     /// Consumed by the memory-map printer to group overlaid slots by
     /// their owning state. Empty for programs without state-locals.
     pub state_local_owners: HashMap<String, String>,
+    /// True when the program declared at least one `save { var ... }`
+    /// variable. Drives the iNES header byte-6 bit-1 (battery flag)
+    /// so emulators and cartridge boards know to persist the
+    /// `$6000-$7FFF` SRAM region across power cycles.
+    pub has_battery_saves: bool,
 }
 
 /// Default call stack depth limit for the NES runtime.
@@ -103,15 +108,23 @@ pub fn analyze(program: &Program) -> AnalysisResult {
     } else {
         0x10
     };
+    // Detect VRAM-buffer intrinsic usage by scanning the AST. When
+    // present, the buffer reserves `$0400-$04FF` and we have to
+    // start the user-RAM bump pointer past that region — otherwise
+    // user globals and the buffer would alias. Programs that don't
+    // use the buffer keep the legacy `$0300` start.
+    let uses_vram_buf = program_uses_vram_buf(program);
+    let initial_ram_addr: u16 = if uses_vram_buf { 0x0500 } else { 0x0300 };
     let mut analyzer = Analyzer {
         symbols: HashMap::new(),
         var_allocations: Vec::new(),
         diagnostics: Vec::new(),
+        next_sram_addr: 0x6000,
         sfx_names,
         music_names,
         palette_names,
         background_names,
-        next_ram_addr: 0x0300, // $0300 is first usable RAM after OAM buffer
+        next_ram_addr: initial_ram_addr,
         next_zp_addr,
         call_graph: HashMap::new(),
         max_depths: HashMap::new(),
@@ -135,6 +148,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         }
     }
 
+    let has_battery_saves = !program.saves.is_empty();
     AnalysisResult {
         symbols: analyzer.symbols,
         var_allocations: analyzer.var_allocations,
@@ -142,6 +156,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         call_graph: analyzer.call_graph,
         max_depths: analyzer.max_depths,
         state_local_owners,
+        has_battery_saves,
     }
 }
 
@@ -164,6 +179,12 @@ struct Analyzer {
     background_names: HashSet<String>,
     next_ram_addr: u16,
     next_zp_addr: u8,
+    /// Bump-pointer for save-block (`save { var ... }`) variables.
+    /// Initialised to `$6000` (the iNES SRAM window) and capped at
+    /// `$8000`. Save vars never share the main-RAM allocator so
+    /// they don't collide with normal globals or interfere with
+    /// the analyzer's RAM-overflow check.
+    next_sram_addr: u16,
     call_graph: HashMap<String, Vec<String>>,
     max_depths: HashMap<String, u32>,
     stack_depth_limit: u32,
@@ -244,6 +265,16 @@ impl Analyzer {
         // Register and allocate globals
         for var in &program.globals {
             self.register_var(var);
+        }
+
+        // Register save-block variables. These get addresses from
+        // the SRAM-only allocator at `$6000+` and never enter the
+        // main-RAM bump pointer. The codegen treats them as
+        // ordinary globals at absolute addresses; the only place
+        // they're special is the iNES header (battery bit) and
+        // the linker reads `analysis.has_battery_saves` for that.
+        for var in &program.saves {
+            self.register_save_var(var);
         }
 
         // Validate palette and background declarations. Palettes
@@ -669,7 +700,7 @@ impl Analyzer {
                 let key = self.scoped_name(&param.name);
                 let size = match param.param_type {
                     NesType::U8 | NesType::I8 | NesType::Bool => 1,
-                    NesType::U16 => 2,
+                    NesType::U16 | NesType::I16 => 2,
                     // Struct/array parameters are not supported
                     // in v0.1; the parser already rejects them,
                     // so defaulting to 1 byte here is just a
@@ -973,7 +1004,25 @@ impl Analyzer {
                 // If the function is known, validate its call signature.
                 // Undefined-function errors are surfaced elsewhere (for
                 // Statement::Call) and via the call-graph pass.
-                if self.function_signatures.contains_key(name) {
+                if is_intrinsic(name) {
+                    // Intrinsics can appear in expression position too
+                    // (e.g. `var x = rand8()`). Validate arity here so
+                    // typos and bad-arity calls don't slip past. Also
+                    // reject the void-only intrinsics (`poke`,
+                    // `seed_rand`, `set_palette_brightness`) at
+                    // expression position so a typo like
+                    // `var x = seed_rand(42)` fails at compile time
+                    // instead of panicking the linker with an
+                    // unresolved label.
+                    self.check_intrinsic_args(name, args, *span);
+                    if is_void_intrinsic(name) {
+                        self.diagnostics.push(Diagnostic::error(
+                            ErrorCode::E0203,
+                            format!("`{name}` does not return a value; it can only be used as a statement"),
+                            *span,
+                        ));
+                    }
+                } else if self.function_signatures.contains_key(name) {
                     self.check_call_signature(name, args, *span);
                 }
                 for arg in args {
@@ -1049,6 +1098,20 @@ impl Analyzer {
                 }
             }
             Expr::IntLiteral(_, _) | Expr::BoolLiteral(_, _) | Expr::ButtonRead(_, _, _) => {}
+            Expr::ButtonEdge(_, button, _, span) => {
+                // Same validation as ButtonRead: the button name
+                // must be recognised. `crate::ir::lowering::button_mask`
+                // returns 0 for unknown names which would silently
+                // compile to "always false"; reject here so typos
+                // surface at compile time.
+                if !is_known_button(button) {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown button '{button}'"),
+                        *span,
+                    ));
+                }
+            }
         }
     }
 
@@ -1322,7 +1385,7 @@ impl Analyzer {
             // before the outer ones.
             let size = match &field.field_type {
                 NesType::U8 | NesType::I8 | NesType::Bool => 1,
-                NesType::U16 => 2,
+                NesType::U16 | NesType::I16 => 2,
                 NesType::Array(elem, count) => {
                     // Reject arrays of structs for now — the
                     // synthetic-variable model used by the
@@ -1605,6 +1668,111 @@ impl Analyzer {
             },
         );
 
+        self.var_allocations.push(VarAllocation {
+            name: key,
+            address,
+            size,
+        });
+    }
+
+    /// Register a `save { var ... }` declaration. Save vars are
+    /// allocated from a separate bump pointer over the iNES SRAM
+    /// window (`$6000-$7FFF`), get a `VarAllocation` entry just
+    /// like a normal global, and live in the main symbol table so
+    /// user code reads/writes them with the usual `=` / load
+    /// syntax. The only thing special is their address range —
+    /// the codegen emits absolute-mode loads/stores automatically
+    /// because the address exceeds the zero-page boundary.
+    ///
+    /// Struct types in save blocks are accepted but not
+    /// flattened into per-field SRAM slots yet — the analyzer
+    /// emits an error if a save block declares a struct, since
+    /// the field-flattening path uses the main-RAM allocator and
+    /// would land struct fields back in `$0300+`. Scalars,
+    /// scalar arrays, and `u16`/`i16` are the supported set for
+    /// this first pass.
+    fn register_save_var(&mut self, var: &VarDecl) {
+        let key = self.scoped_name(&var.name);
+        if self.symbols.contains_key(&key) {
+            self.diagnostics.push(Diagnostic::error(
+                ErrorCode::E0501,
+                format!("duplicate declaration of '{}'", var.name),
+                var.span,
+            ));
+            return;
+        }
+        // Save vars in SRAM are persisted across power cycles, so an
+        // initializer would either silently never run (current
+        // behaviour: globals init at reset, but save vars don't pass
+        // through that path) or actively clobber the player's saved
+        // data on every boot. Neither is what the user wants. Warn
+        // and tell them about the magic-byte sentinel pattern.
+        if var.init.is_some() {
+            self.diagnostics.push(
+                Diagnostic::warning(
+                    ErrorCode::W0111,
+                    format!(
+                        "initializer on save-block field `{}` is ignored — \
+                         SRAM is preserved across power cycles",
+                        var.name
+                    ),
+                    var.span,
+                )
+                .with_help(
+                    "first-power-on defaults need an explicit magic-byte sentinel: \
+                     check a known signature on boot, and only write defaults if it's missing",
+                ),
+            );
+        }
+        if matches!(var.var_type, NesType::Struct(_)) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    ErrorCode::E0201,
+                    "struct types are not supported inside `save { }` blocks yet",
+                    var.span,
+                )
+                .with_help("use scalar fields (u8, i8, u16, i16, bool) or scalar arrays"),
+            );
+            return;
+        }
+        let struct_sizes: HashMap<String, u16> = self
+            .struct_layouts
+            .iter()
+            .map(|(n, l)| (n.clone(), l.size))
+            .collect();
+        let size = type_size_with(&var.var_type, &struct_sizes);
+        let Some(end) = self.next_sram_addr.checked_add(size) else {
+            self.diagnostics.push(Diagnostic::error(
+                ErrorCode::E0301,
+                "save block exceeds the 8 KB SRAM window ($6000-$7FFF)",
+                var.span,
+            ));
+            return;
+        };
+        if end > 0x8000 {
+            self.diagnostics.push(Diagnostic::error(
+                ErrorCode::E0301,
+                "save block exceeds the 8 KB SRAM window ($6000-$7FFF)",
+                var.span,
+            ));
+            return;
+        }
+        let address = self.next_sram_addr;
+        self.next_sram_addr = end;
+        // Mark the save-mode flag so the linker knows to flip
+        // the iNES battery bit. Stored on `var_allocations` via
+        // the address range itself — addresses ≥ `$6000` are SRAM
+        // by construction, so the analyzer needs no extra side
+        // table beyond the existing allocation list.
+        self.symbols.insert(
+            key.clone(),
+            Symbol {
+                name: key.clone(),
+                sym_type: var.var_type.clone(),
+                is_const: false,
+                span: var.span,
+            },
+        );
         self.var_allocations.push(VarAllocation {
             name: key,
             address,
@@ -2236,6 +2404,7 @@ impl Analyzer {
             if *expected == NesType::Bool {
                 match expr {
                     Expr::ButtonRead(..)
+                    | Expr::ButtonEdge(..)
                     | Expr::BinaryOp(
                         _,
                         BinOp::Eq
@@ -2280,7 +2449,7 @@ impl Analyzer {
             }
             Expr::BoolLiteral(_, _) => Some(NesType::Bool),
             Expr::Ident(name, _) => self.resolve_symbol(name).map(|s| s.sym_type.clone()),
-            Expr::ButtonRead(_, _, _) => Some(NesType::Bool),
+            Expr::ButtonRead(_, _, _) | Expr::ButtonEdge(_, _, _, _) => Some(NesType::Bool),
             Expr::BinaryOp(_, op, _, _) => match op {
                 BinOp::Eq
                 | BinOp::NotEq
@@ -2294,7 +2463,12 @@ impl Analyzer {
             },
             Expr::UnaryOp(UnaryOp::Not, _, _) => Some(NesType::Bool),
             Expr::UnaryOp(_, _, _) => Some(NesType::U8),
-            Expr::Call(_, _, _) => Some(NesType::U8), // Simplified for M1
+            Expr::Call(name, _, _) => match name.as_str() {
+                // PRNG intrinsics: rand8 returns u8, rand16 returns u16.
+                "rand8" => Some(NesType::U8),
+                "rand16" => Some(NesType::U16),
+                _ => Some(NesType::U8), // Simplified for M1
+            },
             Expr::ArrayIndex(name, _, _) => {
                 self.resolve_symbol(name).and_then(|s| match &s.sym_type {
                     NesType::Array(elem, _) => Some(elem.as_ref().clone()),
@@ -2532,6 +2706,42 @@ fn collect_calls_block(block: &Block, calls: &mut Vec<String>) {
     }
 }
 
+/// True if the program references any of the VRAM-buffer
+/// intrinsics anywhere user code can reach. Used at analyzer
+/// init time to bump the user-RAM bump pointer past the buffer
+/// region (`$0400-$04FF`) so user globals don't alias the
+/// runtime's ring. Walks both function bodies and state handlers.
+fn program_uses_vram_buf(program: &Program) -> bool {
+    fn block_uses(block: &Block) -> bool {
+        let mut calls = Vec::new();
+        collect_calls_block(block, &mut calls);
+        calls
+            .iter()
+            .any(|c| matches!(c.as_str(), "nt_set" | "nt_attr" | "nt_fill_h"))
+    }
+    for fun in &program.functions {
+        if block_uses(&fun.body) {
+            return true;
+        }
+    }
+    for state in &program.states {
+        for b in [&state.on_enter, &state.on_exit, &state.on_frame]
+            .into_iter()
+            .flatten()
+        {
+            if block_uses(b) {
+                return true;
+            }
+        }
+        for (_, b) in &state.on_scanline {
+            if block_uses(b) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Return true if the given block contains any statement that can
 /// either exit the enclosing loop (`break`, `return`, `transition`)
 /// or yield control back to the frame loop (`wait_frame`).
@@ -2551,7 +2761,50 @@ fn is_small_constant(expr: &Expr) -> bool {
 /// compiler. Intrinsics don't need a declaration and may have
 /// special codegen (e.g. \`poke\` / \`peek\` write to raw addresses).
 fn is_intrinsic(name: &str) -> bool {
-    matches!(name, "poke" | "peek")
+    matches!(
+        name,
+        "poke"
+            | "peek"
+            | "rand8"
+            | "rand16"
+            | "seed_rand"
+            | "set_palette_brightness"
+            | "fade_out"
+            | "fade_in"
+            | "sprite_0_split"
+            | "nt_set"
+            | "nt_attr"
+            | "nt_fill_h"
+    )
+}
+
+/// True if `name` is an intrinsic that does not produce a usable
+/// return value. These are valid only at statement position;
+/// using them as an expression is a type error caught by the
+/// analyzer so the codegen / linker never sees a stray
+/// `Expr::Call` for one of them.
+fn is_void_intrinsic(name: &str) -> bool {
+    matches!(
+        name,
+        "poke"
+            | "seed_rand"
+            | "set_palette_brightness"
+            | "fade_out"
+            | "fade_in"
+            | "sprite_0_split"
+            | "nt_set"
+            | "nt_attr"
+            | "nt_fill_h"
+    )
+}
+
+/// True if `name` is one of the NES controller's eight buttons.
+/// Mirrors the `button_mask` table in `ir::lowering`.
+fn is_known_button(name: &str) -> bool {
+    matches!(
+        name,
+        "a" | "b" | "select" | "start" | "up" | "down" | "left" | "right"
+    )
 }
 
 impl Analyzer {
@@ -2573,6 +2826,73 @@ impl Analyzer {
                 self.diagnostics.push(Diagnostic::error(
                     ErrorCode::E0203,
                     format!("`peek` takes exactly 1 argument (addr), got {}", args.len()),
+                    span,
+                ));
+            }
+            "rand8" | "rand16" if !args.is_empty() => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!("`{name}` takes no arguments, got {}", args.len()),
+                    span,
+                ));
+            }
+            "seed_rand" if args.len() != 1 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`seed_rand` takes exactly 1 argument (seed: u16), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            "set_palette_brightness" if args.len() != 1 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`set_palette_brightness` takes exactly 1 argument (level: u8 0..8), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            "fade_out" | "fade_in" if args.len() != 1 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`{name}` takes exactly 1 argument (step_frames: u8), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            "sprite_0_split" if args.len() != 2 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`sprite_0_split` takes exactly 2 arguments (scroll_x: u8, scroll_y: u8), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            "nt_set" | "nt_attr" if args.len() != 3 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`{name}` takes exactly 3 arguments (x: u8, y: u8, value: u8), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            "nt_fill_h" if args.len() != 4 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`nt_fill_h` takes exactly 4 arguments (x: u8, y: u8, len: u8, tile: u8), got {}",
+                        args.len()
+                    ),
                     span,
                 ));
             }
@@ -2673,7 +2993,8 @@ fn collect_calls_expr(expr: &Expr, calls: &mut Vec<String>) {
         | Expr::BoolLiteral(_, _)
         | Expr::Ident(_, _)
         | Expr::FieldAccess(_, _, _)
-        | Expr::ButtonRead(_, _, _) => {}
+        | Expr::ButtonRead(_, _, _)
+        | Expr::ButtonEdge(_, _, _, _) => {}
     }
 }
 
@@ -2759,12 +3080,12 @@ fn compute_depth(
 fn type_size_with(t: &NesType, struct_sizes: &HashMap<String, u16>) -> u16 {
     match t {
         NesType::U8 | NesType::I8 | NesType::Bool => 1,
-        NesType::U16 => 2,
+        NesType::U16 | NesType::I16 => 2,
         NesType::Array(elem, count) => type_size_with(elem, struct_sizes) * count,
         NesType::Struct(name) => struct_sizes.get(name).copied().unwrap_or(0),
     }
 }
 
 fn is_integer_type(t: &NesType) -> bool {
-    matches!(t, NesType::U8 | NesType::I8 | NesType::U16)
+    matches!(t, NesType::U8 | NesType::I8 | NesType::U16 | NesType::I16)
 }

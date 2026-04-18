@@ -305,6 +305,93 @@ pub enum IrOp {
     /// currently-playing SFX tail.
     StopMusic,
 
+    /// `rand8()` — pull the next 8 bits from the runtime PRNG into
+    /// `dest`. Codegen emits a `JSR __rand8` and stores A. The
+    /// `__rand_used` marker is emitted so the linker splices
+    /// `gen_prng` into PRG ROM.
+    Rand8(IrTemp),
+    /// `rand16()` — pull the next 16 bits from the runtime PRNG into
+    /// `(lo, hi)`. Emits `JSR __rand16` (which returns A=lo, X=hi)
+    /// and stores both bytes.
+    Rand16(IrTemp, IrTemp),
+    /// `seed_rand(x)` — install `(lo, hi)` as the new PRNG state.
+    /// Codegen loads the bytes into A/X and emits `JSR __rand_seed`.
+    SeedRand(IrTemp, IrTemp),
+
+    /// `set_palette_brightness(level)` — write the PPU mask
+    /// emphasis / blanking bits that neslib calls `pal_bright`. The
+    /// runtime translates levels 0..8 into the appropriate `$2001`
+    /// mask byte. Codegen lowers to a JSR to `__set_palette_brightness`
+    /// and emits the `__palette_bright_used` marker.
+    SetPaletteBrightness(IrTemp),
+
+    /// `fade_out(step_frames)` — block for
+    /// `step_frames × 5` frames while walking brightness 4 → 0
+    /// via `__set_palette_brightness`. Codegen lowers to a JSR
+    /// to `__fade_out` and emits both `__fade_used` and
+    /// `__palette_bright_used` markers.
+    FadeOut(IrTemp),
+    /// `fade_in(step_frames)` — block for
+    /// `step_frames × 5` frames while walking brightness 0 → 4.
+    FadeIn(IrTemp),
+
+    /// `sprite_0_split(scroll_x, scroll_y)` — busy-wait for the
+    /// PPU's sprite-0 hit flag (`$2002` bit 6) and then write
+    /// the given scroll values to `$2005`. Used to implement
+    /// fixed status-bar / scrolling-playfield splits on any
+    /// mapper (unlike `on_scanline(N)`, which requires MMC3).
+    Sprite0Split {
+        scroll_x: IrTemp,
+        scroll_y: IrTemp,
+    },
+
+    /// `nt_set(x, y, tile)` — append a single-tile nametable
+    /// write to the VRAM update buffer. Codegen computes the
+    /// PPU address `$2000 + y*32 + x` and lays down a
+    /// `[len=1][addr_hi][addr_lo][tile]` record at the current
+    /// `VRAM_BUF_HEAD`, then bumps the head by 4 and writes a
+    /// fresh `0` sentinel. The NMI handler drains the buffer
+    /// during vblank.
+    NtSet {
+        x: IrTemp,
+        y: IrTemp,
+        tile: IrTemp,
+    },
+    /// `nt_attr(x, y, value)` — same shape as `NtSet` but the
+    /// PPU address resolves to the attribute table at
+    /// `$23C0 + (y/4)*8 + (x/4)`. Useful for changing a 4×4-cell
+    /// metatile group's sub-palette without rewriting the
+    /// underlying tiles.
+    NtAttr {
+        x: IrTemp,
+        y: IrTemp,
+        value: IrTemp,
+    },
+    /// `nt_fill_h(x, y, len, tile)` — append a horizontal run of
+    /// `len` copies of `tile` starting at nametable cell `(x, y)`.
+    /// `len` is a runtime byte; the runtime must keep `len < 253`
+    /// to leave space for the buffer header.
+    NtFillH {
+        x: IrTemp,
+        y: IrTemp,
+        len: IrTemp,
+        tile: IrTemp,
+    },
+
+    /// Edge-triggered input read: `p1.a.pressed` / `p1.a.released`.
+    /// `dest` receives a boolean (0 or the button mask) — set when
+    /// the button is pressed-but-was-not this frame (for
+    /// `.pressed`), or not-pressed-but-was last frame (for
+    /// `.released`). `player` is 0 for P1, 1 for P2. `mask` is
+    /// the button bit. `released` selects the released variant when
+    /// true, pressed when false.
+    ReadInputEdge {
+        dest: IrTemp,
+        player: u8,
+        mask: u8,
+        released: bool,
+    },
+
     // Source mapping
     SourceLoc(Span),
 }

@@ -50,6 +50,7 @@ pub enum ErrorCode {
     W0108, // array elements past byte 255 unreachable via 8-bit X index
     W0109, // too many literal-coord sprite draws on one scanline (NES 8/scanline limit)
     W0110, // `inline fun` declined — body shape not splicable, fell back to regular call
+    W0111, // initializer on a `save { var ... }` field (SRAM is preserved across power cycles, so init never runs)
 }
 
 impl fmt::Display for ErrorCode {
@@ -82,6 +83,7 @@ impl fmt::Display for ErrorCode {
             Self::W0108 => "W0108",
             Self::W0109 => "W0109",
             Self::W0110 => "W0110",
+            Self::W0111 => "W0111",
         };
         write!(f, "{code}")
     }
@@ -99,7 +101,8 @@ impl ErrorCode {
             | Self::W0107
             | Self::W0108
             | Self::W0109
-            | Self::W0110 => Level::Warning,
+            | Self::W0110
+            | Self::W0111 => Level::Warning,
             _ => Level::Error,
         }
     }

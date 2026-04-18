@@ -198,6 +198,63 @@ pub const AUDIO_TRIANGLE_COUNTER: u16 = 0x07F5;
 pub const AUDIO_SFX_PITCH_PTR_LO: u16 = 0x07F6;
 pub const AUDIO_SFX_PITCH_PTR_HI: u16 = 0x07F7;
 
+/// Previous-frame copies of the two controller bytes. Populated
+/// by the NMI handler *after* the current-frame shift loop, so
+/// `curr & ~prev` ("just pressed") and `prev & ~curr`
+/// ("just released") compile to a single AND chain at the read
+/// site. Only touched by programs that reference `p1.button.pressed`
+/// / `.released` (detected via the `__edge_input_used` marker
+/// label); programs without edge-triggered reads leave these
+/// two bytes free.
+pub const PREV_INPUT_P1: u16 = 0x07E6;
+pub const PREV_INPUT_P2: u16 = 0x07E7;
+
+/// VRAM update buffer.
+///
+/// User intrinsics (`nt_set`, `nt_attr`, `nt_fill_h`) append entries
+/// to a 256-byte ring at `$0400-$04FF` during `on frame`; the NMI
+/// handler drains the buffer to PPU `$2007` while it's safe to
+/// write VRAM (vblank). Every entry has the form
+/// `[len][addr_hi][addr_lo][byte_0]...[byte_(len-1)]`. A `len`
+/// byte of zero is the end-of-buffer sentinel: the drain loop
+/// stops there and resets the head pointer to zero.
+///
+/// The buffer is gated on the `__vram_buf_used` marker label —
+/// programs that never call any of the buffer intrinsics keep
+/// these 256 bytes free for analyzer allocation. When the marker
+/// is present, the analyzer skips `$0400-$04FF` so user globals
+/// are pushed into `$0500+`.
+///
+/// `VRAM_BUF_HEAD` is a single byte tracking the next-free offset
+/// from `VRAM_BUF_BASE`. It lives in main RAM next to the buffer
+/// itself rather than in zero page so it doesn't compete with the
+/// runtime's other ZP slots; the codegen reads/writes it via
+/// absolute addressing.
+pub const VRAM_BUF_BASE: u16 = 0x0400;
+pub const VRAM_BUF_END: u16 = 0x04FF;
+pub const VRAM_BUF_HEAD: u16 = 0x07E5;
+
+/// Fade-helper scratch bytes. `FADE_STEP_FRAMES` holds the
+/// per-step frame count saved at the top of `__fade_out` /
+/// `__fade_in`; `FADE_LEVEL` tracks the current brightness level
+/// as the fade walks 4 → 0 or 0 → 4. Programs that never call the
+/// builtins (detected via the absence of `__fade_used`) leave
+/// these bytes free for analyzer allocation.
+pub const FADE_STEP_FRAMES: u16 = 0x07E8;
+pub const FADE_LEVEL: u16 = 0x07E9;
+
+/// PRNG state — two bytes holding a 16-bit xorshift state.
+/// Only touched by the `__rand8` / `__rand16` / `__rand_seed`
+/// runtime routines, which the linker splices in whenever user
+/// code contains the `__rand_used` marker label. The reset path
+/// seeds the state to a non-zero constant (0xACE1) so the very
+/// first `rand8()` call returns a useful value even without an
+/// explicit `seed_rand`. Programs that never touch PRNG skip
+/// both the state init and the routines, leaving these two
+/// bytes free for the analyzer to allocate over.
+pub const PRNG_STATE_LO: u16 = 0x07EA;
+pub const PRNG_STATE_HI: u16 = 0x07EB;
+
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
 ///
@@ -399,6 +456,19 @@ pub struct NmiOptions {
     /// zero cycles for input sampling (~100 cycles: the 88-cycle
     /// body plus the ~12-cycle strobe and loop scaffold).
     pub has_p1_input: bool,
+    /// When true, snapshot the previous-frame controller byte
+    /// into `PREV_INPUT_P1` / `PREV_INPUT_P2` *before* the
+    /// new-frame strobe-and-shift loop. This is the extra state
+    /// the IR codegen's `ReadInputEdge` op reads to compute
+    /// `p1.a.pressed` / `.released`. Programs that don't
+    /// reference edge-triggered input leave this off and the
+    /// two snapshot stores disappear.
+    pub has_edge_input: bool,
+    /// When true, JSR `__vram_buf_drain` from the NMI after the
+    /// existing palette/background handshake. Programs that don't
+    /// call any of the buffer intrinsics leave this off and the
+    /// NMI body is byte-identical to the pre-buffer version.
+    pub has_vram_buf: bool,
 }
 
 #[must_use]
@@ -411,6 +481,8 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
         has_oam,
         has_p2_input,
         has_p1_input,
+        has_edge_input,
+        has_vram_buf,
     } = opts;
     let mut out = Vec::new();
 
@@ -514,12 +586,39 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
         out.extend(gen_ppu_update_apply());
     }
 
+    // VRAM update buffer: drain any entries user code appended this
+    // frame (via `nt_set` / `nt_attr` / `nt_fill_h`). Runs after the
+    // palette/background handshake so compiler-queued PPU writes win
+    // priority for vblank cycles. Gated on `has_vram_buf` — programs
+    // that never touch the buffer skip the JSR + the 256-byte
+    // reservation at `$0400-$04FF`.
+    if has_vram_buf {
+        out.push(Instruction::new(JSR, AM::Label("__vram_buf_drain".into())));
+    }
+
     // Controller sampling. The strobe write to $4016 latches both
     // controller ports on the same clock, so the 8-iteration shift
     // loop that follows can read whichever of the two the program
     // actually uses. Programs that touch no `button.*` at all skip
     // the whole block.
     if has_p1_input || has_p2_input {
+        // Before strobing: snapshot the previous frame's input
+        // byte into main RAM so edge-triggered reads
+        // (`p1.a.pressed` / `.released`) can compute
+        // `curr & ~prev` / `prev & ~curr` at the user-code read
+        // site. Gated on `has_edge_input` so programs without
+        // edge reads skip the two (or four) store bytes and
+        // leave the two PREV_INPUT slots free for the analyzer.
+        if has_edge_input {
+            if has_p1_input {
+                out.push(Instruction::new(LDA, AM::ZeroPage(ZP_INPUT_P1)));
+                out.push(Instruction::new(STA, AM::Absolute(PREV_INPUT_P1)));
+            }
+            if has_p2_input {
+                out.push(Instruction::new(LDA, AM::ZeroPage(ZP_INPUT_P2)));
+                out.push(Instruction::new(STA, AM::Absolute(PREV_INPUT_P2)));
+            }
+        }
         // Strobe: write 1 then 0 to $4016 so both port latches
         // capture the current button state.
         out.push(Instruction::new(LDA, AM::Immediate(0x01)));
@@ -1562,6 +1661,426 @@ pub fn gen_divide() -> Vec<Instruction> {
     out
 }
 
+/// Generate the runtime PRNG routines: `__rand8`, `__rand16`, and
+/// `__rand_seed`. Spliced in by the linker only when user code
+/// contains the `__rand_used` marker label (emitted by the IR
+/// codegen whenever `rand8()`, `rand16()`, or `seed_rand()` is
+/// referenced). Programs that never touch the PRNG pay zero ROM
+/// or cycle cost.
+///
+/// ## Algorithm
+///
+/// A right-shifting Galois-configuration 16-bit LFSR with tap mask
+/// `0xB400` on the high byte (polynomial `x^16 + x^14 + x^13 +
+/// x^11 + 1`). From any non-zero seed it cycles through all 65535
+/// non-zero 16-bit states before repeating. Per step:
+///
+/// ```text
+/// carry = state & 1
+/// state >>= 1
+/// if carry: state ^= 0xB400
+/// ```
+///
+/// State lives in main RAM at `PRNG_STATE_LO`/`PRNG_STATE_HI`; the
+/// reset path seeds it to `0xACE1` so the first draw is useful
+/// without requiring an explicit `seed_rand`.
+///
+/// ## Entry points
+///
+/// - `__rand8`: advances the state once, returns `A` = new low byte.
+///   Clobbers A and flags. ~40 cycles.
+/// - `__rand16`: advances once, returns `A` = new low byte,
+///   `X` = new high byte — 16 bits from the same shift. Clobbers
+///   A, X, and flags. ~50 cycles.
+/// - `__rand_seed`: consumes `A` = low byte, `X` = high byte of the
+///   new seed and writes them to the state slots. Forces bit 0 of
+///   the low byte high so a zero seed (which would stick the LFSR)
+///   becomes `(1, 0)`.
+#[must_use]
+pub fn gen_prng() -> Vec<Instruction> {
+    let mut out = Vec::new();
+
+    // ── __rand8 ──────────────────────────────────────────────
+    // One Galois LFSR step: shift the 16-bit state right, XOR the
+    // high byte with 0xB4 if the shifted-out bit was a 1. The
+    // low tap byte is 0x00 so only the high byte needs EORing.
+    out.push(Instruction::new(NOP, AM::Label("__rand8".into())));
+    // LSR the high byte, ROR the low byte. Carry after ROR holds
+    // the old bit 0 of state_lo (the feedback bit).
+    out.push(Instruction::new(LSR, AM::Absolute(PRNG_STATE_HI)));
+    out.push(Instruction::new(ROR, AM::Absolute(PRNG_STATE_LO)));
+    // If the feedback bit was zero, skip the tap XOR.
+    out.push(Instruction::new(
+        BCC,
+        AM::LabelRelative("__rand8_done".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::Absolute(PRNG_STATE_HI)));
+    out.push(Instruction::new(EOR, AM::Immediate(0xB4)));
+    out.push(Instruction::new(STA, AM::Absolute(PRNG_STATE_HI)));
+    out.push(Instruction::new(NOP, AM::Label("__rand8_done".into())));
+    out.push(Instruction::new(LDA, AM::Absolute(PRNG_STATE_LO)));
+    out.push(Instruction::implied(RTS));
+
+    // ── __rand16 ─────────────────────────────────────────────
+    // A single shift already produces 16 fresh bits (the full
+    // post-shift state). Call `__rand8` once and return both
+    // halves — A = lo, X = hi.
+    out.push(Instruction::new(NOP, AM::Label("__rand16".into())));
+    out.push(Instruction::new(JSR, AM::Label("__rand8".into())));
+    out.push(Instruction::new(LDX, AM::Absolute(PRNG_STATE_HI)));
+    out.push(Instruction::implied(RTS));
+
+    // ── __rand_seed ──────────────────────────────────────────
+    // Store A = lo, X = hi into the state. Force bit 0 of the
+    // low byte high so a zero seed doesn't stick the LFSR.
+    out.push(Instruction::new(NOP, AM::Label("__rand_seed".into())));
+    out.push(Instruction::new(ORA, AM::Immediate(0x01)));
+    out.push(Instruction::new(STA, AM::Absolute(PRNG_STATE_LO)));
+    out.push(Instruction::new(STX, AM::Absolute(PRNG_STATE_HI)));
+    out.push(Instruction::implied(RTS));
+
+    out
+}
+
+/// Generate the `__set_palette_brightness` runtime routine.
+/// Spliced in by the linker only when user code contains the
+/// `__palette_bright_used` marker label.
+///
+/// Each level (passed in A, clamped to 0..=8) writes a specific
+/// `$2001` PPU mask byte. The mapping is best thought of as a
+/// "visual intensity dial" rather than a linear fade: the NES PPU
+/// emphasis bits tint the display towards R / G / B rather than
+/// truly darken or brighten, so the progression is a series of
+/// distinct visual states. Levels 0 and 1 use low-level tricks
+/// (rendering off, greyscale) to approximate black and dim; levels
+/// 2-8 stack emphasis bits to shift the overall colour cast.
+///
+/// | level | mask | effect                           |
+/// |-------|------|----------------------------------|
+/// | 0     | $00  | rendering fully off (black)      |
+/// | 1     | $01  | greyscale only (washed out)      |
+/// | 2     | $1E  | normal sprites + background      |
+/// | 3     | $3E  | + red emphasis                   |
+/// | 4     | $5E  | + green emphasis                 |
+/// | 5     | $9E  | + blue emphasis                  |
+/// | 6     | $7E  | + red + green (yellow tint)      |
+/// | 7     | $BE  | + red + blue (magenta tint)      |
+/// | 8     | $FE  | all three emphasis bits          |
+///
+/// Levels above 8 clamp to 8. Implemented as a CPX dispatch tree
+/// (one `CPX; BNE; LDA; STA; RTS` block per level) rather than a
+/// table lookup because the assembler doesn't expose a
+/// Label-relative `AbsoluteX` mode; the nine-entry tree is ~60
+/// bytes, comparable to a data-table + indexed-load path.
+#[must_use]
+pub fn gen_palette_brightness() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__set_palette_brightness".into()),
+    ));
+    // Clamp level (in A) to 8. If A >= 9, force A = 8.
+    out.push(Instruction::new(CMP, AM::Immediate(9)));
+    out.push(Instruction::new(
+        BCC,
+        AM::LabelRelative("__bright_clamped".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::Immediate(8)));
+    out.push(Instruction::new(NOP, AM::Label("__bright_clamped".into())));
+    // Dispatch by level through a compare-and-set tree. Each level
+    // maps to a specific `$2001` mask byte:
+    //   0: $00 — all rendering off (blank)
+    //   1: $01 — greyscale flag (dim-looking)
+    //   2: $1E — normal sprites + bg
+    //   3: $3E — +red emphasis
+    //   4: $5E — +green emphasis
+    //   5: $9E — +blue emphasis
+    //   6: $7E — +red+green (yellow tint)
+    //   7: $BE — +red+blue (magenta tint)
+    //   8: $FE — all three emphasis bits (brightest)
+    // The table is short enough that the linear CPX tree is
+    // comparable in ROM cost to a proper table-indexed load and
+    // avoids needing a Label-based AbsoluteX mode in the assembler.
+    out.push(Instruction::implied(TAX));
+    let entries: [(u8, u8); 9] = [
+        (0, 0x00),
+        (1, 0x01),
+        (2, 0x1E),
+        (3, 0x3E),
+        (4, 0x5E),
+        (5, 0x9E),
+        (6, 0x7E),
+        (7, 0xBE),
+        (8, 0xFE),
+    ];
+    for (level, mask) in entries {
+        out.push(Instruction::new(CPX, AM::Immediate(level)));
+        out.push(Instruction::new(
+            BNE,
+            AM::LabelRelative(format!("__bright_not_{level}")),
+        ));
+        out.push(Instruction::new(LDA, AM::Immediate(mask)));
+        out.push(Instruction::new(STA, AM::Absolute(PPU_MASK)));
+        out.push(Instruction::implied(RTS));
+        out.push(Instruction::new(
+            NOP,
+            AM::Label(format!("__bright_not_{level}")),
+        ));
+    }
+    // Fall-through (shouldn't hit): leave PPU_MASK untouched.
+    out.push(Instruction::implied(RTS));
+    out
+}
+
+/// Generate the blocking fade helpers `__fade_out` and `__fade_in`,
+/// plus the shared callable `__wait_frame_rt` they use internally.
+/// Spliced by the linker whenever user code contains the
+/// `__fade_used` marker label (emitted by the IR codegen's
+/// `FadeOut` / `FadeIn` ops).
+///
+/// Both fade entry points take `step_frames` in `A` — the number
+/// of frames to hold each brightness level before advancing. A
+/// full fade-out runs through levels 4 → 3 → 2 → 1 → 0 (five
+/// steps) and a fade-in runs 0 → 1 → 2 → 3 → 4, so the total
+/// blocking time is `step_frames × 5` frames.
+///
+/// Internally the fade JSRs `__set_palette_brightness` for each
+/// step and `__wait_frame_rt` between steps. `__set_palette_brightness`
+/// is always linked in alongside fade (we can't emit it conditionally
+/// without also forcing its marker). `__wait_frame_rt` spins on
+/// `ZP_FRAME_FLAG` exactly the way an inline `wait_frame` does.
+///
+/// Main-RAM scratch bytes the routines use:
+///   `FADE_STEP_FRAMES` ($07E8) — saved copy of `step_frames`
+///   `FADE_LEVEL`       ($07E9) — current brightness level
+///
+/// Both slots are free for analyzer allocation in programs that
+/// don't use fade (they never trigger the marker).
+#[must_use]
+pub fn gen_fade() -> Vec<Instruction> {
+    let mut out = Vec::new();
+
+    // ── __wait_frame_rt ──────────────────────────────────────
+    // Callable wait-for-NMI: spin until `ZP_FRAME_FLAG` is
+    // nonzero, then clear it and RTS. Mirrors the inline code
+    // the IR codegen emits for `IrOp::WaitFrame`, but callable
+    // with a JSR from inside other runtime routines.
+    out.push(Instruction::new(NOP, AM::Label("__wait_frame_rt".into())));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__wait_frame_rt_loop".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_FRAME_FLAG)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__wait_frame_rt_loop".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_FRAME_FLAG)));
+    out.push(Instruction::implied(RTS));
+
+    // ── __fade_out ───────────────────────────────────────────
+    // A = step_frames on entry. Loops 4 → 3 → 2 → 1 → 0, calling
+    // __set_palette_brightness each iteration and waiting
+    // step_frames frames between steps.
+    //
+    // Zero-safety: if the caller passes A=0, the inner wait loop
+    // would DEX-underflow from 0 to $FF and burn 256 frames per
+    // step (~21 seconds on NTSC). Force a minimum of 1 so the
+    // pathological "pass 0" case behaves as "1 frame per step"
+    // instead of "hold forever".
+    out.push(Instruction::new(NOP, AM::Label("__fade_out".into())));
+    out.push(Instruction::new(ORA, AM::Immediate(0x00)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_out_ok".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::Immediate(1)));
+    out.push(Instruction::new(NOP, AM::Label("__fade_out_ok".into())));
+    out.push(Instruction::new(STA, AM::Absolute(FADE_STEP_FRAMES)));
+    out.push(Instruction::new(LDA, AM::Immediate(4)));
+    out.push(Instruction::new(STA, AM::Absolute(FADE_LEVEL)));
+    // Fall through into the shared loop that runs until FADE_LEVEL
+    // underflows past 0 (BMI catches the $FF that DEC produces).
+    out.push(Instruction::new(NOP, AM::Label("__fade_step".into())));
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(
+        JSR,
+        AM::Label("__set_palette_brightness".into()),
+    ));
+    // Wait step_frames frames.
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_STEP_FRAMES)));
+    out.push(Instruction::implied(TAX));
+    out.push(Instruction::new(NOP, AM::Label("__fade_wait".into())));
+    out.push(Instruction::new(JSR, AM::Label("__wait_frame_rt".into())));
+    out.push(Instruction::implied(DEX));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_wait".into()),
+    ));
+    // Decrement the level and loop if it's still a valid level.
+    // `__fade_out` is at entry point A; `__fade_in` jumps into a
+    // sibling block below that decrements upward. Here, decrement
+    // and bail out when we hit $FF (underflow past 0).
+    out.push(Instruction::new(DEC, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(CMP, AM::Immediate(0xFF)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_step".into()),
+    ));
+    out.push(Instruction::implied(RTS));
+
+    // ── __fade_in ────────────────────────────────────────────
+    // A = step_frames on entry. Loops 0 → 1 → 2 → 3 → 4.
+    // Uses its own top-of-loop label and increments rather than
+    // decrementing; shares the step-wait body via a small duplicate
+    // loop (cheaper than threading direction through the shared
+    // body for a one-off five-step loop).
+    out.push(Instruction::new(NOP, AM::Label("__fade_in".into())));
+    out.push(Instruction::new(ORA, AM::Immediate(0x00)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_in_ok".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::Immediate(1)));
+    out.push(Instruction::new(NOP, AM::Label("__fade_in_ok".into())));
+    out.push(Instruction::new(STA, AM::Absolute(FADE_STEP_FRAMES)));
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(NOP, AM::Label("__fade_in_step".into())));
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(
+        JSR,
+        AM::Label("__set_palette_brightness".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_STEP_FRAMES)));
+    out.push(Instruction::implied(TAX));
+    out.push(Instruction::new(NOP, AM::Label("__fade_in_wait".into())));
+    out.push(Instruction::new(JSR, AM::Label("__wait_frame_rt".into())));
+    out.push(Instruction::implied(DEX));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_in_wait".into()),
+    ));
+    out.push(Instruction::new(INC, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(CMP, AM::Immediate(5)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_in_step".into()),
+    ));
+    out.push(Instruction::implied(RTS));
+
+    out
+}
+
+/// Generate the `__vram_buf_drain` runtime routine and the matching
+/// reset-time clear. The drain is JSR'd from the NMI handler when
+/// the `__vram_buf_used` marker is present.
+///
+/// On entry the buffer at `VRAM_BUF_BASE` (`$0400`) holds zero or
+/// more entries followed by a zero-byte sentinel. Each entry is
+/// `[len][addr_hi][addr_lo][byte_0]...[byte_(len-1)]`; the drain
+/// walks them in order, programming `$2006` with the PPU address
+/// then writing each data byte to `$2007`. When it hits a zero
+/// `len` byte it resets `VRAM_BUF_HEAD` to zero (so the next
+/// frame starts appending at the front of the buffer) and stores
+/// `0` back at `VRAM_BUF_BASE` so an empty buffer continues to
+/// drain cleanly without a re-init.
+///
+/// Cycle budget: one entry costs ~12 setup cycles + 8 cycles per
+/// data byte. The 256-byte buffer can hold ~50 single-tile writes
+/// (each 4 bytes: `len=1`, `addr_hi`, `addr_lo`, `byte`) which
+/// drains in roughly 1000 cycles, well inside vblank's
+/// ~2273-cycle budget.
+///
+/// Uses register `X` as the current buffer offset. Caller
+/// (the NMI handler) is responsible for save/restore.
+#[must_use]
+pub fn gen_vram_buf_drain() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__vram_buf_drain".into())));
+    // X = current offset into VRAM_BUF_BASE.
+    out.push(Instruction::new(LDX, AM::Immediate(0)));
+    // Top of per-entry loop. A zero `len` byte is the sentinel.
+    out.push(Instruction::new(NOP, AM::Label("__vram_buf_loop".into())));
+    out.push(Instruction::new(LDA, AM::AbsoluteX(VRAM_BUF_BASE)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__vram_buf_done".into()),
+    ));
+    // A holds `len`. Stash it in Y for the inner data-copy loop.
+    out.push(Instruction::implied(TAY));
+    // PPU address: write addr_hi then addr_lo to $2006. The
+    // entry layout is [len][addr_hi][addr_lo], so addr_hi is at
+    // offset+1 and addr_lo at offset+2.
+    out.push(Instruction::implied(INX));
+    out.push(Instruction::new(LDA, AM::AbsoluteX(VRAM_BUF_BASE)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    out.push(Instruction::implied(INX));
+    out.push(Instruction::new(LDA, AM::AbsoluteX(VRAM_BUF_BASE)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    // Inner loop: write `Y` data bytes from offset+3 onward to
+    // $2007. The PPU's auto-increment (set in $2000 bit 2 — we
+    // leave it at 1, the default) advances the VRAM pointer one
+    // cell per write.
+    out.push(Instruction::new(NOP, AM::Label("__vram_buf_data".into())));
+    out.push(Instruction::implied(INX));
+    out.push(Instruction::new(LDA, AM::AbsoluteX(VRAM_BUF_BASE)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2007)));
+    out.push(Instruction::implied(DEY));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__vram_buf_data".into()),
+    ));
+    // Move past the last data byte's offset before looping.
+    out.push(Instruction::implied(INX));
+    out.push(Instruction::new(JMP, AM::Label("__vram_buf_loop".into())));
+    out.push(Instruction::new(NOP, AM::Label("__vram_buf_done".into())));
+    // Reset the head pointer so the next frame starts appending
+    // at offset 0. We don't need to clobber the rest of the
+    // buffer — the writer always lays down a fresh sentinel
+    // after each append.
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::Absolute(VRAM_BUF_HEAD)));
+    out.push(Instruction::new(STA, AM::Absolute(VRAM_BUF_BASE)));
+    // Reset the PPU's internal scroll/address state. Each `$2006`
+    // write during the drain updated the PPU's `t` register
+    // (which holds the next scroll value); leaving it pointing
+    // at our last buffer entry's address would cause the next
+    // frame's rendering to start from a non-zero offset and the
+    // visible image would shift up/right by however many cells
+    // we wrote past `$2000`. The standard fix is to write `0` to
+    // `$2006` twice (resetting `t` to nametable 0 / cell 0) and
+    // then `0` to `$2005` twice (zero X / Y scroll). Two `$2006`
+    // writes also reset the `$2006`/`$2005` write-toggle latch
+    // to "high" so the next frame's drain sees a clean state.
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2005)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2005)));
+    out.push(Instruction::implied(RTS));
+    out
+}
+
+/// Emit the reset-time PRNG state seed. Spliced into the reset
+/// path whenever `gen_prng` is linked in, so the first `rand8()`
+/// call returns a useful value even without an explicit
+/// `seed_rand`. The seed `0xACE1` is an arbitrary non-zero 16-bit
+/// value — any non-zero value works since the Galois LFSR's orbit
+/// visits all 65535 non-zero states.
+#[must_use]
+pub fn gen_prng_init() -> Vec<Instruction> {
+    vec![
+        Instruction::new(LDA, AM::Immediate(0xE1)),
+        Instruction::new(STA, AM::Absolute(PRNG_STATE_LO)),
+        Instruction::new(LDA, AM::Immediate(0xAC)),
+        Instruction::new(STA, AM::Absolute(PRNG_STATE_HI)),
+    ]
+}
+
 // ─── Bank switching ────────────────────────────────────────────────
 //
 // NEScript supports bank switching for MMC1, UxROM, and MMC3. The
@@ -1609,22 +2128,75 @@ pub fn gen_mapper_init(
         Mapper::MMC1 => gen_mmc1_init(mirroring),
         Mapper::UxROM => gen_uxrom_init(total_prg_banks),
         Mapper::MMC3 => gen_mmc3_init(mirroring),
+        Mapper::AxROM => gen_axrom_init(mirroring),
+        Mapper::CNROM => gen_cnrom_init(),
+        Mapper::GNROM => gen_gnrom_init(),
     };
     // Initialize ZP_BANK_CURRENT to the fixed bank index for any
-    // banked mapper. The trampoline emitted by
-    // `gen_bank_trampoline` reads this slot to decide which bank
-    // to restore after a cross-bank call, so it has to be a
-    // sensible value from the very first call. Without this the
-    // RAM-clear leaves it at $00, which would put bank 0 at
-    // $8000 instead of the fixed bank after a fixed-bank caller's
-    // first cross-bank call — a behavior change vs. the pre-
-    // banked-banked codegen that some examples rely on.
-    if mapper != Mapper::NROM && total_prg_banks > 0 {
+    // banked mapper. CNROM and AxROM don't use per-function bank
+    // trampolines the same way MMC1/UxROM/MMC3 do — CNROM has a
+    // fixed 32 KB PRG, and AxROM swaps 32 KB pages as one unit —
+    // so they skip the `ZP_BANK_CURRENT` seed.
+    if matches!(mapper, Mapper::MMC1 | Mapper::UxROM | Mapper::MMC3) && total_prg_banks > 0 {
         #[allow(clippy::cast_possible_truncation)]
         let fixed_bank_index = (total_prg_banks - 1) as u8;
         out.push(Instruction::new(LDA, AM::Immediate(fixed_bank_index)));
         out.push(Instruction::new(STA, AM::ZeroPage(ZP_BANK_CURRENT)));
     }
+    out
+}
+
+/// `AxROM` (mapper 7) reset. The `AxROM` register is a single latch
+/// at `$8000-$FFFF`:
+///   bits 0-2 select the 32 KB PRG bank mapped at `$8000-$FFFF`
+///   bit 4    selects single-screen nametable (0 = lower, 1 = upper)
+///
+/// We write `0` at reset so the ROM starts executing from bank 0
+/// with the lower nametable active. Some `AxROM` boards (Battletoads,
+/// Wizards & Warriors) are bus-conflict-prone so the write has to
+/// hit a ROM byte that matches; the simplest safe approach is to
+/// put a `0x00` byte at a known ROM address and STA there. For
+/// `NEScript`'s usage pattern (single PRG bank → mapper 0-equivalent
+/// layout) this is good enough for the demo to boot.
+fn gen_axrom_init(mirroring: Mirroring) -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__axrom_init".into())));
+    // Start with the lower or upper single-screen nametable active.
+    // `Mirroring::Horizontal` → lower-screen (bit 4 = 0); `Vertical`
+    // → upper-screen (bit 4 = 1). This keeps the existing mirroring
+    // enum useful even though AxROM has no true horizontal/vertical
+    // modes.
+    let init_reg: u8 = match mirroring {
+        Mirroring::Horizontal => 0x00,
+        Mirroring::Vertical => 0x10,
+    };
+    out.push(Instruction::new(LDA, AM::Immediate(init_reg)));
+    out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+    out
+}
+
+/// CNROM (mapper 3) reset. Fixed 32 KB PRG, 8 KB CHR bankswitching
+/// via one write to `$8000-$FFFF`. At power-on the CHR bank is
+/// undefined on some boards, so we explicitly write bank 0.
+fn gen_cnrom_init() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__cnrom_init".into())));
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+    out
+}
+
+/// `GNROM` (mapper 66) reset. Single register at `$8000-$FFFF`:
+///   bits 4-5: select 32 KB PRG page at `$8000-$FFFF`
+///   bits 0-1: select 8 KB CHR bank
+/// At power-on both fields are nominally zero but some boards
+/// leave them undefined, so we explicitly write `$00` — PRG page 0
+/// with CHR bank 0.
+fn gen_gnrom_init() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__gnrom_init".into())));
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::Absolute(0x8000)));
     out
 }
 
@@ -1798,6 +2370,42 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
             out.push(Instruction::new(STA, AM::Absolute(0x8000)));
             out.push(Instruction::implied(PLA));
             out.push(Instruction::new(STA, AM::Absolute(0x8001)));
+            out.push(Instruction::implied(RTS));
+        }
+        Mapper::AxROM => {
+            // AxROM: write the 32 KB PRG bank number to $8000-$FFFF.
+            // Bit 4 selects the single-screen nametable; bits 0-2
+            // select the PRG page. We don't preserve bit 4 here —
+            // user code that toggles between lower/upper nametables
+            // mid-run would need to OR it into A before calling.
+            // The linker's single-bank AxROM layout never actually
+            // invokes this routine today (no cross-bank trampolines
+            // for AxROM yet), but we emit it for parity with the
+            // other mappers.
+            out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+            out.push(Instruction::implied(RTS));
+        }
+        Mapper::CNROM => {
+            // CNROM: writing A to `$8000-$FFFF` selects an 8 KB CHR
+            // bank. PRG is fixed so this routine is only ever useful
+            // for user-driven CHR swaps. Note: real CNROM boards
+            // have bus conflicts (CPU write vs ROM byte at target
+            // address), so a production API should route through a
+            // UxROM-style bus-conflict-safe table. No such API is
+            // exposed to user source yet — declaring more than one
+            // CHR bank in a CNROM program is currently a TODO.
+            out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+            out.push(Instruction::implied(RTS));
+        }
+        Mapper::GNROM => {
+            // GNROM: one register at `$8000-$FFFF` packs both a
+            // 32 KB PRG page (bits 4-5) and an 8 KB CHR bank
+            // (bits 0-1). The input A is the packed byte; user
+            // code is responsible for composing it. Like CNROM
+            // and AxROM, real boards have bus conflicts and a
+            // production API should use a bus-conflict-safe
+            // table.
+            out.push(Instruction::new(STA, AM::Absolute(0x8000)));
             out.push(Instruction::implied(RTS));
         }
     }

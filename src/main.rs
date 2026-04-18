@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use nescript::analyzer;
 use nescript::assets::{BackgroundData, PaletteData};
 use nescript::errors::render_diagnostics;
-use nescript::linker::{render_dbg, render_mlb, render_source_map, LinkedRom};
+use nescript::linker::{
+    render_dbg, render_fceux_nl, render_fceux_ram_nl, render_mlb, render_source_map, LinkedRom,
+};
 use nescript::pipeline::{compile_source, CompileError, CompileOptions as PipelineOptions};
 
 #[derive(Parser)]
@@ -73,6 +75,16 @@ enum Cli {
         /// line records have something to point at.
         #[arg(long, value_name = "PATH")]
         dbg: Option<PathBuf>,
+
+        /// Emit FCEUX-compatible per-bank `.nl` label files and a
+        /// `.ram.nl` file next to the ROM. The argument is the
+        /// prefix; FCEUX appends `.<bank>.nl` / `.ram.nl`. Unlike
+        /// `.dbg` (which Mesen/Mesen2 understand natively), the
+        /// `.nl` format is what FCEUX on Linux reads, and many
+        /// users still prefer FCEUX over Mesen for its lighter
+        /// footprint.
+        #[arg(long, value_name = "PREFIX")]
+        fceux_labels: Option<PathBuf>,
     },
     /// Type-check a source file without building
     Check {
@@ -97,6 +109,7 @@ fn main() {
             symbols,
             source_map,
             dbg,
+            fceux_labels,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
             match compile(
@@ -112,6 +125,7 @@ fn main() {
                     symbols: symbols.clone(),
                     source_map: source_map.clone(),
                     dbg: dbg.clone(),
+                    fceux_labels: fceux_labels.clone(),
                 },
             ) {
                 Ok(rom) => {
@@ -376,6 +390,7 @@ struct CompileOptions {
     symbols: Option<PathBuf>,
     source_map: Option<PathBuf>,
     dbg: Option<PathBuf>,
+    fceux_labels: Option<PathBuf>,
 }
 
 fn compile(input: &PathBuf, output: &Path, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
@@ -485,6 +500,50 @@ fn compile(input: &PathBuf, output: &Path, opts: &CompileOptions) -> Result<Vec<
             eprintln!("error: failed to write dbg file {}: {e}", path.display());
         })?;
     }
+    if let Some(prefix) = opts.fceux_labels.as_ref() {
+        // FCEUX looks for `<rom-name>.<bank-index>.nl` per-bank and
+        // `<rom-name>.ram.nl` for RAM symbols, where `<rom-name>`
+        // is literally the ROM file name (typically something like
+        // `foo.nes`). We treat `--fceux-labels <prefix>` as exactly
+        // that stem and *append* the `.<bank>.nl` suffix rather than
+        // using `with_extension` (which would strip whatever came
+        // after the first `.`). This lets users pass either
+        // `--fceux-labels foo` (→ foo.0.nl, foo.ram.nl) or
+        // `--fceux-labels foo.nes` (→ foo.nes.0.nl, foo.nes.ram.nl,
+        // matching FCEUX's default search paths).
+        //
+        // The fixed bank is always the last physical bank in the
+        // ROM, so for a single-bank NROM layout the index is 0 and
+        // for banked ROMs it's `total_banks - 1`. We derive the
+        // index from the linker's reported fixed-bank file offset:
+        // `(offset - 16) / PRG_BANK_SIZE`.
+        const PRG_BANK_SIZE: usize = 16384;
+        let bank_index = out.link_result.fixed_bank_file_offset.saturating_sub(16) / PRG_BANK_SIZE;
+        let bank_nl = render_fceux_nl(&out.link_result);
+        let bank_path = {
+            let mut p = prefix.as_os_str().to_os_string();
+            p.push(format!(".{bank_index}.nl"));
+            PathBuf::from(p)
+        };
+        std::fs::write(&bank_path, bank_nl).map_err(|e| {
+            eprintln!(
+                "error: failed to write FCEUX bank label file {}: {e}",
+                bank_path.display()
+            );
+        })?;
+        let ram_nl = render_fceux_ram_nl(&out.analysis.var_allocations);
+        let ram_path = {
+            let mut p = prefix.as_os_str().to_os_string();
+            p.push(".ram.nl");
+            PathBuf::from(p)
+        };
+        std::fs::write(&ram_path, ram_nl).map_err(|e| {
+            eprintln!(
+                "error: failed to write FCEUX RAM label file {}: {e}",
+                ram_path.display()
+            );
+        })?;
+    }
 
     Ok(out.rom)
 }
@@ -542,6 +601,7 @@ mod tests {
             call_graph: HashMap::new(),
             max_depths: HashMap::new(),
             state_local_owners: HashMap::new(),
+            has_battery_saves: false,
         }
     }
 

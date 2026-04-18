@@ -22,6 +22,50 @@ use super::LinkedRom;
 use crate::analyzer::VarAllocation;
 use crate::lexer::Span;
 
+/// Render an FCEUX-compatible label file for the fixed PRG bank.
+///
+/// FCEUX looks for `<rom-name>.<bank-index>.nl` per-bank label files
+/// in the same directory as the ROM, then for a `<rom-name>.ram.nl`
+/// for RAM/zero-page labels. Each line in a bank file has the form
+/// `$XXXX#label_name#`, where `$XXXX` is the CPU address inside the
+/// bank window (matching whatever the fixed bank is mapped at at
+/// runtime — for `NEScript`, `$C000-$FFFF`). RAM entries use
+/// `$XXXX#name#` in the `.ram.nl` file; FCEUX doesn't namespace
+/// these per-bank.
+///
+/// Returns the bank-file contents. The caller is responsible for
+/// writing it to disk under the correct per-bank name. RAM-label
+/// output is produced by [`render_fceux_ram_nl`] below.
+#[must_use]
+pub fn render_fceux_nl(linked: &LinkedRom) -> String {
+    let mut out = String::new();
+    let sorted: BTreeMap<&String, &u16> = linked.labels.iter().collect();
+    for (label, &&cpu_addr) in &sorted {
+        let Some(display_name) = mlb_symbol_name(label) else {
+            continue;
+        };
+        // FCEUX expects CPU addresses inside the bank window. The
+        // fixed bank is always at $C000-$FFFF, which is what the
+        // codegen emits, so the address passes through unchanged.
+        let _ = writeln!(out, "${cpu_addr:04X}#{display_name}#");
+    }
+    out
+}
+
+/// Render an FCEUX-compatible RAM label file (`<rom>.ram.nl`).
+/// Addresses are the analyzer's variable allocations (zero page
+/// and main RAM) in ascending order.
+#[must_use]
+pub fn render_fceux_ram_nl(var_allocations: &[VarAllocation]) -> String {
+    let mut out = String::new();
+    let mut vars: Vec<&VarAllocation> = var_allocations.iter().collect();
+    vars.sort_by_key(|a| a.address);
+    for var in vars {
+        let _ = writeln!(out, "${:04X}#{}#", var.address, var.name);
+    }
+    out
+}
+
 /// Render a Mesen-compatible `.mlb` symbol file from a
 /// [`LinkedRom`].
 ///
@@ -697,5 +741,77 @@ mod tests {
             out.contains("name=\"demo\\\"tricky\\\\path.ne\""),
             "quotes + backslashes should be escaped in file record; got:\n{out}"
         );
+    }
+
+    #[test]
+    fn fceux_nl_emits_user_facing_labels_sorted_by_name() {
+        let linked = make_linked(&[
+            ("__reset", 0xC000),
+            ("__nmi", 0xC100),
+            ("__ir_fn_Main_frame", 0xC200),
+            ("__ir_fn_helper", 0xC300),
+            ("__ir_skip_42", 0xC180), // internal, must not appear
+        ]);
+        let out = render_fceux_nl(&linked);
+        assert!(
+            out.contains("$C000#reset#"),
+            "reset entry point should be in .nl; got:\n{out}"
+        );
+        assert!(
+            out.contains("$C100#nmi#"),
+            "nmi entry point should be in .nl; got:\n{out}"
+        );
+        assert!(
+            out.contains("$C200#Main_frame#"),
+            "user frame handler should be in .nl; got:\n{out}"
+        );
+        assert!(
+            out.contains("$C300#helper#"),
+            "user function should be in .nl; got:\n{out}"
+        );
+        assert!(
+            !out.contains("__ir_skip_42"),
+            "internal skip labels should be filtered; got:\n{out}"
+        );
+        assert!(
+            !out.contains("__ir_skip"),
+            "no raw internal labels should leak; got:\n{out}"
+        );
+    }
+
+    #[test]
+    fn fceux_nl_empty_when_no_user_labels() {
+        // Only internal labels — the .nl file should be empty
+        // rather than containing every scaffold label.
+        let linked = make_linked(&[("__ir_skip_0", 0xC010), ("__ir_skip_1", 0xC020)]);
+        let out = render_fceux_nl(&linked);
+        assert!(out.is_empty(), "no user labels → empty .nl; got:\n{out}");
+    }
+
+    #[test]
+    fn fceux_ram_nl_sorted_by_address() {
+        let vars = vec![
+            VarAllocation {
+                name: "enemies".into(),
+                address: 0x0300,
+                size: 4,
+            },
+            VarAllocation {
+                name: "score".into(),
+                address: 0x0010,
+                size: 1,
+            },
+            VarAllocation {
+                name: "pos_x".into(),
+                address: 0x0020,
+                size: 1,
+            },
+        ];
+        let out = render_fceux_ram_nl(&vars);
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0], "$0010#score#");
+        assert_eq!(lines[1], "$0020#pos_x#");
+        assert_eq!(lines[2], "$0300#enemies#");
     }
 }

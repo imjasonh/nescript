@@ -35,6 +35,12 @@ pub struct RomBuilder {
     mapper: u8,
     mirroring: Mirroring,
     header_format: HeaderFormat,
+    /// True when the program declared a `save { var ... }` block.
+    /// Sets byte 6 bit 1 of the iNES header so emulators and
+    /// cartridge boards persist `$6000-$7FFF` SRAM across power
+    /// cycles. Default false; the linker calls `set_battery(true)`
+    /// from `analysis.has_battery_saves`.
+    has_battery: bool,
 }
 
 impl RomBuilder {
@@ -45,7 +51,16 @@ impl RomBuilder {
             mapper: 0, // NROM
             mirroring,
             header_format: HeaderFormat::Ines1,
+            has_battery: false,
         }
+    }
+
+    /// Mark the ROM as carrying battery-backed SRAM. Flips iNES
+    /// header byte 6 bit 1; emulators that respect the flag (FCEUX,
+    /// Mesen, Nestopia, real flash carts) will load/save the
+    /// `$6000-$7FFF` window from/to a `.sav` file alongside the ROM.
+    pub fn set_battery(&mut self, has_battery: bool) {
+        self.has_battery = has_battery;
     }
 
     #[allow(dead_code)]
@@ -130,11 +145,16 @@ impl RomBuilder {
         rom.push(prg_banks as u8); // PRG ROM banks (16 KB units) — low 8 bits
         rom.push(chr_banks as u8); // CHR ROM banks (8 KB units) — low 8 bits
 
-        // Flags 6: mirroring, mapper low nibble
+        // Flags 6: mirroring (bit 0), battery-backed SRAM (bit 1),
+        // mapper low nibble (bits 4-7). Bits 2-3 (trainer, four-screen
+        // mirroring) stay zero — neither is a NEScript feature today.
         let mut flags6 = match self.mirroring {
             Mirroring::Horizontal => 0,
             Mirroring::Vertical => 1,
         };
+        if self.has_battery {
+            flags6 |= 0x02;
+        }
         flags6 |= (self.mapper & 0x0F) << 4;
         rom.push(flags6);
 
@@ -274,6 +294,9 @@ pub fn mapper_number(mapper: Mapper) -> u8 {
         Mapper::NROM => 0,
         Mapper::MMC1 => 1,
         Mapper::UxROM => 2,
+        Mapper::CNROM => 3,
         Mapper::MMC3 => 4,
+        Mapper::AxROM => 7,
+        Mapper::GNROM => 66,
     }
 }
