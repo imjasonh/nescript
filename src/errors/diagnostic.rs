@@ -33,7 +33,7 @@ pub enum ErrorCode {
     E0503, // undefined function
     E0504, // missing start declaration
     E0505, // multiple start declarations
-    E0506, // function has too many parameters (max 4 in v0.1)
+    E0506, // function has too many parameters (max 8)
 
     // E06xx: Unsupported-feature errors (parsed but not lowered)
     E0601, // state-local variable with array initializer is not supported

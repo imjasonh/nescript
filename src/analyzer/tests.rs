@@ -2143,24 +2143,28 @@ fn analyze_debug_frame_overrun_count_with_args_errors() {
 }
 
 #[test]
-fn analyze_rejects_function_with_more_than_4_params() {
-    // The v0.1 calling convention only allocates 4 zero-page
-    // parameter slots ($04-$07). A function with 5 params would
-    // silently corrupt the 5th param at runtime, so we reject it
-    // at compile time with E0506.
+fn analyze_rejects_function_with_more_than_8_params() {
+    // The calling convention allocates four zero-page transport
+    // slots ($04-$07) that leaves pass through, and a per-function
+    // RAM spill region that non-leaves direct-write into. Non-leaf
+    // functions scale past four params cleanly via the spill
+    // region, and we cap at eight both to keep the calling
+    // convention simple and because any call site needing more
+    // than eight arguments is almost certainly better served by a
+    // struct global.
     let errors = analyze_errors(
         r#"
         game "T" { mapper: NROM }
-        fun too_many(a: u8, b: u8, c: u8, d: u8, e: u8) {
+        fun too_many(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8, i: u8) {
             a = 0
         }
-        on frame { too_many(1, 2, 3, 4, 5) }
+        on frame { too_many(1, 2, 3, 4, 5, 6, 7, 8, 9) }
         start Main
     "#,
     );
     assert!(
         errors.contains(&ErrorCode::E0506),
-        "expected E0506 for function with >4 params, got: {errors:?}"
+        "expected E0506 for function with >8 params, got: {errors:?}"
     );
 }
 

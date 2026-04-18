@@ -1622,25 +1622,37 @@ impl Analyzer {
             return;
         }
         // The v0.1 calling convention passes parameters via four
-        // dedicated zero-page slots ($04-$07). Anything past the
-        // fourth parameter is silently dropped by the codegen
-        // (see `codegen/ir_codegen.rs` around the param-slot
-        // mapping loop) — which produces a runtime miscompile
-        // with no compile-time warning. Catch the over-arity case
-        // here so users get a clear error instead.
-        if fun.params.len() > 4 {
+        // Parameters are passed through zero-page transport slots
+        // for *leaf* functions only; non-leaf functions use a
+        // direct-write calling convention where the caller stages
+        // each argument straight into the callee's analyzer-
+        // allocated parameter RAM slot, bypassing the transport
+        // slots entirely. That lifts the per-function parameter cap
+        // from 4 (the number of ZP transport slots at $04-$07) to 8
+        // for non-leaves. Leaves still cap at 4 because their bodies
+        // read `$04-$07` directly and there's nowhere to put extras.
+        //
+        // The analyzer can't know which functions will be leaves
+        // without running the leaf-analysis that only exists in the
+        // codegen, so we apply the looser 8-param cap here and let
+        // the codegen's `function_is_leaf` check demote any
+        // 5-to-8-param function to non-leaf automatically. The net
+        // user-visible rule: 1–4 params works everywhere; 5–8 params
+        // works but forbids the leaf fast path.
+        if fun.params.len() > 8 {
             self.diagnostics.push(
                 Diagnostic::error(
                     ErrorCode::E0506,
                     format!(
-                        "function '{}' has {} parameters; the maximum is 4 in this version",
+                        "function '{}' has {} parameters; the maximum is 8",
                         fun.name,
                         fun.params.len()
                     ),
                     fun.span,
                 )
                 .with_help(
-                    "the v0.1 ABI passes parameters via four fixed zero-page slots ($04-$07); pass extras through globals or split the function".to_string(),
+                    "pass related data through a struct global, or split the function into two"
+                        .to_string(),
                 ),
             );
             return;

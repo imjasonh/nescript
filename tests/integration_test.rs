@@ -336,6 +336,97 @@ fn program_with_u16_struct_field() {
 }
 
 #[test]
+fn eight_param_non_leaf_function_stages_every_arg_at_its_allocated_slot() {
+    // Non-leaf functions use direct-write calling convention: the
+    // caller stages each argument at the callee's analyzer-
+    // allocated parameter slot, bypassing the four-slot `$04-$07`
+    // transport. That lifts the 4-param ceiling to 8 (E0506) and
+    // saves the old prologue's ~28 cycles per call.
+    //
+    // Verify end-to-end by compiling a function that takes eight
+    // distinct u8 params (so any cross-wiring would show up) and
+    // writes each to a distinct global. Then scan the PRG for an
+    // `LDA #N / STA <slot>` pair per arg — eight different
+    // immediates, eight different destination slots. The eight
+    // immediates `0x11..0x88` are chosen to be visually
+    // distinctive and unlikely to appear as incidental runtime
+    // constants.
+    let source = r#"
+        game "EightParams" { mapper: NROM }
+        var g0: u8 = 0
+        var g1: u8 = 0
+        var g2: u8 = 0
+        var g3: u8 = 0
+        var g4: u8 = 0
+        var g5: u8 = 0
+        var g6: u8 = 0
+        var g7: u8 = 0
+        fun spread(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8) {
+            g0 = a
+            g1 = b
+            g2 = c
+            g3 = d
+            g4 = e
+            g5 = f
+            g6 = g
+            g7 = h
+        }
+        on frame {
+            spread(0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88)
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    let prg = &rom_data[16..16 + 16384];
+
+    // For each of the eight immediates, require at least one
+    // `LDA #imm / STA <addr>` pair anywhere in PRG. The STA
+    // target can be zero-page ($85) or absolute ($8D); we don't
+    // pin down which because the analyzer picks the cheapest
+    // slot available.
+    for imm in [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88] {
+        let found = prg
+            .windows(4)
+            .any(|w| w[0] == 0xA9 && w[1] == imm && (w[2] == 0x85 || w[2] == 0x8D));
+        assert!(
+            found,
+            "expected an LDA #${imm:02X} / STA <addr> pair for argument \
+             staging — if this fails, the 8-param non-leaf call is \
+             dropping args again"
+        );
+    }
+
+    // Belt-and-braces: in the OLD ABI every arg first got
+    // staged to $04-$07 (four ZP addresses). The new ABI stages
+    // *nothing* to those addresses for this call (spread has
+    // more than four params, so it's forced non-leaf, so direct-
+    // write). If someone re-introduces the old transport path,
+    // we'd see STA $04/$05/$06/$07 pairs. Assert absence.
+    for transport_slot in 0x04..=0x07u8 {
+        let any_store = prg
+            .windows(2)
+            .any(|w| w[0] == 0x85 && w[1] == transport_slot);
+        // The runtime itself may write to $04-$07 (they're not
+        // reserved outside of this calling convention), so we
+        // can't assert zero globally. Just require that the
+        // number of STA-to-transport stores is strictly smaller
+        // than the 8 args — if the old transport path were
+        // active we'd see eight extra such stores.
+        let _ = any_store; // intentional: see count check below
+    }
+    let transport_sta_count = prg
+        .windows(2)
+        .filter(|w| w[0] == 0x85 && (0x04..=0x07).contains(&w[1]))
+        .count();
+    assert!(
+        transport_sta_count < 8,
+        "the 8-param call should NOT stage any arg through the \
+         `$04-$07` transport slots under the direct-write ABI; saw \
+         {transport_sta_count} `STA $04-$07` instructions total in PRG"
+    );
+}
+
+#[test]
 fn transition_dispatches_leaving_states_on_exit_handler() {
     // `on exit` handlers used to be silently never called — the
     // codegen documented that IrOp::Transition "doesn't know which

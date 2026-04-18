@@ -304,7 +304,7 @@ reset_score()
 
 - **No recursion.** Both direct and indirect recursion are compile errors (`E0402`).
 - **Call depth limit.** The default maximum call depth is 8. Exceeding it produces error `E0401`.
-- **Maximum 4 parameters per function.** The v0.1 calling convention passes parameters via four fixed zero-page slots (`$04`-`$07`). Declaring a function with 5+ parameters produces error `E0506`. Pack additional state into globals or split the function into smaller helpers.
+- **Maximum 8 parameters per function.** The calling convention is hybrid: **leaf** functions (no nested `JSR` in their body) receive up to four parameters through fixed zero-page transport slots `$04`-`$07`, while **non-leaf** functions receive up to eight parameters via direct caller writes into per-function RAM spill slots (no transport, no prologue copy). Declaring a function with 9+ parameters produces error `E0506`. Declaring a leaf with 5+ parameters silently promotes it to the non-leaf convention — you pay the direct-write cost rather than the prologue-copy cost, which is still cheaper than the old transport-plus-spill path.
 
 ---
 
@@ -1349,7 +1349,7 @@ reference NEScript variables.
 | E0503  | Undefined function         |
 | E0504  | Missing start declaration  |
 | E0505  | Multiple start declarations|
-| E0506  | Function has too many parameters (max 4) |
+| E0506  | Function has too many parameters (max 8) |
 
 ### Warnings (W01xx)
 

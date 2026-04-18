@@ -6,14 +6,24 @@
 //
 //   frame -> compute -> scale -> clamp -> fold -> taper
 //
-// Each function takes its argument through the zero-page
-// parameter slots ($04-$07), computes a small transform, and
-// returns a value in A. The chained result is what drives the
-// player sprite's X position on screen each frame.
+// Each function takes its argument through the calling
+// convention and returns a value in A. The chained result is
+// what drives the player sprite's X position on screen each
+// frame.
+//
+// Parameters land at a non-uniform address set:
+//   - The deepest callee (`taper`) is a leaf — it has no nested
+//     `JSR` and can receive its arg in the `$04` transport slot
+//     directly. Its body reads `$04` in place of a spill copy.
+//   - Every other function (`compute`, `scale`, `clamp`, `fold`)
+//     is non-leaf and uses the direct-write convention: each
+//     caller stages the arg straight into the callee's
+//     analyzer-allocated param slot before the `JSR`. No
+//     transport, no prologue copy.
 //
 // What this exercises end-to-end:
 //   - Five levels of nested `JSR` without stack corruption
-//   - Parameter passing via `$04-$07` between callers
+//   - The hybrid leaf / non-leaf calling convention
 //   - Return value propagation through A
 //   - `fun ... -> u8 { return ... }` — the full typed-function
 //     shape, including an early `return` inside an `if`

@@ -80,6 +80,22 @@ fun double_u8(x: u8) -> u8 {
     return x + x
 }
 
+// A six-parameter non-leaf function. The call site exercises
+// the direct-write calling convention — the caller stages each
+// arg straight into the callee's per-param RAM slot, no
+// transport through `$04-$07`. Returns the sum of all six, so
+// a regression that silently drops any one (same shape as PR
+// #31 but for params) knocks the result off 21 and flips the
+// canary red.
+fun sum6(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8) -> u8 {
+    var tmp: u8 = a + b
+    tmp = tmp + c
+    tmp = tmp + d
+    tmp = tmp + e
+    tmp = tmp + f
+    return tmp
+}
+
 // ── Main state ─────────────────────────────────────────────
 
 state Main {
@@ -127,6 +143,12 @@ state Main {
         // caller's frame of reference.
         var r: u8 = double_u8(21)
         if r != 42 { all_ok = 0 }
+
+        // Check 8: six-parameter non-leaf function — exercises
+        // the direct-write calling convention that lifts the
+        // old 4-param ceiling. 1+2+3+4+5+6 = 21.
+        var s: u8 = sum6(1, 2, 3, 4, 5, 6)
+        if s != 21 { all_ok = 0 }
 
         // Drive the backdrop flip. `set_palette` schedules an
         // update during the next vblank, so the effect lands on
