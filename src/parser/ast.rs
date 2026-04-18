@@ -235,6 +235,19 @@ pub enum Mapper {
     MMC1,
     UxROM,
     MMC3,
+    /// `AxROM` (mapper 7). Single-screen mirroring, up to 256 KB PRG
+    /// bankswitched in 32 KB pages via one write to `$8000-$FFFF`.
+    /// Register layout: bits 0-2 select the 32 KB PRG bank, bit 4
+    /// selects single-screen nametable (0 = lower, 1 = upper).
+    /// `Mirroring::Horizontal` → lower-screen, `Mirroring::Vertical`
+    /// → upper-screen in the initial write at reset.
+    AxROM,
+    /// `CNROM` (mapper 3). Fixed 32 KB PRG, 8 KB CHR bankswitching
+    /// via one write to `$8000-$FFFF`. Supports up to ~2 MB of CHR
+    /// ROM though most commercial carts stopped at 32 KB. Useful
+    /// for games that want static PRG but swap entire tile sheets
+    /// per screen / level.
+    CNROM,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -376,6 +389,13 @@ pub enum Expr {
     UnaryOp(UnaryOp, Box<Expr>, Span),
     Call(String, Vec<Expr>, Span),
     ButtonRead(Option<Player>, String, Span),
+    /// Edge-triggered button read: `p1.button.a.pressed` or
+    /// `p1.button.a.released`. The final boolean says which edge
+    /// (true = released, false = pressed) so a single variant
+    /// covers both cases. The analyzer and lowering read
+    /// `PREV_INPUT_P1` / `PREV_INPUT_P2` at the read site and
+    /// XOR against the current byte to compute the edge.
+    ButtonEdge(Option<Player>, String, bool, Span),
     ArrayLiteral(Vec<Expr>, Span),
     Cast(Box<Expr>, NesType, Span),
     /// Struct literal: `Name { field1: expr, field2: expr, ... }`.
@@ -405,6 +425,7 @@ impl Expr {
             | Self::UnaryOp(_, _, s)
             | Self::Call(_, _, s)
             | Self::ButtonRead(_, _, s)
+            | Self::ButtonEdge(_, _, _, s)
             | Self::ArrayLiteral(_, s)
             | Self::Cast(_, _, s)
             | Self::StructLiteral(_, _, s)

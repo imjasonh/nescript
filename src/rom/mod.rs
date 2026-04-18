@@ -274,6 +274,8 @@ pub fn mapper_number(mapper: Mapper) -> u8 {
         Mapper::NROM => 0,
         Mapper::MMC1 => 1,
         Mapper::UxROM => 2,
+        Mapper::CNROM => 3,
         Mapper::MMC3 => 4,
+        Mapper::AxROM => 7,
     }
 }

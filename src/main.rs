@@ -5,7 +5,9 @@ use std::path::{Path, PathBuf};
 use nescript::analyzer;
 use nescript::assets::{BackgroundData, PaletteData};
 use nescript::errors::render_diagnostics;
-use nescript::linker::{render_dbg, render_mlb, render_source_map, LinkedRom};
+use nescript::linker::{
+    render_dbg, render_fceux_nl, render_fceux_ram_nl, render_mlb, render_source_map, LinkedRom,
+};
 use nescript::pipeline::{compile_source, CompileError, CompileOptions as PipelineOptions};
 
 #[derive(Parser)]
@@ -73,6 +75,16 @@ enum Cli {
         /// line records have something to point at.
         #[arg(long, value_name = "PATH")]
         dbg: Option<PathBuf>,
+
+        /// Emit FCEUX-compatible per-bank `.nl` label files and a
+        /// `.ram.nl` file next to the ROM. The argument is the
+        /// prefix; FCEUX appends `.<bank>.nl` / `.ram.nl`. Unlike
+        /// `.dbg` (which Mesen/Mesen2 understand natively), the
+        /// `.nl` format is what FCEUX on Linux reads, and many
+        /// users still prefer FCEUX over Mesen for its lighter
+        /// footprint.
+        #[arg(long, value_name = "PREFIX")]
+        fceux_labels: Option<PathBuf>,
     },
     /// Type-check a source file without building
     Check {
@@ -97,6 +109,7 @@ fn main() {
             symbols,
             source_map,
             dbg,
+            fceux_labels,
         } => {
             let output = output.unwrap_or_else(|| input.with_extension("nes"));
             match compile(
@@ -112,6 +125,7 @@ fn main() {
                     symbols: symbols.clone(),
                     source_map: source_map.clone(),
                     dbg: dbg.clone(),
+                    fceux_labels: fceux_labels.clone(),
                 },
             ) {
                 Ok(rom) => {
@@ -376,6 +390,7 @@ struct CompileOptions {
     symbols: Option<PathBuf>,
     source_map: Option<PathBuf>,
     dbg: Option<PathBuf>,
+    fceux_labels: Option<PathBuf>,
 }
 
 fn compile(input: &PathBuf, output: &Path, opts: &CompileOptions) -> Result<Vec<u8>, ()> {
@@ -483,6 +498,33 @@ fn compile(input: &PathBuf, output: &Path, opts: &CompileOptions) -> Result<Vec<
         );
         std::fs::write(path, dbg).map_err(|e| {
             eprintln!("error: failed to write dbg file {}: {e}", path.display());
+        })?;
+    }
+    if let Some(prefix) = opts.fceux_labels.as_ref() {
+        // FCEUX looks for `<prefix>.<bank-index>.nl` per-bank and
+        // `<prefix>.ram.nl` for RAM symbols. NEScript's fixed bank
+        // is always the last physical bank in the ROM, so for a
+        // single-bank NROM layout the index is 0; for banked ROMs
+        // it's `total_banks - 1`. We derive it from the linker's
+        // reported fixed-bank file offset: (offset - 16) /
+        // PRG_BANK_SIZE.
+        const PRG_BANK_SIZE: usize = 16384;
+        let bank_index = out.link_result.fixed_bank_file_offset.saturating_sub(16) / PRG_BANK_SIZE;
+        let bank_nl = render_fceux_nl(&out.link_result);
+        let bank_path = prefix.with_extension(format!("{bank_index}.nl"));
+        std::fs::write(&bank_path, bank_nl).map_err(|e| {
+            eprintln!(
+                "error: failed to write FCEUX bank label file {}: {e}",
+                bank_path.display()
+            );
+        })?;
+        let ram_nl = render_fceux_ram_nl(&out.analysis.var_allocations);
+        let ram_path = prefix.with_extension("ram.nl");
+        std::fs::write(&ram_path, ram_nl).map_err(|e| {
+            eprintln!(
+                "error: failed to write FCEUX RAM label file {}: {e}",
+                ram_path.display()
+            );
         })?;
     }
 

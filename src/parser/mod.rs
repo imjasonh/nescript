@@ -369,13 +369,17 @@ impl Parser {
                         "MMC1" => Mapper::MMC1,
                         "UxROM" => Mapper::UxROM,
                         "MMC3" => Mapper::MMC3,
+                        "AxROM" => Mapper::AxROM,
+                        "CNROM" => Mapper::CNROM,
                         _ => {
                             return Err(Diagnostic::error(
                                 ErrorCode::E0201,
                                 format!("unknown mapper '{val}'"),
                                 self.current_span(),
                             )
-                            .with_help("supported mappers: NROM, MMC1, UxROM, MMC3"));
+                            .with_help(
+                                "supported mappers: NROM, MMC1, UxROM, MMC3, AxROM, CNROM",
+                            ));
                         }
                     };
                 }
@@ -3152,14 +3156,34 @@ impl Parser {
                 let span = self.current_span();
                 self.advance();
 
-                // Check for button.X (player 1 default)
+                // Check for button.X or button.X.pressed/.released
                 if name == "button" && *self.peek() == TokenKind::Dot {
                     self.advance();
                     let (button, _) = self.expect_name()?;
+                    if *self.peek() == TokenKind::Dot {
+                        self.advance();
+                        if let TokenKind::Ident(edge) = self.peek().clone() {
+                            if edge == "pressed" || edge == "released" {
+                                self.advance();
+                                return Ok(Expr::ButtonEdge(
+                                    None,
+                                    button,
+                                    edge == "released",
+                                    span,
+                                ));
+                            }
+                        }
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            "expected 'pressed' or 'released' after button name",
+                            self.current_span(),
+                        ));
+                    }
                     return Ok(Expr::ButtonRead(None, button, span));
                 }
 
-                // Check for p1.button.X / p2.button.X
+                // Check for p1.button.X / p2.button.X, optionally
+                // followed by .pressed / .released for edge-triggered.
                 if (name == "p1" || name == "p2") && *self.peek() == TokenKind::Dot {
                     self.advance();
                     // Expect 'button'
@@ -3173,6 +3197,25 @@ impl Parser {
                             } else {
                                 Some(Player::P2)
                             };
+                            if *self.peek() == TokenKind::Dot {
+                                self.advance();
+                                if let TokenKind::Ident(edge) = self.peek().clone() {
+                                    if edge == "pressed" || edge == "released" {
+                                        self.advance();
+                                        return Ok(Expr::ButtonEdge(
+                                            player,
+                                            button,
+                                            edge == "released",
+                                            span,
+                                        ));
+                                    }
+                                }
+                                return Err(Diagnostic::error(
+                                    ErrorCode::E0201,
+                                    "expected 'pressed' or 'released' after button name",
+                                    self.current_span(),
+                                ));
+                            }
                             return Ok(Expr::ButtonRead(player, button, span));
                         }
                     }

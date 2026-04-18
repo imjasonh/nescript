@@ -973,7 +973,12 @@ impl Analyzer {
                 // If the function is known, validate its call signature.
                 // Undefined-function errors are surfaced elsewhere (for
                 // Statement::Call) and via the call-graph pass.
-                if self.function_signatures.contains_key(name) {
+                if is_intrinsic(name) {
+                    // Intrinsics can appear in expression position too
+                    // (e.g. `var x = rand8()`). Validate arity here so
+                    // typos and bad-arity calls don't slip past.
+                    self.check_intrinsic_args(name, args, *span);
+                } else if self.function_signatures.contains_key(name) {
                     self.check_call_signature(name, args, *span);
                 }
                 for arg in args {
@@ -1049,6 +1054,20 @@ impl Analyzer {
                 }
             }
             Expr::IntLiteral(_, _) | Expr::BoolLiteral(_, _) | Expr::ButtonRead(_, _, _) => {}
+            Expr::ButtonEdge(_, button, _, span) => {
+                // Same validation as ButtonRead: the button name
+                // must be recognised. `crate::ir::lowering::button_mask`
+                // returns 0 for unknown names which would silently
+                // compile to "always false"; reject here so typos
+                // surface at compile time.
+                if !is_known_button(button) {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown button '{button}'"),
+                        *span,
+                    ));
+                }
+            }
         }
     }
 
@@ -2236,6 +2255,7 @@ impl Analyzer {
             if *expected == NesType::Bool {
                 match expr {
                     Expr::ButtonRead(..)
+                    | Expr::ButtonEdge(..)
                     | Expr::BinaryOp(
                         _,
                         BinOp::Eq
@@ -2280,7 +2300,7 @@ impl Analyzer {
             }
             Expr::BoolLiteral(_, _) => Some(NesType::Bool),
             Expr::Ident(name, _) => self.resolve_symbol(name).map(|s| s.sym_type.clone()),
-            Expr::ButtonRead(_, _, _) => Some(NesType::Bool),
+            Expr::ButtonRead(_, _, _) | Expr::ButtonEdge(_, _, _, _) => Some(NesType::Bool),
             Expr::BinaryOp(_, op, _, _) => match op {
                 BinOp::Eq
                 | BinOp::NotEq
@@ -2294,7 +2314,12 @@ impl Analyzer {
             },
             Expr::UnaryOp(UnaryOp::Not, _, _) => Some(NesType::Bool),
             Expr::UnaryOp(_, _, _) => Some(NesType::U8),
-            Expr::Call(_, _, _) => Some(NesType::U8), // Simplified for M1
+            Expr::Call(name, _, _) => match name.as_str() {
+                // PRNG intrinsics: rand8 returns u8, rand16 returns u16.
+                "rand8" => Some(NesType::U8),
+                "rand16" => Some(NesType::U16),
+                _ => Some(NesType::U8), // Simplified for M1
+            },
             Expr::ArrayIndex(name, _, _) => {
                 self.resolve_symbol(name).and_then(|s| match &s.sym_type {
                     NesType::Array(elem, _) => Some(elem.as_ref().clone()),
@@ -2551,7 +2576,19 @@ fn is_small_constant(expr: &Expr) -> bool {
 /// compiler. Intrinsics don't need a declaration and may have
 /// special codegen (e.g. \`poke\` / \`peek\` write to raw addresses).
 fn is_intrinsic(name: &str) -> bool {
-    matches!(name, "poke" | "peek")
+    matches!(
+        name,
+        "poke" | "peek" | "rand8" | "rand16" | "seed_rand" | "set_palette_brightness"
+    )
+}
+
+/// True if `name` is one of the NES controller's eight buttons.
+/// Mirrors the `button_mask` table in `ir::lowering`.
+fn is_known_button(name: &str) -> bool {
+    matches!(
+        name,
+        "a" | "b" | "select" | "start" | "up" | "down" | "left" | "right"
+    )
 }
 
 impl Analyzer {
@@ -2573,6 +2610,33 @@ impl Analyzer {
                 self.diagnostics.push(Diagnostic::error(
                     ErrorCode::E0203,
                     format!("`peek` takes exactly 1 argument (addr), got {}", args.len()),
+                    span,
+                ));
+            }
+            "rand8" | "rand16" if !args.is_empty() => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!("`{name}` takes no arguments, got {}", args.len()),
+                    span,
+                ));
+            }
+            "seed_rand" if args.len() != 1 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`seed_rand` takes exactly 1 argument (seed: u16), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            "set_palette_brightness" if args.len() != 1 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`set_palette_brightness` takes exactly 1 argument (level: u8 0..8), got {}",
+                        args.len()
+                    ),
                     span,
                 ));
             }
@@ -2673,7 +2737,8 @@ fn collect_calls_expr(expr: &Expr, calls: &mut Vec<String>) {
         | Expr::BoolLiteral(_, _)
         | Expr::Ident(_, _)
         | Expr::FieldAccess(_, _, _)
-        | Expr::ButtonRead(_, _, _) => {}
+        | Expr::ButtonRead(_, _, _)
+        | Expr::ButtonEdge(_, _, _, _) => {}
     }
 }
 

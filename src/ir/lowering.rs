@@ -1119,6 +1119,20 @@ impl LoweringContext {
                             self.emit(IrOp::Poke(addr, val));
                         }
                     }
+                    // `seed_rand(x)` — install `x` as the new PRNG
+                    // state. `x` is widened to u16 so a narrow seed
+                    // still lands in both bytes of the state.
+                    "seed_rand" if args.len() == 1 => {
+                        let seed = self.lower_expr(&args[0]);
+                        let (lo, hi) = self.widen(seed);
+                        self.emit(IrOp::SeedRand(lo, hi));
+                    }
+                    // `set_palette_brightness(level)` — translate a
+                    // 0..8 level into $2001 mask bits.
+                    "set_palette_brightness" if args.len() == 1 => {
+                        let level = self.lower_expr(&args[0]);
+                        self.emit(IrOp::SetPaletteBrightness(level));
+                    }
                     _ => {
                         // Inline expansion at statement context
                         // splices either the return expression
@@ -1668,6 +1682,21 @@ impl LoweringContext {
                         return t;
                     }
                 }
+                // `rand8()` — draw the next 8 bits from the PRNG.
+                if name == "rand8" && args.is_empty() {
+                    let t = self.fresh_temp();
+                    self.emit(IrOp::Rand8(t));
+                    return t;
+                }
+                // `rand16()` — draw the next 16 bits. Return a
+                // wide-marked low temp so callers get u16 semantics.
+                if name == "rand16" && args.is_empty() {
+                    let lo = self.fresh_temp();
+                    let hi = self.fresh_temp();
+                    self.emit(IrOp::Rand16(lo, hi));
+                    self.make_wide(lo, hi);
+                    return lo;
+                }
                 // `inline fun` bodies captured by
                 // `capture_inline_bodies` expand in-place here:
                 // no JSR, no parameter transport, no prologue.
@@ -1680,6 +1709,21 @@ impl LoweringContext {
                 let t = self.fresh_temp();
                 self.emit(IrOp::Call(Some(t), name.clone(), arg_temps));
                 t
+            }
+            Expr::ButtonEdge(player, button, released, _) => {
+                let player_index = match player {
+                    Some(Player::P2) => 1u8,
+                    _ => 0u8,
+                };
+                let mask = button_mask(button);
+                let dest = self.fresh_temp();
+                self.emit(IrOp::ReadInputEdge {
+                    dest,
+                    player: player_index,
+                    mask,
+                    released: *released,
+                });
+                dest
             }
             Expr::ButtonRead(player, button, _) => {
                 // Button reads: read the input byte, mask with the button bit.

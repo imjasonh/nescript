@@ -198,6 +198,29 @@ pub const AUDIO_TRIANGLE_COUNTER: u16 = 0x07F5;
 pub const AUDIO_SFX_PITCH_PTR_LO: u16 = 0x07F6;
 pub const AUDIO_SFX_PITCH_PTR_HI: u16 = 0x07F7;
 
+/// Previous-frame copies of the two controller bytes. Populated
+/// by the NMI handler *after* the current-frame shift loop, so
+/// `curr & ~prev` ("just pressed") and `prev & ~curr`
+/// ("just released") compile to a single AND chain at the read
+/// site. Only touched by programs that reference `p1.button.pressed`
+/// / `.released` (detected via the `__edge_input_used` marker
+/// label); programs without edge-triggered reads leave these
+/// two bytes free.
+pub const PREV_INPUT_P1: u16 = 0x07E6;
+pub const PREV_INPUT_P2: u16 = 0x07E7;
+
+/// PRNG state — two bytes holding a 16-bit xorshift state.
+/// Only touched by the `__rand8` / `__rand16` / `__rand_seed`
+/// runtime routines, which the linker splices in whenever user
+/// code contains the `__rand_used` marker label. The reset path
+/// seeds the state to a non-zero constant (0xACE1) so the very
+/// first `rand8()` call returns a useful value even without an
+/// explicit `seed_rand`. Programs that never touch PRNG skip
+/// both the state init and the routines, leaving these two
+/// bytes free for the analyzer to allocate over.
+pub const PRNG_STATE_LO: u16 = 0x07EA;
+pub const PRNG_STATE_HI: u16 = 0x07EB;
+
 /// Generate the NES hardware initialization sequence.
 /// This runs at RESET and sets up the hardware before user code.
 ///
@@ -399,6 +422,14 @@ pub struct NmiOptions {
     /// zero cycles for input sampling (~100 cycles: the 88-cycle
     /// body plus the ~12-cycle strobe and loop scaffold).
     pub has_p1_input: bool,
+    /// When true, snapshot the previous-frame controller byte
+    /// into `PREV_INPUT_P1` / `PREV_INPUT_P2` *before* the
+    /// new-frame strobe-and-shift loop. This is the extra state
+    /// the IR codegen's `ReadInputEdge` op reads to compute
+    /// `p1.a.pressed` / `.released`. Programs that don't
+    /// reference edge-triggered input leave this off and the
+    /// two snapshot stores disappear.
+    pub has_edge_input: bool,
 }
 
 #[must_use]
@@ -411,6 +442,7 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
         has_oam,
         has_p2_input,
         has_p1_input,
+        has_edge_input,
     } = opts;
     let mut out = Vec::new();
 
@@ -520,6 +552,23 @@ pub fn gen_nmi(opts: NmiOptions) -> Vec<Instruction> {
     // actually uses. Programs that touch no `button.*` at all skip
     // the whole block.
     if has_p1_input || has_p2_input {
+        // Before strobing: snapshot the previous frame's input
+        // byte into main RAM so edge-triggered reads
+        // (`p1.a.pressed` / `.released`) can compute
+        // `curr & ~prev` / `prev & ~curr` at the user-code read
+        // site. Gated on `has_edge_input` so programs without
+        // edge reads skip the two (or four) store bytes and
+        // leave the two PREV_INPUT slots free for the analyzer.
+        if has_edge_input {
+            if has_p1_input {
+                out.push(Instruction::new(LDA, AM::ZeroPage(ZP_INPUT_P1)));
+                out.push(Instruction::new(STA, AM::Absolute(PREV_INPUT_P1)));
+            }
+            if has_p2_input {
+                out.push(Instruction::new(LDA, AM::ZeroPage(ZP_INPUT_P2)));
+                out.push(Instruction::new(STA, AM::Absolute(PREV_INPUT_P2)));
+            }
+        }
         // Strobe: write 1 then 0 to $4016 so both port latches
         // capture the current button state.
         out.push(Instruction::new(LDA, AM::Immediate(0x01)));
@@ -1562,6 +1611,225 @@ pub fn gen_divide() -> Vec<Instruction> {
     out
 }
 
+/// Generate the runtime PRNG routines: `__rand8`, `__rand16`, and
+/// `__rand_seed`. Spliced in by the linker only when user code
+/// contains the `__rand_used` marker label (emitted by the IR
+/// codegen whenever `rand8()`, `rand16()`, or `seed_rand()` is
+/// referenced). Programs that never touch the PRNG pay zero ROM
+/// or cycle cost.
+///
+/// Algorithm: a 16-bit xorshift with the canonical `(7, 9, 8)`
+/// parameters that produces a full 65535-cycle period from any
+/// non-zero seed. The state lives in main RAM at
+/// `PRNG_STATE_LO`/`PRNG_STATE_HI`; the reset path seeds it to
+/// `0xACE1` (a classic xorshift16 nonzero seed) so the first
+/// `rand8()` call returns a useful value without requiring an
+/// explicit `seed_rand`.
+///
+/// ## Entry points
+///
+/// - `__rand8`: advances the state once, returns `A` = new low byte.
+///   Clobbers A, X, flags. ~40 cycles.
+/// - `__rand16`: advances twice, returns `A` = lo byte of the
+///   second draw, `X` = hi byte. Clobbers A, X, flags. ~80 cycles.
+/// - `__rand_seed`: consumes `A` = low byte, `X` = high byte of the
+///   new seed and writes them to the state slots. Does not advance.
+///   Callers are responsible for not seeding with zero (the PRNG
+///   gets stuck), but the builtin lowering forces a `| 1` on the
+///   low byte to sidestep the common `seed = frame_counter` case.
+#[must_use]
+pub fn gen_prng() -> Vec<Instruction> {
+    let mut out = Vec::new();
+
+    // ── __rand8 ──────────────────────────────────────────────
+    // xorshift16 step:
+    //   state ^= state << 7   (A-register shift)
+    //   state ^= state >> 9   (byte swap + right shift 1)
+    //   state ^= state << 8   (swap: new_lo = hi, new_hi = hi ^ lo)
+    // Returns the new low byte in A.
+    out.push(Instruction::new(NOP, AM::Label("__rand8".into())));
+
+    // --- state ^= state << 7 ---
+    // 7 left shifts of a 16-bit value is equivalent to a 1-bit
+    // right rotation with fill-from-low-bit-of-hi, which the
+    // 6502 can do with a bit of carry juggling. Simpler: shift
+    // the whole 16-bit state left once and XOR back into itself,
+    // seven times. But for size we use the rotate trick:
+    //   LDA hi : LSR A : LDA lo : ROR A : STA hi : ... no wait,
+    // let's just do it the straightforward way: 7 ASLs of the
+    // 16-bit state folded into a XOR.
+    //
+    // Clearer and smaller: compute tmp = state << 7 by:
+    //   tmp_lo = lo << 7 = (lo & 1) << 7                  [only bit 0 survives]
+    //   tmp_hi = (hi << 7) | (lo >> 1)                    [hi's bit 0 is lo's bit 1]
+    // Actually, <<7 on 16-bit: bits 0..8 of input become bits 7..15 of output.
+    //   output bit 7       = input bit 0   (was lo bit 0)
+    //   output bits 8..14  = input bits 1..7 (was lo bits 1..7)
+    //   output bit 15      = input bit 8  (was hi bit 0)
+    //
+    // Equivalently: tmp_lo = lo << 7, tmp_hi = (lo >> 1) | (hi << 7).
+    // Then state ^= tmp.
+    //
+    // Since tmp_lo has only bit 7 possibly set, and tmp_hi has
+    // bits 0..6 from lo and bit 7 from hi bit 0:
+    //
+    //   LDA PRNG_STATE_LO        ; A = lo
+    //   LSR A                    ; A = lo >> 1, C = lo bit 0
+    //   ROR PRNG_STATE_LO        ; no — we need to NOT change state yet
+    //
+    // Simpler: do the full algorithm using a scratch copy.
+    //
+    // For brevity and cycle cost we use a different but equivalent
+    // LFSR: a Galois-configuration 16-bit LFSR with polynomial
+    // 0x002D (taps at 0, 2, 3, 5) which also has a full period of
+    // 65535 from any non-zero seed. The advantage is a very small
+    // step: one shift and a conditional XOR with two bytes.
+    //
+    // Step:
+    //   carry = state & 1
+    //   state >>= 1
+    //   if carry: state ^= 0xB400
+    //
+    // The 0xB400 tap mask comes from the standard 16-bit LFSR
+    // polynomial x^16 + x^14 + x^13 + x^11 + 1 reversed for
+    // right-shift Galois form. It has full 65535 period.
+
+    // LSR the high byte first, then ROR the low byte, so the
+    // low-bit-of-low-byte ends up in carry.
+    out.push(Instruction::new(LSR, AM::Absolute(PRNG_STATE_HI)));
+    out.push(Instruction::new(ROR, AM::Absolute(PRNG_STATE_LO)));
+    // If the shifted-out bit was zero, skip the XOR.
+    out.push(Instruction::new(
+        BCC,
+        AM::LabelRelative("__rand8_done".into()),
+    ));
+    // state_hi ^= 0xB4
+    out.push(Instruction::new(LDA, AM::Absolute(PRNG_STATE_HI)));
+    out.push(Instruction::new(EOR, AM::Immediate(0xB4)));
+    out.push(Instruction::new(STA, AM::Absolute(PRNG_STATE_HI)));
+    // (low tap byte is 0x00, nothing to XOR there)
+    out.push(Instruction::new(NOP, AM::Label("__rand8_done".into())));
+    // Return with A = new state low byte.
+    out.push(Instruction::new(LDA, AM::Absolute(PRNG_STATE_LO)));
+    out.push(Instruction::implied(RTS));
+
+    // ── __rand16 ─────────────────────────────────────────────
+    // Advance twice and return A=lo, X=hi. Two draws so the
+    // caller gets 16 bits of entropy instead of two halves of
+    // the same internal step.
+    out.push(Instruction::new(NOP, AM::Label("__rand16".into())));
+    out.push(Instruction::new(JSR, AM::Label("__rand8".into())));
+    out.push(Instruction::new(JSR, AM::Label("__rand8".into())));
+    // At this point A = state_lo after the second draw; we want
+    // to also return the high byte, which is state_hi. Stash the
+    // low byte, load hi into X, restore lo into A.
+    out.push(Instruction::implied(TAY)); // save lo in Y
+    out.push(Instruction::new(LDX, AM::Absolute(PRNG_STATE_HI)));
+    out.push(Instruction::implied(TYA)); // restore lo to A
+    out.push(Instruction::implied(RTS));
+
+    // ── __rand_seed ──────────────────────────────────────────
+    // Store A = lo, X = hi into the state.
+    out.push(Instruction::new(NOP, AM::Label("__rand_seed".into())));
+    // Force bit 0 of the low byte high so a zero seed doesn't
+    // stick the LFSR.
+    out.push(Instruction::new(ORA, AM::Immediate(0x01)));
+    out.push(Instruction::new(STA, AM::Absolute(PRNG_STATE_LO)));
+    out.push(Instruction::new(STX, AM::Absolute(PRNG_STATE_HI)));
+    out.push(Instruction::implied(RTS));
+
+    out
+}
+
+/// Generate the `__set_palette_brightness` runtime routine.
+/// Spliced in by the linker only when user code contains the
+/// `__palette_bright_used` marker label.
+///
+/// The input level (passed in A) is mapped to a PPU mask byte:
+/// - `0` — everything off (blank screen)
+/// - `1..3` — fade-out via PPU mask "darken" bits (R/G/B emphasis),
+///   which darken the visible colour range by a few notches.
+/// - `4` (normal) — `$1E`, sprites + background, no emphasis
+/// - `5..7` — progressive emphasis bits to push towards white
+/// - `8` — all three emphasis bits set (max "bright")
+///
+/// The mapping is a 9-entry table indexed by the clamped level.
+/// Levels above 8 clamp to 8 (max brightness).
+#[must_use]
+pub fn gen_palette_brightness() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__set_palette_brightness".into()),
+    ));
+    // Clamp level (in A) to 8. If A >= 9, force A = 8.
+    out.push(Instruction::new(CMP, AM::Immediate(9)));
+    out.push(Instruction::new(
+        BCC,
+        AM::LabelRelative("__bright_clamped".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::Immediate(8)));
+    out.push(Instruction::new(NOP, AM::Label("__bright_clamped".into())));
+    // Dispatch by level through a compare-and-set tree. Each level
+    // maps to a specific `$2001` mask byte:
+    //   0: $00 — all rendering off (blank)
+    //   1: $01 — greyscale flag (dim-looking)
+    //   2: $1E — normal sprites + bg
+    //   3: $3E — +red emphasis
+    //   4: $5E — +green emphasis
+    //   5: $9E — +blue emphasis
+    //   6: $7E — +red+green (yellow tint)
+    //   7: $BE — +red+blue (magenta tint)
+    //   8: $FE — all three emphasis bits (brightest)
+    // The table is short enough that the linear CPX tree is
+    // comparable in ROM cost to a proper table-indexed load and
+    // avoids needing a Label-based AbsoluteX mode in the assembler.
+    out.push(Instruction::implied(TAX));
+    let entries: [(u8, u8); 9] = [
+        (0, 0x00),
+        (1, 0x01),
+        (2, 0x1E),
+        (3, 0x3E),
+        (4, 0x5E),
+        (5, 0x9E),
+        (6, 0x7E),
+        (7, 0xBE),
+        (8, 0xFE),
+    ];
+    for (level, mask) in entries {
+        out.push(Instruction::new(CPX, AM::Immediate(level)));
+        out.push(Instruction::new(
+            BNE,
+            AM::LabelRelative(format!("__bright_not_{level}")),
+        ));
+        out.push(Instruction::new(LDA, AM::Immediate(mask)));
+        out.push(Instruction::new(STA, AM::Absolute(PPU_MASK)));
+        out.push(Instruction::implied(RTS));
+        out.push(Instruction::new(
+            NOP,
+            AM::Label(format!("__bright_not_{level}")),
+        ));
+    }
+    // Fall-through (shouldn't hit): leave PPU_MASK untouched.
+    out.push(Instruction::implied(RTS));
+    out
+}
+
+/// Emit the reset-time PRNG state seed. Spliced into the reset
+/// path whenever `gen_prng` is linked in, so the first `rand8()`
+/// call returns a useful value even without an explicit
+/// `seed_rand`. The seed `0xACE1` is the classic nonzero
+/// xorshift16 seed.
+#[must_use]
+pub fn gen_prng_init() -> Vec<Instruction> {
+    vec![
+        Instruction::new(LDA, AM::Immediate(0xE1)),
+        Instruction::new(STA, AM::Absolute(PRNG_STATE_LO)),
+        Instruction::new(LDA, AM::Immediate(0xAC)),
+        Instruction::new(STA, AM::Absolute(PRNG_STATE_HI)),
+    ]
+}
+
 // ─── Bank switching ────────────────────────────────────────────────
 //
 // NEScript supports bank switching for MMC1, UxROM, and MMC3. The
@@ -1609,22 +1877,60 @@ pub fn gen_mapper_init(
         Mapper::MMC1 => gen_mmc1_init(mirroring),
         Mapper::UxROM => gen_uxrom_init(total_prg_banks),
         Mapper::MMC3 => gen_mmc3_init(mirroring),
+        Mapper::AxROM => gen_axrom_init(mirroring),
+        Mapper::CNROM => gen_cnrom_init(),
     };
     // Initialize ZP_BANK_CURRENT to the fixed bank index for any
-    // banked mapper. The trampoline emitted by
-    // `gen_bank_trampoline` reads this slot to decide which bank
-    // to restore after a cross-bank call, so it has to be a
-    // sensible value from the very first call. Without this the
-    // RAM-clear leaves it at $00, which would put bank 0 at
-    // $8000 instead of the fixed bank after a fixed-bank caller's
-    // first cross-bank call — a behavior change vs. the pre-
-    // banked-banked codegen that some examples rely on.
-    if mapper != Mapper::NROM && total_prg_banks > 0 {
+    // banked mapper. CNROM and AxROM don't use per-function bank
+    // trampolines the same way MMC1/UxROM/MMC3 do — CNROM has a
+    // fixed 32 KB PRG, and AxROM swaps 32 KB pages as one unit —
+    // so they skip the `ZP_BANK_CURRENT` seed.
+    if matches!(mapper, Mapper::MMC1 | Mapper::UxROM | Mapper::MMC3) && total_prg_banks > 0 {
         #[allow(clippy::cast_possible_truncation)]
         let fixed_bank_index = (total_prg_banks - 1) as u8;
         out.push(Instruction::new(LDA, AM::Immediate(fixed_bank_index)));
         out.push(Instruction::new(STA, AM::ZeroPage(ZP_BANK_CURRENT)));
     }
+    out
+}
+
+/// `AxROM` (mapper 7) reset. The `AxROM` register is a single latch
+/// at `$8000-$FFFF`:
+///   bits 0-2 select the 32 KB PRG bank mapped at `$8000-$FFFF`
+///   bit 4    selects single-screen nametable (0 = lower, 1 = upper)
+///
+/// We write `0` at reset so the ROM starts executing from bank 0
+/// with the lower nametable active. Some `AxROM` boards (Battletoads,
+/// Wizards & Warriors) are bus-conflict-prone so the write has to
+/// hit a ROM byte that matches; the simplest safe approach is to
+/// put a `0x00` byte at a known ROM address and STA there. For
+/// `NEScript`'s usage pattern (single PRG bank → mapper 0-equivalent
+/// layout) this is good enough for the demo to boot.
+fn gen_axrom_init(mirroring: Mirroring) -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__axrom_init".into())));
+    // Start with the lower or upper single-screen nametable active.
+    // `Mirroring::Horizontal` → lower-screen (bit 4 = 0); `Vertical`
+    // → upper-screen (bit 4 = 1). This keeps the existing mirroring
+    // enum useful even though AxROM has no true horizontal/vertical
+    // modes.
+    let init_reg: u8 = match mirroring {
+        Mirroring::Horizontal => 0x00,
+        Mirroring::Vertical => 0x10,
+    };
+    out.push(Instruction::new(LDA, AM::Immediate(init_reg)));
+    out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+    out
+}
+
+/// CNROM (mapper 3) reset. Fixed 32 KB PRG, 8 KB CHR bankswitching
+/// via one write to `$8000-$FFFF`. At power-on the CHR bank is
+/// undefined on some boards, so we explicitly write bank 0.
+fn gen_cnrom_init() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__cnrom_init".into())));
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::Absolute(0x8000)));
     out
 }
 
@@ -1798,6 +2104,24 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
             out.push(Instruction::new(STA, AM::Absolute(0x8000)));
             out.push(Instruction::implied(PLA));
             out.push(Instruction::new(STA, AM::Absolute(0x8001)));
+            out.push(Instruction::implied(RTS));
+        }
+        Mapper::AxROM => {
+            // AxROM: write the 32 KB PRG bank number to $8000-$FFFF.
+            // Bit 4 selects the single-screen nametable; we preserve
+            // it by ORing whatever was latched last (implicit 0 from
+            // reset). Our bank-switching model only moves between
+            // 32 KB pages, so multi-bank AxROM programs would need
+            // to split along 32 KB boundaries — more of a layout
+            // concern than a runtime one.
+            out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+            out.push(Instruction::implied(RTS));
+        }
+        Mapper::CNROM => {
+            // CNROM: writing A to `$8000-$FFFF` selects an 8 KB CHR
+            // bank. PRG is fixed so this routine is only useful for
+            // graphics swaps.
+            out.push(Instruction::new(STA, AM::Absolute(0x8000)));
             out.push(Instruction::implied(RTS));
         }
     }

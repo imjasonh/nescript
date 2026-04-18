@@ -208,6 +208,22 @@ pub struct IrCodeGen<'a> {
     /// the NMI's shift loop, saving ~6 bytes of code and ~30 cycles
     /// per frame.
     p2_input_used: bool,
+    /// Set to true the first time we lower `rand8()`/`rand16()`/
+    /// `seed_rand()`. Drives the `__rand_used` marker label —
+    /// the linker uses it to splice `runtime::gen_prng` into PRG
+    /// ROM and seed the state at reset.
+    rand_used: bool,
+    /// Set to true the first time we lower `set_palette_brightness`.
+    /// Drives the `__palette_bright_used` marker label — the
+    /// linker uses it to splice `runtime::gen_palette_brightness`
+    /// into PRG ROM.
+    palette_bright_used: bool,
+    /// Set to true the first time we lower `IrOp::ReadInputEdge`
+    /// (`p1.a.pressed` / `p1.a.released`). Drives the
+    /// `__edge_input_used` marker label — the linker uses it to
+    /// splice the prev-input snapshot after the NMI's shift loop
+    /// so edge detection sees stable current/previous bytes.
+    edge_input_used: bool,
     /// Source-location markers produced from [`IrOp::SourceLoc`].
     /// Each entry is a `(label_name, span)` pair — the codegen
     /// emits a unique label-definition pseudo-op at the current
@@ -426,6 +442,9 @@ impl<'a> IrCodeGen<'a> {
             default_sprite_used: false,
             p1_input_used: false,
             p2_input_used: false,
+            rand_used: false,
+            palette_bright_used: false,
+            edge_input_used: false,
             source_locs: Vec::new(),
             next_source_loc: 0,
             emit_source_locs: false,
@@ -1908,6 +1927,80 @@ impl<'a> IrCodeGen<'a> {
                 b_lo,
                 b_hi,
             } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::GtEq),
+            IrOp::Rand8(dest) => {
+                self.emit_rand_marker();
+                self.emit(JSR, AM::Label("__rand8".into()));
+                // A now holds the new low byte.
+                self.store_temp(*dest);
+            }
+            IrOp::Rand16(dest_lo, dest_hi) => {
+                self.emit_rand_marker();
+                self.emit(JSR, AM::Label("__rand16".into()));
+                // A = lo, X = hi.
+                self.store_temp(*dest_lo);
+                self.emit(TXA, AM::Implied);
+                self.store_temp(*dest_hi);
+            }
+            IrOp::SeedRand(lo, hi) => {
+                self.emit_rand_marker();
+                // Load hi into X first (since the seed routine
+                // expects A=lo, X=hi and loading A last leaves it
+                // in the right register).
+                let hi_addr = self.temp_addr(*hi);
+                self.emit(LDX, AM::ZeroPage(hi_addr));
+                self.load_temp(*lo);
+                self.emit(JSR, AM::Label("__rand_seed".into()));
+            }
+            IrOp::SetPaletteBrightness(level) => {
+                self.emit_palette_bright_marker();
+                self.load_temp(*level);
+                self.emit(JSR, AM::Label("__set_palette_brightness".into()));
+            }
+            IrOp::ReadInputEdge {
+                dest,
+                player,
+                mask,
+                released,
+            } => {
+                // Mark input usage so the NMI strobe loop gets spliced.
+                if *player == 0 {
+                    self.p1_input_used = true;
+                } else {
+                    self.p2_input_used = true;
+                }
+                // Mark edge-input usage so the NMI emits the prev-state
+                // snapshot after the shift loop.
+                self.edge_input_used = true;
+                // Current input byte:
+                let curr_addr = if *player == 0 {
+                    crate::runtime::ZP_INPUT_P1
+                } else {
+                    crate::runtime::ZP_INPUT_P2
+                };
+                // Previous-frame input byte. Parked in main RAM below
+                // the debug/audio/prng block so it doesn't collide
+                // with ZP; the analyzer never allocates there.
+                let prev_addr: u16 = if *player == 0 {
+                    crate::runtime::PREV_INPUT_P1
+                } else {
+                    crate::runtime::PREV_INPUT_P2
+                };
+                // For `pressed`: curr & ~prev  = curr AND (prev XOR $FF) — simpler:
+                //   LDA prev ; EOR #$FF ; AND curr ; AND #mask
+                // For `released`: ~curr & prev = prev AND (curr XOR $FF):
+                //   LDA curr ; EOR #$FF ; AND prev ; AND #mask
+                if *released {
+                    self.emit(LDA, AM::ZeroPage(curr_addr));
+                    self.emit(EOR, AM::Immediate(0xFF));
+                    self.emit(AND, AM::Absolute(prev_addr));
+                } else {
+                    self.emit(LDA, AM::Absolute(prev_addr));
+                    self.emit(EOR, AM::Immediate(0xFF));
+                    self.emit(AND, AM::ZeroPage(curr_addr));
+                }
+                self.emit(AND, AM::Immediate(*mask));
+                self.store_temp(*dest);
+            }
             IrOp::SourceLoc(span) => {
                 // Emit a uniquely-named label-definition pseudo-op
                 // at the current codegen position — but only when
@@ -2269,6 +2362,30 @@ impl<'a> IrCodeGen<'a> {
         if self.p2_input_used {
             self.emit_label("__p2_input_used");
         }
+        if self.rand_used {
+            self.emit_label("__rand_used");
+        }
+        if self.palette_bright_used {
+            self.emit_label("__palette_bright_used");
+        }
+        if self.edge_input_used {
+            self.emit_label("__edge_input_used");
+        }
+    }
+
+    /// Emit the `__rand_used` marker label at most once per
+    /// program. The linker scans for this label to decide whether
+    /// to splice `runtime::gen_prng` into PRG ROM and seed the
+    /// state at reset.
+    fn emit_rand_marker(&mut self) {
+        self.rand_used = true;
+    }
+
+    /// Emit the `__palette_bright_used` marker at most once per
+    /// program. The linker uses it to splice
+    /// `runtime::gen_palette_brightness` into PRG ROM.
+    fn emit_palette_bright_marker(&mut self) {
+        self.palette_bright_used = true;
     }
 
     /// Emit the MMC3 `__irq_user` handler that dispatches on the
@@ -2659,7 +2776,11 @@ fn function_is_leaf(func: &IrFunction) -> bool {
                 | IrOp::Mul(..)
                 | IrOp::Div(..)
                 | IrOp::Mod(..)
-                | IrOp::Transition(..) => true,
+                | IrOp::Transition(..)
+                | IrOp::Rand8(..)
+                | IrOp::Rand16(..)
+                | IrOp::SeedRand(..)
+                | IrOp::SetPaletteBrightness(..) => true,
                 IrOp::InlineAsm(body) => {
                     // Strip the raw-asm magic prefix if present so
                     // we don't false-match the marker characters.
@@ -2721,6 +2842,7 @@ fn function_is_leaf(func: &IrFunction) -> bool {
                 | IrOp::PlaySfx(..)
                 | IrOp::StartMusic(..)
                 | IrOp::StopMusic
+                | IrOp::ReadInputEdge { .. }
                 | IrOp::SourceLoc(..) => false,
             };
             if is_jsr_emitting {
@@ -2913,6 +3035,7 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
             ..
         } => vec![*a_lo, *a_hi, *b_lo, *b_hi],
         IrOp::ReadInput(_, _)
+        | IrOp::ReadInputEdge { .. }
         | IrOp::WaitFrame
         | IrOp::CycleSprites
         | IrOp::Transition(_)
@@ -2921,9 +3044,13 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
         | IrOp::PlaySfx(_)
         | IrOp::StartMusic(_)
         | IrOp::StopMusic
+        | IrOp::Rand8(_)
+        | IrOp::Rand16(_, _)
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
         | IrOp::SourceLoc(_) => Vec::new(),
+        IrOp::SeedRand(lo, hi) => vec![*lo, *hi],
+        IrOp::SetPaletteBrightness(level) => vec![*level],
     }
 }
 

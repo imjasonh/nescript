@@ -2,7 +2,9 @@ mod debug_symbols;
 #[cfg(test)]
 mod tests;
 
-pub use debug_symbols::{render_dbg, render_mlb, render_source_map};
+pub use debug_symbols::{
+    render_dbg, render_fceux_nl, render_fceux_ram_nl, render_mlb, render_source_map,
+};
 
 use std::collections::HashMap;
 
@@ -425,6 +427,13 @@ impl Linker {
             total_banks,
         ));
 
+        // Seed the PRNG state. Only emitted when the IR codegen
+        // dropped the `__rand_used` marker — programs without PRNG
+        // keep their reset path byte-identical.
+        if has_label(user_code, "__rand_used") {
+            all_instructions.extend(runtime::gen_prng_init());
+        }
+
         // Whether the program produces any visual output. True if
         // the user declared a palette / sprite / background, or if
         // user code contains the `__oam_used` marker (i.e. draws).
@@ -542,6 +551,22 @@ impl Linker {
         }
         if has_div {
             all_instructions.extend(runtime::gen_divide());
+        }
+
+        // PRNG: splice the three entry points (`__rand8`, `__rand16`,
+        // `__rand_seed`) whenever the codegen dropped the `__rand_used`
+        // marker. Programs that never call `rand8()` / `rand16()` /
+        // `seed_rand()` skip this entirely.
+        let has_rand = has_label(user_code, "__rand_used");
+        if has_rand {
+            all_instructions.extend(runtime::gen_prng());
+        }
+
+        // Palette brightness: splice `__set_palette_brightness`
+        // whenever `set_palette_brightness(level)` was called.
+        let has_palette_bright = has_label(user_code, "__palette_bright_used");
+        if has_palette_bright {
+            all_instructions.extend(runtime::gen_palette_brightness());
         }
 
         // Audio subsystem — linked in whenever user code touched
@@ -670,6 +695,10 @@ impl Linker {
         let has_sprite_cycle = has_label(user_code, "__sprite_cycle_used");
         let has_p1_input = has_label(user_code, "__p1_input_used");
         let has_p2_input = has_label(user_code, "__p2_input_used");
+        // `__edge_input_used` is dropped whenever any `p1.a.pressed` /
+        // `p1.a.released` site lowers. Tells the NMI to snapshot the
+        // previous-frame input byte before the new strobe.
+        let has_edge_input = has_label(user_code, "__edge_input_used");
         all_instructions.extend(runtime::gen_nmi(runtime::NmiOptions {
             has_ppu_updates,
             has_audio,
@@ -678,6 +707,7 @@ impl Linker {
             has_oam,
             has_p2_input,
             has_p1_input,
+            has_edge_input,
         }));
 
         // IRQ handler
@@ -747,7 +777,21 @@ impl Linker {
         // the fixed bank — math runtime, audio tick, other state
         // handlers, etc.
         if switchable_banks.is_empty() {
-            builder.set_prg(prg);
+            // AxROM (mapper 7) maps a single 32 KB PRG page at
+            // $8000-$FFFF, so emulators expect PRG size in multiples
+            // of 32 KB. For single-bank AxROM we emit two 16 KB iNES
+            // banks: the first is 0xFF fill (maps at $8000-$BFFF when
+            // bank 0 is selected), and the second is our assembled
+            // fixed-bank code (maps at $C000-$FFFF). Bank-select
+            // writes still work — mapper 7's register picks the 32 KB
+            // page — but with a single PRG page the upper-half code
+            // is always visible.
+            if self.mapper == Mapper::AxROM {
+                let filler = vec![0xFF_u8; 16384];
+                builder.set_prg_banks(vec![filler, prg]);
+            } else {
+                builder.set_prg(prg);
+            }
         } else {
             // Build the merged label table the bank assembler
             // needs. Includes both the cross-bank labels gathered

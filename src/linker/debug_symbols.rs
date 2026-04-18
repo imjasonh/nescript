@@ -22,6 +22,50 @@ use super::LinkedRom;
 use crate::analyzer::VarAllocation;
 use crate::lexer::Span;
 
+/// Render an FCEUX-compatible label file for the fixed PRG bank.
+///
+/// FCEUX looks for `<rom-name>.<bank-index>.nl` per-bank label files
+/// in the same directory as the ROM, then for a `<rom-name>.ram.nl`
+/// for RAM/zero-page labels. Each line in a bank file has the form
+/// `$XXXX#label_name#`, where `$XXXX` is the CPU address inside the
+/// bank window (matching whatever the fixed bank is mapped at at
+/// runtime — for `NEScript`, `$C000-$FFFF`). RAM entries use
+/// `$XXXX#name#` in the `.ram.nl` file; FCEUX doesn't namespace
+/// these per-bank.
+///
+/// Returns the bank-file contents. The caller is responsible for
+/// writing it to disk under the correct per-bank name. RAM-label
+/// output is produced by [`render_fceux_ram_nl`] below.
+#[must_use]
+pub fn render_fceux_nl(linked: &LinkedRom) -> String {
+    let mut out = String::new();
+    let sorted: BTreeMap<&String, &u16> = linked.labels.iter().collect();
+    for (label, &&cpu_addr) in &sorted {
+        let Some(display_name) = mlb_symbol_name(label) else {
+            continue;
+        };
+        // FCEUX expects CPU addresses inside the bank window. The
+        // fixed bank is always at $C000-$FFFF, which is what the
+        // codegen emits, so the address passes through unchanged.
+        let _ = writeln!(out, "${cpu_addr:04X}#{display_name}#");
+    }
+    out
+}
+
+/// Render an FCEUX-compatible RAM label file (`<rom>.ram.nl`).
+/// Addresses are the analyzer's variable allocations (zero page
+/// and main RAM) in ascending order.
+#[must_use]
+pub fn render_fceux_ram_nl(var_allocations: &[VarAllocation]) -> String {
+    let mut out = String::new();
+    let mut vars: Vec<&VarAllocation> = var_allocations.iter().collect();
+    vars.sort_by_key(|a| a.address);
+    for var in vars {
+        let _ = writeln!(out, "${:04X}#{}#", var.address, var.name);
+    }
+    out
+}
+
 /// Render a Mesen-compatible `.mlb` symbol file from a
 /// [`LinkedRom`].
 ///

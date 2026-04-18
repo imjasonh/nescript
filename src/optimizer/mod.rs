@@ -574,6 +574,7 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         }
         IrOp::LoadVarHi(_, _)
         | IrOp::ReadInput(_, _)
+        | IrOp::ReadInputEdge { .. }
         | IrOp::WaitFrame
         | IrOp::CycleSprites
         | IrOp::Transition(_)
@@ -582,9 +583,18 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         | IrOp::PlaySfx(_)
         | IrOp::StartMusic(_)
         | IrOp::StopMusic
+        | IrOp::Rand8(_)
+        | IrOp::Rand16(_, _)
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
         | IrOp::SourceLoc(_) => {}
+        IrOp::SeedRand(lo, hi) => {
+            used.insert(*lo);
+            used.insert(*hi);
+        }
+        IrOp::SetPaletteBrightness(level) => {
+            used.insert(*level);
+        }
     }
 }
 
@@ -614,9 +624,12 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::CmpLtEq(d, _, _)
         | IrOp::CmpGtEq(d, _, _)
         | IrOp::ArrayLoad(d, _, _) => Some(*d),
+        IrOp::Rand16(d, _) => Some(*d),
         IrOp::Call(dest, _, _) => *dest,
         IrOp::ReadInput(d, _) => Some(*d),
+        IrOp::ReadInputEdge { dest, .. } => Some(*dest),
         IrOp::Peek(d, _) => Some(*d),
+        IrOp::Rand8(d) => Some(*d),
         IrOp::StoreVar(_, _)
         | IrOp::StoreVarHi(_, _)
         | IrOp::ArrayStore(_, _, _)
@@ -632,6 +645,8 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::PlaySfx(_)
         | IrOp::StartMusic(_)
         | IrOp::StopMusic
+        | IrOp::SeedRand(_, _)
+        | IrOp::SetPaletteBrightness(_)
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
         | IrOp::SourceLoc(_) => None,

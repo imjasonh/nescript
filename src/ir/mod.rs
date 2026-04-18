@@ -305,6 +305,40 @@ pub enum IrOp {
     /// currently-playing SFX tail.
     StopMusic,
 
+    /// `rand8()` — pull the next 8 bits from the runtime PRNG into
+    /// `dest`. Codegen emits a `JSR __rand8` and stores A. The
+    /// `__rand_used` marker is emitted so the linker splices
+    /// `gen_prng` into PRG ROM.
+    Rand8(IrTemp),
+    /// `rand16()` — pull the next 16 bits from the runtime PRNG into
+    /// `(lo, hi)`. Emits `JSR __rand16` (which returns A=lo, X=hi)
+    /// and stores both bytes.
+    Rand16(IrTemp, IrTemp),
+    /// `seed_rand(x)` — install `(lo, hi)` as the new PRNG state.
+    /// Codegen loads the bytes into A/X and emits `JSR __rand_seed`.
+    SeedRand(IrTemp, IrTemp),
+
+    /// `set_palette_brightness(level)` — write the PPU mask
+    /// emphasis / blanking bits that neslib calls `pal_bright`. The
+    /// runtime translates levels 0..8 into the appropriate `$2001`
+    /// mask byte. Codegen lowers to a JSR to `__set_palette_brightness`
+    /// and emits the `__palette_bright_used` marker.
+    SetPaletteBrightness(IrTemp),
+
+    /// Edge-triggered input read: `p1.a.pressed` / `p1.a.released`.
+    /// `dest` receives a boolean (0 or the button mask) — set when
+    /// the button is pressed-but-was-not this frame (for
+    /// `.pressed`), or not-pressed-but-was last frame (for
+    /// `.released`). `player` is 0 for P1, 1 for P2. `mask` is
+    /// the button bit. `released` selects the released variant when
+    /// true, pressed when false.
+    ReadInputEdge {
+        dest: IrTemp,
+        player: u8,
+        mask: u8,
+        released: bool,
+    },
+
     // Source mapping
     SourceLoc(Span),
 }
