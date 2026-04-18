@@ -1325,6 +1325,93 @@ The address argument to both is a compile-time constant. Zero-page
 addresses compile to `STA $XX` / `LDA $XX`; anything larger compiles
 to absolute addressing.
 
+## VRAM Update Buffer
+
+The PPU's `$2006` / `$2007` registers can only be written safely
+during vblank — writing during active rendering corrupts the
+internal address register and garbles every subsequent tile.
+`on frame` handlers run partly during vblank and partly during
+rendering, so user code can't directly `poke` the PPU.
+
+The VRAM update buffer solves this: user intrinsics **queue** PPU
+writes to a 256-byte ring at `$0400-$04FF` during `on frame`, and
+the NMI handler **drains** the ring to `$2007` during vblank. User
+code never touches `$2006` or `$2007` directly.
+
+Three intrinsics cover the common patterns:
+
+```
+nt_set(x, y, tile)              // one tile at nametable cell (x, y)
+nt_attr(x, y, value)            // one attribute byte covering the
+                                //   4×4-cell metatile at (x, y)
+nt_fill_h(x, y, len, tile)      // horizontal run of `len` copies
+                                //   of `tile` starting at (x, y)
+```
+
+`x` and `y` are nametable cell coordinates (`0..32`, `0..30`) — not
+pixel coordinates. The compiler computes the PPU address
+(`$2000 + y*32 + x` for nametable, `$23C0 + (y/4)*8 + (x/4)` for
+attribute) and emits the buffer-append inline at each call site.
+
+### HUD pattern
+
+Queue an update only when the underlying state changes. That
+makes per-frame cost scale with what actually moved, not with HUD
+complexity:
+
+```
+var score:      u8 = 0
+var last_score: u8 = 255   // 255 forces the first-frame paint
+
+on frame {
+    // ... gameplay that may or may not bump `score` ...
+
+    if score != last_score {
+        last_score = score
+        var digit: u8 = score & 0x0F
+        nt_set(28, 1, digit)    // one 4-byte buffer entry
+    }
+}
+```
+
+A typical HUD touches two or three cells per change, so the 256-
+byte buffer is more than enough for any realistic frame. See
+`examples/hud_demo.ne` for a worked example with a bouncing-ball
+playfield, a score cell that updates on each wall hit, a 5-cell
+lives indicator drawn via `nt_fill_h`, and a one-shot `nt_attr`
+call at startup that paints the HUD row in a distinct palette.
+
+### Budget
+
+Per-entry buffer cost:
+
+| Intrinsic      | Buffer bytes       | Drain cycles         |
+|----------------|--------------------|----------------------|
+| `nt_set`       | 4                  | ~20                  |
+| `nt_attr`      | 4                  | ~20                  |
+| `nt_fill_h`    | `3 + len`          | `~12 + 8*len`        |
+
+The 256-byte buffer holds ~50 single-tile writes that drain in
+~1000 cycles, well inside vblank's ~2273-cycle budget. Programs
+that don't call any of the three intrinsics pay zero bytes and
+zero cycles — the drain routine isn't linked, the NMI doesn't
+JSR it, and the 256-byte buffer region stays available for user
+variables.
+
+### Limits
+
+- Only **horizontal** writes (PPU auto-increment 1). Vertical
+  writes (column-fill) would need to toggle `$2000` bit 2; that's
+  a known follow-up documented in `docs/future-work.md` §G.
+- `nt_fill_h` takes a runtime `len`. If `len` overflows the
+  remaining space in the buffer (head + 3 + len > 256) the writer
+  scribbles into neighbouring RAM. The runtime does not bounds-
+  check; a debug-mode overflow trap is a known follow-up.
+- The buffer does not coalesce adjacent writes. Calling
+  `nt_set(0, 0, 1)` then `nt_set(1, 0, 2)` emits two separate
+  entries (8 buffer bytes) even though a single `len=2` entry
+  would fit both.
+
 ## Inline Assembly
 
 For more elaborate sequences, use `asm { ... }` blocks:
