@@ -868,8 +868,62 @@ fn analyze_on_scanline_requires_mmc3() {
     "#,
     );
     assert!(
-        errors.contains(&ErrorCode::E0203),
-        "on scanline without MMC3 should produce E0203, got: {errors:?}"
+        errors.contains(&ErrorCode::E0603),
+        "on scanline without MMC3 should produce E0603, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_state_local_array_initializer_rejected() {
+    // Regression guard against the state-local-array silent drop. The
+    // IR lowerer's `on_enter` initializer loop `continue`s past
+    // ArrayLiteral inits without emitting any stores, so without this
+    // diagnostic the program compiles and the buffer is full of stale
+    // RAM at runtime.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        state Main {
+            var buf: u8[4] = [10, 20, 30, 40]
+            on frame { scroll(buf[0], buf[1]) }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0601),
+        "state-local array initializer should produce E0601, got: {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_on_exit_declaration_accepted() {
+    // Regression guard: `on exit` handlers were lowered to IR
+    // functions but never dispatched by transitions, so any side
+    // effect inside silently never ran. The codegen now emits a
+    // runtime CMP-chain against `ZP_CURRENT_STATE` before every
+    // `transition` to JSR the leaving state's on_exit — confirm
+    // the analyzer accepts the declaration so the feature stays
+    // usable.
+    let result = analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        state Main {
+            on enter {}
+            on frame { transition Other }
+            on exit { scroll(0, 0) }
+        }
+        state Other {
+            on enter {}
+            on frame {}
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        result.diagnostics.iter().all(|d| !d.is_error()),
+        "`on exit` should be accepted now that transitions dispatch it, got: {:?}",
+        result.diagnostics
     );
 }
 
@@ -1916,6 +1970,34 @@ fn analyze_fast_var_underscore_exempt() {
 }
 
 #[test]
+fn analyze_slow_var_forced_out_of_zero_page() {
+    // The `slow` keyword should keep a u8 var out of zero page so
+    // users can free a hot ZP slot for a different variable. Before
+    // this was wired up, `slow` was parsed but ignored (same silent-
+    // drop shape as the PR #31 state-local bug).
+    let result = analyze_ok(
+        r#"
+        game "T" { mapper: NROM }
+        slow var cold: u8 = 0
+        on frame {
+            if cold == 0 { wait_frame }
+        }
+        start Main
+    "#,
+    );
+    let alloc = result
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "cold")
+        .expect("`cold` should be allocated");
+    assert!(
+        alloc.address >= 0x0100,
+        "`slow var cold` should live outside zero page but was allocated at ${:04X}",
+        alloc.address
+    );
+}
+
+#[test]
 fn analyze_oversized_array_warns_w0108() {
     // A u8 array with 300 elements has byte size 300 > 256. The
     // codegen lowers `arr[i]` to `LDA base,X` with X 8-bit, so
@@ -2061,24 +2143,28 @@ fn analyze_debug_frame_overrun_count_with_args_errors() {
 }
 
 #[test]
-fn analyze_rejects_function_with_more_than_4_params() {
-    // The v0.1 calling convention only allocates 4 zero-page
-    // parameter slots ($04-$07). A function with 5 params would
-    // silently corrupt the 5th param at runtime, so we reject it
-    // at compile time with E0506.
+fn analyze_rejects_function_with_more_than_8_params() {
+    // The calling convention allocates four zero-page transport
+    // slots ($04-$07) that leaves pass through, and a per-function
+    // RAM spill region that non-leaves direct-write into. Non-leaf
+    // functions scale past four params cleanly via the spill
+    // region, and we cap at eight both to keep the calling
+    // convention simple and because any call site needing more
+    // than eight arguments is almost certainly better served by a
+    // struct global.
     let errors = analyze_errors(
         r#"
         game "T" { mapper: NROM }
-        fun too_many(a: u8, b: u8, c: u8, d: u8, e: u8) {
+        fun too_many(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8, i: u8) {
             a = 0
         }
-        on frame { too_many(1, 2, 3, 4, 5) }
+        on frame { too_many(1, 2, 3, 4, 5, 6, 7, 8, 9) }
         start Main
     "#,
     );
     assert!(
         errors.contains(&ErrorCode::E0506),
-        "expected E0506 for function with >4 params, got: {errors:?}"
+        "expected E0506 for function with >8 params, got: {errors:?}"
     );
 }
 

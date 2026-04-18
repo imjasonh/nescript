@@ -22,7 +22,7 @@
 //! (`0x80-0xFF`) for IR temp storage per function. Functions reset the
 //! temp counter at entry.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::analyzer::VarAllocation;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
@@ -261,13 +261,6 @@ pub struct IrCodeGen<'a> {
     /// dispatcher loop, top-level functions).
     current_bank: Option<String>,
     allocations: &'a [VarAllocation],
-    /// Set of function names whose body never `JSR`s any other
-    /// routine. Leaf functions skip the parameter-spill prologue
-    /// (`LDA $04 / STA <local>`) entirely — they can read their
-    /// arguments straight out of the transport slots `$04..$07`
-    /// for the lifetime of the body, since nothing else clobbers
-    /// those slots from inside. Detected by [`function_is_leaf`].
-    leaf_functions: HashSet<String>,
     /// Per-function-scoped overrides for inline-asm `{name}`
     /// substitution. Leaf functions point their parameters at the
     /// transport slots `$04..$07` instead of the analyzer's
@@ -275,6 +268,20 @@ pub struct IrCodeGen<'a> {
     /// body resolves to the live transport slot rather than the
     /// stale per-function spill destination.
     leaf_param_overrides: HashMap<String, u16>,
+    /// For every non-leaf function, the ordered list of addresses
+    /// its parameters occupy. The direct-write calling convention
+    /// has the *caller* of a non-leaf function stage each argument
+    /// straight into these slots before the `JSR`, bypassing the
+    /// `$04-$07` transport entirely. This saves the 12-to-16-cycle
+    /// spill prologue and, more importantly, lifts the 4-param cap
+    /// that the transport slots imposed. Populated alongside
+    /// `leaf_functions` in [`IrCodeGen::new`].
+    ///
+    /// Leaves are deliberately absent: their callers still use the
+    /// `$04-$07` transport (which the body reads directly, since
+    /// leaves have no nested `JSR` to clobber them), and a lookup
+    /// miss here means "this callee is a leaf, use the transport".
+    non_leaf_param_addrs: HashMap<String, Vec<u16>>,
 }
 
 impl<'a> IrCodeGen<'a> {
@@ -288,6 +295,19 @@ impl<'a> IrCodeGen<'a> {
             if let Some(alloc) = allocations.iter().find(|a| a.name == global.name) {
                 var_addrs.insert(global.var_id, alloc.address);
                 var_sizes.insert(global.var_id, alloc.size);
+            }
+        }
+        // Pick up every *other* allocation the analyzer made that the
+        // IR lowerer synthesized a `VarId` for but didn't push as an
+        // `IrGlobal` — flattened struct fields (`"pos.x"`) are the
+        // biggest class, but this also catches any future synthesized
+        // name. Without this, `pos.x = 100` resolves its `VarId`
+        // against a `var_addrs` that never learned the address, and
+        // the codegen silently drops the write (the PR #31 shape).
+        for alloc in allocations {
+            if let Some(&var_id) = ir.var_map.get(&alloc.name) {
+                var_addrs.entry(var_id).or_insert(alloc.address);
+                var_sizes.entry(var_id).or_insert(alloc.size);
             }
         }
         // Map every function-local — parameters AND body-declared
@@ -330,25 +350,40 @@ impl<'a> IrCodeGen<'a> {
         // `{name}` substitution agrees). `gen_function` skips the
         // spill prologue entirely for these — saving 12 cycles
         // and 12 bytes of code per leaf-function call site.
-        let mut leaf_functions: HashSet<String> = HashSet::new();
         let mut leaf_param_overrides: HashMap<String, u16> = HashMap::new();
+        let mut non_leaf_param_addrs: HashMap<String, Vec<u16>> = HashMap::new();
         for func in &ir.functions {
-            if !function_is_leaf(func) {
-                continue;
-            }
-            leaf_functions.insert(func.name.clone());
-            let scope = scope_prefix_for_fn(&func.name);
-            for (i, local) in func
-                .locals
-                .iter()
-                .take(func.param_count)
-                .take(4)
-                .enumerate()
-            {
-                let addr = 0x04u16 + i as u16;
-                var_addrs.insert(local.var_id, addr);
-                let qualified = format!("__local__{scope}__{}", local.name);
-                leaf_param_overrides.insert(qualified, addr);
+            if function_is_leaf(func) {
+                let scope = scope_prefix_for_fn(&func.name);
+                for (i, local) in func.locals.iter().take(func.param_count).enumerate() {
+                    let addr = 0x04u16 + i as u16;
+                    var_addrs.insert(local.var_id, addr);
+                    let qualified = format!("__local__{scope}__{}", local.name);
+                    leaf_param_overrides.insert(qualified, addr);
+                }
+            } else if func.param_count > 0 {
+                // Non-leaf: callers direct-write each argument into
+                // these param slots. Resolve each param's allocated
+                // address from `var_addrs` (which was populated from
+                // the analyzer's per-function spill allocations a
+                // few loops up). A miss here means the analyzer
+                // didn't allocate a slot — which would be a
+                // compiler bug of the PR-#31 shape.
+                let addrs: Vec<u16> = func
+                    .locals
+                    .iter()
+                    .take(func.param_count)
+                    .map(|local| {
+                        *var_addrs.get(&local.var_id).unwrap_or_else(|| {
+                            panic!(
+                                "internal compiler error: parameter {:?} of \
+                                 function {:?} has no allocated address",
+                                local.name, func.name
+                            )
+                        })
+                    })
+                    .collect();
+                non_leaf_param_addrs.insert(func.name.clone(), addrs);
             }
         }
         let function_names = ir.functions.iter().map(|f| f.name.clone()).collect();
@@ -400,8 +435,8 @@ impl<'a> IrCodeGen<'a> {
             function_banks,
             current_bank: None,
             allocations,
-            leaf_functions,
             leaf_param_overrides,
+            non_leaf_param_addrs,
         }
     }
 
@@ -508,6 +543,22 @@ impl<'a> IrCodeGen<'a> {
     fn emit_label(&mut self, name: &str) {
         self.instructions
             .push(Instruction::new(NOP, AM::Label(name.to_string())));
+    }
+
+    /// Resolve a variable's allocated address. Any IR op referencing a
+    /// `VarId` must have been allocated by the analyzer — a miss here
+    /// is a compiler bug, not valid input (this is the shape of the
+    /// state-local silent-drop from PR #31). Crash loudly rather than
+    /// emit zero bytes and let a golden capture the broken behaviour.
+    fn var_addr(&self, var: VarId) -> u16 {
+        *self.var_addrs.get(&var).unwrap_or_else(|| {
+            panic!(
+                "internal compiler error: IR op references {var:?} with no \
+                 allocated address (did the analyzer forget to allocate it, \
+                 or did the IR lowerer synthesize a VarId it didn't register \
+                 as a global/local?)"
+            )
+        })
     }
 
     /// Return the zero-page address for an IR temp, allocating a new slot
@@ -705,11 +756,17 @@ impl<'a> IrCodeGen<'a> {
         // literals write N bytes from `init_array` at successive
         // offsets from the global's base address. Uninitialized
         // globals (neither set) stay at the $00 the RAM-clear left
-        // them.
+        // them — and since struct-literal parents only exist to
+        // parent their expanded field globals, they land here with
+        // no init data and no allocated address (only the fields
+        // have addresses). Skip before calling `var_addr` so we
+        // don't mis-diagnose a legitimate container as a silent
+        // drop.
         for global in &ir.globals {
-            let Some(&base) = self.var_addrs.get(&global.var_id) else {
+            if global.init_array.is_empty() && global.init_value.is_none() {
                 continue;
-            };
+            }
+            let base = self.var_addr(global.var_id);
             if !global.init_array.is_empty() {
                 for (offset, &byte) in global.init_array.iter().enumerate() {
                     let addr = base.wrapping_add(offset as u16);
@@ -947,45 +1004,25 @@ impl<'a> IrCodeGen<'a> {
 
         self.emit_label(&format!("__ir_fn_{}", func.name));
 
-        // Prologue: spill the parameter-transport slots $04-$07
-        // into the function's per-local RAM slots. The caller
-        // stages arguments into $04-$07 before the JSR; this
-        // copy makes sure that when the function body later
-        // makes a nested call (which clobbers $04-$07 again to
-        // pass its own arguments), the caller's parameters are
-        // still available in their dedicated RAM slots.
+        // No parameter-spill prologue. Two call-conventions handle
+        // arguments entirely at the *call site*:
         //
-        // Parameters are the first `param_count` entries of
-        // `func.locals`. The analyzer refuses functions with
-        // more than 4 parameters (E0506), so the `.take(4)`
-        // below is a defensive guard — it should never be hit
-        // in a well-formed program.
+        //   - Leaf functions: caller writes to the fixed transport
+        //     slots `$04..$07`, body reads them directly for its
+        //     entire lifetime. No prologue copy needed because
+        //     leaves never `JSR` (by definition), so the transport
+        //     slots never get clobbered from inside the body.
         //
-        // Leaf functions skip this entirely: their var_addrs
-        // were already rewired to $04-$07 in `IrCodeGen::new`,
-        // and since they never JSR from inside their body, the
-        // transport slots stay live for the whole function. This
-        // saves 12 cycles per call to every leaf primitive — the
-        // SHA-256 example's `cp_wk`, `xor_wk`, `add_wk`, etc. are
-        // all leaves.
-        if !self.leaf_functions.contains(&func.name) {
-            for (i, local) in func
-                .locals
-                .iter()
-                .take(func.param_count)
-                .take(4)
-                .enumerate()
-            {
-                if let Some(&addr) = self.var_addrs.get(&local.var_id) {
-                    self.emit(LDA, AM::ZeroPage(0x04 + i as u8));
-                    if addr < 0x100 {
-                        self.emit(STA, AM::ZeroPage(addr as u8));
-                    } else {
-                        self.emit(STA, AM::Absolute(addr));
-                    }
-                }
-            }
-        }
+        //   - Non-leaf functions: caller direct-writes each arg
+        //     into the callee's per-parameter RAM slot (see
+        //     `non_leaf_param_addrs`). No prologue copy needed
+        //     because the arg is already exactly where the body
+        //     expects to read it.
+        //
+        // The old "transport-then-spill" prologue added 4 LDA/STA
+        // pairs (~28 cycles, 16 bytes) at every non-leaf entry.
+        // Skipping it saves the cycles *and* removes the hard
+        // 4-param ceiling that the four transport slots imposed.
 
         // At the start of a frame handler that actually draws
         // sprites, clear the OAM shadow buffer so stale sprites from
@@ -1203,23 +1240,21 @@ impl<'a> IrCodeGen<'a> {
                 self.store_temp(*dest);
             }
             IrOp::LoadVar(dest, var) => {
-                if let Some(&addr) = self.var_addrs.get(var) {
-                    if addr < 0x100 {
-                        self.emit(LDA, AM::ZeroPage(addr as u8));
-                    } else {
-                        self.emit(LDA, AM::Absolute(addr));
-                    }
-                    self.store_temp(*dest);
+                let addr = self.var_addr(*var);
+                if addr < 0x100 {
+                    self.emit(LDA, AM::ZeroPage(addr as u8));
+                } else {
+                    self.emit(LDA, AM::Absolute(addr));
                 }
+                self.store_temp(*dest);
             }
             IrOp::StoreVar(var, src) => {
-                if let Some(&addr) = self.var_addrs.get(var) {
-                    self.load_temp(*src);
-                    if addr < 0x100 {
-                        self.emit(STA, AM::ZeroPage(addr as u8));
-                    } else {
-                        self.emit(STA, AM::Absolute(addr));
-                    }
+                let addr = self.var_addr(*var);
+                self.load_temp(*src);
+                if addr < 0x100 {
+                    self.emit(STA, AM::ZeroPage(addr as u8));
+                } else {
+                    self.emit(STA, AM::Absolute(addr));
                 }
             }
             IrOp::Add(d, a, b) => {
@@ -1340,39 +1375,79 @@ impl<'a> IrCodeGen<'a> {
             IrOp::CmpLtEq(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::LtEq),
             IrOp::CmpGtEq(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::GtEq),
             IrOp::ArrayLoad(dest, var, idx) => {
-                if let Some(&base_addr) = self.var_addrs.get(var) {
-                    self.load_temp(*idx);
-                    self.emit_bounds_check(*var);
-                    self.emit(TAX, AM::Implied);
-                    if base_addr < 0x100 {
-                        self.emit(LDA, AM::ZeroPageX(base_addr as u8));
-                    } else {
-                        self.emit(LDA, AM::AbsoluteX(base_addr));
-                    }
-                    self.store_temp(*dest);
+                let base_addr = self.var_addr(*var);
+                self.load_temp(*idx);
+                self.emit_bounds_check(*var);
+                self.emit(TAX, AM::Implied);
+                if base_addr < 0x100 {
+                    self.emit(LDA, AM::ZeroPageX(base_addr as u8));
+                } else {
+                    self.emit(LDA, AM::AbsoluteX(base_addr));
                 }
+                self.store_temp(*dest);
             }
             IrOp::ArrayStore(var, idx, val) => {
-                if let Some(&base_addr) = self.var_addrs.get(var) {
-                    self.load_temp(*idx);
-                    self.emit_bounds_check(*var);
-                    self.emit(TAX, AM::Implied);
-                    self.load_temp(*val);
-                    if base_addr < 0x100 {
-                        self.emit(STA, AM::ZeroPageX(base_addr as u8));
-                    } else {
-                        self.emit(STA, AM::AbsoluteX(base_addr));
-                    }
+                let base_addr = self.var_addr(*var);
+                self.load_temp(*idx);
+                self.emit_bounds_check(*var);
+                self.emit(TAX, AM::Implied);
+                self.load_temp(*val);
+                if base_addr < 0x100 {
+                    self.emit(STA, AM::ZeroPageX(base_addr as u8));
+                } else {
+                    self.emit(STA, AM::AbsoluteX(base_addr));
                 }
             }
             IrOp::Call(dest, name, args) => {
-                // Pass up to 4 arguments via zero-page slots $04-$07.
-                // Arguments beyond the fourth are silently dropped
-                // (the analyzer has already validated arity against
-                // the declared signature).
-                for (i, arg) in args.iter().enumerate().take(4) {
-                    self.load_temp(*arg);
-                    self.emit(STA, AM::ZeroPage(0x04 + i as u8));
+                // Two calling conventions, selected by callee shape:
+                //
+                //   - **Leaf callees** (no nested `JSR` in body AND
+                //     ≤4 params): stage each argument into the fixed
+                //     zero-page transport slots `$04..$07`. The
+                //     callee reads them straight out of `$04..$07`
+                //     for its entire body — leaves never clobber
+                //     those slots, so no prologue copy is needed.
+                //     Fastest path; 3-cycle ZP stores and 3-cycle
+                //     ZP loads inside the body.
+                //
+                //   - **Non-leaf callees** (≥1 nested `JSR` OR 5–8
+                //     params): direct-write each argument straight
+                //     into the callee's analyzer-allocated parameter
+                //     RAM slot. No transport step, no prologue copy.
+                //     Saves ~24 cycles and ~16 bytes per call vs the
+                //     old "transport + spill" ABI, and — crucially —
+                //     scales past 4 params because the slots live
+                //     wherever the analyzer put them, not in a fixed
+                //     ZP window. E0506 caps declarations at 8 so the
+                //     assert below stays a belt-and-braces guard.
+                assert!(
+                    args.len() <= 8,
+                    "internal compiler error: Call to {name:?} with \
+                     {} args (max 8); E0506 should have caught this",
+                    args.len()
+                );
+                if let Some(param_addrs) = self.non_leaf_param_addrs.get(name).cloned() {
+                    debug_assert_eq!(
+                        args.len(),
+                        param_addrs.len(),
+                        "arity mismatch at non-leaf call to {name}: \
+                         {} args vs {} params",
+                        args.len(),
+                        param_addrs.len()
+                    );
+                    for (arg, addr) in args.iter().zip(param_addrs.iter()) {
+                        self.load_temp(*arg);
+                        if *addr < 0x100 {
+                            self.emit(STA, AM::ZeroPage(*addr as u8));
+                        } else {
+                            self.emit(STA, AM::Absolute(*addr));
+                        }
+                    }
+                } else {
+                    for (i, arg) in args.iter().enumerate() {
+                        self.load_temp(*arg);
+                        self.emit(STA, AM::ZeroPage(0x04 + i as u8));
+                    }
                 }
                 // Pick the right JSR target. Four cases:
                 //   1. Caller and callee are both in the fixed bank
@@ -1573,24 +1648,63 @@ impl<'a> IrCodeGen<'a> {
                 self.emit(STA, AM::Absolute(0x07EF));
             }
             IrOp::Transition(name) => {
-                // Write the target state's index to current_state, then
-                // call the target state's on_enter handler if it exists,
-                // then JMP to main loop for the new state's frame handler.
+                // Order of operations for `transition Foo`:
+                //   1. Dispatch the *current* state's `on exit` (if any
+                //      state declares one) by runtime check against
+                //      `ZP_CURRENT_STATE`. The IR op only knows the
+                //      target state's name, not the source, so we emit
+                //      a small CMP-chain that matches whichever state
+                //      is currently active and JSRs its exit handler.
+                //      This is the fix for the long-latent silent-drop
+                //      bug where on_exit handlers were lowered but
+                //      never called — caught by the analyzer tripwire
+                //      that rejected `on exit` declarations until this
+                //      dispatch existed. Example programs (pong, war,
+                //      state_machine) relied on `stop_music` inside
+                //      `on exit` that had been silently never running.
+                //   2. Write the target state's index to current_state.
+                //   3. Call the target state's on_enter (if defined).
+                //   4. JMP back to the main loop.
                 //
-                // Note: on_exit of the current state isn't called here
-                // because we don't know from an IR op alone which state
-                // we're leaving. Proper on_exit support would need
-                // per-state transition lowering. Future improvement.
-                if let Some(&idx) = self.state_indices.get(name) {
-                    self.emit(LDA, AM::Immediate(idx));
-                    self.emit(STA, AM::ZeroPage(ZP_CURRENT_STATE));
-                    // Call the target state's on_enter handler if defined
-                    let enter_fn = format!("{name}_enter");
-                    if self.function_exists(&enter_fn) {
-                        self.emit(JSR, AM::Label(format!("__ir_fn_{enter_fn}")));
+                // `transition <unknown>` is rejected by the analyzer
+                // as E0502, so a miss in `state_indices` here is a
+                // compiler bug, not valid input.
+                let mut exit_fns: Vec<(u8, String)> = self
+                    .state_indices
+                    .iter()
+                    .filter(|(state, _)| self.function_exists(&format!("{state}_exit")))
+                    .map(|(state, &i)| (i, format!("{state}_exit")))
+                    .collect();
+                exit_fns.sort_by_key(|(i, _)| *i);
+                if !exit_fns.is_empty() {
+                    let suffix = self.local_label_suffix();
+                    let done = format!("__ir_xit_done_{suffix}");
+                    self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
+                    for (i, (state_idx, exit_fn)) in exit_fns.iter().enumerate() {
+                        let skip = format!("__ir_xit_skip_{suffix}_{i}");
+                        self.emit(CMP, AM::Immediate(*state_idx));
+                        self.emit(BNE, AM::LabelRelative(skip.clone()));
+                        self.emit(JSR, AM::Label(format!("__ir_fn_{exit_fn}")));
+                        self.emit(JMP, AM::Label(done.clone()));
+                        self.emit_label(&skip);
                     }
-                    self.emit(JMP, AM::Label("__ir_main_loop".into()));
+                    self.emit_label(&done);
                 }
+
+                let &idx = self.state_indices.get(name).unwrap_or_else(|| {
+                    panic!(
+                        "internal compiler error: IrOp::Transition references \
+                         state {name:?} which has no dispatch index (did the \
+                         analyzer forget to reject an unknown state name?)"
+                    )
+                });
+                self.emit(LDA, AM::Immediate(idx));
+                self.emit(STA, AM::ZeroPage(ZP_CURRENT_STATE));
+                let enter_fn = format!("{name}_enter");
+                if self.function_exists(&enter_fn) {
+                    self.emit(JSR, AM::Label(format!("__ir_fn_{enter_fn}")));
+                }
+                self.emit(JMP, AM::Label("__ir_main_loop".into()));
             }
             IrOp::Scroll(x, y) => {
                 // PPU scroll register $2005 takes two writes: X then Y
@@ -1691,25 +1805,23 @@ impl<'a> IrCodeGen<'a> {
             IrOp::SetPalette(name) => self.gen_set_palette(name),
             IrOp::LoadBackground(name) => self.gen_load_background(name),
             IrOp::LoadVarHi(dest, var) => {
-                if let Some(&base) = self.var_addrs.get(var) {
-                    let addr = base.wrapping_add(1);
-                    if addr < 0x100 {
-                        self.emit(LDA, AM::ZeroPage(addr as u8));
-                    } else {
-                        self.emit(LDA, AM::Absolute(addr));
-                    }
-                    self.store_temp(*dest);
+                let base = self.var_addr(*var);
+                let addr = base.wrapping_add(1);
+                if addr < 0x100 {
+                    self.emit(LDA, AM::ZeroPage(addr as u8));
+                } else {
+                    self.emit(LDA, AM::Absolute(addr));
                 }
+                self.store_temp(*dest);
             }
             IrOp::StoreVarHi(var, src) => {
-                if let Some(&base) = self.var_addrs.get(var) {
-                    let addr = base.wrapping_add(1);
-                    self.load_temp(*src);
-                    if addr < 0x100 {
-                        self.emit(STA, AM::ZeroPage(addr as u8));
-                    } else {
-                        self.emit(STA, AM::Absolute(addr));
-                    }
+                let base = self.var_addr(*var);
+                let addr = base.wrapping_add(1);
+                self.load_temp(*src);
+                if addr < 0x100 {
+                    self.emit(STA, AM::ZeroPage(addr as u8));
+                } else {
+                    self.emit(STA, AM::Absolute(addr));
                 }
             }
             IrOp::Add16 {
@@ -2188,7 +2300,16 @@ impl<'a> IrCodeGen<'a> {
         self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
         let done_label = "__irq_user_done".to_string();
         for (state_idx_iter, (state_name, lines)) in groups.iter().enumerate() {
-            let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
+            // Scanline groups are built from declared state names, so any
+            // miss here is a compiler-internal inconsistency. Failing to 0
+            // would silently route this state's scanline handlers to
+            // state 0, which is a PR-#31-shaped silent miscompile.
+            let state_idx = *self.state_indices.get(state_name).unwrap_or_else(|| {
+                panic!(
+                    "internal compiler error: scanline group for state \
+                     {state_name:?} has no dispatch index"
+                )
+            });
             let next_state_label = format!("__irq_ns_{state_idx_iter}");
             self.emit(CMP, AM::Immediate(state_idx));
             self.emit(BNE, AM::LabelRelative(next_state_label.clone()));
@@ -2261,7 +2382,15 @@ impl<'a> IrCodeGen<'a> {
         self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
         let reload_done = "__ir_mmc3_reload_done".to_string();
         for (i, (state_name, lines)) in groups.iter().enumerate() {
-            let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
+            // Same invariant as the IRQ dispatcher above: scanline groups
+            // are built from declared states, so a missing entry is a
+            // compiler bug rather than valid input.
+            let state_idx = *self.state_indices.get(state_name).unwrap_or_else(|| {
+                panic!(
+                    "internal compiler error: scanline reload for state \
+                     {state_name:?} has no dispatch index"
+                )
+            });
             let skip_label = format!("__ir_reload_skip_{i}");
             self.emit(CMP, AM::Immediate(state_idx));
             self.emit(BNE, AM::LabelRelative(skip_label.clone()));
@@ -2496,9 +2625,18 @@ fn scope_prefix_for_fn(name: &str) -> String {
     }
 }
 
-/// True if `func` doesn't `JSR` any other routine from inside its
-/// body. Leaf functions skip the parameter-spill prologue and read
-/// their args straight out of the transport slots `$04..$07`.
+/// True if `func` is eligible for the "leaf" calling convention:
+/// its body emits no `JSR`, and its parameter count fits in the
+/// four zero-page transport slots (`$04-$07`). Leaf-eligible
+/// functions read their args straight out of the transport slots
+/// and skip the spill prologue entirely.
+///
+/// The `param_count <= 4` check matters for the direct-write
+/// calling convention: non-leaf (5-to-8-param) functions have the
+/// caller stage each argument directly into the callee's
+/// per-parameter RAM slot, which is where leaves *can't* live
+/// because their params would then need a prologue copy out of
+/// `$04-$07` — defeating the whole point of the leaf fast path.
 ///
 /// The match below is exhaustive on `IrOp` so adding a new variant
 /// that secretly emits a `JSR` (e.g. a future `Mul16` calling a
@@ -2507,6 +2645,9 @@ fn scope_prefix_for_fn(name: &str) -> String {
 /// ops are: `Call`, `Mul`, `Div`, `Mod`, `Transition`, plus
 /// `InlineAsm` bodies that mention `JSR` as a token.
 fn function_is_leaf(func: &IrFunction) -> bool {
+    if func.param_count > 4 {
+        return false;
+    }
     for block in &func.blocks {
         for op in &block.ops {
             // Returning `false` from any arm marks the function as
@@ -4382,30 +4523,27 @@ mod more_tests {
 }
 
 #[test]
-fn gen_function_prologue_spills_params_to_local_ram() {
-    // Regression test for the param-slot clobbering bug fixed
-    // on the War bug-cleanup branch (see `git log`): without the
-    // param-spill prologue, a function's parameters live only
-    // in the transport slots $04-$07. The first nested call
-    // inside the body would overwrite those slots with its
-    // own arguments, silently corrupting the caller's params.
+fn non_leaf_call_direct_writes_args_to_callee_param_slots() {
+    // Non-leaf functions receive their parameters via direct
+    // caller writes to the callee's analyzer-allocated RAM slot,
+    // bypassing the `$04-$07` transport entirely. That's both
+    // faster (~24 cycles saved per call by eliminating the old
+    // spill prologue) and what lifts the 4-param ceiling — the
+    // slots live wherever the analyzer put them.
     //
     // Compile a function that takes `x: u8`, calls `helper(x)`,
-    // then uses `x` again. Verify that immediately after the
-    // `__ir_fn_caller` label, the codegen emits a spill
-    // `LDA $04 / STA <slot>` where `<slot>` is the analyzer's
-    // dedicated address for the param — crucially, not $04
-    // itself (which nested calls would clobber) and not
-    // $05/$06/$07 either.
+    // and verify two invariants:
     //
-    // Earlier revisions of this test asserted `<slot>` had to
-    // be an absolute address at `$0300+`, reflecting a codegen
-    // that minted a fresh per-function RAM range. After
-    // `compiler-bugs.md` #1 — the inline-asm `{param}`
-    // resolution fix — the codegen reuses the analyzer's
-    // allocation, which can land in zero page when there's
-    // room. The invariant that matters is "separate from the
-    // transport slots", not "must be main RAM".
+    //   1. The caller of `caller` stages its argument at the
+    //      RAM slot the analyzer allocated for `x` (NOT at
+    //      `$04-$07`), because `caller` is non-leaf.
+    //   2. The callee `caller`'s entry does NOT emit an
+    //      `LDA $04 / STA <slot>` prologue — args are already
+    //      where the body expects to read them.
+    //
+    // Together these assertions would have failed the old ABI
+    // as well, but in the opposite direction — they're a
+    // regression guard for the new convention.
     use crate::parser;
     let src = r#"
         game "Test" { mapper: NROM }
@@ -4430,45 +4568,67 @@ fn gen_function_prologue_spills_params_to_local_ram() {
     let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir);
     let insts = codegen.generate(&ir);
 
-    // Walk the instructions emitted for `caller` (up until the
-    // next function label) looking for the spill `LDA $04` /
-    // `STA <slot>` pair. `<slot>` is accepted as either
-    // `ZeroPage(addr)` or `Absolute(addr)`, as long as `addr`
-    // is outside the `$04-$07` transport range.
+    // (2) The body of `caller` must not open with a prologue
+    //     `LDA $04` — the first thing inside `__ir_fn_caller`
+    //     should be related to the nested JSR to `helper`, not
+    //     a spill copy.
     let caller_idx = insts
         .iter()
         .position(|i| i.mode == AM::Label("__ir_fn_caller".into()))
         .expect("caller function should be emitted");
-    let mut saw_lda_zp4 = false;
-    let mut saw_sta_separate = false;
-    for inst in &insts[caller_idx + 1..] {
-        if let AM::Label(l) = &inst.mode {
-            if l.starts_with("__ir_fn_") && l != "__ir_fn_caller" {
-                break;
-            }
-        }
-        if inst.opcode == LDA && inst.mode == AM::ZeroPage(0x04) {
-            saw_lda_zp4 = true;
-            continue;
-        }
-        if saw_lda_zp4 && inst.opcode == STA {
-            let addr: u16 = match inst.mode {
-                AM::ZeroPage(a) => u16::from(a),
-                AM::Absolute(a) => a,
-                _ => continue,
-            };
-            if !(0x04..=0x07).contains(&addr) {
-                saw_sta_separate = true;
-                break;
-            }
-        }
+    for inst in insts[caller_idx + 1..].iter().take(4) {
+        assert!(
+            !(inst.opcode == LDA && inst.mode == AM::ZeroPage(0x04)),
+            "non-leaf `caller` should not open with an `LDA $04` \
+             prologue under the direct-write ABI — args are written \
+             to caller's slots by the caller, not copied here"
+        );
     }
+
+    // (1) Walk the frame handler (which invokes `caller`) and
+    //     locate the `STA` that stages the argument. Because
+    //     `caller` is non-leaf, the staging STA must go to
+    //     `caller.x`'s allocated slot — which the analyzer
+    //     records under `"__local__caller__x"`. The target
+    //     must be outside `$04-$07`.
+    let x_slot = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "__local__caller__x")
+        .expect("analyzer should allocate a slot for caller's param `x`")
+        .address;
     assert!(
-        saw_lda_zp4 && saw_sta_separate,
-        "caller function should open with `LDA $04` followed by \
-         a `STA <slot>` that spills the param out of the \
-         transport slots — the param-clobbering fix is not in \
-         effect"
+        !(0x04..=0x07).contains(&x_slot),
+        "non-leaf param slot must live outside the `$04-$07` \
+         transport range, got ${x_slot:04X}"
+    );
+
+    // The staging STA may land in either Main_frame or in
+    // caller's body (if the test source becomes nested). Scan
+    // from the start of Main_frame and require the slot to be
+    // hit at least once before any __ir_fn_ label other than
+    // Main_frame / caller.
+    let frame_idx = insts
+        .iter()
+        .position(|i| i.mode == AM::Label("__ir_fn_Main_frame".into()))
+        .expect("Main_frame handler should be emitted");
+    let saw_stage = insts[frame_idx + 1..].iter().any(|inst| {
+        if inst.opcode != STA {
+            return false;
+        }
+        let addr: u16 = match inst.mode {
+            AM::ZeroPage(a) => u16::from(a),
+            AM::Absolute(a) => a,
+            _ => return false,
+        };
+        addr == x_slot
+    });
+    assert!(
+        saw_stage,
+        "caller site should stage the `42` argument directly at \
+         `caller.x`'s slot (${x_slot:04X}), not at `$04`. \
+         Emitted instructions follow: {:#?}",
+        &insts[frame_idx + 1..].iter().take(40).collect::<Vec<_>>()
     );
 }
 

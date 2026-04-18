@@ -565,6 +565,26 @@ impl Analyzer {
             self.next_zp_addr = overlay_zp_base;
             self.next_ram_addr = overlay_ram_base;
             for var in &state.locals {
+                // Array initializers on state-locals aren't lowered
+                // yet — the IR would need to emit a runtime memcpy
+                // from a ROM blob into the allocated RAM region on
+                // each on_enter, and today the lowerer just
+                // `continue`s past the decl. Refuse the program rather
+                // than silently dropping the initializer (PR-#31-shaped
+                // bug). See docs/future-work.md for the plan.
+                if let Some(Expr::ArrayLiteral(_, _)) = &var.init {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0601,
+                        format!(
+                            "state-local variable '{}' has an array \
+                             initializer; this isn't lowered yet. Move \
+                             the array to a program-level `var` or \
+                             assign the elements inside `on_enter`.",
+                            var.name
+                        ),
+                        var.span,
+                    ));
+                }
                 self.register_var(var);
             }
             if self.next_zp_addr > max_zp {
@@ -612,10 +632,13 @@ impl Analyzer {
                 self.current_scope_prefix = None;
             }
             // `on scanline(N)` is only valid with mappers that have a
-            // scanline-counting IRQ source (currently only MMC3).
+            // scanline-counting IRQ source (currently only MMC3). Keep
+            // this as a hard error — without MMC3 the codegen emits
+            // the handler functions but the IRQ dispatcher is never
+            // wired up, so the handlers silently never run.
             if !state.on_scanline.is_empty() && program.game.mapper != Mapper::MMC3 {
                 self.diagnostics.push(Diagnostic::error(
-                    ErrorCode::E0203,
+                    ErrorCode::E0603,
                     "`on scanline` requires the MMC3 mapper",
                     state.span,
                 ));
@@ -1523,7 +1546,7 @@ impl Analyzer {
             }
         }
 
-        let Some(address) = self.allocate_ram(size, var.span) else {
+        let Some(address) = self.allocate_ram_with_placement(size, var.placement, var.span) else {
             // Allocation failed (E0301 already emitted) — still add the
             // symbol so that later references don't cascade into E0502,
             // but don't record a var_allocations entry.
@@ -1599,25 +1622,37 @@ impl Analyzer {
             return;
         }
         // The v0.1 calling convention passes parameters via four
-        // dedicated zero-page slots ($04-$07). Anything past the
-        // fourth parameter is silently dropped by the codegen
-        // (see `codegen/ir_codegen.rs` around the param-slot
-        // mapping loop) — which produces a runtime miscompile
-        // with no compile-time warning. Catch the over-arity case
-        // here so users get a clear error instead.
-        if fun.params.len() > 4 {
+        // Parameters are passed through zero-page transport slots
+        // for *leaf* functions only; non-leaf functions use a
+        // direct-write calling convention where the caller stages
+        // each argument straight into the callee's analyzer-
+        // allocated parameter RAM slot, bypassing the transport
+        // slots entirely. That lifts the per-function parameter cap
+        // from 4 (the number of ZP transport slots at $04-$07) to 8
+        // for non-leaves. Leaves still cap at 4 because their bodies
+        // read `$04-$07` directly and there's nowhere to put extras.
+        //
+        // The analyzer can't know which functions will be leaves
+        // without running the leaf-analysis that only exists in the
+        // codegen, so we apply the looser 8-param cap here and let
+        // the codegen's `function_is_leaf` check demote any
+        // 5-to-8-param function to non-leaf automatically. The net
+        // user-visible rule: 1–4 params works everywhere; 5–8 params
+        // works but forbids the leaf fast path.
+        if fun.params.len() > 8 {
             self.diagnostics.push(
                 Diagnostic::error(
                     ErrorCode::E0506,
                     format!(
-                        "function '{}' has {} parameters; the maximum is 4 in this version",
+                        "function '{}' has {} parameters; the maximum is 8",
                         fun.name,
                         fun.params.len()
                     ),
                     fun.span,
                 )
                 .with_help(
-                    "the v0.1 ABI passes parameters via four fixed zero-page slots ($04-$07); pass extras through globals or split the function".to_string(),
+                    "pass related data through a struct global, or split the function into two"
+                        .to_string(),
                 ),
             );
             return;
@@ -1644,9 +1679,23 @@ impl Analyzer {
     /// zero-page user region is bounded above by [`ZP_USER_CAP`] to
     /// leave room for IR codegen temp slots starting at $80.
     fn allocate_ram(&mut self, size: u16, span: Span) -> Option<u16> {
+        self.allocate_ram_with_placement(size, Placement::Auto, span)
+    }
+
+    fn allocate_ram_with_placement(
+        &mut self,
+        size: u16,
+        placement: Placement,
+        span: Span,
+    ) -> Option<u16> {
         // Zero-page u8 allocation — bounded by ZP_USER_CAP to avoid
-        // colliding with the IR temp region at $80+.
-        if size == 1 && self.next_zp_addr < ZP_USER_CAP {
+        // colliding with the IR temp region at $80+. `slow` forces
+        // main RAM so users can deliberately keep a u8 out of ZP
+        // (e.g. a cold variable they don't want wasting a ZP slot);
+        // without this branch the `slow` keyword parsed but had no
+        // observable effect, which is the same silent-drop shape
+        // that bit PR #31.
+        if size == 1 && self.next_zp_addr < ZP_USER_CAP && placement != Placement::Slow {
             let addr = u16::from(self.next_zp_addr);
             self.next_zp_addr = self.next_zp_addr.wrapping_add(1);
             return Some(addr);

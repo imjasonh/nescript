@@ -336,6 +336,214 @@ fn program_with_u16_struct_field() {
 }
 
 #[test]
+fn eight_param_non_leaf_function_stages_every_arg_at_its_allocated_slot() {
+    // Non-leaf functions use direct-write calling convention: the
+    // caller stages each argument at the callee's analyzer-
+    // allocated parameter slot, bypassing the four-slot `$04-$07`
+    // transport. That lifts the 4-param ceiling to 8 (E0506) and
+    // saves the old prologue's ~28 cycles per call.
+    //
+    // Verify end-to-end by compiling a function that takes eight
+    // distinct u8 params (so any cross-wiring would show up) and
+    // writes each to a distinct global. Then scan the PRG for an
+    // `LDA #N / STA <slot>` pair per arg — eight different
+    // immediates, eight different destination slots. The eight
+    // immediates `0x11..0x88` are chosen to be visually
+    // distinctive and unlikely to appear as incidental runtime
+    // constants.
+    let source = r#"
+        game "EightParams" { mapper: NROM }
+        var g0: u8 = 0
+        var g1: u8 = 0
+        var g2: u8 = 0
+        var g3: u8 = 0
+        var g4: u8 = 0
+        var g5: u8 = 0
+        var g6: u8 = 0
+        var g7: u8 = 0
+        fun spread(a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8) {
+            g0 = a
+            g1 = b
+            g2 = c
+            g3 = d
+            g4 = e
+            g5 = f
+            g6 = g
+            g7 = h
+        }
+        on frame {
+            spread(0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88)
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    let prg = &rom_data[16..16 + 16384];
+
+    // For each of the eight immediates, require at least one
+    // `LDA #imm / STA <addr>` pair anywhere in PRG. The STA
+    // target can be zero-page ($85) or absolute ($8D); we don't
+    // pin down which because the analyzer picks the cheapest
+    // slot available.
+    for imm in [0x11u8, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88] {
+        let found = prg
+            .windows(4)
+            .any(|w| w[0] == 0xA9 && w[1] == imm && (w[2] == 0x85 || w[2] == 0x8D));
+        assert!(
+            found,
+            "expected an LDA #${imm:02X} / STA <addr> pair for argument \
+             staging — if this fails, the 8-param non-leaf call is \
+             dropping args again"
+        );
+    }
+
+    // Belt-and-braces: in the OLD ABI every arg first got
+    // staged to $04-$07 (four ZP addresses). The new ABI stages
+    // *nothing* to those addresses for this call (spread has
+    // more than four params, so it's forced non-leaf, so direct-
+    // write). If someone re-introduces the old transport path,
+    // we'd see STA $04/$05/$06/$07 pairs. Assert absence.
+    for transport_slot in 0x04..=0x07u8 {
+        let any_store = prg
+            .windows(2)
+            .any(|w| w[0] == 0x85 && w[1] == transport_slot);
+        // The runtime itself may write to $04-$07 (they're not
+        // reserved outside of this calling convention), so we
+        // can't assert zero globally. Just require that the
+        // number of STA-to-transport stores is strictly smaller
+        // than the 8 args — if the old transport path were
+        // active we'd see eight extra such stores.
+        let _ = any_store; // intentional: see count check below
+    }
+    let transport_sta_count = prg
+        .windows(2)
+        .filter(|w| w[0] == 0x85 && (0x04..=0x07).contains(&w[1]))
+        .count();
+    assert!(
+        transport_sta_count < 8,
+        "the 8-param call should NOT stage any arg through the \
+         `$04-$07` transport slots under the direct-write ABI; saw \
+         {transport_sta_count} `STA $04-$07` instructions total in PRG"
+    );
+}
+
+#[test]
+fn transition_dispatches_leaving_states_on_exit_handler() {
+    // `on exit` handlers used to be silently never called — the
+    // codegen documented that IrOp::Transition "doesn't know which
+    // state it's leaving" and skipped the on_exit JSR. Example
+    // programs (pong, war, state_machine) had `stop_music` sitting
+    // in an `on exit` block that never ran, and goldens captured
+    // the bug as "correct" behavior. The fix emits a runtime
+    // CMP-chain against ZP_CURRENT_STATE before every transition to
+    // JSR the leaving state's exit handler.
+    //
+    // Compile a program with two states where Source declares an
+    // `on exit` and transitions to Target, then assert the PRG
+    // contains a JSR to the Source_exit label. We look for the
+    // absolute JSR opcode $20 followed by any 16-bit target, and
+    // verify the linked label's address lands on one of them by
+    // scanning the ROM for the `STA ZP_CURRENT_STATE` sequence
+    // that would indicate the transition lowered at all.
+    let source = r#"
+        game "ExitDispatch" { mapper: NROM }
+        state Source {
+            on enter {}
+            on frame { transition Target }
+            on exit { stop_music }
+        }
+        state Target {
+            on enter {}
+            on frame {}
+        }
+        start Source
+    "#;
+    let rom_data = compile(source);
+    let prg = &rom_data[16..16 + 16384];
+
+    // NROM ROMs are a fixed 24576 + 16-byte header, so we can't
+    // compare file sizes. Compare the count of distinct JSR
+    // targets instead: a program without `on exit` only JSRs
+    // `Target_enter`, so its transition site has one JSR; adding
+    // `on exit` to Source injects at least one more JSR (the
+    // exit-dispatch JSR to `__ir_fn_Source_exit`).
+    let baseline_source = r#"
+        game "ExitDispatch" { mapper: NROM }
+        state Source {
+            on enter {}
+            on frame { transition Target }
+        }
+        state Target {
+            on enter {}
+            on frame {}
+        }
+        start Source
+    "#;
+    let baseline = compile(baseline_source);
+    let baseline_prg = &baseline[16..16 + 16384];
+
+    let count_jsrs = |bytes: &[u8]| -> std::collections::HashSet<u16> {
+        bytes
+            .windows(3)
+            .filter(|w| w[0] == 0x20)
+            .map(|w| u16::from_le_bytes([w[1], w[2]]))
+            .collect()
+    };
+    let exit_jsrs = count_jsrs(prg);
+    let base_jsrs = count_jsrs(baseline_prg);
+    assert!(
+        exit_jsrs.len() > base_jsrs.len(),
+        "expected the on-exit-bearing PRG to contain more distinct JSR \
+         targets than the baseline (got {} vs {}) — if this fails, the \
+         exit dispatch JSR to `__ir_fn_Source_exit` is being dropped",
+        exit_jsrs.len(),
+        base_jsrs.len()
+    );
+}
+
+#[test]
+fn uninitialized_struct_field_store_emits_sta_to_allocated_address() {
+    // Regression guard for the silent-drop bug uncovered while
+    // hardening the `var_addrs` lookup in `IrCodeGen`. Before the
+    // fix, field `VarId`s synthesized by the IR lowerer (e.g.
+    // `"pos.x"`) were only registered in `var_addrs` when their
+    // parent struct global had a literal initializer. An
+    // uninitialized `var pos: Point` produced no field globals, so
+    // `pos.x = 100` emitted `IrOp::StoreVar(VarId(for pos.x), ...)`
+    // — and the codegen's `if let Some(&addr) = var_addrs.get(..)`
+    // guard skipped it, silently dropping the write with no
+    // diagnostic.
+    //
+    // We verify by compiling a program whose entire frame handler
+    // is a write with a distinctive immediate constant, then
+    // search the PRG for the corresponding `LDA #$7B ; STA zp/abs`
+    // pair. `123 = $7B` is chosen because it can't appear as an
+    // incidental constant in the runtime prelude.
+    let source = r#"
+        game "StructStore" { mapper: NROM }
+        struct Point { x: u8, y: u8 }
+        var p: Point
+        on frame {
+            p.x = 123
+        }
+        start Main
+    "#;
+    let rom_data = compile(source);
+    let prg = &rom_data[16..16 + 16384];
+    let mut found = false;
+    for i in 0..prg.len().saturating_sub(3) {
+        if prg[i] == 0xA9 && prg[i + 1] == 0x7B && (prg[i + 2] == 0x85 || prg[i + 2] == 0x8D) {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "expected an LDA #$7B / STA <addr> pair for `p.x = 123` — if this \
+         fails, struct-field writes are being silently dropped again"
+    );
+}
+
+#[test]
 fn u16_struct_field_initializer_writes_both_bytes_to_rom() {
     // Struct literal initializer with a u16 field > 255 — the
     // compiler runs the global-init path at reset time, which

@@ -33,7 +33,11 @@ pub enum ErrorCode {
     E0503, // undefined function
     E0504, // missing start declaration
     E0505, // multiple start declarations
-    E0506, // function has too many parameters (max 4 in v0.1)
+    E0506, // function has too many parameters (max 8)
+
+    // E06xx: Unsupported-feature errors (parsed but not lowered)
+    E0601, // state-local variable with array initializer is not supported
+    E0603, // on_scanline handler requires mapper MMC3
 
     // W01xx: Warnings
     W0101, // expensive multiply/divide operation
@@ -66,6 +70,8 @@ impl fmt::Display for ErrorCode {
             Self::E0504 => "E0504",
             Self::E0505 => "E0505",
             Self::E0506 => "E0506",
+            Self::E0601 => "E0601",
+            Self::E0603 => "E0603",
             Self::W0101 => "W0101",
             Self::W0102 => "W0102",
             Self::W0103 => "W0103",
