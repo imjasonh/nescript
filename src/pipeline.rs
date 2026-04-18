@@ -227,7 +227,8 @@ pub fn compile_source(
     }
 
     let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper)
-        .with_header(program.game.header);
+        .with_header(program.game.header)
+        .with_battery(analysis.has_battery_saves);
     let switchable_banks: Vec<PrgBank> = program
         .banks
         .iter()

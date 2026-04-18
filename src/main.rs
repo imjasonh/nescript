@@ -601,6 +601,7 @@ mod tests {
             call_graph: HashMap::new(),
             max_depths: HashMap::new(),
             state_local_owners: HashMap::new(),
+            has_battery_saves: false,
         }
     }
 

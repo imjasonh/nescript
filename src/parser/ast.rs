@@ -4,6 +4,16 @@ use crate::lexer::Span;
 pub struct Program {
     pub game: GameDecl,
     pub globals: Vec<VarDecl>,
+    /// Battery-backed save variables, declared inside a top-level
+    /// `save { var ... }` block. The analyzer allocates these at
+    /// `$6000+` (the iNES SRAM region) instead of main RAM, and the
+    /// ROM builder flips byte-6 bit-1 of the iNES header so
+    /// emulators and cartridge boards persist this region across
+    /// power cycles. SRAM is uninitialized at first power-on, so
+    /// users should checksum or use a magic-byte sentinel to detect
+    /// a fresh battery — the compiler does not auto-initialize
+    /// save fields.
+    pub saves: Vec<VarDecl>,
     pub constants: Vec<ConstDecl>,
     pub enums: Vec<EnumDecl>,
     pub structs: Vec<StructDecl>,
@@ -376,6 +386,14 @@ pub enum NesType {
     U8,
     I8,
     U16,
+    /// Signed 16-bit integer. Same two-byte layout as `U16` but the
+    /// analyzer tracks the signedness on literals, casts, and
+    /// assignments. Arithmetic emits the same carry-propagating
+    /// paired operations as `U16`; comparisons are currently
+    /// lowered through the same unsigned 16-bit compare path that
+    /// `U16` uses (matching the existing `I8` behaviour). A proper
+    /// signed-compare lowering would be a separate follow-up.
+    I16,
     Bool,
     Array(Box<NesType>, u16),
     /// A user-declared struct, identified by its name. The analyzer
@@ -389,6 +407,7 @@ impl std::fmt::Display for NesType {
             Self::U8 => write!(f, "u8"),
             Self::I8 => write!(f, "i8"),
             Self::U16 => write!(f, "u16"),
+            Self::I16 => write!(f, "i16"),
             Self::Bool => write!(f, "bool"),
             Self::Array(t, n) => write!(f, "{t}[{n}]"),
             Self::Struct(name) => write!(f, "{name}"),

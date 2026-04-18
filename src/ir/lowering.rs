@@ -441,7 +441,7 @@ impl LoweringContext {
                 _ => {
                     let fval = self.eval_const(fexpr);
                     let size = match field_type {
-                        Some(NesType::U16) => 2,
+                        Some(NesType::U16 | NesType::I16) => 2,
                         _ => 1,
                     };
                     self.globals.push(IrGlobal {
@@ -913,7 +913,7 @@ impl LoweringContext {
                 // of the initializer stored at base+1. Mirror the
                 // `VarDecl` lowering in `lower_statement` so wide
                 // inits round-trip cleanly.
-                if matches!(var.var_type, NesType::U16) {
+                if matches!(var.var_type, NesType::U16 | NesType::I16) {
                     let (_, hi) = self.widen(val);
                     self.emit(IrOp::StoreVarHi(var_id, hi));
                 }
@@ -996,9 +996,15 @@ impl LoweringContext {
                     } else {
                         let val = self.lower_expr(init);
                         self.emit(IrOp::StoreVar(var_id, val));
-                        // u16 var: write the high byte too, zero-
-                        // extending narrow initializers.
-                        if matches!(var.var_type, NesType::U16) {
+                        // u16 / i16 var: write the high byte too,
+                        // zero-extending narrow initializers. For
+                        // `i16` negative literals, the IR lowering
+                        // of integer literals already packs both
+                        // bytes via the IntLiteral path, so `widen`
+                        // produces the correct sign/zero-extension
+                        // — narrow-to-wide stores here still do the
+                        // right thing for both signednesses.
+                        if matches!(var.var_type, NesType::U16 | NesType::I16) {
                             let (_, hi) = self.widen(val);
                             self.emit(IrOp::StoreVarHi(var_id, hi));
                         }
@@ -1283,7 +1289,7 @@ impl LoweringContext {
                 // u16 fields need the high byte written too — the
                 // `widen` helper yields a zero-extended high temp
                 // when the RHS is narrow.
-                if matches!(self.var_types.get(&full), Some(NesType::U16)) {
+                if matches!(self.var_types.get(&full), Some(NesType::U16 | NesType::I16)) {
                     let (_, val_hi) = self.widen(val);
                     self.emit(IrOp::StoreVarHi(field_var, val_hi));
                 }
@@ -1296,8 +1302,10 @@ impl LoweringContext {
                 let var_id = self.get_or_create_var(name);
                 // Is the destination a u16 variable? Wide vars need
                 // both bytes written on every assignment, otherwise
-                // the high byte silently stays stale.
-                let dest_is_u16 = matches!(self.var_types.get(name), Some(NesType::U16));
+                // the high byte silently stays stale. Both `u16`
+                // and `i16` use this wide-store path.
+                let dest_is_u16 =
+                    matches!(self.var_types.get(name), Some(NesType::U16 | NesType::I16));
                 match op {
                     AssignOp::Assign => {
                         let val = self.lower_expr(expr);
@@ -1388,7 +1396,10 @@ impl LoweringContext {
                 // follow the same two-byte path as u16 globals.
                 let full_name = format!("{name}.{field}");
                 let var_id = self.get_or_create_var(&full_name);
-                let dest_is_u16 = matches!(self.var_types.get(&full_name), Some(NesType::U16));
+                let dest_is_u16 = matches!(
+                    self.var_types.get(&full_name),
+                    Some(NesType::U16 | NesType::I16)
+                );
                 match op {
                     AssignOp::Assign => {
                         let val = self.lower_expr(expr);
@@ -1684,10 +1695,10 @@ impl LoweringContext {
                 let var_id = self.get_or_create_var(name);
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadVar(t, var_id));
-                // For u16 variables, also load the high byte and
-                // register the temp pair as wide so downstream ops
-                // can emit 16-bit IR when appropriate.
-                if matches!(self.var_types.get(name), Some(NesType::U16)) {
+                // For u16 / i16 variables, also load the high byte
+                // and register the temp pair as wide so downstream
+                // ops can emit 16-bit IR when appropriate.
+                if matches!(self.var_types.get(name), Some(NesType::U16 | NesType::I16)) {
                     let hi = self.fresh_temp();
                     self.emit(IrOp::LoadVarHi(hi, var_id));
                     self.make_wide(t, hi);
@@ -1712,7 +1723,10 @@ impl LoweringContext {
                 let var_id = self.get_or_create_var(&full_name);
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadVar(t, var_id));
-                if matches!(self.var_types.get(&full_name), Some(NesType::U16)) {
+                if matches!(
+                    self.var_types.get(&full_name),
+                    Some(NesType::U16 | NesType::I16)
+                ) {
                     let hi = self.fresh_temp();
                     self.emit(IrOp::LoadVarHi(hi, var_id));
                     self.make_wide(t, hi);
@@ -1721,6 +1735,24 @@ impl LoweringContext {
             }
             Expr::BinaryOp(left, op, right, _) => self.lower_binop(left, *op, right),
             Expr::UnaryOp(op, inner, _) => {
+                // Constant-fold `-<literal>` into a wide two's-
+                // complement literal so a negative source like
+                // `-10` assigned to an `i16` stores $FFF6 (sign-
+                // extended) rather than the zero-extended $00F6
+                // that a byte-level negate + widen would produce.
+                // Without this fold, `var vy: i16 = -10` would
+                // silently land at $00F6 = 246 in the target.
+                if let (UnaryOp::Negate, Expr::IntLiteral(v, _)) = (op, inner.as_ref()) {
+                    let negated = (*v).wrapping_neg();
+                    let t = self.fresh_temp();
+                    self.emit(IrOp::LoadImm(t, negated as u8));
+                    if *v != 0 {
+                        let hi = self.fresh_temp();
+                        self.emit(IrOp::LoadImm(hi, (negated >> 8) as u8));
+                        self.make_wide(t, hi);
+                    }
+                    return t;
+                }
                 let val = self.lower_expr(inner);
                 let t = self.fresh_temp();
                 match op {
@@ -2235,7 +2267,7 @@ fn utf8_char_len(lead: u8) -> usize {
 fn type_size(t: &NesType) -> u16 {
     match t {
         NesType::U8 | NesType::I8 | NesType::Bool => 1,
-        NesType::U16 => 2,
+        NesType::U16 | NesType::I16 => 2,
         NesType::Array(elem, count) => type_size(elem) * count,
         // Struct sizes are resolved in the analyzer. IR lowering only
         // sees struct types on `var` declarations, which are skipped

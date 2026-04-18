@@ -768,6 +768,7 @@ mod tests {
                 span: Span::dummy(),
             },
             globals: Vec::new(),
+            saves: Vec::new(),
             constants: Vec::new(),
             enums: Vec::new(),
             structs: Vec::new(),

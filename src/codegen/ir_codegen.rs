@@ -1831,7 +1831,16 @@ impl<'a> IrCodeGen<'a> {
                             .map(|a| a.address)
                     }))
                 };
-                match crate::asm::parse_inline(&to_parse) {
+                // Rewrite ca65-style local labels (`.foo:` /
+                // `BNE .foo`) into unique per-block identifiers so
+                // two inline-asm blocks in the same function can
+                // use overlapping local names without colliding in
+                // the linker's label table. `.foo` → `__ilab_N_foo`
+                // where N comes from the same monotonic suffix
+                // source our other local labels use.
+                let suffix = self.local_label_suffix();
+                let mangled = mangle_dot_labels(&to_parse, &suffix);
+                match crate::asm::parse_inline(&mangled) {
                     Ok(parsed) => self.instructions.extend(parsed),
                     Err(msg) => {
                         eprintln!("inline asm error: {msg}");
@@ -2951,6 +2960,69 @@ fn function_is_leaf(func: &IrFunction) -> bool {
 /// Addresses that fit in a byte become zero-page syntax (`$XX`),
 /// otherwise absolute (`$XXXX`). This lets users write
 /// `lda {score}` and have it resolve to `lda $10` or similar.
+///
+/// Rewrite ca65-style local labels (`.label`) into globally unique
+/// names scoped to a single inline-asm block. The parser doesn't
+/// accept `.` as a label character, so we replace every `.IDENT`
+/// occurrence — both `.foo:` definitions and `BNE .foo` references —
+/// with `__ilab_<suffix>_IDENT`. `suffix` is the caller's
+/// local-label counter so two inline-asm blocks in the same
+/// function can both use `.loop:` without colliding in the
+/// linker's label table.
+///
+/// The dollar-prefixed hex literals (`$10`, `$FFFC`) and the
+/// dot-prefixed assembler directives we don't yet accept (`.byte`,
+/// `.word`, …) both survive: the substitution looks specifically
+/// for `.` followed by an ident start character that the label
+/// validator would accept (letter or underscore), so `$10` isn't
+/// affected and directives don't match because their first letter
+/// is immediately followed by more letters without a colon /
+/// reference context.
+fn mangle_dot_labels(body: &str, suffix: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(body.len());
+    let bytes = body.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let c = bytes[i];
+        // Trip on a `.` that precedes an identifier-start character
+        // (letter or underscore). Anything else (whitespace, dollar
+        // signs, punctuation, digits) flows through unchanged.
+        if c == b'.' && i + 1 < bytes.len() && is_ident_start(bytes[i + 1]) {
+            // Make sure the `.` isn't itself preceded by an
+            // identifier character (would be `name.field`, not a
+            // label). Leading position at the start of the buffer,
+            // start of a line, or after whitespace / punctuation is
+            // fine.
+            let is_label_ctx = i == 0 || !is_ident_continue(bytes[i - 1]);
+            if is_label_ctx {
+                // Consume the identifier after the dot.
+                let start = i + 1;
+                let mut end = start;
+                while end < bytes.len() && is_ident_continue(bytes[end]) {
+                    end += 1;
+                }
+                // Append the mangled form without the leading dot.
+                let _ = write!(out, "__ilab_{suffix}_");
+                out.push_str(&body[start..end]);
+                i = end;
+                continue;
+            }
+        }
+        out.push(c as char);
+        i += 1;
+    }
+    out
+}
+
+fn is_ident_start(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphabetic()
+}
+
+fn is_ident_continue(b: u8) -> bool {
+    b == b'_' || b.is_ascii_alphanumeric()
+}
+
 fn substitute_asm_vars<F: Fn(&str) -> Option<u16>>(body: &str, resolver: F) -> String {
     let mut out = String::with_capacity(body.len());
     let bytes = body.as_bytes();

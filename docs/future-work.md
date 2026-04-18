@@ -246,24 +246,28 @@ in the order they should probably be tackled (cheapest/highest-
 leverage first). Anything we finish moves out of this section and
 into the top of the file with a "ships today" note.
 
-### A. Numeric types beyond `u8 / i8 / u16 / bool`
+### A. Numeric types beyond `u8 / i8 / u16 / i16 / bool`
 
-- **`i16`.** The smallest change with the highest blast radius.
-  Negative metasprite offsets, signed velocities, signed scroll
-  deltas, subtraction-of-positions — none of that works today
-  without underflow hazards. Design sketch:
-  - Lexer: no change (type names are already identifiers).
-  - Parser: add `i16` to the primitive-type list.
-  - Analyzer: extend `Type` + coercion table; signed×unsigned
-    mixing should require an explicit cast.
-  - IR: `Add/Sub/Cmp` already carry a signedness flag for `i8`;
-    extend the 16-bit variants the same way.
-  - Codegen: `CMP`/`BCC`/`BCS` for unsigned vs `BMI`/`BPL`/signed
-    compare for signed (XOR the high bits before subtract, or
-    branch on the overflow flag).
-- **`u32` / `i32`.** Lower priority; realistically needed only for
-  score totals and frame counters. A synthesizable pair of
-  16-bit halves is usually enough.
+`i16` ships today; see `examples/i16_demo.ne`. Two known limitations
+match the existing `i8` behaviour and will be tackled together when
+proper signedness tracking lands in the IR:
+
+- **Comparisons are unsigned.** `CmpLt16`/`CmpGt16` use `BCC`/`BCS`,
+  so `i16` compares against negative values give wrong results. The
+  fix is a `Signedness` field on `Cmp16Kind` (and `CmpKind` for
+  `i8`) plus signed branch lowering — `BMI`/`BPL` after an
+  XOR-on-sign-bit prologue.
+- **Narrow-to-wide widening zero-extends.** Assigning a runtime
+  `i8` expression to an `i16` does not sign-extend the high byte.
+  Negative literals are folded to the correct wide form by the
+  lowerer's existing constant-fold path; only runtime expressions
+  hit the bug.
+
+Lower-priority numeric follow-ups:
+
+- **`u32` / `i32`.** Realistically needed only for score totals and
+  frame counters. A synthesizable pair of 16-bit halves is usually
+  enough.
 
 ### B. Pointers & function pointers
 
@@ -290,9 +294,13 @@ different shapes (e.g. a 16-bit counter viewed as `lo: u8, hi: u8`).
 
 ### D. Full inline-assembly escape hatch
 
-- Today the inline-asm lexer accepts `label:` but not `.label:`
-  (ca65 style). Port the lexer to accept `.`-prefixed local
-  labels and emit them as ca65-compatible locals (`@label`).
+`.label:` ships today — the codegen mangles dot-labels into per-block
+unique names (`__ilab_<N>_label`) so two inline-asm blocks in the
+same function can both use `.loop:` without colliding. See
+`tests/integration_test.rs::inline_asm_dot_labels_are_per_block_unique`.
+
+Still TODO:
+
 - Accept cc65's `asm()` format specifiers — `%b` (byte), `%w`
   (word), `%l` (long), `%v` (var), `%o` (offset), `%g` (global),
   `%s` (string) — so users can splat a compiler-allocated symbol
@@ -448,13 +456,22 @@ assembler source. An `@metatiles("room.nxt")` loader (and
 `@room("level1.nxt")` for layouts — see §H) removes a whole class
 of hand-typed tile arrays.
 
-### S. SRAM / battery-backed saves
+### S. SRAM / battery-backed saves follow-ups
 
-Already in the spec as a "reserved for future versions" item. Add
-a top-level `save { var … }` block that lands its allocations at
-`$6000+`, flips the iNES battery flag, and exposes the allocations
-to the rest of the program as if they were ordinary globals (with
-a compiler-emitted checksum on write to survive cold starts).
+`save { var ... }` ships today — see `examples/sram_demo.ne`. The
+analyzer allocates save vars from a separate `$6000+` bump pointer,
+the linker flips iNES byte-6 bit-1, and `W0111` warns when a save
+var carries an initializer (SRAM is preserved across power cycles
+so initializers would either silently not run or clobber the
+player's data on every boot). Two follow-ups are still worth doing:
+
+- **First-power-on detection** — an `on first_boot { ... }` handler
+  that runs once when a magic-byte sentinel is missing. Today users
+  have to roll the sentinel check by hand.
+- **Struct fields in save blocks** — currently rejected because the
+  field-flattening path uses the main-RAM allocator. Routing it
+  through the SRAM allocator instead is a few lines of analyzer
+  refactor.
 
 ### T. PAL/NTSC region abstraction
 
@@ -542,14 +559,15 @@ to a specific bank to avoid bank-switch cost on a hot path.
 
 Remaining gap items in order of user value:
 
-1. `i16` (§A) — unblocks signed physics, metasprite offsets.
-2. VRAM update buffer (§G) — unblocks HUDs, dialog, streaming.
-3. Register allocator (existing section) — compounding size win.
+1. VRAM update buffer (§G) — unblocks HUDs, dialog, streaming.
+2. Register allocator (existing section) — compounding size win.
+3. Signedness on Cmp16/Cmp ops (§A follow-up) — closes the i16
+   correctness gap.
 4. Metatiles + collision (§H) — closes several items at once.
-5. Inline-asm completeness (§D) — escape hatch for power users.
+5. Inline-asm format specifiers + directive list (§D follow-ups).
 6. Arrays-of-structs + bitfields (§C) + fn pointers (§B) —
    turns NEScript into a general-purpose NES language.
-7. SRAM (§S) + UNROM-512 + MMC5 (§V) — ecosystem fit.
+7. UNROM-512 + MMC5 (§V) — ecosystem fit.
 8. FamiStudio import (§Q) + DPCM (§O) + expansion audio (§P).
 
 ---

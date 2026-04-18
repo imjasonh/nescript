@@ -1850,7 +1850,10 @@ pub fn gen_fade() -> Vec<Instruction> {
     // instead of "hold forever".
     out.push(Instruction::new(NOP, AM::Label("__fade_out".into())));
     out.push(Instruction::new(ORA, AM::Immediate(0x00)));
-    out.push(Instruction::new(BNE, AM::LabelRelative("__fade_out_ok".into())));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_out_ok".into()),
+    ));
     out.push(Instruction::new(LDA, AM::Immediate(1)));
     out.push(Instruction::new(NOP, AM::Label("__fade_out_ok".into())));
     out.push(Instruction::new(STA, AM::Absolute(FADE_STEP_FRAMES)));
@@ -1895,7 +1898,10 @@ pub fn gen_fade() -> Vec<Instruction> {
     // body for a one-off five-step loop).
     out.push(Instruction::new(NOP, AM::Label("__fade_in".into())));
     out.push(Instruction::new(ORA, AM::Immediate(0x00)));
-    out.push(Instruction::new(BNE, AM::LabelRelative("__fade_in_ok".into())));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_in_ok".into()),
+    ));
     out.push(Instruction::new(LDA, AM::Immediate(1)));
     out.push(Instruction::new(NOP, AM::Label("__fade_in_ok".into())));
     out.push(Instruction::new(STA, AM::Absolute(FADE_STEP_FRAMES)));

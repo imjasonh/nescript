@@ -201,3 +201,48 @@ The NEScript runtime handles this automatically. The programmer reads button sta
 | Vblank time             | ~2,273 cycles  | PPU updates must be fast                 |
 | Frame budget            | ~29,780 cycles | Frame overrun detection in debug mode    |
 | No multiply/divide HW   | --             | Software routines, power-of-2 optimization|
+
+---
+
+## Debugger-assisted workflows
+
+NEScript compiles three debugger-friendly sidecar files that Mesen,
+Mesen2, and FCEUX can load alongside the `.nes`. All three are
+off by default (release ROMs should be as small as possible) and
+enabled per-run via CLI flags:
+
+| Flag                            | Format                           | Consumers       |
+|---------------------------------|----------------------------------|-----------------|
+| `--symbols <path.mlb>`          | Mesen labels (`P:` / `R:` lines) | Mesen, Mesen2   |
+| `--dbg <path.dbg>`              | ca65 debug-info format           | Mesen, Mesen2, FCEUX |
+| `--fceux-labels <prefix>`       | `<prefix>.<bank>.nl` + `.ram.nl` | FCEUX           |
+
+### Mesen trace-log
+
+Mesen supports address-based execution tracing via its `log` /
+`save-log` scripting APIs. Combined with NEScript's `debug.log`
+builtin, the standard workflow is:
+
+1. Build with `--debug` and `--symbols out.mlb`. `debug.log(value)`
+   writes `value` to the emulator debug port every time it executes.
+2. In the `game { }` block, set `debug_port: mesen` so writes land
+   at `$4018` (Mesen's documented tracing port):
+
+   ```
+   game "MyGame" {
+       mapper: NROM
+       debug_port: mesen
+   }
+   ```
+
+3. In Mesen, enable the trace log (Debug → Trace Logger), load
+   the `.mlb`, and filter by memory operation on `$4018`. Each
+   `debug.log(x)` call appears in the trace with the source
+   function + line resolved from the label table.
+
+For FCEUX on Linux, keep the default `debug_port: fceux` (writes
+to `$4800`) and pass `--fceux-labels out` — FCEUX reads
+`out.<bank>.nl` automatically when it opens the ROM from the same
+directory. FCEUX's conditional-breakpoint syntax can match writes
+to `$4800` directly (`A(4800)!=0`) so you can break when any log
+fires.

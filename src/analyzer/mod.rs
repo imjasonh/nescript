@@ -35,6 +35,11 @@ pub struct AnalysisResult {
     /// Consumed by the memory-map printer to group overlaid slots by
     /// their owning state. Empty for programs without state-locals.
     pub state_local_owners: HashMap<String, String>,
+    /// True when the program declared at least one `save { var ... }`
+    /// variable. Drives the iNES header byte-6 bit-1 (battery flag)
+    /// so emulators and cartridge boards know to persist the
+    /// `$6000-$7FFF` SRAM region across power cycles.
+    pub has_battery_saves: bool,
 }
 
 /// Default call stack depth limit for the NES runtime.
@@ -107,6 +112,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         symbols: HashMap::new(),
         var_allocations: Vec::new(),
         diagnostics: Vec::new(),
+        next_sram_addr: 0x6000,
         sfx_names,
         music_names,
         palette_names,
@@ -135,6 +141,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         }
     }
 
+    let has_battery_saves = !program.saves.is_empty();
     AnalysisResult {
         symbols: analyzer.symbols,
         var_allocations: analyzer.var_allocations,
@@ -142,6 +149,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         call_graph: analyzer.call_graph,
         max_depths: analyzer.max_depths,
         state_local_owners,
+        has_battery_saves,
     }
 }
 
@@ -164,6 +172,12 @@ struct Analyzer {
     background_names: HashSet<String>,
     next_ram_addr: u16,
     next_zp_addr: u8,
+    /// Bump-pointer for save-block (`save { var ... }`) variables.
+    /// Initialised to `$6000` (the iNES SRAM window) and capped at
+    /// `$8000`. Save vars never share the main-RAM allocator so
+    /// they don't collide with normal globals or interfere with
+    /// the analyzer's RAM-overflow check.
+    next_sram_addr: u16,
     call_graph: HashMap<String, Vec<String>>,
     max_depths: HashMap<String, u32>,
     stack_depth_limit: u32,
@@ -244,6 +258,16 @@ impl Analyzer {
         // Register and allocate globals
         for var in &program.globals {
             self.register_var(var);
+        }
+
+        // Register save-block variables. These get addresses from
+        // the SRAM-only allocator at `$6000+` and never enter the
+        // main-RAM bump pointer. The codegen treats them as
+        // ordinary globals at absolute addresses; the only place
+        // they're special is the iNES header (battery bit) and
+        // the linker reads `analysis.has_battery_saves` for that.
+        for var in &program.saves {
+            self.register_save_var(var);
         }
 
         // Validate palette and background declarations. Palettes
@@ -669,7 +693,7 @@ impl Analyzer {
                 let key = self.scoped_name(&param.name);
                 let size = match param.param_type {
                     NesType::U8 | NesType::I8 | NesType::Bool => 1,
-                    NesType::U16 => 2,
+                    NesType::U16 | NesType::I16 => 2,
                     // Struct/array parameters are not supported
                     // in v0.1; the parser already rejects them,
                     // so defaulting to 1 byte here is just a
@@ -1354,7 +1378,7 @@ impl Analyzer {
             // before the outer ones.
             let size = match &field.field_type {
                 NesType::U8 | NesType::I8 | NesType::Bool => 1,
-                NesType::U16 => 2,
+                NesType::U16 | NesType::I16 => 2,
                 NesType::Array(elem, count) => {
                     // Reject arrays of structs for now — the
                     // synthetic-variable model used by the
@@ -1637,6 +1661,111 @@ impl Analyzer {
             },
         );
 
+        self.var_allocations.push(VarAllocation {
+            name: key,
+            address,
+            size,
+        });
+    }
+
+    /// Register a `save { var ... }` declaration. Save vars are
+    /// allocated from a separate bump pointer over the iNES SRAM
+    /// window (`$6000-$7FFF`), get a `VarAllocation` entry just
+    /// like a normal global, and live in the main symbol table so
+    /// user code reads/writes them with the usual `=` / load
+    /// syntax. The only thing special is their address range —
+    /// the codegen emits absolute-mode loads/stores automatically
+    /// because the address exceeds the zero-page boundary.
+    ///
+    /// Struct types in save blocks are accepted but not
+    /// flattened into per-field SRAM slots yet — the analyzer
+    /// emits an error if a save block declares a struct, since
+    /// the field-flattening path uses the main-RAM allocator and
+    /// would land struct fields back in `$0300+`. Scalars,
+    /// scalar arrays, and `u16`/`i16` are the supported set for
+    /// this first pass.
+    fn register_save_var(&mut self, var: &VarDecl) {
+        let key = self.scoped_name(&var.name);
+        if self.symbols.contains_key(&key) {
+            self.diagnostics.push(Diagnostic::error(
+                ErrorCode::E0501,
+                format!("duplicate declaration of '{}'", var.name),
+                var.span,
+            ));
+            return;
+        }
+        // Save vars in SRAM are persisted across power cycles, so an
+        // initializer would either silently never run (current
+        // behaviour: globals init at reset, but save vars don't pass
+        // through that path) or actively clobber the player's saved
+        // data on every boot. Neither is what the user wants. Warn
+        // and tell them about the magic-byte sentinel pattern.
+        if var.init.is_some() {
+            self.diagnostics.push(
+                Diagnostic::warning(
+                    ErrorCode::W0111,
+                    format!(
+                        "initializer on save-block field `{}` is ignored — \
+                         SRAM is preserved across power cycles",
+                        var.name
+                    ),
+                    var.span,
+                )
+                .with_help(
+                    "first-power-on defaults need an explicit magic-byte sentinel: \
+                     check a known signature on boot, and only write defaults if it's missing",
+                ),
+            );
+        }
+        if matches!(var.var_type, NesType::Struct(_)) {
+            self.diagnostics.push(
+                Diagnostic::error(
+                    ErrorCode::E0201,
+                    "struct types are not supported inside `save { }` blocks yet",
+                    var.span,
+                )
+                .with_help("use scalar fields (u8, i8, u16, i16, bool) or scalar arrays"),
+            );
+            return;
+        }
+        let struct_sizes: HashMap<String, u16> = self
+            .struct_layouts
+            .iter()
+            .map(|(n, l)| (n.clone(), l.size))
+            .collect();
+        let size = type_size_with(&var.var_type, &struct_sizes);
+        let Some(end) = self.next_sram_addr.checked_add(size) else {
+            self.diagnostics.push(Diagnostic::error(
+                ErrorCode::E0301,
+                "save block exceeds the 8 KB SRAM window ($6000-$7FFF)",
+                var.span,
+            ));
+            return;
+        };
+        if end > 0x8000 {
+            self.diagnostics.push(Diagnostic::error(
+                ErrorCode::E0301,
+                "save block exceeds the 8 KB SRAM window ($6000-$7FFF)",
+                var.span,
+            ));
+            return;
+        }
+        let address = self.next_sram_addr;
+        self.next_sram_addr = end;
+        // Mark the save-mode flag so the linker knows to flip
+        // the iNES battery bit. Stored on `var_allocations` via
+        // the address range itself — addresses ≥ `$6000` are SRAM
+        // by construction, so the analyzer needs no extra side
+        // table beyond the existing allocation list.
+        self.symbols.insert(
+            key.clone(),
+            Symbol {
+                name: key.clone(),
+                sym_type: var.var_type.clone(),
+                is_const: false,
+                span: var.span,
+            },
+        );
         self.var_allocations.push(VarAllocation {
             name: key,
             address,
@@ -2877,12 +3006,12 @@ fn compute_depth(
 fn type_size_with(t: &NesType, struct_sizes: &HashMap<String, u16>) -> u16 {
     match t {
         NesType::U8 | NesType::I8 | NesType::Bool => 1,
-        NesType::U16 => 2,
+        NesType::U16 | NesType::I16 => 2,
         NesType::Array(elem, count) => type_size_with(elem, struct_sizes) * count,
         NesType::Struct(name) => struct_sizes.get(name).copied().unwrap_or(0),
     }
 }
 
 fn is_integer_type(t: &NesType) -> bool {
-    matches!(t, NesType::U8 | NesType::I8 | NesType::U16)
+    matches!(t, NesType::U8 | NesType::I8 | NesType::U16 | NesType::I16)
 }

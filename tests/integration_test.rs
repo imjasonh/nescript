@@ -43,7 +43,7 @@ fn compile(source: &str) -> Vec<u8> {
     let mut instructions = codegen.generate(&ir_program);
     nescript::codegen::peephole::optimize(&mut instructions);
 
-    let linker = Linker::new(program.game.mirroring);
+    let linker = Linker::new(program.game.mirroring).with_battery(analysis.has_battery_saves);
     linker.link_with_all_assets(&instructions, &sprites, &sfx, &music)
 }
 
@@ -3410,6 +3410,283 @@ start Main
         !has_poll_pattern,
         "program without sprite_0_split should not emit the sprite-0 busy-wait"
     );
+}
+
+#[test]
+fn inline_asm_dot_labels_are_per_block_unique() {
+    // Two inline-asm blocks in the same function can both use
+    // `.loop:` without colliding in the linker's label table.
+    // The codegen mangles `.X` to `__ilab_<N>_X` where `<N>` is
+    // the per-call-site monotonic suffix.
+    let source = r#"
+game "DotLabelCollide" { mapper: NROM }
+var counter: u8 = 0
+fun double_loop() {
+    asm {
+        LDX #5
+    .loop:
+        DEX
+        BNE .loop
+        STX {counter}
+    }
+    asm {
+        LDX #3
+    .loop:
+        DEX
+        BNE .loop
+        STX {counter}
+    }
+}
+on frame { double_loop() }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    // Both `.loop:` definitions should be present, mangled to
+    // distinct `__ilab_<N>_loop` labels.
+    let mangled: Vec<&String> = linked
+        .labels
+        .keys()
+        .filter(|k| k.starts_with("__ilab_") && k.ends_with("_loop"))
+        .collect();
+    assert!(
+        mangled.len() >= 2,
+        "expected at least two mangled `.loop` labels, found {}: {:?}",
+        mangled.len(),
+        mangled
+    );
+}
+
+#[test]
+fn inline_asm_dot_label_does_not_match_dollar_hex() {
+    // `STA $2002` writes to PPU status; the substituter must NOT
+    // mangle the `$2002` operand — only `.IDENT` patterns. This is
+    // a regression check for the dot-vs-dollar disambiguation.
+    let source = r#"
+game "DollarOk" { mapper: NROM }
+fun touch_ppu() {
+    asm {
+        LDA $2002
+    }
+}
+on frame { touch_ppu() }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.diagnostics.iter().all(|d| !d.is_error()),
+        "$2002 in inline asm should compile cleanly; got {:?}",
+        analysis.diagnostics
+    );
+    // Compile to a ROM — if the mangler corrupted the operand,
+    // the asm parser would error and the linker would emit BRK.
+    let _rom = compile(source);
+}
+
+#[test]
+fn save_block_allocates_at_sram_window_and_sets_battery_bit() {
+    // `save { var x: u16 = 0 }` should land at $6000+ (iNES SRAM
+    // window) and flip iNES header byte-6 bit-1 so emulators
+    // persist the region across power cycles.
+    let source = r#"
+game "SaveProg" { mapper: NROM }
+save {
+    var hi: u16 = 0
+    var coins: u8 = 0
+}
+on frame {
+    coins += 1
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis.has_battery_saves,
+        "save block should set has_battery_saves"
+    );
+    let hi_alloc = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "hi")
+        .expect("hi should have a VarAllocation");
+    assert_eq!(hi_alloc.address, 0x6000, "hi should land at $6000");
+    assert_eq!(hi_alloc.size, 2, "u16 hi should be 2 bytes");
+    let coins_alloc = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "coins")
+        .expect("coins should have a VarAllocation");
+    assert_eq!(
+        coins_alloc.address, 0x6002,
+        "coins should land right after hi"
+    );
+    // Build the ROM and verify the iNES header bit.
+    let rom = compile(source);
+    assert_eq!(
+        rom[6] & 0x02,
+        0x02,
+        "iNES byte 6 bit 1 should be set for battery"
+    );
+}
+
+#[test]
+fn no_save_block_leaves_battery_bit_clear() {
+    // Sanity: a program with no save block must NOT set the
+    // battery bit.
+    let source = r#"
+game "NoSave" { mapper: NROM }
+on frame { }
+start Main
+"#;
+    let rom = compile(source);
+    assert_eq!(rom[6] & 0x02, 0, "no save block → no battery bit");
+}
+
+#[test]
+fn save_block_initializer_warns() {
+    // Initializers on save vars are silently dropped at codegen
+    // time (globals init at reset, save vars don't). Warn so the
+    // user knows their default isn't taking effect.
+    let source = r#"
+game "SaveInit" { mapper: NROM }
+save {
+    var hi: u16 = 12345
+}
+on frame { }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| !d.is_error()
+                && matches!(d.code, nescript::errors::ErrorCode::W0111)),
+        "save-block initializer should emit W0111; got {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn save_block_struct_field_errors() {
+    // Struct types in save blocks aren't supported yet — must error,
+    // not silently allocate the struct fields back in main RAM.
+    let source = r#"
+game "BadSave" { mapper: NROM }
+struct Stats { hp: u8, mp: u8 }
+save {
+    var stats: Stats
+}
+on frame { }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.is_error() && d.message.contains("struct types are not supported")),
+        "struct in save block should error; got {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
+fn i16_negative_literal_sign_extends_to_wide_store() {
+    // `var vy: i16 = -10` should store $F6 in the low byte and
+    // $FF in the high byte — sign-extended two's complement.
+    // A pre-fix lowering would byte-negate to $F6 and then
+    // zero-extend, producing $00F6 (= 246) which is wrong for
+    // signed semantics. Regression assert: scan the assembled
+    // ROM for `LDA #$F6 / STA <addr> / LDA #$FF / STA <addr+1>`.
+    let source = r#"
+game "I16Neg" { mapper: NROM }
+var vy: i16 = -10
+on frame {
+    vy = vy + 1
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    // `LDA #$F6` = `A9 F6`; `LDA #$FF` = `A9 FF`. Find them
+    // adjacent to the var's address, accounting for the STA
+    // instructions in between.
+    //
+    // We scan for the byte-pair pattern `A9 F6` followed within
+    // ~10 bytes by `A9 FF`. That's tight enough to catch the
+    // neg-literal store sequence and loose enough to survive
+    // any peephole reordering.
+    let rom = &linked.rom;
+    let lda_f6 = rom
+        .windows(2)
+        .position(|w| w == [0xA9_u8, 0xF6])
+        .expect("should emit LDA #$F6 for the i16 negative-literal low byte");
+    let near = &rom[lda_f6..(lda_f6 + 16).min(rom.len())];
+    assert!(
+        near.windows(2).any(|w| w == [0xA9_u8, 0xFF]),
+        "should emit LDA #$FF (sign-extended high byte) within 16 bytes of LDA #$F6"
+    );
+}
+
+#[test]
+fn i16_compiles_with_arithmetic_and_compare() {
+    // End-to-end compile of an i16 program with `+`, `-`, `>=`,
+    // and `as u8` cast. Just makes sure the type lowering path
+    // doesn't panic; the ROM-shape correctness is covered by
+    // `i16_demo.nes` and its emulator golden.
+    let source = include_str!("../examples/i16_demo.ne");
+    let rom = compile(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 0);
 }
 
 #[test]

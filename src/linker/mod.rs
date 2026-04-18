@@ -45,6 +45,11 @@ pub struct Linker {
     mirroring: Mirroring,
     mapper: Mapper,
     header_format: HeaderFormat,
+    /// True when the program declared a `save { var ... }` block.
+    /// Threaded through to [`RomBuilder::set_battery`] so the iNES
+    /// header byte 6 bit 1 is set; emulators that respect it persist
+    /// the `$6000-$7FFF` SRAM region across power cycles.
+    has_battery: bool,
 }
 
 /// CHR data for a sprite, placed at a specific tile index in CHR ROM.
@@ -191,6 +196,7 @@ impl Linker {
             mirroring,
             mapper: Mapper::NROM,
             header_format: HeaderFormat::Ines1,
+            has_battery: false,
         }
     }
 
@@ -199,6 +205,7 @@ impl Linker {
             mirroring,
             mapper,
             header_format: HeaderFormat::Ines1,
+            has_battery: false,
         }
     }
 
@@ -208,6 +215,14 @@ impl Linker {
     #[must_use]
     pub fn with_header(mut self, header: HeaderFormat) -> Self {
         self.header_format = header;
+        self
+    }
+
+    /// Mark the ROM as battery-backed. Threaded through from
+    /// `analysis.has_battery_saves`; flips iNES byte-6 bit-1.
+    #[must_use]
+    pub fn with_battery(mut self, has_battery: bool) -> Self {
+        self.has_battery = has_battery;
         self
     }
 
@@ -787,6 +802,7 @@ impl Linker {
         if self.header_format == HeaderFormat::Nes2 {
             builder.enable_nes2();
         }
+        builder.set_battery(self.has_battery);
 
         // Multi-bank layout: each switchable bank is an independent
         // 16 KB slot whose contents are either the assembled

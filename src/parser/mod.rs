@@ -132,6 +132,7 @@ impl Parser {
         let mut metasprites = Vec::new();
         let mut sfx = Vec::new();
         let mut music = Vec::new();
+        let mut saves: Vec<crate::parser::ast::VarDecl> = Vec::new();
         let mut banks = Vec::new();
         let mut start_state = None;
         let mut on_frame = None;
@@ -180,6 +181,34 @@ impl Parser {
                 }
                 TokenKind::KwMusic => {
                     music.push(self.parse_music_decl()?);
+                }
+                TokenKind::KwSave => {
+                    // `save { var x: u8 = 0  var y: u16 = 100 }` —
+                    // a block of variable declarations that the
+                    // analyzer allocates at $6000+ (cartridge SRAM
+                    // window) instead of main RAM. Parsed as a
+                    // sequence of plain `VarDecl`s; the analyzer
+                    // and ROM builder are what make them battery-
+                    // backed.
+                    self.advance();
+                    self.expect(&TokenKind::LBrace)?;
+                    while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+                        match self.peek().clone() {
+                            TokenKind::KwVar | TokenKind::KwFast | TokenKind::KwSlow => {
+                                saves.push(self.parse_var_decl()?);
+                            }
+                            other => {
+                                return Err(Diagnostic::error(
+                                    ErrorCode::E0201,
+                                    format!(
+                                        "expected `var` declaration inside `save {{ }}`, got `{other}`"
+                                    ),
+                                    self.current_span(),
+                                ));
+                            }
+                        }
+                    }
+                    self.expect(&TokenKind::RBrace)?;
                 }
                 TokenKind::KwBank => {
                     let (bank, nested_funs) = self.parse_bank_decl()?;
@@ -249,6 +278,7 @@ impl Parser {
         Ok(Program {
             game,
             globals,
+            saves,
             constants,
             enums,
             structs,
@@ -2989,6 +3019,10 @@ impl Parser {
             TokenKind::KwU16 => {
                 self.advance();
                 NesType::U16
+            }
+            TokenKind::KwI16 => {
+                self.advance();
+                NesType::I16
             }
             TokenKind::KwBool => {
                 self.advance();
