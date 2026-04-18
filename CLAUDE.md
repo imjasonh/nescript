@@ -225,6 +225,48 @@ change needs a manual update + review.
 - `docs/future-work.md` is the authoritative roadmap. If you finish an
   item, delete its section; if you add a new gap, write one.
 
+## New-feature PR checklist (don't ship silent drops)
+
+PR #31 shipped a year-old state-local bug where the analyzer
+allocated ZP slots for `state Foo { var x }` but the IR codegen
+silently emitted zero bytes for every `LoadVar`/`StoreVar` on them.
+The bug survived because pixel/audio goldens captured the broken
+behaviour as ground truth and no test asserted a write-wait-read
+round-trip. Several other features (uninitialized struct-field
+writes, `on exit` handlers, `slow` placement, state-local array
+initializers) had the same shape when we audited. To avoid
+repeating the pattern, every new language-feature PR must include:
+
+1. **An example program** under `examples/` that exercises the
+   feature on a path the emulator harness can observe at frame
+   180. If the feature doesn't produce visible output on
+   autopilot, rig a frame counter to drive it (see
+   `examples/palette_and_background.ne` for the pattern).
+2. **A runtime behaviour assertion**, not just a shape or
+   byte-level assertion. Integration tests that only
+   `rom::validate_ines(&rom)` the output are ROM-*is-valid*
+   tests, not *feature-works* tests — they pass against a
+   compiler that silently drops the feature. Either add a
+   byte-level assertion that the expected instruction sequence
+   appears (e.g. `LDA #$7B / STA <addr>` for a known-value
+   write, as
+   `uninitialized_struct_field_store_emits_sta_to_allocated_address`
+   does), or — better — a round-trip test that compiles
+   `write(42) → wait_frame → assert(read == 42)` and fails
+   against a silently-dropping codegen.
+3. **A negative test** that gives the analyzer a program using
+   the feature invalidly and asserts the right error code fires.
+   Without this, a future refactor that stops emitting the
+   diagnostic lets the silent-drop shape back in.
+
+Address-map lookups in the codegen are a specific trap: the
+pattern `if let Some(&addr) = self.<some_map>.get(var) { ... }`
+with no `else` branch is how PR #31 shipped. If an IR op
+references a `VarId` / state name / function name, treat a map
+miss as a **compiler bug** and panic — use
+`IrCodeGen::var_addr(var)` or an explicit `.unwrap_or_else(||
+panic!(...))`. A silent zero-byte emit is worse than a crash.
+
 ## Things to avoid
 
 - **Don't add backwards-compat shims.** The repo is pre-1.0; breaking

@@ -1397,10 +1397,17 @@ impl<'a> IrCodeGen<'a> {
             }
             IrOp::Call(dest, name, args) => {
                 // Pass up to 4 arguments via zero-page slots $04-$07.
-                // Arguments beyond the fourth are silently dropped
-                // (the analyzer has already validated arity against
-                // the declared signature).
-                for (i, arg) in args.iter().enumerate().take(4) {
+                // E0506 rejects function declarations with more than
+                // four parameters, so a call with >4 args is a
+                // compiler-internal inconsistency — panic rather than
+                // silently drop the extras (PR-#31-shaped miscompile).
+                assert!(
+                    args.len() <= 4,
+                    "internal compiler error: Call to {name:?} with \
+                     {} args (max 4); E0506 should have caught this",
+                    args.len()
+                );
+                for (i, arg) in args.iter().enumerate() {
                     self.load_temp(*arg);
                     self.emit(STA, AM::ZeroPage(0x04 + i as u8));
                 }
