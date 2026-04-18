@@ -307,6 +307,8 @@ fn nes2_mapper_high_nibble_in_byte_8_is_zero_for_small_mappers() {
         crate::parser::ast::Mapper::MMC1,
         crate::parser::ast::Mapper::UxROM,
         crate::parser::ast::Mapper::MMC3,
+        crate::parser::ast::Mapper::AxROM,
+        crate::parser::ast::Mapper::CNROM,
     ] {
         let mut builder = RomBuilder::new(Mirroring::Horizontal);
         builder.set_mapper(crate::rom::mapper_number(mapper));

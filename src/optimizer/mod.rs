@@ -624,12 +624,18 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::CmpLtEq(d, _, _)
         | IrOp::CmpGtEq(d, _, _)
         | IrOp::ArrayLoad(d, _, _) => Some(*d),
-        IrOp::Rand16(d, _) => Some(*d),
         IrOp::Call(dest, _, _) => *dest,
         IrOp::ReadInput(d, _) => Some(*d),
         IrOp::ReadInputEdge { dest, .. } => Some(*dest),
         IrOp::Peek(d, _) => Some(*d),
-        IrOp::Rand8(d) => Some(*d),
+        // Rand8 / Rand16 have an observable side effect — advancing
+        // the PRNG state — so a statement-level call like
+        // `rand8()` (result discarded) must NOT be dropped by DCE.
+        // Returning `None` here keeps the JSR regardless of whether
+        // the dest temp is live; the dest is still referenced by
+        // `op_source_temps` so live expression-position uses still
+        // track correctly.
+        IrOp::Rand8(_) | IrOp::Rand16(_, _) => None,
         IrOp::StoreVar(_, _)
         | IrOp::StoreVarHi(_, _)
         | IrOp::ArrayStore(_, _, _)

@@ -3073,6 +3073,53 @@ start Main
 }
 
 #[test]
+fn rand8_statement_survives_dce() {
+    // `rand8()` at statement position (result discarded) has a
+    // side effect — advancing the PRNG state — so DCE must not
+    // eliminate the JSR. Regression test: earlier the op_dest
+    // helper returned Some(dest) for Rand8, which let DCE drop
+    // statement-level draws where the temp was unused.
+    let source = r#"
+game "StmtRand" { mapper: NROM }
+on frame {
+    rand8()
+    rand16()
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    let rand8_addr = *linked
+        .labels
+        .get("__rand8")
+        .expect("statement-level rand8() should still link in the PRNG routine");
+    assert!(
+        contains_jsr_to(&linked.rom, rand8_addr),
+        "rand8() statement should keep its JSR through the optimizer"
+    );
+}
+
+#[test]
 fn set_palette_brightness_lowers_to_jsr() {
     let source = r#"
 game "FadeDemo" { mapper: NROM }
@@ -3214,6 +3261,40 @@ start Main
         "unknown button name inside edge-trigger should error; got {:?}",
         analysis.diagnostics
     );
+}
+
+#[test]
+fn void_intrinsic_in_expression_position_errors() {
+    // `seed_rand(...)`, `set_palette_brightness(...)`, and `poke(...)`
+    // don't produce values, so using them in expression position
+    // should be a compile-time error (not a linker panic later).
+    let cases = [
+        "var x: u8 = seed_rand(42)",
+        "var x: u8 = set_palette_brightness(4)",
+        "var x: u8 = poke(0x0200, 1)",
+    ];
+    for frag in cases {
+        let source = format!(
+            r#"
+game "BadVoid" {{ mapper: NROM }}
+on frame {{
+    {frag}
+}}
+start Main
+"#
+        );
+        let (program, _) = nescript::parser::parse(&source);
+        let program = program.expect("parse should succeed");
+        let analysis = analyzer::analyze(&program);
+        assert!(
+            analysis
+                .diagnostics
+                .iter()
+                .any(|d| d.is_error() && d.message.contains("does not return a value")),
+            "void-intrinsic in expr position should be an error; fragment was `{frag}`, got {:?}",
+            analysis.diagnostics
+        );
+    }
 }
 
 #[test]

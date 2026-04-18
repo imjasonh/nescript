@@ -1133,6 +1133,20 @@ impl LoweringContext {
                         let level = self.lower_expr(&args[0]);
                         self.emit(IrOp::SetPaletteBrightness(level));
                     }
+                    // `rand8()` / `rand16()` at statement position —
+                    // valid because they have side effects (advancing
+                    // the PRNG state). The returned value is discarded
+                    // by routing through a fresh temp that nothing
+                    // reads; the JSR still runs so the state advances.
+                    "rand8" if args.is_empty() => {
+                        let t = self.fresh_temp();
+                        self.emit(IrOp::Rand8(t));
+                    }
+                    "rand16" if args.is_empty() => {
+                        let lo = self.fresh_temp();
+                        let hi = self.fresh_temp();
+                        self.emit(IrOp::Rand16(lo, hi));
+                    }
                     _ => {
                         // Inline expansion at statement context
                         // splices either the return expression

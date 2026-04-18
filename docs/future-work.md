@@ -394,30 +394,17 @@ NMI-time write budget (~2273 cycles) is too tight for a full
 nametable. RLE is the smaller first step — emit a `nametable` that
 can declare `compression: rle` and decompress at swap time.
 
-### J. Palette brightness / fade (ships today)
+### J. Palette-fade follow-ups
 
-`set_palette_brightness(level: u8)` is a builtin that maps the
-0..8 level onto `$2001` PPU mask emphasis bits. See
-`examples/palette_brightness_demo.ne` for an end-to-end demo.
-The runtime `__set_palette_brightness` routine is spliced in only
-when user code references the builtin. Follow-ups still worth
-doing:
+`set_palette_brightness(level: u8)` ships today (levels 0..8 mapped
+onto `$2001` emphasis bits); `examples/palette_brightness_demo.ne`
+exercises it. Two follow-ups are still worth doing:
 
 - Blocking `fade_out(frames)` / `fade_in(frames)` helpers — today
   users write them in user-space with a for-loop + `wait_frame`.
   Making them builtin would elide the frame-counting boilerplate.
 - A brightness-LUT path that recolours the active palette in
   addition to the emphasis bits, for non-NTSC-assumption fades.
-
-### K. Edge-triggered input (ships today)
-
-`p1.button.a.pressed` / `p1.button.a.released` (and the P2 variants)
-report the rising / falling edge of the button relative to the
-previous frame. Implementation: one IR op
-(`ReadInputEdge { player, mask, released }`), two main-RAM bytes
-(`$07E6/$07E7` for P1/P2 prev state), and a new NMI-side snapshot
-of the current input byte before the next strobe, all gated on the
-`__edge_input_used` marker. See `examples/edge_input_demo.ne`.
 
 ### L. Sprite 0 hit split-screen
 
@@ -444,17 +431,6 @@ the rotation automatically — plus a `draw ... priority: pinned`
 modifier for HUD sprites that must stay at low OAM slots — is the
 cleaner user-facing API. Mentioned already under Open Design
 Questions; bumping it into the active roadmap.
-
-### N. Runtime PRNG (ships today)
-
-`rand8()` / `rand16()` / `seed_rand(seed: u16)` are builtin
-intrinsics backed by a 16-bit Galois LFSR (polynomial `0xB400`,
-full 65535-cycle period from any non-zero seed). State lives in
-main RAM at `$07EA/$07EB` and is seeded to `0xACE1` at reset so
-the first draw is useful without explicit seeding. Routines +
-seed init are gated on the `__rand_used` marker — programs that
-never call any of the three pay zero bytes. See
-`examples/prng_demo.ne`.
 
 ### O. DPCM / DMC sample playback
 
@@ -518,16 +494,11 @@ three reads every program needs.
 
 ### V. Additional mappers
 
-**Shipped:**
-- **AxROM** (mapper 7) — single-screen mirroring, 32 KB PRG pages.
-  `mapper: AxROM` in `game { }`. Linker pads single-bank ROMs to
-  32 KB. See `examples/axrom_simple.ne`.
-- **CNROM** (mapper 3) — fixed 32 KB PRG, 8 KB CHR bankswitching.
-  `mapper: CNROM`. See `examples/cnrom_simple.ne`. User-visible CHR
-  bank selection is still TODO — the reset-time init writes bank 0
-  and nothing else is exposed yet.
-
-**Still TODO:**
+AxROM (mapper 7) and CNROM (mapper 3) both ship today; see
+`examples/axrom_simple.ne` and `examples/cnrom_simple.ne`. CNROM's
+user-visible CHR bankswitching is still TODO — the reset-time init
+writes bank 0 and nothing else is exposed yet, so CHR swaps
+mid-frame aren't reachable from user source. The next set:
 
 1. **GNROM / MHROM** (mapper 66). Combines AxROM-style PRG with
    CNROM-style CHR banking. Another single-register mapper.
@@ -558,13 +529,13 @@ Today the debug port is hardcoded to `$4800`. Expose
 `mesen`, emit writes to `$4018` (Mesen's documented debug port)
 and document the trace-log tool invocation in the debug docs.
 
-### Y. FCEUX `.nl` / `.ld` label file output (ships today)
+### Y. FCEUX `.ld` line-info follow-up
 
-`--fceux-labels <prefix>` emits `<prefix>.<bank-index>.nl` for
-each PRG bank plus `<prefix>.ram.nl` for RAM/zero-page labels.
-Each bank line has the form `$XXXX#label_name#` which is what
-FCEUX reads. Still TODO: a `.ld` line-info file that pairs with
-the source map for proper line-level stepping in FCEUX.
+`--fceux-labels <prefix>` ships today and emits
+`<prefix>.<bank-index>.nl` + `<prefix>.ram.nl`. FCEUX also reads a
+`.ld` line-info file for source-level stepping; wiring that up
+against the existing source-map data would close the loop without
+much code.
 
 ### Z. Explicit bank-placement hints on functions and data
 
@@ -583,10 +554,7 @@ to a specific bank to avoid bank-switch cost on a hot path.
 
 ### Priority ranking
 
-Already shipped: edge-triggered input (§K), PRNG (§N), palette
-brightness (§J), AxROM + CNROM (§V), FCEUX labels (§Y).
-
-Remaining order by user value:
+Remaining gap items in order of user value:
 
 1. `i16` (§A) — unblocks signed physics, metasprite offsets.
 2. VRAM update buffer (§G) — unblocks HUDs, dialog, streaming.

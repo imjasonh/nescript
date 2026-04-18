@@ -1618,121 +1618,72 @@ pub fn gen_divide() -> Vec<Instruction> {
 /// referenced). Programs that never touch the PRNG pay zero ROM
 /// or cycle cost.
 ///
-/// Algorithm: a 16-bit xorshift with the canonical `(7, 9, 8)`
-/// parameters that produces a full 65535-cycle period from any
-/// non-zero seed. The state lives in main RAM at
-/// `PRNG_STATE_LO`/`PRNG_STATE_HI`; the reset path seeds it to
-/// `0xACE1` (a classic xorshift16 nonzero seed) so the first
-/// `rand8()` call returns a useful value without requiring an
-/// explicit `seed_rand`.
+/// ## Algorithm
+///
+/// A right-shifting Galois-configuration 16-bit LFSR with tap mask
+/// `0xB400` on the high byte (polynomial `x^16 + x^14 + x^13 +
+/// x^11 + 1`). From any non-zero seed it cycles through all 65535
+/// non-zero 16-bit states before repeating. Per step:
+///
+/// ```text
+/// carry = state & 1
+/// state >>= 1
+/// if carry: state ^= 0xB400
+/// ```
+///
+/// State lives in main RAM at `PRNG_STATE_LO`/`PRNG_STATE_HI`; the
+/// reset path seeds it to `0xACE1` so the first draw is useful
+/// without requiring an explicit `seed_rand`.
 ///
 /// ## Entry points
 ///
 /// - `__rand8`: advances the state once, returns `A` = new low byte.
-///   Clobbers A, X, flags. ~40 cycles.
-/// - `__rand16`: advances twice, returns `A` = lo byte of the
-///   second draw, `X` = hi byte. Clobbers A, X, flags. ~80 cycles.
+///   Clobbers A and flags. ~40 cycles.
+/// - `__rand16`: advances once, returns `A` = new low byte,
+///   `X` = new high byte — 16 bits from the same shift. Clobbers
+///   A, X, and flags. ~50 cycles.
 /// - `__rand_seed`: consumes `A` = low byte, `X` = high byte of the
-///   new seed and writes them to the state slots. Does not advance.
-///   Callers are responsible for not seeding with zero (the PRNG
-///   gets stuck), but the builtin lowering forces a `| 1` on the
-///   low byte to sidestep the common `seed = frame_counter` case.
+///   new seed and writes them to the state slots. Forces bit 0 of
+///   the low byte high so a zero seed (which would stick the LFSR)
+///   becomes `(1, 0)`.
 #[must_use]
 pub fn gen_prng() -> Vec<Instruction> {
     let mut out = Vec::new();
 
     // ── __rand8 ──────────────────────────────────────────────
-    // xorshift16 step:
-    //   state ^= state << 7   (A-register shift)
-    //   state ^= state >> 9   (byte swap + right shift 1)
-    //   state ^= state << 8   (swap: new_lo = hi, new_hi = hi ^ lo)
-    // Returns the new low byte in A.
+    // One Galois LFSR step: shift the 16-bit state right, XOR the
+    // high byte with 0xB4 if the shifted-out bit was a 1. The
+    // low tap byte is 0x00 so only the high byte needs EORing.
     out.push(Instruction::new(NOP, AM::Label("__rand8".into())));
-
-    // --- state ^= state << 7 ---
-    // 7 left shifts of a 16-bit value is equivalent to a 1-bit
-    // right rotation with fill-from-low-bit-of-hi, which the
-    // 6502 can do with a bit of carry juggling. Simpler: shift
-    // the whole 16-bit state left once and XOR back into itself,
-    // seven times. But for size we use the rotate trick:
-    //   LDA hi : LSR A : LDA lo : ROR A : STA hi : ... no wait,
-    // let's just do it the straightforward way: 7 ASLs of the
-    // 16-bit state folded into a XOR.
-    //
-    // Clearer and smaller: compute tmp = state << 7 by:
-    //   tmp_lo = lo << 7 = (lo & 1) << 7                  [only bit 0 survives]
-    //   tmp_hi = (hi << 7) | (lo >> 1)                    [hi's bit 0 is lo's bit 1]
-    // Actually, <<7 on 16-bit: bits 0..8 of input become bits 7..15 of output.
-    //   output bit 7       = input bit 0   (was lo bit 0)
-    //   output bits 8..14  = input bits 1..7 (was lo bits 1..7)
-    //   output bit 15      = input bit 8  (was hi bit 0)
-    //
-    // Equivalently: tmp_lo = lo << 7, tmp_hi = (lo >> 1) | (hi << 7).
-    // Then state ^= tmp.
-    //
-    // Since tmp_lo has only bit 7 possibly set, and tmp_hi has
-    // bits 0..6 from lo and bit 7 from hi bit 0:
-    //
-    //   LDA PRNG_STATE_LO        ; A = lo
-    //   LSR A                    ; A = lo >> 1, C = lo bit 0
-    //   ROR PRNG_STATE_LO        ; no — we need to NOT change state yet
-    //
-    // Simpler: do the full algorithm using a scratch copy.
-    //
-    // For brevity and cycle cost we use a different but equivalent
-    // LFSR: a Galois-configuration 16-bit LFSR with polynomial
-    // 0x002D (taps at 0, 2, 3, 5) which also has a full period of
-    // 65535 from any non-zero seed. The advantage is a very small
-    // step: one shift and a conditional XOR with two bytes.
-    //
-    // Step:
-    //   carry = state & 1
-    //   state >>= 1
-    //   if carry: state ^= 0xB400
-    //
-    // The 0xB400 tap mask comes from the standard 16-bit LFSR
-    // polynomial x^16 + x^14 + x^13 + x^11 + 1 reversed for
-    // right-shift Galois form. It has full 65535 period.
-
-    // LSR the high byte first, then ROR the low byte, so the
-    // low-bit-of-low-byte ends up in carry.
+    // LSR the high byte, ROR the low byte. Carry after ROR holds
+    // the old bit 0 of state_lo (the feedback bit).
     out.push(Instruction::new(LSR, AM::Absolute(PRNG_STATE_HI)));
     out.push(Instruction::new(ROR, AM::Absolute(PRNG_STATE_LO)));
-    // If the shifted-out bit was zero, skip the XOR.
+    // If the feedback bit was zero, skip the tap XOR.
     out.push(Instruction::new(
         BCC,
         AM::LabelRelative("__rand8_done".into()),
     ));
-    // state_hi ^= 0xB4
     out.push(Instruction::new(LDA, AM::Absolute(PRNG_STATE_HI)));
     out.push(Instruction::new(EOR, AM::Immediate(0xB4)));
     out.push(Instruction::new(STA, AM::Absolute(PRNG_STATE_HI)));
-    // (low tap byte is 0x00, nothing to XOR there)
     out.push(Instruction::new(NOP, AM::Label("__rand8_done".into())));
-    // Return with A = new state low byte.
     out.push(Instruction::new(LDA, AM::Absolute(PRNG_STATE_LO)));
     out.push(Instruction::implied(RTS));
 
     // ── __rand16 ─────────────────────────────────────────────
-    // Advance twice and return A=lo, X=hi. Two draws so the
-    // caller gets 16 bits of entropy instead of two halves of
-    // the same internal step.
+    // A single shift already produces 16 fresh bits (the full
+    // post-shift state). Call `__rand8` once and return both
+    // halves — A = lo, X = hi.
     out.push(Instruction::new(NOP, AM::Label("__rand16".into())));
     out.push(Instruction::new(JSR, AM::Label("__rand8".into())));
-    out.push(Instruction::new(JSR, AM::Label("__rand8".into())));
-    // At this point A = state_lo after the second draw; we want
-    // to also return the high byte, which is state_hi. Stash the
-    // low byte, load hi into X, restore lo into A.
-    out.push(Instruction::implied(TAY)); // save lo in Y
     out.push(Instruction::new(LDX, AM::Absolute(PRNG_STATE_HI)));
-    out.push(Instruction::implied(TYA)); // restore lo to A
     out.push(Instruction::implied(RTS));
 
     // ── __rand_seed ──────────────────────────────────────────
-    // Store A = lo, X = hi into the state.
+    // Store A = lo, X = hi into the state. Force bit 0 of the
+    // low byte high so a zero seed doesn't stick the LFSR.
     out.push(Instruction::new(NOP, AM::Label("__rand_seed".into())));
-    // Force bit 0 of the low byte high so a zero seed doesn't
-    // stick the LFSR.
     out.push(Instruction::new(ORA, AM::Immediate(0x01)));
     out.push(Instruction::new(STA, AM::Absolute(PRNG_STATE_LO)));
     out.push(Instruction::new(STX, AM::Absolute(PRNG_STATE_HI)));
@@ -1745,16 +1696,32 @@ pub fn gen_prng() -> Vec<Instruction> {
 /// Spliced in by the linker only when user code contains the
 /// `__palette_bright_used` marker label.
 ///
-/// The input level (passed in A) is mapped to a PPU mask byte:
-/// - `0` — everything off (blank screen)
-/// - `1..3` — fade-out via PPU mask "darken" bits (R/G/B emphasis),
-///   which darken the visible colour range by a few notches.
-/// - `4` (normal) — `$1E`, sprites + background, no emphasis
-/// - `5..7` — progressive emphasis bits to push towards white
-/// - `8` — all three emphasis bits set (max "bright")
+/// Each level (passed in A, clamped to 0..=8) writes a specific
+/// `$2001` PPU mask byte. The mapping is best thought of as a
+/// "visual intensity dial" rather than a linear fade: the NES PPU
+/// emphasis bits tint the display towards R / G / B rather than
+/// truly darken or brighten, so the progression is a series of
+/// distinct visual states. Levels 0 and 1 use low-level tricks
+/// (rendering off, greyscale) to approximate black and dim; levels
+/// 2-8 stack emphasis bits to shift the overall colour cast.
 ///
-/// The mapping is a 9-entry table indexed by the clamped level.
-/// Levels above 8 clamp to 8 (max brightness).
+/// | level | mask | effect                           |
+/// |-------|------|----------------------------------|
+/// | 0     | $00  | rendering fully off (black)      |
+/// | 1     | $01  | greyscale only (washed out)      |
+/// | 2     | $1E  | normal sprites + background      |
+/// | 3     | $3E  | + red emphasis                   |
+/// | 4     | $5E  | + green emphasis                 |
+/// | 5     | $9E  | + blue emphasis                  |
+/// | 6     | $7E  | + red + green (yellow tint)      |
+/// | 7     | $BE  | + red + blue (magenta tint)      |
+/// | 8     | $FE  | all three emphasis bits          |
+///
+/// Levels above 8 clamp to 8. Implemented as a CPX dispatch tree
+/// (one `CPX; BNE; LDA; STA; RTS` block per level) rather than a
+/// table lookup because the assembler doesn't expose a
+/// Label-relative `AbsoluteX` mode; the nine-entry tree is ~60
+/// bytes, comparable to a data-table + indexed-load path.
 #[must_use]
 pub fn gen_palette_brightness() -> Vec<Instruction> {
     let mut out = Vec::new();
@@ -1818,8 +1785,9 @@ pub fn gen_palette_brightness() -> Vec<Instruction> {
 /// Emit the reset-time PRNG state seed. Spliced into the reset
 /// path whenever `gen_prng` is linked in, so the first `rand8()`
 /// call returns a useful value even without an explicit
-/// `seed_rand`. The seed `0xACE1` is the classic nonzero
-/// xorshift16 seed.
+/// `seed_rand`. The seed `0xACE1` is an arbitrary non-zero 16-bit
+/// value — any non-zero value works since the Galois LFSR's orbit
+/// visits all 65535 non-zero states.
 #[must_use]
 pub fn gen_prng_init() -> Vec<Instruction> {
     vec![
@@ -2108,19 +2076,26 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
         }
         Mapper::AxROM => {
             // AxROM: write the 32 KB PRG bank number to $8000-$FFFF.
-            // Bit 4 selects the single-screen nametable; we preserve
-            // it by ORing whatever was latched last (implicit 0 from
-            // reset). Our bank-switching model only moves between
-            // 32 KB pages, so multi-bank AxROM programs would need
-            // to split along 32 KB boundaries — more of a layout
-            // concern than a runtime one.
+            // Bit 4 selects the single-screen nametable; bits 0-2
+            // select the PRG page. We don't preserve bit 4 here —
+            // user code that toggles between lower/upper nametables
+            // mid-run would need to OR it into A before calling.
+            // The linker's single-bank AxROM layout never actually
+            // invokes this routine today (no cross-bank trampolines
+            // for AxROM yet), but we emit it for parity with the
+            // other mappers.
             out.push(Instruction::new(STA, AM::Absolute(0x8000)));
             out.push(Instruction::implied(RTS));
         }
         Mapper::CNROM => {
             // CNROM: writing A to `$8000-$FFFF` selects an 8 KB CHR
-            // bank. PRG is fixed so this routine is only useful for
-            // graphics swaps.
+            // bank. PRG is fixed so this routine is only ever useful
+            // for user-driven CHR swaps. Note: real CNROM boards
+            // have bus conflicts (CPU write vs ROM byte at target
+            // address), so a production API should route through a
+            // UxROM-style bus-conflict-safe table. No such API is
+            // exposed to user source yet — declaring more than one
+            // CHR bank in a CNROM program is currently a TODO.
             out.push(Instruction::new(STA, AM::Absolute(0x8000)));
             out.push(Instruction::implied(RTS));
         }

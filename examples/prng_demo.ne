@@ -1,9 +1,11 @@
 // PRNG demo — sprite positions driven by the runtime PRNG.
 //
-// Each frame draws four sprites at addresses pulled from the
-// xorshift-style `rand8()` intrinsic, with an extra `rand16()`
-// sample binned into a horizontal velocity. Exercises `rand8`,
-// `rand16`, and `seed_rand` end-to-end.
+// Each frame draws four sprites at pseudorandom coordinates pulled
+// from the Galois-LFSR `rand8()` intrinsic, plus one sprite whose
+// (x, y) pair comes from a single `rand16()` draw. Exercises all
+// three PRNG intrinsics (`rand8`, `rand16`, `seed_rand`) end-to-end.
+// `seed_rand(0x1234)` on the first frame pins the sequence so the
+// committed golden is deterministic.
 
 game "PRNG Demo" {
     mapper: NROM

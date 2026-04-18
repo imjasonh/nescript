@@ -320,6 +320,18 @@ impl Linker {
             "NROM does not support switchable PRG banks (got {} banks)",
             switchable_banks.len()
         );
+        // CNROM has a fixed 32 KB PRG — user-declared switchable PRG
+        // banks are meaningless. AxROM switches 32 KB pages as a
+        // unit, which the current 16 KB-per-bank trampoline model
+        // doesn't support cleanly. Reject both up front so a silent
+        // layout mismatch doesn't produce a subtly broken ROM.
+        assert!(
+            switchable_banks.is_empty() || !matches!(self.mapper, Mapper::CNROM | Mapper::AxROM),
+            "{:?} does not yet support switchable PRG banks (got {} banks); \
+             use MMC1/UxROM/MMC3 for per-function banking",
+            self.mapper,
+            switchable_banks.len()
+        );
         self.link_banked_inner(
             user_code,
             sprites,

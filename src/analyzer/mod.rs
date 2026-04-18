@@ -976,8 +976,21 @@ impl Analyzer {
                 if is_intrinsic(name) {
                     // Intrinsics can appear in expression position too
                     // (e.g. `var x = rand8()`). Validate arity here so
-                    // typos and bad-arity calls don't slip past.
+                    // typos and bad-arity calls don't slip past. Also
+                    // reject the void-only intrinsics (`poke`,
+                    // `seed_rand`, `set_palette_brightness`) at
+                    // expression position so a typo like
+                    // `var x = seed_rand(42)` fails at compile time
+                    // instead of panicking the linker with an
+                    // unresolved label.
                     self.check_intrinsic_args(name, args, *span);
+                    if is_void_intrinsic(name) {
+                        self.diagnostics.push(Diagnostic::error(
+                            ErrorCode::E0203,
+                            format!("`{name}` does not return a value; it can only be used as a statement"),
+                            *span,
+                        ));
+                    }
                 } else if self.function_signatures.contains_key(name) {
                     self.check_call_signature(name, args, *span);
                 }
@@ -2580,6 +2593,15 @@ fn is_intrinsic(name: &str) -> bool {
         name,
         "poke" | "peek" | "rand8" | "rand16" | "seed_rand" | "set_palette_brightness"
     )
+}
+
+/// True if `name` is an intrinsic that does not produce a usable
+/// return value. These are valid only at statement position;
+/// using them as an expression is a type error caught by the
+/// analyzer so the codegen / linker never sees a stray
+/// `Expr::Call` for one of them.
+fn is_void_intrinsic(name: &str) -> bool {
+    matches!(name, "poke" | "seed_rand" | "set_palette_brightness")
 }
 
 /// True if `name` is one of the NES controller's eight buttons.
