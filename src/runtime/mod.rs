@@ -2045,6 +2045,22 @@ pub fn gen_vram_buf_drain() -> Vec<Instruction> {
     out.push(Instruction::new(LDA, AM::Immediate(0)));
     out.push(Instruction::new(STA, AM::Absolute(VRAM_BUF_HEAD)));
     out.push(Instruction::new(STA, AM::Absolute(VRAM_BUF_BASE)));
+    // Reset the PPU's internal scroll/address state. Each `$2006`
+    // write during the drain updated the PPU's `t` register
+    // (which holds the next scroll value); leaving it pointing
+    // at our last buffer entry's address would cause the next
+    // frame's rendering to start from a non-zero offset and the
+    // visible image would shift up/right by however many cells
+    // we wrote past `$2000`. The standard fix is to write `0` to
+    // `$2006` twice (resetting `t` to nametable 0 / cell 0) and
+    // then `0` to `$2005` twice (zero X / Y scroll). Two `$2006`
+    // writes also reset the `$2006`/`$2005` write-toggle latch
+    // to "high" so the next frame's drain sees a clean state.
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2006)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2005)));
+    out.push(Instruction::new(STA, AM::Absolute(0x2005)));
     out.push(Instruction::implied(RTS));
     out
 }
