@@ -565,6 +565,26 @@ impl Analyzer {
             self.next_zp_addr = overlay_zp_base;
             self.next_ram_addr = overlay_ram_base;
             for var in &state.locals {
+                // Array initializers on state-locals aren't lowered
+                // yet — the IR would need to emit a runtime memcpy
+                // from a ROM blob into the allocated RAM region on
+                // each on_enter, and today the lowerer just
+                // `continue`s past the decl. Refuse the program rather
+                // than silently dropping the initializer (PR-#31-shaped
+                // bug). See docs/future-work.md for the plan.
+                if let Some(Expr::ArrayLiteral(_, _)) = &var.init {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0601,
+                        format!(
+                            "state-local variable '{}' has an array \
+                             initializer; this isn't lowered yet. Move \
+                             the array to a program-level `var` or \
+                             assign the elements inside `on_enter`.",
+                            var.name
+                        ),
+                        var.span,
+                    ));
+                }
                 self.register_var(var);
             }
             if self.next_zp_addr > max_zp {
@@ -612,10 +632,13 @@ impl Analyzer {
                 self.current_scope_prefix = None;
             }
             // `on scanline(N)` is only valid with mappers that have a
-            // scanline-counting IRQ source (currently only MMC3).
+            // scanline-counting IRQ source (currently only MMC3). Keep
+            // this as a hard error — without MMC3 the codegen emits
+            // the handler functions but the IRQ dispatcher is never
+            // wired up, so the handlers silently never run.
             if !state.on_scanline.is_empty() && program.game.mapper != Mapper::MMC3 {
                 self.diagnostics.push(Diagnostic::error(
-                    ErrorCode::E0203,
+                    ErrorCode::E0603,
                     "`on scanline` requires the MMC3 mapper",
                     state.span,
                 ));
@@ -1523,7 +1546,7 @@ impl Analyzer {
             }
         }
 
-        let Some(address) = self.allocate_ram(size, var.span) else {
+        let Some(address) = self.allocate_ram_with_placement(size, var.placement, var.span) else {
             // Allocation failed (E0301 already emitted) — still add the
             // symbol so that later references don't cascade into E0502,
             // but don't record a var_allocations entry.
@@ -1644,9 +1667,23 @@ impl Analyzer {
     /// zero-page user region is bounded above by [`ZP_USER_CAP`] to
     /// leave room for IR codegen temp slots starting at $80.
     fn allocate_ram(&mut self, size: u16, span: Span) -> Option<u16> {
+        self.allocate_ram_with_placement(size, Placement::Auto, span)
+    }
+
+    fn allocate_ram_with_placement(
+        &mut self,
+        size: u16,
+        placement: Placement,
+        span: Span,
+    ) -> Option<u16> {
         // Zero-page u8 allocation — bounded by ZP_USER_CAP to avoid
-        // colliding with the IR temp region at $80+.
-        if size == 1 && self.next_zp_addr < ZP_USER_CAP {
+        // colliding with the IR temp region at $80+. `slow` forces
+        // main RAM so users can deliberately keep a u8 out of ZP
+        // (e.g. a cold variable they don't want wasting a ZP slot);
+        // without this branch the `slow` keyword parsed but had no
+        // observable effect, which is the same silent-drop shape
+        // that bit PR #31.
+        if size == 1 && self.next_zp_addr < ZP_USER_CAP && placement != Placement::Slow {
             let addr = u16::from(self.next_zp_addr);
             self.next_zp_addr = self.next_zp_addr.wrapping_add(1);
             return Some(addr);

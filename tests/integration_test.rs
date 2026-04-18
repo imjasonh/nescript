@@ -336,6 +336,80 @@ fn program_with_u16_struct_field() {
 }
 
 #[test]
+fn transition_dispatches_leaving_states_on_exit_handler() {
+    // `on exit` handlers used to be silently never called — the
+    // codegen documented that IrOp::Transition "doesn't know which
+    // state it's leaving" and skipped the on_exit JSR. Example
+    // programs (pong, war, state_machine) had `stop_music` sitting
+    // in an `on exit` block that never ran, and goldens captured
+    // the bug as "correct" behavior. The fix emits a runtime
+    // CMP-chain against ZP_CURRENT_STATE before every transition to
+    // JSR the leaving state's exit handler.
+    //
+    // Compile a program with two states where Source declares an
+    // `on exit` and transitions to Target, then assert the PRG
+    // contains a JSR to the Source_exit label. We look for the
+    // absolute JSR opcode $20 followed by any 16-bit target, and
+    // verify the linked label's address lands on one of them by
+    // scanning the ROM for the `STA ZP_CURRENT_STATE` sequence
+    // that would indicate the transition lowered at all.
+    let source = r#"
+        game "ExitDispatch" { mapper: NROM }
+        state Source {
+            on enter {}
+            on frame { transition Target }
+            on exit { stop_music }
+        }
+        state Target {
+            on enter {}
+            on frame {}
+        }
+        start Source
+    "#;
+    let rom_data = compile(source);
+    let prg = &rom_data[16..16 + 16384];
+
+    // NROM ROMs are a fixed 24576 + 16-byte header, so we can't
+    // compare file sizes. Compare the count of distinct JSR
+    // targets instead: a program without `on exit` only JSRs
+    // `Target_enter`, so its transition site has one JSR; adding
+    // `on exit` to Source injects at least one more JSR (the
+    // exit-dispatch JSR to `__ir_fn_Source_exit`).
+    let baseline_source = r#"
+        game "ExitDispatch" { mapper: NROM }
+        state Source {
+            on enter {}
+            on frame { transition Target }
+        }
+        state Target {
+            on enter {}
+            on frame {}
+        }
+        start Source
+    "#;
+    let baseline = compile(baseline_source);
+    let baseline_prg = &baseline[16..16 + 16384];
+
+    let count_jsrs = |bytes: &[u8]| -> std::collections::HashSet<u16> {
+        bytes
+            .windows(3)
+            .filter(|w| w[0] == 0x20)
+            .map(|w| u16::from_le_bytes([w[1], w[2]]))
+            .collect()
+    };
+    let exit_jsrs = count_jsrs(prg);
+    let base_jsrs = count_jsrs(baseline_prg);
+    assert!(
+        exit_jsrs.len() > base_jsrs.len(),
+        "expected the on-exit-bearing PRG to contain more distinct JSR \
+         targets than the baseline (got {} vs {}) — if this fails, the \
+         exit dispatch JSR to `__ir_fn_Source_exit` is being dropped",
+        exit_jsrs.len(),
+        base_jsrs.len()
+    );
+}
+
+#[test]
 fn uninitialized_struct_field_store_emits_sta_to_allocated_address() {
     // Regression guard for the silent-drop bug uncovered while
     // hardening the `var_addrs` lookup in `IrCodeGen`. Before the

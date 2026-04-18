@@ -1603,24 +1603,63 @@ impl<'a> IrCodeGen<'a> {
                 self.emit(STA, AM::Absolute(0x07EF));
             }
             IrOp::Transition(name) => {
-                // Write the target state's index to current_state, then
-                // call the target state's on_enter handler if it exists,
-                // then JMP to main loop for the new state's frame handler.
+                // Order of operations for `transition Foo`:
+                //   1. Dispatch the *current* state's `on exit` (if any
+                //      state declares one) by runtime check against
+                //      `ZP_CURRENT_STATE`. The IR op only knows the
+                //      target state's name, not the source, so we emit
+                //      a small CMP-chain that matches whichever state
+                //      is currently active and JSRs its exit handler.
+                //      This is the fix for the long-latent silent-drop
+                //      bug where on_exit handlers were lowered but
+                //      never called — caught by the analyzer tripwire
+                //      that rejected `on exit` declarations until this
+                //      dispatch existed. Example programs (pong, war,
+                //      state_machine) relied on `stop_music` inside
+                //      `on exit` that had been silently never running.
+                //   2. Write the target state's index to current_state.
+                //   3. Call the target state's on_enter (if defined).
+                //   4. JMP back to the main loop.
                 //
-                // Note: on_exit of the current state isn't called here
-                // because we don't know from an IR op alone which state
-                // we're leaving. Proper on_exit support would need
-                // per-state transition lowering. Future improvement.
-                if let Some(&idx) = self.state_indices.get(name) {
-                    self.emit(LDA, AM::Immediate(idx));
-                    self.emit(STA, AM::ZeroPage(ZP_CURRENT_STATE));
-                    // Call the target state's on_enter handler if defined
-                    let enter_fn = format!("{name}_enter");
-                    if self.function_exists(&enter_fn) {
-                        self.emit(JSR, AM::Label(format!("__ir_fn_{enter_fn}")));
+                // `transition <unknown>` is rejected by the analyzer
+                // as E0502, so a miss in `state_indices` here is a
+                // compiler bug, not valid input.
+                let mut exit_fns: Vec<(u8, String)> = self
+                    .state_indices
+                    .iter()
+                    .filter(|(state, _)| self.function_exists(&format!("{state}_exit")))
+                    .map(|(state, &i)| (i, format!("{state}_exit")))
+                    .collect();
+                exit_fns.sort_by_key(|(i, _)| *i);
+                if !exit_fns.is_empty() {
+                    let suffix = self.local_label_suffix();
+                    let done = format!("__ir_xit_done_{suffix}");
+                    self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
+                    for (i, (state_idx, exit_fn)) in exit_fns.iter().enumerate() {
+                        let skip = format!("__ir_xit_skip_{suffix}_{i}");
+                        self.emit(CMP, AM::Immediate(*state_idx));
+                        self.emit(BNE, AM::LabelRelative(skip.clone()));
+                        self.emit(JSR, AM::Label(format!("__ir_fn_{exit_fn}")));
+                        self.emit(JMP, AM::Label(done.clone()));
+                        self.emit_label(&skip);
                     }
-                    self.emit(JMP, AM::Label("__ir_main_loop".into()));
+                    self.emit_label(&done);
                 }
+
+                let &idx = self.state_indices.get(name).unwrap_or_else(|| {
+                    panic!(
+                        "internal compiler error: IrOp::Transition references \
+                         state {name:?} which has no dispatch index (did the \
+                         analyzer forget to reject an unknown state name?)"
+                    )
+                });
+                self.emit(LDA, AM::Immediate(idx));
+                self.emit(STA, AM::ZeroPage(ZP_CURRENT_STATE));
+                let enter_fn = format!("{name}_enter");
+                if self.function_exists(&enter_fn) {
+                    self.emit(JSR, AM::Label(format!("__ir_fn_{enter_fn}")));
+                }
+                self.emit(JMP, AM::Label("__ir_main_loop".into()));
             }
             IrOp::Scroll(x, y) => {
                 // PPU scroll register $2005 takes two writes: X then Y
@@ -2216,7 +2255,16 @@ impl<'a> IrCodeGen<'a> {
         self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
         let done_label = "__irq_user_done".to_string();
         for (state_idx_iter, (state_name, lines)) in groups.iter().enumerate() {
-            let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
+            // Scanline groups are built from declared state names, so any
+            // miss here is a compiler-internal inconsistency. Failing to 0
+            // would silently route this state's scanline handlers to
+            // state 0, which is a PR-#31-shaped silent miscompile.
+            let state_idx = *self.state_indices.get(state_name).unwrap_or_else(|| {
+                panic!(
+                    "internal compiler error: scanline group for state \
+                     {state_name:?} has no dispatch index"
+                )
+            });
             let next_state_label = format!("__irq_ns_{state_idx_iter}");
             self.emit(CMP, AM::Immediate(state_idx));
             self.emit(BNE, AM::LabelRelative(next_state_label.clone()));
@@ -2289,7 +2337,15 @@ impl<'a> IrCodeGen<'a> {
         self.emit(LDA, AM::ZeroPage(ZP_CURRENT_STATE));
         let reload_done = "__ir_mmc3_reload_done".to_string();
         for (i, (state_name, lines)) in groups.iter().enumerate() {
-            let state_idx = self.state_indices.get(state_name).copied().unwrap_or(0);
+            // Same invariant as the IRQ dispatcher above: scanline groups
+            // are built from declared states, so a missing entry is a
+            // compiler bug rather than valid input.
+            let state_idx = *self.state_indices.get(state_name).unwrap_or_else(|| {
+                panic!(
+                    "internal compiler error: scanline reload for state \
+                     {state_name:?} has no dispatch index"
+                )
+            });
             let skip_label = format!("__ir_reload_skip_{i}");
             self.emit(CMP, AM::Immediate(state_idx));
             self.emit(BNE, AM::LabelRelative(skip_label.clone()));
