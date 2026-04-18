@@ -345,6 +345,39 @@ pub enum IrOp {
         scroll_y: IrTemp,
     },
 
+    /// `nt_set(x, y, tile)` — append a single-tile nametable
+    /// write to the VRAM update buffer. Codegen computes the
+    /// PPU address `$2000 + y*32 + x` and lays down a
+    /// `[len=1][addr_hi][addr_lo][tile]` record at the current
+    /// `VRAM_BUF_HEAD`, then bumps the head by 4 and writes a
+    /// fresh `0` sentinel. The NMI handler drains the buffer
+    /// during vblank.
+    NtSet {
+        x: IrTemp,
+        y: IrTemp,
+        tile: IrTemp,
+    },
+    /// `nt_attr(x, y, value)` — same shape as `NtSet` but the
+    /// PPU address resolves to the attribute table at
+    /// `$23C0 + (y/4)*8 + (x/4)`. Useful for changing a 4×4-cell
+    /// metatile group's sub-palette without rewriting the
+    /// underlying tiles.
+    NtAttr {
+        x: IrTemp,
+        y: IrTemp,
+        value: IrTemp,
+    },
+    /// `nt_fill_h(x, y, len, tile)` — append a horizontal run of
+    /// `len` copies of `tile` starting at nametable cell `(x, y)`.
+    /// `len` is a runtime byte; the runtime must keep `len < 253`
+    /// to leave space for the buffer header.
+    NtFillH {
+        x: IrTemp,
+        y: IrTemp,
+        len: IrTemp,
+        tile: IrTemp,
+    },
+
     /// Edge-triggered input read: `p1.a.pressed` / `p1.a.released`.
     /// `dest` receives a boolean (0 or the button mask) — set when
     /// the button is pressed-but-was-not this frame (for

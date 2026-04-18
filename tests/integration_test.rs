@@ -3506,6 +3506,168 @@ start Main
 }
 
 #[test]
+fn nt_set_emits_buffer_append_and_drain_marker() {
+    // `nt_set(x, y, tile)` should:
+    //   1. Mark `__vram_buf_used` so the linker splices the
+    //      drain routine and gates the NMI JSR.
+    //   2. Emit a 4-byte append: write `[1][addr_hi][addr_lo][tile]`
+    //      starting at VRAM_BUF_BASE+head, bump the head, write a
+    //      fresh `0` sentinel after.
+    let source = r#"
+game "VramSet" { mapper: NROM }
+on frame {
+    nt_set(2, 1, 7)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    // The drain routine must be linked in.
+    assert!(
+        linked.labels.contains_key("__vram_buf_drain"),
+        "nt_set should pull __vram_buf_drain into the ROM"
+    );
+    // The NMI must JSR the drain. JSR opcode is 0x20; target
+    // address is the drain label resolved by the linker.
+    let drain_addr = *linked.labels.get("__vram_buf_drain").unwrap();
+    let lo = (drain_addr & 0xFF) as u8;
+    let hi = (drain_addr >> 8) as u8;
+    assert!(
+        linked
+            .rom
+            .windows(3)
+            .any(|w| w[0] == 0x20 && w[1] == lo && w[2] == hi),
+        "NMI should JSR __vram_buf_drain"
+    );
+}
+
+#[test]
+fn vram_buf_omitted_without_use() {
+    // Programs that never call any of the buffer intrinsics should
+    // not link in the drain routine and should keep main RAM
+    // starting at $0300.
+    let source = r#"
+game "NoVram" { mapper: NROM }
+var x: u8 = 0
+on frame { x = x + 1 }
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.unwrap();
+    let analysis = analyzer::analyze(&program);
+    let x_alloc = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "x")
+        .expect("x should be allocated");
+    // Without the buffer, `x` lives in zero page (the default
+    // for u8 globals); pre-buffer programs never had main-RAM
+    // allocations bumped to $0500.
+    assert!(
+        x_alloc.address < 0x100,
+        "u8 global should still land in zero page when buffer unused"
+    );
+    let mut ir_program = ir::lower(&program, &analysis);
+    optimizer::optimize(&mut ir_program);
+    let sprites = assets::resolve_sprites(&program, Path::new(".")).unwrap();
+    let sfx = assets::resolve_sfx(&program).unwrap();
+    let music = assets::resolve_music(&program).unwrap();
+    let mut codegen = IrCodeGen::new(&analysis.var_allocations, &ir_program)
+        .with_sprites(&sprites)
+        .with_audio(&sfx, &music);
+    let mut instructions = codegen.generate(&ir_program);
+    nescript::codegen::peephole::optimize(&mut instructions);
+    let linked = Linker::new(program.game.mirroring).link_banked_with_ppu_detailed(
+        &instructions,
+        &sprites,
+        &sfx,
+        &music,
+        &[],
+        &[],
+        &[],
+    );
+    assert!(
+        !linked.labels.contains_key("__vram_buf_drain"),
+        "drain routine must not be linked when no buffer intrinsic was used"
+    );
+}
+
+#[test]
+fn vram_buf_bumps_user_ram_past_buffer_when_used() {
+    // When user code touches the buffer, the analyzer should bump
+    // the main-RAM allocator to $0500 so user globals don't alias
+    // the buffer at $0400-$04FF. Force a main-RAM allocation by
+    // declaring a large array (too big for ZP).
+    let source = r#"
+game "VramBigVar" { mapper: NROM }
+var big: u8[200]
+on frame {
+    nt_set(0, 0, 1)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    let big_alloc = analysis
+        .var_allocations
+        .iter()
+        .find(|a| a.name == "big")
+        .expect("big should be allocated");
+    assert!(
+        big_alloc.address >= 0x0500,
+        "user array should land at $0500+ when VRAM buffer is in use, got ${:04X}",
+        big_alloc.address
+    );
+    assert!(
+        big_alloc.address + big_alloc.size <= 0x0800,
+        "and should fit in main RAM"
+    );
+}
+
+#[test]
+fn nt_set_arity_enforced() {
+    let source = r#"
+game "BadVram" { mapper: NROM }
+on frame {
+    nt_set(1, 2)
+}
+start Main
+"#;
+    let (program, _) = nescript::parser::parse(source);
+    let program = program.expect("parse should succeed");
+    let analysis = analyzer::analyze(&program);
+    assert!(
+        analysis
+            .diagnostics
+            .iter()
+            .any(|d| d.is_error() && d.message.contains("nt_set")),
+        "wrong-arity nt_set should error; got {:?}",
+        analysis.diagnostics
+    );
+}
+
+#[test]
 fn save_block_allocates_at_sram_window_and_sets_battery_bit() {
     // `save { var x: u16 = 0 }` should land at $6000+ (iNES SRAM
     // window) and flip iNES header byte-6 bit-1 so emulators
@@ -3586,8 +3748,7 @@ start Main
         analysis
             .diagnostics
             .iter()
-            .any(|d| !d.is_error()
-                && matches!(d.code, nescript::errors::ErrorCode::W0111)),
+            .any(|d| !d.is_error() && matches!(d.code, nescript::errors::ErrorCode::W0111)),
         "save-block initializer should emit W0111; got {:?}",
         analysis.diagnostics
     );

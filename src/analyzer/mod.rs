@@ -108,6 +108,13 @@ pub fn analyze(program: &Program) -> AnalysisResult {
     } else {
         0x10
     };
+    // Detect VRAM-buffer intrinsic usage by scanning the AST. When
+    // present, the buffer reserves `$0400-$04FF` and we have to
+    // start the user-RAM bump pointer past that region — otherwise
+    // user globals and the buffer would alias. Programs that don't
+    // use the buffer keep the legacy `$0300` start.
+    let uses_vram_buf = program_uses_vram_buf(program);
+    let initial_ram_addr: u16 = if uses_vram_buf { 0x0500 } else { 0x0300 };
     let mut analyzer = Analyzer {
         symbols: HashMap::new(),
         var_allocations: Vec::new(),
@@ -117,7 +124,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         music_names,
         palette_names,
         background_names,
-        next_ram_addr: 0x0300, // $0300 is first usable RAM after OAM buffer
+        next_ram_addr: initial_ram_addr,
         next_zp_addr,
         call_graph: HashMap::new(),
         max_depths: HashMap::new(),
@@ -2699,6 +2706,42 @@ fn collect_calls_block(block: &Block, calls: &mut Vec<String>) {
     }
 }
 
+/// True if the program references any of the VRAM-buffer
+/// intrinsics anywhere user code can reach. Used at analyzer
+/// init time to bump the user-RAM bump pointer past the buffer
+/// region (`$0400-$04FF`) so user globals don't alias the
+/// runtime's ring. Walks both function bodies and state handlers.
+fn program_uses_vram_buf(program: &Program) -> bool {
+    fn block_uses(block: &Block) -> bool {
+        let mut calls = Vec::new();
+        collect_calls_block(block, &mut calls);
+        calls
+            .iter()
+            .any(|c| matches!(c.as_str(), "nt_set" | "nt_attr" | "nt_fill_h"))
+    }
+    for fun in &program.functions {
+        if block_uses(&fun.body) {
+            return true;
+        }
+    }
+    for state in &program.states {
+        for b in [&state.on_enter, &state.on_exit, &state.on_frame]
+            .into_iter()
+            .flatten()
+        {
+            if block_uses(b) {
+                return true;
+            }
+        }
+        for (_, b) in &state.on_scanline {
+            if block_uses(b) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Return true if the given block contains any statement that can
 /// either exit the enclosing loop (`break`, `return`, `transition`)
 /// or yield control back to the frame loop (`wait_frame`).
@@ -2729,6 +2772,9 @@ fn is_intrinsic(name: &str) -> bool {
             | "fade_out"
             | "fade_in"
             | "sprite_0_split"
+            | "nt_set"
+            | "nt_attr"
+            | "nt_fill_h"
     )
 }
 
@@ -2740,7 +2786,15 @@ fn is_intrinsic(name: &str) -> bool {
 fn is_void_intrinsic(name: &str) -> bool {
     matches!(
         name,
-        "poke" | "seed_rand" | "set_palette_brightness" | "fade_out" | "fade_in" | "sprite_0_split"
+        "poke"
+            | "seed_rand"
+            | "set_palette_brightness"
+            | "fade_out"
+            | "fade_in"
+            | "sprite_0_split"
+            | "nt_set"
+            | "nt_attr"
+            | "nt_fill_h"
     )
 }
 
@@ -2817,6 +2871,26 @@ impl Analyzer {
                     ErrorCode::E0203,
                     format!(
                         "`sprite_0_split` takes exactly 2 arguments (scroll_x: u8, scroll_y: u8), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            "nt_set" | "nt_attr" if args.len() != 3 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`{name}` takes exactly 3 arguments (x: u8, y: u8, value: u8), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            "nt_fill_h" if args.len() != 4 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`nt_fill_h` takes exactly 4 arguments (x: u8, y: u8, len: u8, tile: u8), got {}",
                         args.len()
                     ),
                     span,

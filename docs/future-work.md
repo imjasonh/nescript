@@ -336,27 +336,31 @@ documented as a **design choice** anywhere. Add a paragraph to the
 language guide explaining why, plus a pointer to the hand-rolled
 explicit-stack pattern (small `u8[N]` stack + `u8` top).
 
-### G. VRAM update buffer primitive
+### G. VRAM update buffer follow-ups
 
-The highest-leverage missing runtime feature. Today
-`load_background` / `set_palette` queue PPU writes under the hood,
-but there is no user-visible "write these N bytes into nametable
-slot `(x,y)` next vblank" primitive. That's the idiom behind every
-scoreboard, dialog box, destroyed-metatile animation, and streaming
-scroll in the nesdoug chapters. Concrete API sketch:
+`nt_set(x, y, tile)`, `nt_attr(x, y, value)`, and
+`nt_fill_h(x, y, len, tile)` ship today — see
+`examples/vram_buffer_demo.ne`. The runtime ring lives at
+`$0400-$04FF` (gated on the `__vram_buf_used` marker; the analyzer
+bumps the user-RAM bump pointer to `$0500` when the buffer is in
+use). Each append lays down `[len][addr_hi][addr_lo][data…]` and
+writes a fresh `0` sentinel; the NMI drains the buffer at vblank
+via `LDA $0400,X / STA $2007` indexed-absolute (4 cycles per data
+byte, no ZP cost).
 
-```
-buffer.nametable_write(x, y, [0x20, 0x21, 0x22])   // horizontal
-buffer.nametable_write_v(x, y, [0x20, 0x21, 0x22]) // vertical
-buffer.attribute_write(x, y, 0b00011011)           // one byte
-buffer.flush()                                     // force an eof
-```
+Still TODO:
 
-Runtime shape: a fixed ring buffer at a known RAM address
-(`$0400`?). Each entry is `[header, addr_hi, addr_lo, len, data…]`
-where `header` carries the `NT_UPD_HORZ` / `NT_UPD_VERT` /
-`NT_UPD_EOF` bits the neslib engine already uses. The NMI handler
-drains the buffer every frame and writes `$FF` as the sentinel.
+- **Vertical (column) writes** — `nt_write_v(x, y, ...)` would set
+  `$2000` bit 2 (auto-increment 32) before the data writes and
+  clear it after. Useful for tilemap-driven scrolling.
+- **Variable-length writes from a u8 array global** — today
+  `nt_fill_h` repeats one tile; a `nt_copy_h(x, y, src_var, len)`
+  variant that copies from a declared `u8[N]` global removes the
+  fill-only restriction.
+- **Buffer-overflow detection** — the runtime drain assumes the
+  256-byte buffer never overflows. A debug-mode check that traps
+  when `head` would advance past `$04FF` would catch the worst
+  failure mode (writes wrapping into adjacent RAM).
 
 ### H. Metatiles + collision as a first-class construct
 
@@ -559,12 +563,13 @@ to a specific bank to avoid bank-switch cost on a hot path.
 
 Remaining gap items in order of user value:
 
-1. VRAM update buffer (§G) — unblocks HUDs, dialog, streaming.
-2. Register allocator (existing section) — compounding size win.
-3. Signedness on Cmp16/Cmp ops (§A follow-up) — closes the i16
+1. Register allocator (existing section) — compounding size win.
+2. Signedness on Cmp16/Cmp ops (§A follow-up) — closes the i16
    correctness gap.
-4. Metatiles + collision (§H) — closes several items at once.
-5. Inline-asm format specifiers + directive list (§D follow-ups).
+3. Metatiles + collision (§H) — closes several items at once.
+4. Inline-asm format specifiers + directive list (§D follow-ups).
+5. VRAM buffer follow-ups (§G) — vertical writes, array copy,
+   overflow detection.
 6. Arrays-of-structs + bitfields (§C) + fn pointers (§B) —
    turns NEScript into a general-purpose NES language.
 7. UNROM-512 + MMC5 (§V) — ecosystem fit.

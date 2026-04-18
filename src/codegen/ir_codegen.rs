@@ -235,6 +235,13 @@ pub struct IrCodeGen<'a> {
     /// splice the prev-input snapshot after the NMI's shift loop
     /// so edge detection sees stable current/previous bytes.
     edge_input_used: bool,
+    /// Set to true the first time we lower a VRAM-buffer
+    /// intrinsic (`nt_set`, `nt_attr`, `nt_fill_h`). Drives the
+    /// `__vram_buf_used` marker label — the linker uses it to
+    /// splice `runtime::gen_vram_buf_drain` into PRG, call it
+    /// from NMI, and reserve the 256-byte buffer at `$0400-$04FF`
+    /// from the analyzer's RAM allocator.
+    vram_buf_used: bool,
     /// Source-location markers produced from [`IrOp::SourceLoc`].
     /// Each entry is a `(label_name, span)` pair — the codegen
     /// emits a unique label-definition pseudo-op at the current
@@ -465,6 +472,7 @@ impl<'a> IrCodeGen<'a> {
             palette_bright_used: false,
             fade_used: false,
             edge_input_used: false,
+            vram_buf_used: false,
             source_locs: Vec::new(),
             next_source_loc: 0,
             emit_source_locs: false,
@@ -2041,6 +2049,18 @@ impl<'a> IrCodeGen<'a> {
                 self.load_temp(*scroll_y);
                 self.emit(STA, AM::Absolute(0x2005));
             }
+            IrOp::NtSet { x, y, tile } => {
+                self.emit_vram_buf_marker();
+                self.gen_nt_buf_append_single(*x, *y, *tile, /* attr= */ false);
+            }
+            IrOp::NtAttr { x, y, value } => {
+                self.emit_vram_buf_marker();
+                self.gen_nt_buf_append_single(*x, *y, *value, /* attr= */ true);
+            }
+            IrOp::NtFillH { x, y, len, tile } => {
+                self.emit_vram_buf_marker();
+                self.gen_nt_buf_append_fill_h(*x, *y, *len, *tile);
+            }
             IrOp::ReadInputEdge {
                 dest,
                 player,
@@ -2459,6 +2479,9 @@ impl<'a> IrCodeGen<'a> {
         if self.edge_input_used {
             self.emit_label("__edge_input_used");
         }
+        if self.vram_buf_used {
+            self.emit_label("__vram_buf_used");
+        }
     }
 
     /// Emit the `__rand_used` marker label at most once per
@@ -2482,6 +2505,146 @@ impl<'a> IrCodeGen<'a> {
     fn emit_fade_marker(&mut self) {
         self.fade_used = true;
         self.palette_bright_used = true;
+    }
+
+    /// Emit the `__vram_buf_used` marker. The linker uses it to
+    /// splice `runtime::gen_vram_buf_drain` and call it from the
+    /// NMI handler; the analyzer (separately, by scanning the AST
+    /// for any of the buffer intrinsics) bumps the user RAM start
+    /// past the 256-byte buffer at `$0400-$04FF`.
+    fn emit_vram_buf_marker(&mut self) {
+        self.vram_buf_used = true;
+    }
+
+    /// Append a single-byte VRAM-buffer entry. Used by both `nt_set`
+    /// and `nt_attr` — the only difference is which PPU base
+    /// address the `(x, y)` cell maps to. With `attr=false` the
+    /// target is the nametable at `$2000 + y*32 + x`; with
+    /// `attr=true` it's the attribute table at
+    /// `$23C0 + (y/4)*8 + (x/4)`.
+    ///
+    /// Layout written to the buffer at `VRAM_BUF_HEAD`:
+    /// `[len=1][addr_hi][addr_lo][data]`. After the append we
+    /// bump the head by 4 and store a fresh `0` sentinel so the
+    /// next NMI drain sees a well-formed buffer regardless of
+    /// whether more entries get appended later in the frame.
+    ///
+    /// The address arithmetic stays in the accumulator end-to-end
+    /// (no extra ZP scratch needed): `addr_hi` is `$20 + (y >> 3)`
+    /// for nametables or just `$23` for the attribute table; and
+    /// `addr_lo` is `(y << 5) | x` for nametables or
+    /// `$C0 + (y / 4) * 8 + (x / 4)` for the attribute table.
+    fn gen_nt_buf_append_single(&mut self, x: IrTemp, y: IrTemp, data: IrTemp, attr: bool) {
+        let x_addr = self.temp_addr(x);
+        let y_addr = self.temp_addr(y);
+        let data_addr = self.temp_addr(data);
+        // X = head offset.
+        self.emit(LDX, AM::Absolute(crate::runtime::VRAM_BUF_HEAD));
+        // Write `len = 1`.
+        self.emit(LDA, AM::Immediate(1));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // Write `addr_hi`.
+        if attr {
+            self.emit(LDA, AM::Immediate(0x23));
+        } else {
+            self.emit(LDA, AM::ZeroPage(y_addr));
+            self.emit(LSR, AM::Accumulator);
+            self.emit(LSR, AM::Accumulator);
+            self.emit(LSR, AM::Accumulator);
+            self.emit(CLC, AM::Implied);
+            self.emit(ADC, AM::Immediate(0x20));
+        }
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // Write `addr_lo`.
+        if attr {
+            // (y / 4) * 8 = (y & ~3) << 1
+            self.emit(LDA, AM::ZeroPage(y_addr));
+            self.emit(AND, AM::Immediate(0x1C));
+            self.emit(ASL, AM::Accumulator);
+            // + (x >> 2)
+            self.emit(STA, AM::ZeroPage(0x02)); // safe scratch outside NMI / mul
+            self.emit(LDA, AM::ZeroPage(x_addr));
+            self.emit(LSR, AM::Accumulator);
+            self.emit(LSR, AM::Accumulator);
+            self.emit(CLC, AM::Implied);
+            self.emit(ADC, AM::ZeroPage(0x02));
+            // + $C0
+            self.emit(CLC, AM::Implied);
+            self.emit(ADC, AM::Immediate(0xC0));
+        } else {
+            // (y << 5) + x
+            self.emit(LDA, AM::ZeroPage(y_addr));
+            self.emit(ASL, AM::Accumulator);
+            self.emit(ASL, AM::Accumulator);
+            self.emit(ASL, AM::Accumulator);
+            self.emit(ASL, AM::Accumulator);
+            self.emit(ASL, AM::Accumulator);
+            self.emit(CLC, AM::Implied);
+            self.emit(ADC, AM::ZeroPage(x_addr));
+        }
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // Write the single data byte.
+        self.emit(LDA, AM::ZeroPage(data_addr));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // Update head and lay down a fresh sentinel.
+        self.emit(STX, AM::Absolute(crate::runtime::VRAM_BUF_HEAD));
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+    }
+
+    /// Append a horizontal-fill VRAM-buffer entry. Layout:
+    /// `[len][addr_hi][addr_lo][tile][tile]...[tile]` where the
+    /// tile byte is repeated `len` times. The PPU's auto-increment
+    /// (1 by default) advances the VRAM cursor one cell per byte.
+    fn gen_nt_buf_append_fill_h(&mut self, x: IrTemp, y: IrTemp, len: IrTemp, tile: IrTemp) {
+        let x_addr = self.temp_addr(x);
+        let y_addr = self.temp_addr(y);
+        let len_addr = self.temp_addr(len);
+        let tile_addr = self.temp_addr(tile);
+        self.emit(LDX, AM::Absolute(crate::runtime::VRAM_BUF_HEAD));
+        // len
+        self.emit(LDA, AM::ZeroPage(len_addr));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // addr_hi = $20 + (y >> 3)
+        self.emit(LDA, AM::ZeroPage(y_addr));
+        self.emit(LSR, AM::Accumulator);
+        self.emit(LSR, AM::Accumulator);
+        self.emit(LSR, AM::Accumulator);
+        self.emit(CLC, AM::Implied);
+        self.emit(ADC, AM::Immediate(0x20));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // addr_lo = (y << 5) + x
+        self.emit(LDA, AM::ZeroPage(y_addr));
+        self.emit(ASL, AM::Accumulator);
+        self.emit(ASL, AM::Accumulator);
+        self.emit(ASL, AM::Accumulator);
+        self.emit(ASL, AM::Accumulator);
+        self.emit(ASL, AM::Accumulator);
+        self.emit(CLC, AM::Implied);
+        self.emit(ADC, AM::ZeroPage(x_addr));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        // Inner loop: write `len` copies of `tile`. We use Y as the
+        // fill counter so X stays as the buffer offset.
+        let suffix = self.local_label_suffix();
+        let fill_label = format!("__ir_nt_fill_{suffix}");
+        self.emit(LDY, AM::ZeroPage(len_addr));
+        self.emit_label(&fill_label);
+        self.emit(LDA, AM::ZeroPage(tile_addr));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
+        self.emit(INX, AM::Implied);
+        self.emit(DEY, AM::Implied);
+        self.emit(BNE, AM::LabelRelative(fill_label));
+        // Update head + sentinel.
+        self.emit(STX, AM::Absolute(crate::runtime::VRAM_BUF_HEAD));
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(STA, AM::AbsoluteX(crate::runtime::VRAM_BUF_BASE));
     }
 
     /// Emit the MMC3 `__irq_user` handler that dispatches on the
@@ -2942,6 +3105,9 @@ fn function_is_leaf(func: &IrFunction) -> bool {
                 | IrOp::StopMusic
                 | IrOp::ReadInputEdge { .. }
                 | IrOp::Sprite0Split { .. }
+                | IrOp::NtSet { .. }
+                | IrOp::NtAttr { .. }
+                | IrOp::NtFillH { .. }
                 | IrOp::SourceLoc(..) => false,
             };
             if is_jsr_emitting {
@@ -3215,6 +3381,9 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
         IrOp::SetPaletteBrightness(level) => vec![*level],
         IrOp::FadeOut(n) | IrOp::FadeIn(n) => vec![*n],
         IrOp::Sprite0Split { scroll_x, scroll_y } => vec![*scroll_x, *scroll_y],
+        IrOp::NtSet { x, y, tile } => vec![*x, *y, *tile],
+        IrOp::NtAttr { x, y, value } => vec![*x, *y, *value],
+        IrOp::NtFillH { x, y, len, tile } => vec![*x, *y, *len, *tile],
     }
 }
 

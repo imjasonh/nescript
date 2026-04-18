@@ -602,6 +602,22 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
             used.insert(*scroll_x);
             used.insert(*scroll_y);
         }
+        IrOp::NtSet { x, y, tile } => {
+            used.insert(*x);
+            used.insert(*y);
+            used.insert(*tile);
+        }
+        IrOp::NtAttr { x, y, value } => {
+            used.insert(*x);
+            used.insert(*y);
+            used.insert(*value);
+        }
+        IrOp::NtFillH { x, y, len, tile } => {
+            used.insert(*x);
+            used.insert(*y);
+            used.insert(*len);
+            used.insert(*tile);
+        }
     }
 }
 
@@ -663,6 +679,9 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::FadeOut(_)
         | IrOp::FadeIn(_)
         | IrOp::Sprite0Split { .. }
+        | IrOp::NtSet { .. }
+        | IrOp::NtAttr { .. }
+        | IrOp::NtFillH { .. }
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
         | IrOp::SourceLoc(_) => None,

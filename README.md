@@ -62,6 +62,7 @@ start Main
 - **IR-based optimizer** -- constant folding, dead code elimination, strength reduction (incl. div/mod by power-of-two), copy propagation, peephole passes including INC/DEC fold and live-range slot recycling
 - **Full 16-bit arithmetic** -- `u16` and `i16` add/sub/compare lower to carry-propagating paired operations; negative `i16` literals fold to wide two's complement
 - **Battery-backed saves** -- `save { var ... }` blocks land at `$6000+`, flip the iNES battery flag, and persist across power cycles
+- **VRAM update buffer** -- `nt_set(x, y, tile)`, `nt_attr(x, y, val)`, `nt_fill_h(x, y, len, tile)` queue PPU writes during `on frame`; the NMI drains them at vblank without touching `$2006`/`$2007` from user code
 - **Multiple mappers** -- NROM, MMC1, UxROM, MMC3 (including multi-scanline IRQ dispatch per state), AxROM (mapper 7), CNROM (mapper 3), GNROM / MHROM (mapper 66)
 - **Runtime PRNG** -- `rand8()`, `rand16()`, `seed_rand(s)` backed by a zero-cost-when-unused Galois LFSR
 - **Edge-triggered input** -- `p1.button.a.pressed` / `.released` for menu / one-shot input handling

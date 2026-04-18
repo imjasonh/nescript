@@ -1188,6 +1188,28 @@ impl LoweringContext {
                             scroll_y: y,
                         });
                     }
+                    // VRAM update buffer intrinsics. Each call appends
+                    // one entry to the runtime ring at $0400 that the
+                    // NMI handler drains during vblank.
+                    "nt_set" if args.len() == 3 => {
+                        let x = self.lower_expr(&args[0]);
+                        let y = self.lower_expr(&args[1]);
+                        let tile = self.lower_expr(&args[2]);
+                        self.emit(IrOp::NtSet { x, y, tile });
+                    }
+                    "nt_attr" if args.len() == 3 => {
+                        let x = self.lower_expr(&args[0]);
+                        let y = self.lower_expr(&args[1]);
+                        let value = self.lower_expr(&args[2]);
+                        self.emit(IrOp::NtAttr { x, y, value });
+                    }
+                    "nt_fill_h" if args.len() == 4 => {
+                        let x = self.lower_expr(&args[0]);
+                        let y = self.lower_expr(&args[1]);
+                        let len = self.lower_expr(&args[2]);
+                        let tile = self.lower_expr(&args[3]);
+                        self.emit(IrOp::NtFillH { x, y, len, tile });
+                    }
                     // `rand8()` / `rand16()` at statement position —
                     // valid because they have side effects (advancing
                     // the PRNG state). The returned value is discarded

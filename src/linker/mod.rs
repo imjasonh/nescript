@@ -610,6 +610,14 @@ impl Linker {
             all_instructions.extend(runtime::gen_fade());
         }
 
+        // VRAM update buffer drain. Splices the `__vram_buf_drain`
+        // routine when any `nt_set` / `nt_attr` / `nt_fill_h`
+        // intrinsic was lowered. The NMI handler JSRs it during
+        // vblank.
+        if has_label(user_code, "__vram_buf_used") {
+            all_instructions.extend(runtime::gen_vram_buf_drain());
+        }
+
         // Audio subsystem — linked in whenever user code touched
         // audio (detected via the `__audio_used` marker emitted by
         // the IR codegen). The driver body, period table, and
@@ -740,6 +748,11 @@ impl Linker {
         // `p1.a.released` site lowers. Tells the NMI to snapshot the
         // previous-frame input byte before the new strobe.
         let has_edge_input = has_label(user_code, "__edge_input_used");
+        // `__vram_buf_used` is dropped by the IR codegen for any
+        // `nt_set` / `nt_attr` / `nt_fill_h` call site. Brings in
+        // both the `__vram_buf_drain` runtime routine and the
+        // NMI-side JSR that calls it during vblank.
+        let has_vram_buf = has_label(user_code, "__vram_buf_used");
         all_instructions.extend(runtime::gen_nmi(runtime::NmiOptions {
             has_ppu_updates,
             has_audio,
@@ -749,6 +762,7 @@ impl Linker {
             has_p2_input,
             has_p1_input,
             has_edge_input,
+            has_vram_buf,
         }));
 
         // IRQ handler
