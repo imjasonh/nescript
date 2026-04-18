@@ -340,13 +340,18 @@ explicit-stack pattern (small `u8[N]` stack + `u8` top).
 
 `nt_set(x, y, tile)`, `nt_attr(x, y, value)`, and
 `nt_fill_h(x, y, len, tile)` ship today — see
-`examples/vram_buffer_demo.ne`. The runtime ring lives at
-`$0400-$04FF` (gated on the `__vram_buf_used` marker; the analyzer
-bumps the user-RAM bump pointer to `$0500` when the buffer is in
-use). Each append lays down `[len][addr_hi][addr_lo][data…]` and
-writes a fresh `0` sentinel; the NMI drains the buffer at vblank
-via `LDA $0400,X / STA $2007` indexed-absolute (4 cycles per data
-byte, no ZP cost).
+`examples/vram_buffer_demo.ne` (minimal drain test) and
+`examples/hud_demo.ne` (realistic score/lives HUD with
+shadow-compare writes and one-shot attribute paint). The runtime
+ring lives at `$0400-$04FF` (gated on the `__vram_buf_used`
+marker; the analyzer bumps the user-RAM bump pointer to `$0500`
+when the buffer is in use). Each append lays down
+`[len][addr_hi][addr_lo][data…]` and writes a fresh `0` sentinel;
+the NMI drains the buffer at vblank via `LDA $0400,X / STA
+$2007` indexed-absolute (4 cycles per data byte, no ZP cost),
+then resets `$2006`/`$2005` to zero so the PPU's scroll latch is
+clean for the next frame (otherwise trailing `$2006` writes shift
+the rendered image by however many cells we wrote past `$2000`).
 
 Still TODO:
 
@@ -584,13 +589,12 @@ Remaining gap items in order of user value:
    would be cheap but would invalidate any copy-pasted ca65 fragments.
 2. **Debug port address.** $4800 is conventional but not universal. Should
    we support multiple debug output methods?
-3. **OAM allocation strategy.** Sequential allocation remains the default;
-   the `cycle_sprites` opt-in keyword rotates the DMA offset each frame so
-   scenes past the 8-per-scanline budget flicker instead of dropping the
-   same sprite every frame. Open question: should automatic cycling become
-   a `game` attribute (`sprite_flicker: true`) that emits the increment
-   without requiring a per-frame call, and/or add a `draw ... priority:
-   pinned` modifier for HUD sprites that must stay at low OAM slots?
+3. **Pinned OAM slots for HUD sprites.** Automatic sprite cycling is
+   decided — both the manual `cycle_sprites` keyword and the
+   `game { sprite_flicker: true }` attribute ship today (see §M).
+   Open question: should we add a `draw ... priority: pinned`
+   modifier that opts a specific sprite out of the rotation so HUD
+   elements stay at low OAM slots?
 4. **Error recovery granularity.** How aggressively should the parser
    recover? More recovery means more errors per compile but also risks
    cascading false errors.
