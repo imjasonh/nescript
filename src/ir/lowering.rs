@@ -95,6 +95,12 @@ struct LoweringContext {
     /// here keeps the per-statement lowering simple and avoids
     /// having to thread the program through every helper.
     metasprites: HashMap<String, MetaspriteInfo>,
+    /// When true (driven by `game { sprite_flicker: true }`), the
+    /// lowerer injects an `IrOp::CycleSprites` op at the top of
+    /// every `on frame` handler, giving the runtime the same
+    /// rotating-OAM effect as an explicit `cycle_sprites` call
+    /// without requiring user code to opt in at every site.
+    auto_sprite_flicker: bool,
 }
 
 /// A captured `inline fun` body that the lowerer can splice in
@@ -186,6 +192,7 @@ impl LoweringContext {
             start_state: String::new(),
             wide_hi: HashMap::new(),
             metasprites: HashMap::new(),
+            auto_sprite_flicker: false,
         }
     }
 
@@ -542,6 +549,10 @@ impl LoweringContext {
         // Capture state metadata before lowering
         self.state_names = program.states.iter().map(|s| s.name.clone()).collect();
         program.start_state.clone_into(&mut self.start_state);
+        // Pick up the `sprite_flicker` game attribute so each
+        // on-frame handler's prologue can inject a CycleSprites
+        // op without threading the flag through per-handler calls.
+        self.auto_sprite_flicker = program.game.sprite_flicker;
 
         // Capture metasprite declarations so the per-statement
         // Draw lowering can expand `draw Hero` into one
@@ -909,6 +920,18 @@ impl LoweringContext {
             }
         }
 
+        // When `game { sprite_flicker: true }` is set, implicitly
+        // call `cycle_sprites` at the top of every `on frame`
+        // handler. Detected via the handler name suffix —
+        // `{state}_frame` — so `on_enter` / `on_exit` / scanline
+        // handlers don't pay the extra ~10 bytes. The existing
+        // `IrOp::CycleSprites` lowering emits the `__sprite_cycle_used`
+        // marker on its first hit, which is all the linker needs to
+        // switch the NMI over to the rotating-OAM variant.
+        if self.auto_sprite_flicker && name.ends_with("_frame") {
+            self.emit(IrOp::CycleSprites);
+        }
+
         self.lower_block(block);
         self.end_block(IrTerminator::Return(None));
 
@@ -1132,6 +1155,32 @@ impl LoweringContext {
                     "set_palette_brightness" if args.len() == 1 => {
                         let level = self.lower_expr(&args[0]);
                         self.emit(IrOp::SetPaletteBrightness(level));
+                    }
+                    // `fade_out(step_frames)` / `fade_in(step_frames)` —
+                    // blocking fades that walk brightness 4 → 0 and
+                    // 0 → 4 respectively, calling
+                    // `__set_palette_brightness` per step with
+                    // `step_frames` frames of wait between steps.
+                    "fade_out" if args.len() == 1 => {
+                        let n = self.lower_expr(&args[0]);
+                        self.emit(IrOp::FadeOut(n));
+                    }
+                    "fade_in" if args.len() == 1 => {
+                        let n = self.lower_expr(&args[0]);
+                        self.emit(IrOp::FadeIn(n));
+                    }
+                    // `sprite_0_split(scroll_x, scroll_y)` — busy-wait
+                    // for the PPU's sprite-0 hit flag, then write
+                    // the new scroll values to `$2005`. Works on
+                    // any mapper (NROM/UxROM/MMC1 included), unlike
+                    // `on_scanline(N)` which requires MMC3's IRQ.
+                    "sprite_0_split" if args.len() == 2 => {
+                        let x = self.lower_expr(&args[0]);
+                        let y = self.lower_expr(&args[1]);
+                        self.emit(IrOp::Sprite0Split {
+                            scroll_x: x,
+                            scroll_y: y,
+                        });
                     }
                     // `rand8()` / `rand16()` at statement position —
                     // valid because they have side effects (advancing

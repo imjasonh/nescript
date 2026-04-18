@@ -51,10 +51,14 @@ const ZP_CURRENT_STATE: u8 = 0x03;
 /// with only a single scanline handler ignore the counter.
 const ZP_SCANLINE_STEP: u8 = 0x0C;
 
-/// Emulator debug output port. Writes to this address are logged by
-/// Mesen / fceux when the debugger is attached. Used by `debug.log`
-/// and `debug.assert` when compiled with `--debug`.
-const DEBUG_PORT: u16 = 0x4800;
+/// Default emulator debug output port. Writes to this address are
+/// logged by FCEUX (which defaults to `$4800`) when the debugger is
+/// attached. Programs can override via `game { debug_port: mesen }`
+/// (which selects `$4018`, Mesen's documented tracing port) or
+/// `debug_port: 0xXXXX` for a custom address. Used by `debug.log`,
+/// `debug.assert`, and the `__debug_halt` bounds-check sentinel
+/// when compiled with `--debug`.
+const DEFAULT_DEBUG_PORT: u16 = 0x4800;
 
 /// IR codegen that produces 6502 instructions from an `IrProgram`.
 #[allow(clippy::struct_excessive_bools)]
@@ -218,6 +222,13 @@ pub struct IrCodeGen<'a> {
     /// linker uses it to splice `runtime::gen_palette_brightness`
     /// into PRG ROM.
     palette_bright_used: bool,
+    /// Set to true the first time we lower `fade_out` / `fade_in`.
+    /// Drives the `__fade_used` marker label — the linker uses it
+    /// to splice `runtime::gen_fade` into PRG ROM. Fade routines
+    /// call `__set_palette_brightness`, so this flag also forces
+    /// `palette_bright_used` so the brightness routine is always
+    /// linked in whenever fade is.
+    fade_used: bool,
     /// Set to true the first time we lower `IrOp::ReadInputEdge`
     /// (`p1.a.pressed` / `p1.a.released`). Drives the
     /// `__edge_input_used` marker label — the linker uses it to
@@ -244,6 +255,14 @@ pub struct IrCodeGen<'a> {
     /// the final ROM. Enabled by the CLI when `--source-map` is
     /// passed.
     emit_source_locs: bool,
+    /// Absolute address the runtime writes to for `debug.log`
+    /// output, `debug.assert` failures, and the `__debug_halt`
+    /// bounds-check sentinel. Defaults to [`DEFAULT_DEBUG_PORT`]
+    /// (`$4800`, the FCEUX convention); programs can override via
+    /// `game { debug_port: mesen }` (selects `$4018`) or
+    /// `debug_port: 0xXXXX` for an arbitrary address. Threaded in
+    /// from the analyzer via [`Self::with_debug_port`].
+    debug_port: u16,
     /// Byte size of each named global / local variable. Keyed by
     /// IR `VarId`, mirrors [`Self::var_addrs`]. Used by the
     /// debug-mode array bounds checker to emit an `idx >= size`
@@ -444,10 +463,12 @@ impl<'a> IrCodeGen<'a> {
             p2_input_used: false,
             rand_used: false,
             palette_bright_used: false,
+            fade_used: false,
             edge_input_used: false,
             source_locs: Vec::new(),
             next_source_loc: 0,
             emit_source_locs: false,
+            debug_port: DEFAULT_DEBUG_PORT,
             var_sizes,
             bounds_halt_used: false,
             banked_streams: HashMap::new(),
@@ -497,6 +518,19 @@ impl<'a> IrCodeGen<'a> {
     #[must_use]
     pub fn with_source_map(mut self, enabled: bool) -> Self {
         self.emit_source_locs = enabled;
+        self
+    }
+
+    /// Install the absolute address that `debug.log`,
+    /// `debug.assert`, and the `__debug_halt` sentinel should
+    /// target. The analyzer threads the program's
+    /// `game { debug_port: ... }` value through; callers that
+    /// build an `IrCodeGen` directly (unit tests, integration
+    /// tests) can skip this and inherit the FCEUX-convention
+    /// default `$4800`.
+    #[must_use]
+    pub fn with_debug_port(mut self, port: u16) -> Self {
+        self.debug_port = port;
         self
     }
 
@@ -954,7 +988,8 @@ impl<'a> IrCodeGen<'a> {
             // port before wedging, so the log shows a bounds-check
             // failure as a distinct event from a plain halt.
             self.emit(LDA, AM::Immediate(0xBC));
-            self.emit(STA, AM::Absolute(DEBUG_PORT));
+            let port = self.debug_port;
+            self.emit(STA, AM::Absolute(port));
             self.emit(JMP, AM::Label("__debug_halt".to_string()));
         }
 
@@ -1734,9 +1769,10 @@ impl<'a> IrCodeGen<'a> {
             }
             IrOp::DebugLog(args) => {
                 if self.debug_mode {
+                    let port = self.debug_port;
                     for arg in args {
                         self.load_temp(*arg);
-                        self.emit(STA, AM::Absolute(DEBUG_PORT));
+                        self.emit(STA, AM::Absolute(port));
                     }
                 }
                 // In release mode, stripped entirely
@@ -1749,7 +1785,8 @@ impl<'a> IrCodeGen<'a> {
                     self.emit(BNE, AM::LabelRelative(pass_label.clone()));
                     // Assertion failed: write marker to debug port and BRK
                     self.emit(LDA, AM::Immediate(0xFF));
-                    self.emit(STA, AM::Absolute(DEBUG_PORT));
+                    let port = self.debug_port;
+                    self.emit(STA, AM::Absolute(port));
                     self.emit(BRK, AM::Implied);
                     self.emit_label(&pass_label);
                 }
@@ -1955,6 +1992,45 @@ impl<'a> IrCodeGen<'a> {
                 self.emit_palette_bright_marker();
                 self.load_temp(*level);
                 self.emit(JSR, AM::Label("__set_palette_brightness".into()));
+            }
+            IrOp::FadeOut(step_frames) | IrOp::FadeIn(step_frames) => {
+                self.emit_fade_marker();
+                self.load_temp(*step_frames);
+                let target = if matches!(op, IrOp::FadeOut(_)) {
+                    "__fade_out"
+                } else {
+                    "__fade_in"
+                };
+                self.emit(JSR, AM::Label(target.into()));
+            }
+            IrOp::Sprite0Split { scroll_x, scroll_y } => {
+                // Two-phase busy-wait on PPU `$2002` bit 6 (sprite-0
+                // hit flag), then write the requested scroll values
+                // to `$2005`. Phase 1 waits for the flag to clear
+                // (the previous frame's hit is still latched at
+                // NMI time and doesn't clear until the pre-render
+                // scanline); phase 2 waits for it to set again on
+                // the current frame's sprite-0 overlap. Emitted
+                // inline — no runtime routine — so each call site
+                // gets its own pair of local labels.
+                let suffix = self.local_label_suffix();
+                let clear_label = format!("__ir_spr0_clear_{suffix}");
+                let set_label = format!("__ir_spr0_set_{suffix}");
+                // Phase 1: wait for flag clear.
+                self.emit_label(&clear_label);
+                self.emit(LDA, AM::Absolute(0x2002));
+                self.emit(AND, AM::Immediate(0x40));
+                self.emit(BNE, AM::LabelRelative(clear_label));
+                // Phase 2: wait for flag set.
+                self.emit_label(&set_label);
+                self.emit(LDA, AM::Absolute(0x2002));
+                self.emit(AND, AM::Immediate(0x40));
+                self.emit(BEQ, AM::LabelRelative(set_label));
+                // Write new scroll: `$2005` takes two writes, X then Y.
+                self.load_temp(*scroll_x);
+                self.emit(STA, AM::Absolute(0x2005));
+                self.load_temp(*scroll_y);
+                self.emit(STA, AM::Absolute(0x2005));
             }
             IrOp::ReadInputEdge {
                 dest,
@@ -2368,6 +2444,9 @@ impl<'a> IrCodeGen<'a> {
         if self.palette_bright_used {
             self.emit_label("__palette_bright_used");
         }
+        if self.fade_used {
+            self.emit_label("__fade_used");
+        }
         if self.edge_input_used {
             self.emit_label("__edge_input_used");
         }
@@ -2385,6 +2464,14 @@ impl<'a> IrCodeGen<'a> {
     /// program. The linker uses it to splice
     /// `runtime::gen_palette_brightness` into PRG ROM.
     fn emit_palette_bright_marker(&mut self) {
+        self.palette_bright_used = true;
+    }
+
+    /// Emit the `__fade_used` marker at most once per program.
+    /// `gen_fade` also calls `__set_palette_brightness`, so fade
+    /// use forces the palette-brightness marker too.
+    fn emit_fade_marker(&mut self) {
+        self.fade_used = true;
         self.palette_bright_used = true;
     }
 
@@ -2780,7 +2867,9 @@ fn function_is_leaf(func: &IrFunction) -> bool {
                 | IrOp::Rand8(..)
                 | IrOp::Rand16(..)
                 | IrOp::SeedRand(..)
-                | IrOp::SetPaletteBrightness(..) => true,
+                | IrOp::SetPaletteBrightness(..)
+                | IrOp::FadeOut(..)
+                | IrOp::FadeIn(..) => true,
                 IrOp::InlineAsm(body) => {
                     // Strip the raw-asm magic prefix if present so
                     // we don't false-match the marker characters.
@@ -2843,6 +2932,7 @@ fn function_is_leaf(func: &IrFunction) -> bool {
                 | IrOp::StartMusic(..)
                 | IrOp::StopMusic
                 | IrOp::ReadInputEdge { .. }
+                | IrOp::Sprite0Split { .. }
                 | IrOp::SourceLoc(..) => false,
             };
             if is_jsr_emitting {
@@ -3051,6 +3141,8 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
         | IrOp::SourceLoc(_) => Vec::new(),
         IrOp::SeedRand(lo, hi) => vec![*lo, *hi],
         IrOp::SetPaletteBrightness(level) => vec![*level],
+        IrOp::FadeOut(n) | IrOp::FadeIn(n) => vec![*n],
+        IrOp::Sprite0Split { scroll_x, scroll_y } => vec![*scroll_x, *scroll_y],
     }
 }
 

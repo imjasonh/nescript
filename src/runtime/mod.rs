@@ -209,6 +209,15 @@ pub const AUDIO_SFX_PITCH_PTR_HI: u16 = 0x07F7;
 pub const PREV_INPUT_P1: u16 = 0x07E6;
 pub const PREV_INPUT_P2: u16 = 0x07E7;
 
+/// Fade-helper scratch bytes. `FADE_STEP_FRAMES` holds the
+/// per-step frame count saved at the top of `__fade_out` /
+/// `__fade_in`; `FADE_LEVEL` tracks the current brightness level
+/// as the fade walks 4 → 0 or 0 → 4. Programs that never call the
+/// builtins (detected via the absence of `__fade_used`) leave
+/// these bytes free for analyzer allocation.
+pub const FADE_STEP_FRAMES: u16 = 0x07E8;
+pub const FADE_LEVEL: u16 = 0x07E9;
+
 /// PRNG state — two bytes holding a 16-bit xorshift state.
 /// Only touched by the `__rand8` / `__rand16` / `__rand_seed`
 /// runtime routines, which the linker splices in whenever user
@@ -1782,6 +1791,143 @@ pub fn gen_palette_brightness() -> Vec<Instruction> {
     out
 }
 
+/// Generate the blocking fade helpers `__fade_out` and `__fade_in`,
+/// plus the shared callable `__wait_frame_rt` they use internally.
+/// Spliced by the linker whenever user code contains the
+/// `__fade_used` marker label (emitted by the IR codegen's
+/// `FadeOut` / `FadeIn` ops).
+///
+/// Both fade entry points take `step_frames` in `A` — the number
+/// of frames to hold each brightness level before advancing. A
+/// full fade-out runs through levels 4 → 3 → 2 → 1 → 0 (five
+/// steps) and a fade-in runs 0 → 1 → 2 → 3 → 4, so the total
+/// blocking time is `step_frames × 5` frames.
+///
+/// Internally the fade JSRs `__set_palette_brightness` for each
+/// step and `__wait_frame_rt` between steps. `__set_palette_brightness`
+/// is always linked in alongside fade (we can't emit it conditionally
+/// without also forcing its marker). `__wait_frame_rt` spins on
+/// `ZP_FRAME_FLAG` exactly the way an inline `wait_frame` does.
+///
+/// Main-RAM scratch bytes the routines use:
+///   `FADE_STEP_FRAMES` ($07E8) — saved copy of `step_frames`
+///   `FADE_LEVEL`       ($07E9) — current brightness level
+///
+/// Both slots are free for analyzer allocation in programs that
+/// don't use fade (they never trigger the marker).
+#[must_use]
+pub fn gen_fade() -> Vec<Instruction> {
+    let mut out = Vec::new();
+
+    // ── __wait_frame_rt ──────────────────────────────────────
+    // Callable wait-for-NMI: spin until `ZP_FRAME_FLAG` is
+    // nonzero, then clear it and RTS. Mirrors the inline code
+    // the IR codegen emits for `IrOp::WaitFrame`, but callable
+    // with a JSR from inside other runtime routines.
+    out.push(Instruction::new(NOP, AM::Label("__wait_frame_rt".into())));
+    out.push(Instruction::new(
+        NOP,
+        AM::Label("__wait_frame_rt_loop".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_FRAME_FLAG)));
+    out.push(Instruction::new(
+        BEQ,
+        AM::LabelRelative("__wait_frame_rt_loop".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::ZeroPage(ZP_FRAME_FLAG)));
+    out.push(Instruction::implied(RTS));
+
+    // ── __fade_out ───────────────────────────────────────────
+    // A = step_frames on entry. Loops 4 → 3 → 2 → 1 → 0, calling
+    // __set_palette_brightness each iteration and waiting
+    // step_frames frames between steps.
+    //
+    // Zero-safety: if the caller passes A=0, the inner wait loop
+    // would DEX-underflow from 0 to $FF and burn 256 frames per
+    // step (~21 seconds on NTSC). Force a minimum of 1 so the
+    // pathological "pass 0" case behaves as "1 frame per step"
+    // instead of "hold forever".
+    out.push(Instruction::new(NOP, AM::Label("__fade_out".into())));
+    out.push(Instruction::new(ORA, AM::Immediate(0x00)));
+    out.push(Instruction::new(BNE, AM::LabelRelative("__fade_out_ok".into())));
+    out.push(Instruction::new(LDA, AM::Immediate(1)));
+    out.push(Instruction::new(NOP, AM::Label("__fade_out_ok".into())));
+    out.push(Instruction::new(STA, AM::Absolute(FADE_STEP_FRAMES)));
+    out.push(Instruction::new(LDA, AM::Immediate(4)));
+    out.push(Instruction::new(STA, AM::Absolute(FADE_LEVEL)));
+    // Fall through into the shared loop that runs until FADE_LEVEL
+    // underflows past 0 (BMI catches the $FF that DEC produces).
+    out.push(Instruction::new(NOP, AM::Label("__fade_step".into())));
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(
+        JSR,
+        AM::Label("__set_palette_brightness".into()),
+    ));
+    // Wait step_frames frames.
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_STEP_FRAMES)));
+    out.push(Instruction::implied(TAX));
+    out.push(Instruction::new(NOP, AM::Label("__fade_wait".into())));
+    out.push(Instruction::new(JSR, AM::Label("__wait_frame_rt".into())));
+    out.push(Instruction::implied(DEX));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_wait".into()),
+    ));
+    // Decrement the level and loop if it's still a valid level.
+    // `__fade_out` is at entry point A; `__fade_in` jumps into a
+    // sibling block below that decrements upward. Here, decrement
+    // and bail out when we hit $FF (underflow past 0).
+    out.push(Instruction::new(DEC, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(CMP, AM::Immediate(0xFF)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_step".into()),
+    ));
+    out.push(Instruction::implied(RTS));
+
+    // ── __fade_in ────────────────────────────────────────────
+    // A = step_frames on entry. Loops 0 → 1 → 2 → 3 → 4.
+    // Uses its own top-of-loop label and increments rather than
+    // decrementing; shares the step-wait body via a small duplicate
+    // loop (cheaper than threading direction through the shared
+    // body for a one-off five-step loop).
+    out.push(Instruction::new(NOP, AM::Label("__fade_in".into())));
+    out.push(Instruction::new(ORA, AM::Immediate(0x00)));
+    out.push(Instruction::new(BNE, AM::LabelRelative("__fade_in_ok".into())));
+    out.push(Instruction::new(LDA, AM::Immediate(1)));
+    out.push(Instruction::new(NOP, AM::Label("__fade_in_ok".into())));
+    out.push(Instruction::new(STA, AM::Absolute(FADE_STEP_FRAMES)));
+    out.push(Instruction::new(LDA, AM::Immediate(0)));
+    out.push(Instruction::new(STA, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(NOP, AM::Label("__fade_in_step".into())));
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(
+        JSR,
+        AM::Label("__set_palette_brightness".into()),
+    ));
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_STEP_FRAMES)));
+    out.push(Instruction::implied(TAX));
+    out.push(Instruction::new(NOP, AM::Label("__fade_in_wait".into())));
+    out.push(Instruction::new(JSR, AM::Label("__wait_frame_rt".into())));
+    out.push(Instruction::implied(DEX));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_in_wait".into()),
+    ));
+    out.push(Instruction::new(INC, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(LDA, AM::Absolute(FADE_LEVEL)));
+    out.push(Instruction::new(CMP, AM::Immediate(5)));
+    out.push(Instruction::new(
+        BNE,
+        AM::LabelRelative("__fade_in_step".into()),
+    ));
+    out.push(Instruction::implied(RTS));
+
+    out
+}
+
 /// Emit the reset-time PRNG state seed. Spliced into the reset
 /// path whenever `gen_prng` is linked in, so the first `rand8()`
 /// call returns a useful value even without an explicit
@@ -1847,6 +1993,7 @@ pub fn gen_mapper_init(
         Mapper::MMC3 => gen_mmc3_init(mirroring),
         Mapper::AxROM => gen_axrom_init(mirroring),
         Mapper::CNROM => gen_cnrom_init(),
+        Mapper::GNROM => gen_gnrom_init(),
     };
     // Initialize ZP_BANK_CURRENT to the fixed bank index for any
     // banked mapper. CNROM and AxROM don't use per-function bank
@@ -1897,6 +2044,20 @@ fn gen_axrom_init(mirroring: Mirroring) -> Vec<Instruction> {
 fn gen_cnrom_init() -> Vec<Instruction> {
     let mut out = Vec::new();
     out.push(Instruction::new(NOP, AM::Label("__cnrom_init".into())));
+    out.push(Instruction::new(LDA, AM::Immediate(0x00)));
+    out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+    out
+}
+
+/// `GNROM` (mapper 66) reset. Single register at `$8000-$FFFF`:
+///   bits 4-5: select 32 KB PRG page at `$8000-$FFFF`
+///   bits 0-1: select 8 KB CHR bank
+/// At power-on both fields are nominally zero but some boards
+/// leave them undefined, so we explicitly write `$00` — PRG page 0
+/// with CHR bank 0.
+fn gen_gnrom_init() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__gnrom_init".into())));
     out.push(Instruction::new(LDA, AM::Immediate(0x00)));
     out.push(Instruction::new(STA, AM::Absolute(0x8000)));
     out
@@ -2096,6 +2257,17 @@ pub fn gen_bank_select(mapper: Mapper) -> Vec<Instruction> {
             // UxROM-style bus-conflict-safe table. No such API is
             // exposed to user source yet — declaring more than one
             // CHR bank in a CNROM program is currently a TODO.
+            out.push(Instruction::new(STA, AM::Absolute(0x8000)));
+            out.push(Instruction::implied(RTS));
+        }
+        Mapper::GNROM => {
+            // GNROM: one register at `$8000-$FFFF` packs both a
+            // 32 KB PRG page (bits 4-5) and an 8 KB CHR bank
+            // (bits 0-1). The input A is the packed byte; user
+            // code is responsible for composing it. Like CNROM
+            // and AxROM, real boards have bus conflicts and a
+            // production API should use a bus-conflict-safe
+            // table.
             out.push(Instruction::new(STA, AM::Absolute(0x8000)));
             out.push(Instruction::implied(RTS));
         }

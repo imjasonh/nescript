@@ -306,6 +306,58 @@ reset_score()
 - **Call depth limit.** The default maximum call depth is 8. Exceeding it produces error `E0401`.
 - **Maximum 8 parameters per function.** The calling convention is hybrid: **leaf** functions (no nested `JSR` in their body) receive up to four parameters through fixed zero-page transport slots `$04`-`$07`, while **non-leaf** functions receive up to eight parameters via direct caller writes into per-function RAM spill slots (no transport, no prologue copy). Declaring a function with 9+ parameters produces error `E0506`. Declaring a leaf with 5+ parameters silently promotes it to the non-leaf convention — you pay the direct-write cost rather than the prologue-copy cost, which is still cheaper than the old transport-plus-spill path.
 
+#### Why no recursion?
+
+This is a deliberate design choice, not a bug. NEScript uses a hybrid
+direct-write calling convention that lands each function's
+parameters and locals at a fixed RAM address the analyzer reserves
+at compile time. Recursion would require each activation to have
+its own stack frame, which means either:
+
+1. A software stack pointer managed by a prologue/epilogue at every
+   call site (costs cycles on a platform that only has 2 KB of RAM
+   and a 256-byte hardware stack), or
+2. The hardware stack carrying frames directly (the 6502's 256-byte
+   `$0100-$01FF` stack overflows fast — a single recursive call
+   with any meaningful locals blows it within a handful of levels).
+
+Neither is a good fit for the NES's constraints, and NEScript
+already surfaces the tradeoff at compile time via the call-depth
+limit (`E0401`) and the parameter cap (`E0506`). The direct-write
+convention is what makes those limits enforceable.
+
+If you actually need recursion-shaped logic — flood fill, tree
+walking, tile-spread simulations — the idiomatic pattern is an
+explicit stack held in a small `u8` array:
+
+```
+const MAX_STACK: u8 = 32
+var stack: u8[MAX_STACK] = [0; 32]
+var top: u8 = 0
+
+fun flood_push(x: u8) {
+    stack[top] = x
+    top += 1
+}
+
+fun flood_pop() -> u8 {
+    top -= 1
+    return stack[top]
+}
+
+fun flood_fill(start: u8) {
+    flood_push(start)
+    while top > 0 {
+        var here: u8 = flood_pop()
+        // ...process `here`, push neighbours that need visiting...
+    }
+}
+```
+
+This gives the compiler full visibility into the worst-case stack
+depth (`MAX_STACK`), uses flat RAM instead of the hardware stack,
+and composes cleanly with the call-graph validator.
+
 ---
 
 ## States

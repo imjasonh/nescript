@@ -394,43 +394,27 @@ NMI-time write budget (~2273 cycles) is too tight for a full
 nametable. RLE is the smaller first step — emit a `nametable` that
 can declare `compression: rle` and decompress at swap time.
 
-### J. Palette-fade follow-ups
+### J. Palette-fade brightness LUT follow-up
 
-`set_palette_brightness(level: u8)` ships today (levels 0..8 mapped
-onto `$2001` emphasis bits); `examples/palette_brightness_demo.ne`
-exercises it. Two follow-ups are still worth doing:
+`set_palette_brightness(level: u8)` and the blocking
+`fade_out(step_frames)` / `fade_in(step_frames)` builtins all ship
+today — see `examples/palette_brightness_demo.ne` and
+`examples/fade_demo.ne`. One follow-up still worth doing: a
+brightness-LUT path that recolours the active palette in addition
+to the emphasis bits, for non-NTSC-assumption fades. The current
+implementation only manipulates `$2001` emphasis bits, so the
+"dimmed" end of the fade still shows colour tint rather than a
+true colour-space darken.
 
-- Blocking `fade_out(frames)` / `fade_in(frames)` helpers — today
-  users write them in user-space with a for-loop + `wait_frame`.
-  Making them builtin would elide the frame-counting boilerplate.
-- A brightness-LUT path that recolours the active palette in
-  addition to the emphasis bits, for non-NTSC-assumption fades.
+### M. Sprite cycling follow-ups
 
-### L. Sprite 0 hit split-screen
-
-`split(x, y)` is the neslib primitive for a fixed status bar above
-a scrolling playfield without MMC3. NEScript only offers
-`on_scanline(N)` on MMC3. A sprite-0-hit-based split that works on
-NROM/UxROM/MMC1 unlocks most of the tutorial games. API:
-
-```
-sprite_0_split scanline: 32, {
-  scroll_x: 0,
-  scroll_y: 0,
-}
-```
-
-…emits a busy-wait on `$2002` bit 6 followed by the requested
-scroll write.
-
-### M. Automatic sprite cycling
-
-The existing `cycle_sprites` opt-in keyword rotates the DMA offset
-each frame. A `game { sprite_flicker: true }` attribute that emits
-the rotation automatically — plus a `draw ... priority: pinned`
-modifier for HUD sprites that must stay at low OAM slots — is the
-cleaner user-facing API. Mentioned already under Open Design
-Questions; bumping it into the active roadmap.
+Auto sprite cycling ships today via `game { sprite_flicker: true }`
+— the IR lowerer injects an `IrOp::CycleSprites` at the top of
+every `on frame` handler when the flag is set. See
+`examples/auto_sprite_flicker.ne`. A companion `draw ... priority:
+pinned` modifier for HUD sprites that must stay at low OAM slots
+is still missing — today pinning has to be manual (draw the HUD
+sprites first).
 
 ### O. DPCM / DMC sample playback
 
@@ -494,19 +478,19 @@ three reads every program needs.
 
 ### V. Additional mappers
 
-AxROM (mapper 7) and CNROM (mapper 3) both ship today; see
-`examples/axrom_simple.ne` and `examples/cnrom_simple.ne`. CNROM's
-user-visible CHR bankswitching is still TODO — the reset-time init
-writes bank 0 and nothing else is exposed yet, so CHR swaps
-mid-frame aren't reachable from user source. The next set:
+AxROM (mapper 7), CNROM (mapper 3), and GNROM (mapper 66) all
+ship today; see `examples/axrom_simple.ne`, `examples/cnrom_simple.ne`,
+and `examples/gnrom_simple.ne`. CNROM and GNROM both have CHR
+bankswitching but user-visible CHR swaps aren't reachable from
+user source yet — the reset-time init writes bank 0 and the
+`__bank_select` routine exists but has no user-exposed API. The
+next set:
 
-1. **GNROM / MHROM** (mapper 66). Combines AxROM-style PRG with
-   CNROM-style CHR banking. Another single-register mapper.
-2. **MMC2** (mapper 9, Punch-Out only realistically). Medium.
-3. **UNROM-512** (mapper 30). The modern homebrew sweet spot —
+1. **MMC2** (mapper 9, Punch-Out only realistically). Medium.
+2. **UNROM-512** (mapper 30). The modern homebrew sweet spot —
    512 KB PRG + CHR-RAM + self-flashing. Mapping is UxROM-like
    plus a one-screen bit.
-4. **MMC5** (mapper 5). Big. Driven by FamiStudio's expansion
+3. **MMC5** (mapper 5). Big. Driven by FamiStudio's expansion
    audio more than by the extra PRG/CHR modes. Probably last.
 
 Each new mapper needs a `Mapper::X` variant, a reset-time
@@ -522,12 +506,14 @@ target (`--target nsf`) would wrap the existing music/sfx blocks
 in the NSF header and expose `init`/`play` entry points. Nearly
 free, gets the chiptune audience for ~a day of work.
 
-### X. Configurable / Mesen-native debug output
+### X. Mesen trace-log documentation follow-up
 
-Today the debug port is hardcoded to `$4800`. Expose
-`debug.port: $4800 | mesen` on the `game { }` block. For
-`mesen`, emit writes to `$4018` (Mesen's documented debug port)
-and document the trace-log tool invocation in the debug docs.
+`game { debug_port: fceux | mesen | 0xXXXX }` ships today — see
+the integration test `debug_log_targets_configured_port`. Mesen's
+trace-log tool invocation still isn't documented anywhere in the
+NEScript docs; a short section under `docs/nes-reference.md`
+walking through how to hook a Mesen trace-log against a ROM built
+with `debug_port: mesen` would close the gap.
 
 ### Y. FCEUX `.ld` line-info follow-up
 
@@ -558,14 +544,13 @@ Remaining gap items in order of user value:
 
 1. `i16` (§A) — unblocks signed physics, metasprite offsets.
 2. VRAM update buffer (§G) — unblocks HUDs, dialog, streaming.
-3. Sprite-0 split (§L) + auto sprite cycling (§M) — cheap polish.
-4. Register allocator (existing section) — compounding size win.
-5. Metatiles + collision (§H) — closes several items at once.
-6. Inline-asm completeness (§D) — escape hatch for power users.
-7. Arrays-of-structs + bitfields (§C) + fn pointers (§B) —
+3. Register allocator (existing section) — compounding size win.
+4. Metatiles + collision (§H) — closes several items at once.
+5. Inline-asm completeness (§D) — escape hatch for power users.
+6. Arrays-of-structs + bitfields (§C) + fn pointers (§B) —
    turns NEScript into a general-purpose NES language.
-8. SRAM (§S) + UNROM-512 + GNROM + MMC5 (§V) — ecosystem fit.
-9. FamiStudio import (§Q) + DPCM (§O) + expansion audio (§P).
+7. SRAM (§S) + UNROM-512 + MMC5 (§V) — ecosystem fit.
+8. FamiStudio import (§Q) + DPCM (§O) + expansion audio (§P).
 
 ---
 

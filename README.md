@@ -61,10 +61,13 @@ start Main
 - **Compile-time safety** -- call depth limits, recursion detection, type checking, unused-var warnings
 - **IR-based optimizer** -- constant folding, dead code elimination, strength reduction (incl. div/mod by power-of-two), copy propagation, peephole passes including INC/DEC fold and live-range slot recycling
 - **Full 16-bit arithmetic** -- u16 add/sub/compare lower to carry-propagating paired operations
-- **Multiple mappers** -- NROM, MMC1, UxROM, MMC3 (including multi-scanline IRQ dispatch per state), AxROM (mapper 7), CNROM (mapper 3)
-- **Runtime PRNG** -- `rand8()`, `rand16()`, `seed_rand(s)` backed by a zero-cost-when-unused xorshift LFSR
+- **Multiple mappers** -- NROM, MMC1, UxROM, MMC3 (including multi-scanline IRQ dispatch per state), AxROM (mapper 7), CNROM (mapper 3), GNROM / MHROM (mapper 66)
+- **Runtime PRNG** -- `rand8()`, `rand16()`, `seed_rand(s)` backed by a zero-cost-when-unused Galois LFSR
 - **Edge-triggered input** -- `p1.button.a.pressed` / `.released` for menu / one-shot input handling
-- **Palette brightness fades** -- `set_palette_brightness(level)` for cheap neslib-style screen fades
+- **Palette brightness fades** -- `set_palette_brightness(level)` + blocking `fade_out(n)` / `fade_in(n)` helpers
+- **Sprite-0 split** -- `sprite_0_split(scroll_x, scroll_y)` for mid-frame scroll changes on any mapper
+- **Auto sprite cycling** -- `game { sprite_flicker: true }` to mitigate the NES's 8-sprites-per-scanline limit with no per-frame boilerplate
+- **Configurable debug port** -- `game { debug_port: fceux \| mesen \| 0xXXXX }` targets either debugger convention
 - **Audio subsystem** -- frame-walking pulse driver with user-declared `sfx`/`music` blocks, builtin effects and tracks, period table, and zero-cost elision when unused
 - **Palette & background pipeline** -- `palette` and `background` blocks, initial values loaded at reset, vblank-safe `set_palette` / `load_background` runtime swaps
 - **Asset pipeline** -- PNG-to-CHR conversion, inline tile data, sfx envelopes, music note streams

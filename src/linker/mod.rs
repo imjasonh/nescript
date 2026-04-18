@@ -321,12 +321,14 @@ impl Linker {
             switchable_banks.len()
         );
         // CNROM has a fixed 32 KB PRG — user-declared switchable PRG
-        // banks are meaningless. AxROM switches 32 KB pages as a
-        // unit, which the current 16 KB-per-bank trampoline model
-        // doesn't support cleanly. Reject both up front so a silent
-        // layout mismatch doesn't produce a subtly broken ROM.
+        // banks are meaningless. AxROM and GNROM switch 32 KB pages
+        // as a unit, which the current 16 KB-per-bank trampoline
+        // model doesn't support cleanly. Reject all three up front
+        // so a silent layout mismatch doesn't produce a subtly
+        // broken ROM.
         assert!(
-            switchable_banks.is_empty() || !matches!(self.mapper, Mapper::CNROM | Mapper::AxROM),
+            switchable_banks.is_empty()
+                || !matches!(self.mapper, Mapper::CNROM | Mapper::AxROM | Mapper::GNROM),
             "{:?} does not yet support switchable PRG banks (got {} banks); \
              use MMC1/UxROM/MMC3 for per-function banking",
             self.mapper,
@@ -576,9 +578,21 @@ impl Linker {
 
         // Palette brightness: splice `__set_palette_brightness`
         // whenever `set_palette_brightness(level)` was called.
+        // Fade builtins (`fade_out` / `fade_in`) also require the
+        // brightness routine — the codegen's `emit_fade_marker`
+        // forces `__palette_bright_used` whenever fade is used, so
+        // this path picks up fade as a side effect.
         let has_palette_bright = has_label(user_code, "__palette_bright_used");
         if has_palette_bright {
             all_instructions.extend(runtime::gen_palette_brightness());
+        }
+
+        // Fade helpers (`__fade_out` / `__fade_in` plus the shared
+        // `__wait_frame_rt` subroutine). Splices when user code
+        // called `fade_out(n)` or `fade_in(n)`.
+        let has_fade = has_label(user_code, "__fade_used");
+        if has_fade {
+            all_instructions.extend(runtime::gen_fade());
         }
 
         // Audio subsystem — linked in whenever user code touched
@@ -789,16 +803,17 @@ impl Linker {
         // the fixed bank — math runtime, audio tick, other state
         // handlers, etc.
         if switchable_banks.is_empty() {
-            // AxROM (mapper 7) maps a single 32 KB PRG page at
-            // $8000-$FFFF, so emulators expect PRG size in multiples
-            // of 32 KB. For single-bank AxROM we emit two 16 KB iNES
-            // banks: the first is 0xFF fill (maps at $8000-$BFFF when
-            // bank 0 is selected), and the second is our assembled
-            // fixed-bank code (maps at $C000-$FFFF). Bank-select
-            // writes still work — mapper 7's register picks the 32 KB
-            // page — but with a single PRG page the upper-half code
-            // is always visible.
-            if self.mapper == Mapper::AxROM {
+            // AxROM (mapper 7) and GNROM (mapper 66) both map a
+            // single 32 KB PRG page at $8000-$FFFF, so emulators
+            // expect PRG size in multiples of 32 KB. For single-page
+            // AxROM/GNROM we emit two 16 KB iNES banks: the first
+            // is 0xFF fill (maps at $8000-$BFFF when bank 0 is
+            // selected), and the second is our assembled fixed-bank
+            // code (maps at $C000-$FFFF). Bank-select writes still
+            // work — the mapper's register picks the 32 KB page —
+            // but with a single PRG page the upper-half code is
+            // always visible.
+            if matches!(self.mapper, Mapper::AxROM | Mapper::GNROM) {
                 let filler = vec![0xFF_u8; 16384];
                 builder.set_prg_banks(vec![filler, prg]);
             } else {

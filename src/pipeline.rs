@@ -200,7 +200,8 @@ pub fn compile_source(
         .with_sprites(&sprites)
         .with_audio(&sfx, &music)
         .with_debug(opts.debug)
-        .with_source_map(opts.emit_source_map);
+        .with_source_map(opts.emit_source_map)
+        .with_debug_port(program.game.debug_port);
     let mut instructions = codegen.generate(&ir_program);
     peephole::optimize(&mut instructions);
 

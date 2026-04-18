@@ -357,6 +357,11 @@ impl Parser {
         let mut mapper = Mapper::NROM;
         let mut mirroring = Mirroring::Horizontal;
         let mut header = HeaderFormat::Ines1;
+        // Default to the FCEUX `$4800` convention; programs
+        // targeting Mesen can override to `$4018` via
+        // `debug_port: mesen`.
+        let mut debug_port: u16 = 0x4800;
+        let mut sprite_flicker: bool = false;
 
         while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
             let (key, _) = self.expect_ident()?;
@@ -371,6 +376,7 @@ impl Parser {
                         "MMC3" => Mapper::MMC3,
                         "AxROM" => Mapper::AxROM,
                         "CNROM" => Mapper::CNROM,
+                        "GNROM" => Mapper::GNROM,
                         _ => {
                             return Err(Diagnostic::error(
                                 ErrorCode::E0201,
@@ -378,7 +384,7 @@ impl Parser {
                                 self.current_span(),
                             )
                             .with_help(
-                                "supported mappers: NROM, MMC1, UxROM, MMC3, AxROM, CNROM",
+                                "supported mappers: NROM, MMC1, UxROM, MMC3, AxROM, CNROM, GNROM",
                             ));
                         }
                     };
@@ -412,6 +418,66 @@ impl Parser {
                         }
                     };
                 }
+                "sprite_flicker" => {
+                    // The lexer emits `true` / `false` as
+                    // `TokenKind::BoolLiteral` (not `Ident`), so
+                    // match on the token rather than going through
+                    // `expect_ident`.
+                    match self.peek().clone() {
+                        TokenKind::BoolLiteral(b) => {
+                            self.advance();
+                            sprite_flicker = b;
+                        }
+                        _ => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                "expected `true` or `false` for sprite_flicker",
+                                self.current_span(),
+                            ));
+                        }
+                    }
+                }
+                "debug_port" => {
+                    // Accept either a named alias (`fceux`, `mesen`)
+                    // or an integer literal for custom ports. The
+                    // numeric path routes through the normal int
+                    // literal parser so both decimal and `0x…`
+                    // hex work.
+                    match self.peek().clone() {
+                        TokenKind::Ident(alias) => {
+                            self.advance();
+                            debug_port = match alias.as_str() {
+                                "fceux" => 0x4800,
+                                "mesen" => 0x4018,
+                                _ => {
+                                    return Err(Diagnostic::error(
+                                        ErrorCode::E0201,
+                                        format!("unknown debug port alias '{alias}'"),
+                                        self.current_span(),
+                                    )
+                                    .with_help(
+                                        "supported aliases: fceux ($4800), mesen ($4018); \
+                                         or pass a numeric literal (e.g. `0x2FFF`)",
+                                    ));
+                                }
+                            };
+                        }
+                        TokenKind::IntLiteral(n) => {
+                            // IntLiteral is already a u16, so it
+                            // can't exceed the 6502 address space —
+                            // no range check needed.
+                            self.advance();
+                            debug_port = n;
+                        }
+                        _ => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                "expected an alias (`fceux`, `mesen`) or a numeric address",
+                                self.current_span(),
+                            ));
+                        }
+                    }
+                }
                 _ => {
                     return Err(Diagnostic::error(
                         ErrorCode::E0201,
@@ -428,6 +494,8 @@ impl Parser {
             mapper,
             mirroring,
             header,
+            debug_port,
+            sprite_flicker,
             span: Span::new(
                 start_span.file_id,
                 start_span.start,

@@ -325,6 +325,26 @@ pub enum IrOp {
     /// and emits the `__palette_bright_used` marker.
     SetPaletteBrightness(IrTemp),
 
+    /// `fade_out(step_frames)` — block for
+    /// `step_frames × 5` frames while walking brightness 4 → 0
+    /// via `__set_palette_brightness`. Codegen lowers to a JSR
+    /// to `__fade_out` and emits both `__fade_used` and
+    /// `__palette_bright_used` markers.
+    FadeOut(IrTemp),
+    /// `fade_in(step_frames)` — block for
+    /// `step_frames × 5` frames while walking brightness 0 → 4.
+    FadeIn(IrTemp),
+
+    /// `sprite_0_split(scroll_x, scroll_y)` — busy-wait for the
+    /// PPU's sprite-0 hit flag (`$2002` bit 6) and then write
+    /// the given scroll values to `$2005`. Used to implement
+    /// fixed status-bar / scrolling-playfield splits on any
+    /// mapper (unlike `on_scanline(N)`, which requires MMC3).
+    Sprite0Split {
+        scroll_x: IrTemp,
+        scroll_y: IrTemp,
+    },
+
     /// Edge-triggered input read: `p1.a.pressed` / `p1.a.released`.
     /// `dest` receives a boolean (0 or the button mask) — set when
     /// the button is pressed-but-was-not this frame (for

@@ -763,6 +763,8 @@ mod tests {
                 mapper: Mapper::NROM,
                 mirroring: Mirroring::Horizontal,
                 header: HeaderFormat::Ines1,
+                debug_port: 0x4800,
+                sprite_flicker: false,
                 span: Span::dummy(),
             },
             globals: Vec::new(),

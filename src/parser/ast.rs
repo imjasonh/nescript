@@ -226,6 +226,24 @@ pub struct GameDecl {
     /// iNES header flavor to emit. Defaults to [`HeaderFormat::Ines1`];
     /// programs can opt into NES 2.0 via `game Foo { header: nes2 }`.
     pub header: HeaderFormat,
+    /// Absolute address the runtime should write to for `debug.log`
+    /// output and `__debug_halt` sentinels. Defaults to `$4800`
+    /// (the FCEUX convention). Programs targeting Mesen/Mesen2 can
+    /// set `debug_port: mesen` in the `game { }` block, which
+    /// selects `$4018` — Mesen's documented tracing port. Custom
+    /// addresses (`debug_port: 0x2FFF`) are also accepted so ROMs
+    /// for unusual debuggers can retarget the port.
+    pub debug_port: u16,
+    /// When true, every `on frame { }` handler automatically bumps
+    /// the OAM cycle offset by 4 at the top — the same effect as
+    /// calling `cycle_sprites` as the first statement. Paired with
+    /// the `__sprite_cycle_used` runtime path this turns the NES's
+    /// 8-sprites-per-scanline hardware dropout into per-frame
+    /// flicker, which the eye reconstructs into a full sprite
+    /// count across frames. Opt-in because it adds ~10 bytes per
+    /// handler and the flicker only looks correct if user code
+    /// isn't already managing priorities manually.
+    pub sprite_flicker: bool,
     pub span: Span,
 }
 
@@ -248,6 +266,13 @@ pub enum Mapper {
     /// for games that want static PRG but swap entire tile sheets
     /// per screen / level.
     CNROM,
+    /// `GNROM` / `MHROM` (mapper 66). Combines `AxROM`-style 32 KB
+    /// PRG pages with `CNROM`-style 8 KB CHR bankswitching in one
+    /// register at `$8000-$FFFF`. Bits 4-5 select the PRG page,
+    /// bits 0-1 select the CHR bank. Useful for small-to-medium
+    /// homebrew games that outgrow NROM but don't need MMC1's
+    /// mirroring control or MMC3's scanline IRQ.
+    GNROM,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

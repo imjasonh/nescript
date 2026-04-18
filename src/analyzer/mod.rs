@@ -2591,7 +2591,15 @@ fn is_small_constant(expr: &Expr) -> bool {
 fn is_intrinsic(name: &str) -> bool {
     matches!(
         name,
-        "poke" | "peek" | "rand8" | "rand16" | "seed_rand" | "set_palette_brightness"
+        "poke"
+            | "peek"
+            | "rand8"
+            | "rand16"
+            | "seed_rand"
+            | "set_palette_brightness"
+            | "fade_out"
+            | "fade_in"
+            | "sprite_0_split"
     )
 }
 
@@ -2601,7 +2609,10 @@ fn is_intrinsic(name: &str) -> bool {
 /// analyzer so the codegen / linker never sees a stray
 /// `Expr::Call` for one of them.
 fn is_void_intrinsic(name: &str) -> bool {
-    matches!(name, "poke" | "seed_rand" | "set_palette_brightness")
+    matches!(
+        name,
+        "poke" | "seed_rand" | "set_palette_brightness" | "fade_out" | "fade_in" | "sprite_0_split"
+    )
 }
 
 /// True if `name` is one of the NES controller's eight buttons.
@@ -2657,6 +2668,26 @@ impl Analyzer {
                     ErrorCode::E0203,
                     format!(
                         "`set_palette_brightness` takes exactly 1 argument (level: u8 0..8), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            "fade_out" | "fade_in" if args.len() != 1 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`{name}` takes exactly 1 argument (step_frames: u8), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            "sprite_0_split" if args.len() != 2 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`sprite_0_split` takes exactly 2 arguments (scroll_x: u8, scroll_y: u8), got {}",
                         args.len()
                     ),
                     span,

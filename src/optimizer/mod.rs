@@ -595,6 +595,13 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         IrOp::SetPaletteBrightness(level) => {
             used.insert(*level);
         }
+        IrOp::FadeOut(step_frames) | IrOp::FadeIn(step_frames) => {
+            used.insert(*step_frames);
+        }
+        IrOp::Sprite0Split { scroll_x, scroll_y } => {
+            used.insert(*scroll_x);
+            used.insert(*scroll_y);
+        }
     }
 }
 
@@ -653,6 +660,9 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::StopMusic
         | IrOp::SeedRand(_, _)
         | IrOp::SetPaletteBrightness(_)
+        | IrOp::FadeOut(_)
+        | IrOp::FadeIn(_)
+        | IrOp::Sprite0Split { .. }
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
         | IrOp::SourceLoc(_) => None,
