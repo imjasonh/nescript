@@ -394,33 +394,30 @@ NMI-time write budget (~2273 cycles) is too tight for a full
 nametable. RLE is the smaller first step — emit a `nametable` that
 can declare `compression: rle` and decompress at swap time.
 
-### J. Palette brightness / fade
+### J. Palette brightness / fade (ships today)
 
-Neslib's `pal_bright(level: 0..8)` is a one-call fade that flips
-the PPU mask emphasis bits and optionally darkens the active
-palette via a brightness LUT. One-call fade-in / fade-out is
-enormous polish for nearly no runtime cost. API:
+`set_palette_brightness(level: u8)` is a builtin that maps the
+0..8 level onto `$2001` PPU mask emphasis bits. See
+`examples/palette_brightness_demo.ne` for an end-to-end demo.
+The runtime `__set_palette_brightness` routine is spliced in only
+when user code references the builtin. Follow-ups still worth
+doing:
 
-```
-builtin set_palette_brightness(level: u8)   // 0=off, 4=normal, 8=white
-builtin fade_out(frames: u8)                // blocks; drives mask bits
-builtin fade_in(frames: u8)
-```
+- Blocking `fade_out(frames)` / `fade_in(frames)` helpers — today
+  users write them in user-space with a for-loop + `wait_frame`.
+  Making them builtin would elide the frame-counting boilerplate.
+- A brightness-LUT path that recolours the active palette in
+  addition to the emphasis bits, for non-NTSC-assumption fades.
 
-### K. Edge-triggered input
+### K. Edge-triggered input (ships today)
 
-Today NEScript exposes level-state buttons (`p1.a` is whatever the
-hardware reports this frame). Every menu needs a "just pressed
-this frame" primitive. Extend the button type with `.pressed` and
-`.released` accessors:
-
-```
-if p1.a.pressed { menu_accept() }
-if p1.start.released { pause_menu() }
-```
-
-Implementation is one more ZP byte per controller (`p1_prev`) and
-an XOR in the input polling stub.
+`p1.button.a.pressed` / `p1.button.a.released` (and the P2 variants)
+report the rising / falling edge of the button relative to the
+previous frame. Implementation: one IR op
+(`ReadInputEdge { player, mask, released }`), two main-RAM bytes
+(`$07E6/$07E7` for P1/P2 prev state), and a new NMI-side snapshot
+of the current input byte before the next strobe, all gated on the
+`__edge_input_used` marker. See `examples/edge_input_demo.ne`.
 
 ### L. Sprite 0 hit split-screen
 
@@ -448,11 +445,16 @@ modifier for HUD sprites that must stay at low OAM slots — is the
 cleaner user-facing API. Mentioned already under Open Design
 Questions; bumping it into the active roadmap.
 
-### N. Runtime PRNG
+### N. Runtime PRNG (ships today)
 
-`rand8()` / `rand16()` / `set_rand(seed: u16)` are in every
-nesdoug demo. Implement as a ZP-held 16-bit LFSR (xorshift16 is
-tiny and good enough). Users shouldn't have to hand-roll this.
+`rand8()` / `rand16()` / `seed_rand(seed: u16)` are builtin
+intrinsics backed by a 16-bit Galois LFSR (polynomial `0xB400`,
+full 65535-cycle period from any non-zero seed). State lives in
+main RAM at `$07EA/$07EB` and is seeded to `0xACE1` at reset so
+the first draw is useful without explicit seeding. Routines +
+seed init are gated on the `__rand_used` marker — programs that
+never call any of the three pay zero bytes. See
+`examples/prng_demo.ne`.
 
 ### O. DPCM / DMC sample playback
 
@@ -516,21 +518,31 @@ three reads every program needs.
 
 ### V. Additional mappers
 
-In priority order (cheapest × highest demand first):
+**Shipped:**
+- **AxROM** (mapper 7) — single-screen mirroring, 32 KB PRG pages.
+  `mapper: AxROM` in `game { }`. Linker pads single-bank ROMs to
+  32 KB. See `examples/axrom_simple.ne`.
+- **CNROM** (mapper 3) — fixed 32 KB PRG, 8 KB CHR bankswitching.
+  `mapper: CNROM`. See `examples/cnrom_simple.ne`. User-visible CHR
+  bank selection is still TODO — the reset-time init writes bank 0
+  and nothing else is exposed yet.
 
-1. **AxROM** (mapper 7). Single-screen mirroring, up to 256 KB PRG
-   bankswitched in 32 KB pages. Almost a trivial extension of the
-   UxROM path — one register, different mirroring bit.
-2. **CNROM** (mapper 3). 8 KB CHR bankswitching, fixed 32 KB PRG.
-   One register, CHR-only. Also trivial.
-3. **GNROM / MHROM** (mapper 66). Combines AxROM-style PRG with
+**Still TODO:**
+
+1. **GNROM / MHROM** (mapper 66). Combines AxROM-style PRG with
    CNROM-style CHR banking. Another single-register mapper.
-4. **MMC2** (mapper 9, Punch-Out only realistically). Medium.
-5. **UNROM-512** (mapper 30). The modern homebrew sweet spot —
+2. **MMC2** (mapper 9, Punch-Out only realistically). Medium.
+3. **UNROM-512** (mapper 30). The modern homebrew sweet spot —
    512 KB PRG + CHR-RAM + self-flashing. Mapping is UxROM-like
    plus a one-screen bit.
-6. **MMC5** (mapper 5). Big. Driven by FamiStudio's expansion
+4. **MMC5** (mapper 5). Big. Driven by FamiStudio's expansion
    audio more than by the extra PRG/CHR modes. Probably last.
+
+Each new mapper needs a `Mapper::X` variant, a reset-time
+`gen_xrom_init()` in the runtime, bank-select support in
+`gen_bank_select()`, and an iNES mapper number in `rom::mapper_number`.
+The PR checklist ("example + behaviour test + negative test") is
+still the bar for each of these.
 
 ### W. NSF output target
 
@@ -546,13 +558,13 @@ Today the debug port is hardcoded to `$4800`. Expose
 `mesen`, emit writes to `$4018` (Mesen's documented debug port)
 and document the trace-log tool invocation in the debug docs.
 
-### Y. FCEUX `.nl` / `.ld` label file output
+### Y. FCEUX `.nl` / `.ld` label file output (ships today)
 
-`--dbg` writes ca65-compatible debug info, which Mesen + Mesen2 +
-FCEUX all consume for source-level stepping. FCEUX also supports
-its native `.nl` (per-bank label) / `.ld` (line) files, which some
-users prefer. Cheap addition: `--fceux-labels <prefix>` emits
-`<prefix>.0.nl`, `<prefix>.1.nl`, …, `<prefix>.ld`.
+`--fceux-labels <prefix>` emits `<prefix>.<bank-index>.nl` for
+each PRG bank plus `<prefix>.ram.nl` for RAM/zero-page labels.
+Each bank line has the form `$XXXX#label_name#` which is what
+FCEUX reads. Still TODO: a `.ld` line-info file that pairs with
+the source map for proper line-level stepping in FCEUX.
 
 ### Z. Explicit bank-placement hints on functions and data
 
@@ -571,19 +583,21 @@ to a specific bank to avoid bank-switch cost on a hot path.
 
 ### Priority ranking
 
-In practice the order I'd tackle these for maximum user value:
+Already shipped: edge-triggered input (§K), PRNG (§N), palette
+brightness (§J), AxROM + CNROM (§V), FCEUX labels (§Y).
+
+Remaining order by user value:
 
 1. `i16` (§A) — unblocks signed physics, metasprite offsets.
 2. VRAM update buffer (§G) — unblocks HUDs, dialog, streaming.
-3. Edge-triggered input (§K) + PRNG (§N) — one-line demo wins.
-4. Palette fade (§J) + sprite-0 split (§L) — cheap polish wins.
-5. Register allocator (existing section) — compounding size win.
-6. Metatiles + collision (§H) — closes several items at once.
-7. Inline-asm completeness (§D) — escape hatch for power users.
-8. Arrays-of-structs + bitfields (§C) + fn pointers (§B) —
+3. Sprite-0 split (§L) + auto sprite cycling (§M) — cheap polish.
+4. Register allocator (existing section) — compounding size win.
+5. Metatiles + collision (§H) — closes several items at once.
+6. Inline-asm completeness (§D) — escape hatch for power users.
+7. Arrays-of-structs + bitfields (§C) + fn pointers (§B) —
    turns NEScript into a general-purpose NES language.
-9. SRAM (§S) + AxROM/CNROM/UNROM-512 (§V) — ecosystem fit.
-10. FamiStudio import (§Q) + DPCM (§O) + expansion audio (§P).
+8. SRAM (§S) + UNROM-512 + GNROM + MMC5 (§V) — ecosystem fit.
+9. FamiStudio import (§Q) + DPCM (§O) + expansion audio (§P).
 
 ---
 
