@@ -1107,3 +1107,164 @@ fn inline_fun_nested_inlines_substitute_correctly() {
             .collect::<Vec<_>>()
     );
 }
+
+#[test]
+fn cmp_on_i16_var_emits_signed_kind() {
+    // Two i16 vars compared via `<` should lower to a CmpLt16 op
+    // tagged `Signedness::Signed` so the codegen picks the
+    // signed-branch lowering. This is the regression guard for
+    // the §A-follow-up gap: before signedness tracking landed, a
+    // negative i16 always compared greater than zero because the
+    // BCC-based unsigned path saw $FFxx > $00yy.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var a: i16 = -1
+        var b: i16 = 1
+        var hit: u8 = 0
+        on frame { if a < b { hit = 1 } }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let cmp = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .find_map(|op| match op {
+            IrOp::CmpLt16 { signed, .. } => Some(*signed),
+            _ => None,
+        })
+        .expect("expected a CmpLt16 op");
+    assert_eq!(cmp, Signedness::Signed);
+}
+
+#[test]
+fn cmp_on_u16_var_stays_unsigned() {
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var a: u16 = 0
+        var b: u16 = 1
+        var hit: u8 = 0
+        on frame { if a < b { hit = 1 } }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let cmp = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .find_map(|op| match op {
+            IrOp::CmpLt16 { signed, .. } => Some(*signed),
+            _ => None,
+        })
+        .expect("expected a CmpLt16 op");
+    assert_eq!(cmp, Signedness::Unsigned);
+}
+
+#[test]
+fn cmp_on_i8_var_emits_signed_kind() {
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var a: i8 = -1
+        var b: i8 = 1
+        var hit: u8 = 0
+        on frame { if a < b { hit = 1 } }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let cmp = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .find_map(|op| match op {
+            IrOp::CmpLt(_, _, _, signed) => Some(*signed),
+            _ => None,
+        })
+        .expect("expected a CmpLt op");
+    assert_eq!(cmp, Signedness::Signed);
+}
+
+#[test]
+fn i8_widened_to_i16_emits_sign_extend() {
+    // Loading an i8 as the rhs of an i16 add should sign-extend
+    // the high byte rather than zero-extending it. The IR shape
+    // we look for is a `SignExtend` op feeding the high-byte
+    // input to the resulting `Add16`.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var w: i16 = 0
+        var n: i8 = -10
+        on frame { w = w + n }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let has_sx = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .any(|op| matches!(op, IrOp::SignExtend(_, _)));
+    assert!(
+        has_sx,
+        "i8 → i16 widen should emit SignExtend; ops: {:?}",
+        frame_fn
+            .blocks
+            .iter()
+            .flat_map(|b| &b.ops)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn cast_to_u16_strips_signed_flag() {
+    // An explicit `as u16` cast on an `i16` value should make the
+    // subsequent compare lower as unsigned — the user has opted
+    // out of signed semantics.
+    let ir = lower_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        var a: i16 = -1
+        var b: u16 = 1
+        var hit: u8 = 0
+        on frame { if (a as u16) < b { hit = 1 } }
+        start Main
+    "#,
+    );
+    let frame_fn = ir
+        .functions
+        .iter()
+        .find(|f| f.name.contains("frame"))
+        .expect("frame handler should exist");
+    let cmp = frame_fn
+        .blocks
+        .iter()
+        .flat_map(|b| &b.ops)
+        .find_map(|op| match op {
+            IrOp::CmpLt16 { signed, .. } => Some(*signed),
+            _ => None,
+        })
+        .expect("expected a CmpLt16 op");
+    assert_eq!(cmp, Signedness::Unsigned);
+}

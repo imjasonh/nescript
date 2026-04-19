@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use super::*;
 use crate::analyzer::AnalysisResult;
@@ -86,6 +86,20 @@ struct LoweringContext {
     /// by binary-op, compare, and assignment lowering when they
     /// need to decide between `Add`/`Add16`, etc.
     wide_hi: HashMap<IrTemp, IrTemp>,
+    /// Temps whose source value is a signed integer (`i8` / `i16`).
+    /// Populated by the `LoadVar` / cast / negate / sign-extended-
+    /// literal paths and propagated through arithmetic in
+    /// `lower_binop`. Consumed at compare time to pick between
+    /// `Signedness::Unsigned` and `Signedness::Signed`, and by
+    /// `widen()` to decide whether the synthesized high byte should
+    /// be `LoadImm 0` (zero-extension) or [`IrOp::SignExtend`]
+    /// (sign-extension). Tracking the signedness on the temp itself —
+    /// rather than re-deriving it from the AST at every consumer —
+    /// keeps the consumer code matched to the existing `is_wide` /
+    /// `widen` shape, and means a temp can carry a different
+    /// signedness than its source variable when the user inserts an
+    /// explicit `as` cast.
+    signed_temps: HashSet<IrTemp>,
     /// Captured metasprite declarations keyed by name. When a
     /// `Statement::Draw` names a metasprite (rather than a flat
     /// sprite), the lowering expands it inline into one
@@ -191,6 +205,7 @@ impl LoweringContext {
             state_names: Vec::new(),
             start_state: String::new(),
             wide_hi: HashMap::new(),
+            signed_temps: HashSet::new(),
             metasprites: HashMap::new(),
             auto_sprite_flicker: false,
         }
@@ -722,6 +737,7 @@ impl LoweringContext {
         // fixed on the War cleanup branch; see `git log` for the
         // full reproduction).
         self.wide_hi.clear();
+        self.signed_temps.clear();
         self.current_blocks = Vec::new();
         self.current_locals = Vec::new();
         // Enter the function's local scope so all bare identifier
@@ -842,6 +858,7 @@ impl LoweringContext {
         // from the previous function and emit
         // catastrophically wrong 16-bit IR ops.
         self.wide_hi.clear();
+        self.signed_temps.clear();
         self.current_blocks = Vec::new();
         self.current_scope_prefix = Some(scope_prefix.to_string());
         // Seed `current_locals` with the state's declared locals so any
@@ -1600,7 +1617,14 @@ impl LoweringContext {
         self.emit(IrOp::LoadVar(var_temp, var_id));
         let end_temp = self.lower_expr(end);
         let cmp_temp = self.fresh_temp();
-        self.emit(IrOp::CmpLt(cmp_temp, var_temp, end_temp));
+        // `for` loops drive a u8 counter today (analyzer enforces),
+        // so the unsigned compare is always correct.
+        self.emit(IrOp::CmpLt(
+            cmp_temp,
+            var_temp,
+            end_temp,
+            Signedness::Unsigned,
+        ));
         self.end_block(IrTerminator::Branch(
             cmp_temp,
             body_label.clone(),
@@ -1664,16 +1688,43 @@ impl LoweringContext {
     }
 
     /// Return the high-byte temp for a wide value. If `t` is not
-    /// wide, zero-extend it: allocate a fresh temp, emit `LoadImm 0`,
-    /// and return the pair. Used before emitting a 16-bit IR op when
-    /// one operand is narrow and the other is wide.
+    /// wide, extend it: allocate a fresh temp and emit either
+    /// `LoadImm 0` (zero-extend, for unsigned narrow values) or
+    /// [`IrOp::SignExtend`] (for signed narrow values). Used before
+    /// emitting a 16-bit IR op when one operand is narrow and the
+    /// other is wide. The signed path is what makes
+    /// `var s8: i8 = -10; var w: i16 = 0; w = s8` round-trip
+    /// correctly — without it, the store would land at `$00F6`
+    /// (=246) instead of `$FFF6` (=-10).
     fn widen(&mut self, t: IrTemp) -> (IrTemp, IrTemp) {
         if let Some(&hi) = self.wide_hi.get(&t) {
             return (t, hi);
         }
         let hi = self.fresh_temp();
-        self.emit(IrOp::LoadImm(hi, 0));
+        if self.signed_temps.contains(&t) {
+            self.emit(IrOp::SignExtend(hi, t));
+            self.signed_temps.insert(hi);
+        } else {
+            self.emit(IrOp::LoadImm(hi, 0));
+        }
         (t, hi)
+    }
+
+    /// Mark a temp as carrying a signed value. See `signed_temps` for
+    /// the consumer model.
+    fn mark_signed(&mut self, t: IrTemp) {
+        self.signed_temps.insert(t);
+    }
+
+    /// Combined signedness for a binary op: signed if either operand
+    /// is signed. Mirrors the way C / Rust promote to the widest
+    /// signed type when one side is signed.
+    fn binop_signedness(&self, a: IrTemp, b: IrTemp) -> Signedness {
+        if self.signed_temps.contains(&a) || self.signed_temps.contains(&b) {
+            Signedness::Signed
+        } else {
+            Signedness::Unsigned
+        }
     }
 
     fn lower_expr(&mut self, expr: &Expr) -> IrTemp {
@@ -1717,13 +1768,25 @@ impl LoweringContext {
                 let var_id = self.get_or_create_var(name);
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadVar(t, var_id));
+                let scoped = self.scoped_key(name);
+                let var_ty = self
+                    .var_types
+                    .get(&scoped)
+                    .or_else(|| self.var_types.get(name))
+                    .cloned();
                 // For u16 / i16 variables, also load the high byte
                 // and register the temp pair as wide so downstream
                 // ops can emit 16-bit IR when appropriate.
-                if matches!(self.var_types.get(name), Some(NesType::U16 | NesType::I16)) {
+                if matches!(var_ty, Some(NesType::U16 | NesType::I16)) {
                     let hi = self.fresh_temp();
                     self.emit(IrOp::LoadVarHi(hi, var_id));
                     self.make_wide(t, hi);
+                    if matches!(var_ty, Some(NesType::I16)) {
+                        self.mark_signed(t);
+                        self.mark_signed(hi);
+                    }
+                } else if matches!(var_ty, Some(NesType::I8)) {
+                    self.mark_signed(t);
                 }
                 t
             }
@@ -1732,6 +1795,18 @@ impl LoweringContext {
                 let idx = self.lower_expr(index);
                 let t = self.fresh_temp();
                 self.emit(IrOp::ArrayLoad(t, var_id, idx));
+                let scoped = self.scoped_key(name);
+                let elem_ty = match self
+                    .var_types
+                    .get(&scoped)
+                    .or_else(|| self.var_types.get(name))
+                {
+                    Some(NesType::Array(elem, _)) => Some(elem.as_ref().clone()),
+                    _ => None,
+                };
+                if matches!(elem_ty, Some(NesType::I8 | NesType::I16)) {
+                    self.mark_signed(t);
+                }
                 t
             }
             Expr::FieldAccess(name, field, _) => {
@@ -1745,13 +1820,17 @@ impl LoweringContext {
                 let var_id = self.get_or_create_var(&full_name);
                 let t = self.fresh_temp();
                 self.emit(IrOp::LoadVar(t, var_id));
-                if matches!(
-                    self.var_types.get(&full_name),
-                    Some(NesType::U16 | NesType::I16)
-                ) {
+                let var_ty = self.var_types.get(&full_name).cloned();
+                if matches!(var_ty, Some(NesType::U16 | NesType::I16)) {
                     let hi = self.fresh_temp();
                     self.emit(IrOp::LoadVarHi(hi, var_id));
                     self.make_wide(t, hi);
+                    if matches!(var_ty, Some(NesType::I16)) {
+                        self.mark_signed(t);
+                        self.mark_signed(hi);
+                    }
+                } else if matches!(var_ty, Some(NesType::I8)) {
+                    self.mark_signed(t);
                 }
                 t
             }
@@ -1772,13 +1851,25 @@ impl LoweringContext {
                         let hi = self.fresh_temp();
                         self.emit(IrOp::LoadImm(hi, (negated >> 8) as u8));
                         self.make_wide(t, hi);
+                        self.mark_signed(t);
+                        self.mark_signed(hi);
+                    } else {
+                        // -0 is still a literal that wants signed
+                        // semantics in any compare it participates in.
+                        self.mark_signed(t);
                     }
                     return t;
                 }
                 let val = self.lower_expr(inner);
                 let t = self.fresh_temp();
                 match op {
-                    UnaryOp::Negate => self.emit(IrOp::Negate(t, val)),
+                    UnaryOp::Negate => {
+                        self.emit(IrOp::Negate(t, val));
+                        // Negation is the canonical signed op — its
+                        // result is always interpreted as a signed
+                        // two's-complement value.
+                        self.mark_signed(t);
+                    }
                     UnaryOp::Not => {
                         // Logical not: compare with 0
                         let zero = self.fresh_temp();
@@ -1874,9 +1965,26 @@ impl LoweringContext {
                 self.emit(IrOp::LoadImm(t, 0));
                 t
             }
-            Expr::Cast(inner, _, _) => {
-                // For now, just evaluate the inner expression (truncation/extension is a no-op on 8-bit)
-                self.lower_expr(inner)
+            Expr::Cast(inner, target, _) => {
+                // Lower the inner expression and re-tag the result's
+                // signedness to match the cast target. Casts to `i8`
+                // / `i16` mark the temp signed (the user is asserting
+                // signed interpretation regardless of the source);
+                // casts to `u8` / `u16` strip the signed flag so
+                // subsequent compares pick the unsigned path. Width
+                // changes are still no-ops at IR level — the codegen
+                // only cares about the low byte for narrowing, and
+                // widening uses the same `widen()` path as everywhere
+                // else.
+                let t = self.lower_expr(inner);
+                match target {
+                    NesType::I8 | NesType::I16 => self.mark_signed(t),
+                    NesType::U8 | NesType::U16 => {
+                        self.signed_temps.remove(&t);
+                    }
+                    _ => {}
+                }
+                t
             }
             Expr::DebugCall(method, _args, _) => {
                 // The analyzer already validated the method name and
@@ -1947,6 +2055,13 @@ impl LoweringContext {
         // variants, which truncate to the low byte. (Multi-byte
         // bitwise / multiply could be added later; today they're
         // rare enough in NES code to defer.)
+        // Combined signedness: signed iff either operand is signed.
+        // For compares the value goes into the IR op's `signed`
+        // field; for arithmetic we propagate it onto the result temp
+        // so a chain like `cast_i8 + 1 < limit` keeps signed
+        // semantics through to the compare.
+        let sign = self.binop_signedness(l, r);
+
         if wide {
             let (a_lo, a_hi) = self.widen(l);
             let (b_lo, b_hi) = self.widen(r);
@@ -1962,6 +2077,10 @@ impl LoweringContext {
                         b_hi,
                     });
                     self.make_wide(t, d_hi);
+                    if sign == Signedness::Signed {
+                        self.mark_signed(t);
+                        self.mark_signed(d_hi);
+                    }
                     return t;
                 }
                 BinOp::Sub => {
@@ -1975,6 +2094,10 @@ impl LoweringContext {
                         b_hi,
                     });
                     self.make_wide(t, d_hi);
+                    if sign == Signedness::Signed {
+                        self.mark_signed(t);
+                        self.mark_signed(d_hi);
+                    }
                     return t;
                 }
                 BinOp::Eq => {
@@ -2004,6 +2127,7 @@ impl LoweringContext {
                         a_hi,
                         b_lo,
                         b_hi,
+                        signed: sign,
                     });
                     return t;
                 }
@@ -2014,6 +2138,7 @@ impl LoweringContext {
                         a_hi,
                         b_lo,
                         b_hi,
+                        signed: sign,
                     });
                     return t;
                 }
@@ -2024,6 +2149,7 @@ impl LoweringContext {
                         a_hi,
                         b_lo,
                         b_hi,
+                        signed: sign,
                     });
                     return t;
                 }
@@ -2034,6 +2160,7 @@ impl LoweringContext {
                         a_hi,
                         b_lo,
                         b_hi,
+                        signed: sign,
                     });
                     return t;
                 }
@@ -2054,15 +2181,24 @@ impl LoweringContext {
             BinOp::BitwiseXor => self.emit(IrOp::Xor(t, l, r)),
             BinOp::Eq => self.emit(IrOp::CmpEq(t, l, r)),
             BinOp::NotEq => self.emit(IrOp::CmpNe(t, l, r)),
-            BinOp::Lt => self.emit(IrOp::CmpLt(t, l, r)),
-            BinOp::Gt => self.emit(IrOp::CmpGt(t, l, r)),
-            BinOp::LtEq => self.emit(IrOp::CmpLtEq(t, l, r)),
-            BinOp::GtEq => self.emit(IrOp::CmpGtEq(t, l, r)),
+            BinOp::Lt => self.emit(IrOp::CmpLt(t, l, r, sign)),
+            BinOp::Gt => self.emit(IrOp::CmpGt(t, l, r, sign)),
+            BinOp::LtEq => self.emit(IrOp::CmpLtEq(t, l, r, sign)),
+            BinOp::GtEq => self.emit(IrOp::CmpGtEq(t, l, r, sign)),
             BinOp::ShiftLeft => self.emit(IrOp::ShiftLeftVar(t, l, r)),
             BinOp::ShiftRight => self.emit(IrOp::ShiftRightVar(t, l, r)),
             BinOp::Div => self.emit(IrOp::Div(t, l, r)),
             BinOp::Mod => self.emit(IrOp::Mod(t, l, r)),
             BinOp::And | BinOp::Or => unreachable!("handled above"),
+        }
+
+        if sign == Signedness::Signed
+            && matches!(
+                op,
+                BinOp::Add | BinOp::Sub | BinOp::Mul | BinOp::Div | BinOp::Mod
+            )
+        {
+            self.mark_signed(t);
         }
 
         t

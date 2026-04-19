@@ -27,7 +27,9 @@ use std::collections::HashMap;
 use crate::analyzer::VarAllocation;
 use crate::asm::{AddressingMode as AM, Instruction, Opcode::*};
 use crate::assets::{MusicData, SfxData};
-use crate::ir::{IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator, VarId};
+use crate::ir::{
+    IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator, Signedness, VarId,
+};
 use crate::parser::ast::Channel;
 use crate::runtime::{
     AUDIO_NOISE_COUNTER, AUDIO_NOISE_PTR_HI, AUDIO_NOISE_PTR_LO, AUDIO_SFX_PITCH_PTR_HI,
@@ -1141,22 +1143,30 @@ impl<'a> IrCodeGen<'a> {
                 (
                     IrOp::CmpEq(d, a, b)
                     | IrOp::CmpNe(d, a, b)
-                    | IrOp::CmpLt(d, a, b)
-                    | IrOp::CmpGt(d, a, b)
-                    | IrOp::CmpLtEq(d, a, b)
-                    | IrOp::CmpGtEq(d, a, b),
+                    | IrOp::CmpLt(d, a, b, _)
+                    | IrOp::CmpGt(d, a, b, _)
+                    | IrOp::CmpLtEq(d, a, b, _)
+                    | IrOp::CmpGtEq(d, a, b, _),
                     IrTerminator::Branch(cond, true_lbl, false_lbl),
                 ) if cond == d && self.use_counts.get(d).copied().unwrap_or(0) == 1 => {
-                    let kind = match op {
-                        IrOp::CmpEq(..) => CmpKind::Eq,
-                        IrOp::CmpNe(..) => CmpKind::Ne,
-                        IrOp::CmpLt(..) => CmpKind::Lt,
-                        IrOp::CmpGt(..) => CmpKind::Gt,
-                        IrOp::CmpLtEq(..) => CmpKind::LtEq,
-                        IrOp::CmpGtEq(..) => CmpKind::GtEq,
+                    let (kind, signed) = match op {
+                        IrOp::CmpEq(..) => (CmpKind::Eq, Signedness::Unsigned),
+                        IrOp::CmpNe(..) => (CmpKind::Ne, Signedness::Unsigned),
+                        IrOp::CmpLt(.., s) => (CmpKind::Lt, *s),
+                        IrOp::CmpGt(.., s) => (CmpKind::Gt, *s),
+                        IrOp::CmpLtEq(.., s) => (CmpKind::LtEq, *s),
+                        IrOp::CmpGtEq(.., s) => (CmpKind::GtEq, *s),
                         _ => unreachable!(),
                     };
-                    Some((*d, *a, *b, kind, true_lbl.clone(), false_lbl.clone()))
+                    Some((
+                        *d,
+                        *a,
+                        *b,
+                        kind,
+                        signed,
+                        true_lbl.clone(),
+                        false_lbl.clone(),
+                    ))
                 }
                 _ => None,
             });
@@ -1178,13 +1188,13 @@ impl<'a> IrCodeGen<'a> {
             self.retire_op_sources(op);
         }
 
-        if let Some((d, a, b, kind, true_lbl, false_lbl)) = fuse_cmp_branch {
+        if let Some((d, a, b, kind, signed, true_lbl, false_lbl)) = fuse_cmp_branch {
             // Emit the fused compare + branch *first*. Retiring
             // a/b before the emit would free their slots while
             // the values are still live — `load_temp(a)` would
             // then re-allocate `a` to whatever stale slot the
             // free list pops next.
-            self.gen_cmp_branch(a, b, kind, &true_lbl, &false_lbl);
+            self.gen_cmp_branch(a, b, kind, signed, &true_lbl, &false_lbl);
             // Now that the CMP has read both operands, drop their
             // use counts the same way `retire_op_sources` would
             // for a non-fused Cmp op. The destination temp's
@@ -1231,9 +1241,23 @@ impl<'a> IrCodeGen<'a> {
         a: IrTemp,
         b: IrTemp,
         kind: CmpKind,
+        signed: Signedness,
         true_label: &str,
         false_label: &str,
     ) {
+        // Signed ordering compares lower through a different
+        // primitive (`gen_cmp_signed_set_n`) that leaves the result
+        // in the N flag instead of the carry flag, so dispatch out
+        // before the unsigned `LDA / CMP` lead-in.
+        if signed == Signedness::Signed
+            && matches!(
+                kind,
+                CmpKind::Lt | CmpKind::Gt | CmpKind::LtEq | CmpKind::GtEq
+            )
+        {
+            self.gen_cmp_branch_signed(a, b, kind, true_label, false_label);
+            return;
+        }
         self.load_temp(a);
         let b_addr = self.temp_addr(b);
         self.emit(CMP, AM::ZeroPage(b_addr));
@@ -1292,6 +1316,102 @@ impl<'a> IrCodeGen<'a> {
         }
         // Fall-through path lands here for the false case.
         self.emit(JMP, AM::Label(false_blk));
+    }
+
+    /// Fused signed compare + branch. After
+    /// [`gen_cmp_signed_set_n`], the N flag holds `1` iff
+    /// `a < b` under signed semantics; convert that single flag
+    /// into a branch to either `true_label` or `false_label`
+    /// depending on the requested predicate. Mirrors the unsigned
+    /// `gen_cmp_branch` shape (skip-over-`JMP` to keep the
+    /// destination in `JMP` range) so distance to the target
+    /// block is unconstrained.
+    fn gen_cmp_branch_signed(
+        &mut self,
+        a: IrTemp,
+        b: IrTemp,
+        kind: CmpKind,
+        true_label: &str,
+        false_label: &str,
+    ) {
+        // For `Gt`/`GtEq`, swap operands so the underlying primitive
+        // still computes "is left < right?" — `a > b` is `b < a`,
+        // and `a >= b` is `!(a < b)`.
+        let (lhs, rhs, branch_kind) = match kind {
+            CmpKind::Lt => (a, b, SignedBranchKind::Lt),
+            CmpKind::Gt => (b, a, SignedBranchKind::Lt),
+            CmpKind::GtEq => (a, b, SignedBranchKind::GtEq),
+            CmpKind::LtEq => (b, a, SignedBranchKind::GtEq),
+            CmpKind::Eq | CmpKind::Ne => unreachable!("equality is signedness-independent"),
+        };
+
+        self.gen_cmp_signed_set_n(lhs, rhs);
+
+        let suffix = self.local_label_suffix();
+        let skip_label = format!("__ir_cmp_skip_{suffix}");
+        let true_blk = format!("__ir_blk_{true_label}");
+        let false_blk = format!("__ir_blk_{false_label}");
+
+        match branch_kind {
+            SignedBranchKind::Lt => {
+                // N=1 means lhs < rhs; jump to true. Inverted = BPL.
+                self.emit(BPL, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+            SignedBranchKind::GtEq => {
+                // N=0 means lhs >= rhs; jump to true. Inverted = BMI.
+                self.emit(BMI, AM::LabelRelative(skip_label.clone()));
+                self.emit(JMP, AM::Label(true_blk));
+                self.emit_label(&skip_label);
+            }
+        }
+        self.emit(JMP, AM::Label(false_blk));
+    }
+
+    /// Subtract `b` from `a` as a one-byte signed compare and leave
+    /// the **N** flag set iff `a < b` under signed semantics. Uses
+    /// the standard 6502 idiom: subtract, then if signed overflow
+    /// occurred (V=1) flip N via `EOR #$80` so the resulting flag
+    /// reflects the true sign of the difference.
+    ///
+    /// Trashes A. The C/V flags are left in the SBC's natural state
+    /// — callers that only care about N (the only consumer today)
+    /// don't need to touch them.
+    fn gen_cmp_signed_set_n(&mut self, a: IrTemp, b: IrTemp) {
+        self.load_temp(a);
+        self.emit(SEC, AM::Implied);
+        let b_addr = self.temp_addr(b);
+        self.emit(SBC, AM::ZeroPage(b_addr));
+
+        let suffix = self.local_label_suffix();
+        let skip_label = format!("__ir_cmp_s_no_v_{suffix}");
+        // No overflow — N is already correct, skip the flip.
+        self.emit(BVC, AM::LabelRelative(skip_label.clone()));
+        // Overflow — flip the N flag by toggling A's bit 7. The
+        // subsequent BMI/BPL only inspects N, so we don't have to
+        // re-establish C or V.
+        self.emit(EOR, AM::Immediate(0x80));
+        self.emit_label(&skip_label);
+    }
+
+    /// Emit `dest = (src bit 7 == 1) ? $FF : $00`. The 6-instruction
+    /// branchless form is shorter than the obvious BMI lowering and
+    /// has deterministic timing — both nice properties for an op
+    /// that lands inside hot 16-bit-arithmetic prologues.
+    fn gen_sign_extend(&mut self, dest: IrTemp, src: IrTemp) {
+        self.load_temp(src);
+        // Move sign bit into carry.
+        self.emit(ASL, AM::Accumulator);
+        // After ASL, carry = original bit 7. Build $FF (negative)
+        // or $00 (non-negative) without a branch:
+        //   LDA #$00; ADC #$FF; EOR #$FF
+        // C=1 (was negative) → $00 + $FF + 1 = $00 (carry set) → EOR → $FF
+        // C=0 (was positive) → $00 + $FF + 0 = $FF              → EOR → $00
+        self.emit(LDA, AM::Immediate(0x00));
+        self.emit(ADC, AM::Immediate(0xFF));
+        self.emit(EOR, AM::Immediate(0xFF));
+        self.store_temp(dest);
     }
 
     #[allow(clippy::too_many_lines)]
@@ -1430,12 +1550,13 @@ impl<'a> IrCodeGen<'a> {
                 self.emit(EOR, AM::Immediate(0xFF));
                 self.store_temp(*d);
             }
-            IrOp::CmpEq(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::Eq),
-            IrOp::CmpNe(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::Ne),
-            IrOp::CmpLt(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::Lt),
-            IrOp::CmpGt(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::Gt),
-            IrOp::CmpLtEq(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::LtEq),
-            IrOp::CmpGtEq(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::GtEq),
+            IrOp::CmpEq(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::Eq, Signedness::Unsigned),
+            IrOp::CmpNe(d, a, b) => self.gen_cmp(*d, *a, *b, CmpKind::Ne, Signedness::Unsigned),
+            IrOp::CmpLt(d, a, b, s) => self.gen_cmp(*d, *a, *b, CmpKind::Lt, *s),
+            IrOp::CmpGt(d, a, b, s) => self.gen_cmp(*d, *a, *b, CmpKind::Gt, *s),
+            IrOp::CmpLtEq(d, a, b, s) => self.gen_cmp(*d, *a, *b, CmpKind::LtEq, *s),
+            IrOp::CmpGtEq(d, a, b, s) => self.gen_cmp(*d, *a, *b, CmpKind::GtEq, *s),
+            IrOp::SignExtend(d, src) => self.gen_sign_extend(*d, *src),
             IrOp::ArrayLoad(dest, var, idx) => {
                 let base_addr = self.var_addr(*var);
                 self.load_temp(*idx);
@@ -1945,42 +2066,62 @@ impl<'a> IrCodeGen<'a> {
                 a_hi,
                 b_lo,
                 b_hi,
-            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::Eq),
+            } => self.gen_cmp16(
+                *dest,
+                *a_lo,
+                *a_hi,
+                *b_lo,
+                *b_hi,
+                Cmp16Kind::Eq,
+                Signedness::Unsigned,
+            ),
             IrOp::CmpNe16 {
                 dest,
                 a_lo,
                 a_hi,
                 b_lo,
                 b_hi,
-            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::Ne),
+            } => self.gen_cmp16(
+                *dest,
+                *a_lo,
+                *a_hi,
+                *b_lo,
+                *b_hi,
+                Cmp16Kind::Ne,
+                Signedness::Unsigned,
+            ),
             IrOp::CmpLt16 {
                 dest,
                 a_lo,
                 a_hi,
                 b_lo,
                 b_hi,
-            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::Lt),
+                signed,
+            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::Lt, *signed),
             IrOp::CmpGt16 {
                 dest,
                 a_lo,
                 a_hi,
                 b_lo,
                 b_hi,
-            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::Gt),
+                signed,
+            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::Gt, *signed),
             IrOp::CmpLtEq16 {
                 dest,
                 a_lo,
                 a_hi,
                 b_lo,
                 b_hi,
-            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::LtEq),
+                signed,
+            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::LtEq, *signed),
             IrOp::CmpGtEq16 {
                 dest,
                 a_lo,
                 a_hi,
                 b_lo,
                 b_hi,
-            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::GtEq),
+                signed,
+            } => self.gen_cmp16(*dest, *a_lo, *a_hi, *b_lo, *b_hi, Cmp16Kind::GtEq, *signed),
             IrOp::Rand8(dest) => {
                 self.emit_rand_marker();
                 self.emit(JSR, AM::Label("__rand8".into()));
@@ -2790,6 +2931,7 @@ impl<'a> IrCodeGen<'a> {
     /// a u8 bool (0 or 1) in `dest`. All six comparison kinds are
     /// handled uniformly: compare high bytes first, then low bytes
     /// only when high bytes are equal.
+    #[allow(clippy::too_many_arguments)]
     fn gen_cmp16(
         &mut self,
         dest: IrTemp,
@@ -2798,7 +2940,20 @@ impl<'a> IrCodeGen<'a> {
         b_lo: IrTemp,
         b_hi: IrTemp,
         kind: Cmp16Kind,
+        signed: Signedness,
     ) {
+        // Signed ordering: dispatch through the signed primitive
+        // that leaves N=1 when `lhs < rhs`. Eq/Ne are signedness-
+        // independent, so the unsigned path below handles them.
+        if signed == Signedness::Signed
+            && matches!(
+                kind,
+                Cmp16Kind::Lt | Cmp16Kind::Gt | Cmp16Kind::LtEq | Cmp16Kind::GtEq
+            )
+        {
+            self.gen_cmp16_signed(dest, a_lo, a_hi, b_lo, b_hi, kind);
+            return;
+        }
         let suffix = self.local_label_suffix();
         let true_label = format!("__ir_cmp16_t_{suffix}");
         let false_label = format!("__ir_cmp16_f_{suffix}");
@@ -2888,7 +3043,83 @@ impl<'a> IrCodeGen<'a> {
         self.store_temp(dest);
     }
 
-    fn gen_cmp(&mut self, dest: IrTemp, a: IrTemp, b: IrTemp, kind: CmpKind) {
+    /// Signed 16-bit ordering compare materializing a 0/1 boolean.
+    /// Uses the canonical `CMP lo / SBC hi` idiom: the combined
+    /// effect leaves the **N** flag (after a `BVC`-guarded `EOR
+    /// #$80` flip on signed overflow) set iff `lhs < rhs` under
+    /// signed semantics. `Gt` and `LtEq` are derived by swapping
+    /// operands; `GtEq` is `!Lt`, lowered by inverting the branch.
+    fn gen_cmp16_signed(
+        &mut self,
+        dest: IrTemp,
+        a_lo: IrTemp,
+        a_hi: IrTemp,
+        b_lo: IrTemp,
+        b_hi: IrTemp,
+        kind: Cmp16Kind,
+    ) {
+        let (lhs_lo, lhs_hi, rhs_lo, rhs_hi, want_lt) = match kind {
+            Cmp16Kind::Lt => (a_lo, a_hi, b_lo, b_hi, true),
+            Cmp16Kind::Gt => (b_lo, b_hi, a_lo, a_hi, true),
+            Cmp16Kind::GtEq => (a_lo, a_hi, b_lo, b_hi, false),
+            Cmp16Kind::LtEq => (b_lo, b_hi, a_lo, a_hi, false),
+            Cmp16Kind::Eq | Cmp16Kind::Ne => unreachable!("signedness-independent"),
+        };
+
+        self.gen_cmp16_signed_set_n(lhs_lo, lhs_hi, rhs_lo, rhs_hi);
+
+        let suffix = self.local_label_suffix();
+        let true_label = format!("__ir_cmp16_st_{suffix}");
+        let end_label = format!("__ir_cmp16_se_{suffix}");
+
+        // After the primitive: N=1 iff lhs < rhs.
+        if want_lt {
+            self.emit(BMI, AM::LabelRelative(true_label.clone()));
+        } else {
+            self.emit(BPL, AM::LabelRelative(true_label.clone()));
+        }
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(JMP, AM::Label(end_label.clone()));
+        self.emit_label(&true_label);
+        self.emit(LDA, AM::Immediate(1));
+        self.emit_label(&end_label);
+        self.store_temp(dest);
+    }
+
+    /// 16-bit signed compare primitive: `CMP a_lo, b_lo / LDA a_hi /
+    /// SBC b_hi`, then flip N if the SBC overflowed. After this
+    /// runs, N=1 ↔ `(a_lo:a_hi) < (b_lo:b_hi)` under signed
+    /// semantics. Trashes A.
+    fn gen_cmp16_signed_set_n(&mut self, a_lo: IrTemp, a_hi: IrTemp, b_lo: IrTemp, b_hi: IrTemp) {
+        self.load_temp(a_lo);
+        let b_lo_addr = self.temp_addr(b_lo);
+        // CMP performs an unsigned compare and sets carry like SBC
+        // does, so we can chain it straight into a high-byte SBC
+        // without an explicit SEC.
+        self.emit(CMP, AM::ZeroPage(b_lo_addr));
+        self.load_temp(a_hi);
+        let b_hi_addr = self.temp_addr(b_hi);
+        self.emit(SBC, AM::ZeroPage(b_hi_addr));
+
+        let suffix = self.local_label_suffix();
+        let skip = format!("__ir_cmp16_s_no_v_{suffix}");
+        self.emit(BVC, AM::LabelRelative(skip.clone()));
+        // Signed overflow occurred — flip the N flag by toggling A
+        // bit 7. The downstream BMI/BPL only inspects N.
+        self.emit(EOR, AM::Immediate(0x80));
+        self.emit_label(&skip);
+    }
+
+    fn gen_cmp(&mut self, dest: IrTemp, a: IrTemp, b: IrTemp, kind: CmpKind, signed: Signedness) {
+        if signed == Signedness::Signed
+            && matches!(
+                kind,
+                CmpKind::Lt | CmpKind::Gt | CmpKind::LtEq | CmpKind::GtEq
+            )
+        {
+            self.gen_cmp_signed(dest, a, b, kind);
+            return;
+        }
         self.load_temp(a);
         let b_addr = self.temp_addr(b);
         self.emit(CMP, AM::ZeroPage(b_addr));
@@ -2917,6 +3148,35 @@ impl<'a> IrCodeGen<'a> {
         self.emit(LDA, AM::Immediate(0));
         self.emit(JMP, AM::Label(end_label.clone()));
         // True path
+        self.emit_label(&true_label);
+        self.emit(LDA, AM::Immediate(1));
+        self.emit_label(&end_label);
+        self.store_temp(dest);
+    }
+
+    /// Signed 8-bit ordering compare. `Gt` swaps to `Lt`, `LtEq`
+    /// swaps to `GtEq`, then both predicates dispatch through
+    /// [`gen_cmp_signed_set_n`].
+    fn gen_cmp_signed(&mut self, dest: IrTemp, a: IrTemp, b: IrTemp, kind: CmpKind) {
+        let (lhs, rhs, want_lt) = match kind {
+            CmpKind::Lt => (a, b, true),
+            CmpKind::Gt => (b, a, true),
+            CmpKind::GtEq => (a, b, false),
+            CmpKind::LtEq => (b, a, false),
+            CmpKind::Eq | CmpKind::Ne => unreachable!("signedness-independent"),
+        };
+        self.gen_cmp_signed_set_n(lhs, rhs);
+
+        let suffix = self.local_label_suffix();
+        let true_label = format!("__ir_cmp_st_{suffix}");
+        let end_label = format!("__ir_cmp_se_{suffix}");
+        if want_lt {
+            self.emit(BMI, AM::LabelRelative(true_label.clone()));
+        } else {
+            self.emit(BPL, AM::LabelRelative(true_label.clone()));
+        }
+        self.emit(LDA, AM::Immediate(0));
+        self.emit(JMP, AM::Label(end_label.clone()));
         self.emit_label(&true_label);
         self.emit(LDA, AM::Immediate(1));
         self.emit_label(&end_label);
@@ -2971,6 +3231,16 @@ enum Cmp16Kind {
     Lt,
     Gt,
     LtEq,
+    GtEq,
+}
+
+/// Internal helper for `gen_cmp_branch_signed`: after the operand-
+/// swap step, the residual predicate is always one of the two
+/// canonical forms — strictly less than, or greater-or-equal — so
+/// we only need a two-armed branch lowering.
+#[derive(Debug, Clone, Copy)]
+enum SignedBranchKind {
+    Lt,
     GtEq,
 }
 
@@ -3071,6 +3341,7 @@ fn function_is_leaf(func: &IrFunction) -> bool {
                 | IrOp::ShiftRightVar(..)
                 | IrOp::Negate(..)
                 | IrOp::Complement(..)
+                | IrOp::SignExtend(..)
                 | IrOp::CmpEq(..)
                 | IrOp::CmpNe(..)
                 | IrOp::CmpLt(..)
@@ -3286,12 +3557,12 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
         | IrOp::ShiftRightVar(_, a, b)
         | IrOp::CmpEq(_, a, b)
         | IrOp::CmpNe(_, a, b)
-        | IrOp::CmpLt(_, a, b)
-        | IrOp::CmpGt(_, a, b)
-        | IrOp::CmpLtEq(_, a, b)
-        | IrOp::CmpGtEq(_, a, b) => vec![*a, *b],
+        | IrOp::CmpLt(_, a, b, _)
+        | IrOp::CmpGt(_, a, b, _)
+        | IrOp::CmpLtEq(_, a, b, _)
+        | IrOp::CmpGtEq(_, a, b, _) => vec![*a, *b],
         IrOp::ShiftLeft(_, src, _) | IrOp::ShiftRight(_, src, _) => vec![*src],
-        IrOp::Negate(_, src) | IrOp::Complement(_, src) => vec![*src],
+        IrOp::Negate(_, src) | IrOp::Complement(_, src) | IrOp::SignExtend(_, src) => vec![*src],
         IrOp::ArrayLoad(_, _, idx) => vec![*idx],
         IrOp::ArrayStore(_, idx, val) => vec![*idx, *val],
         IrOp::Call(_, _, args) => args.clone(),

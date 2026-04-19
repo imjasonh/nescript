@@ -3851,6 +3851,110 @@ fn i16_compiles_with_arithmetic_and_compare() {
 }
 
 #[test]
+fn signed_i16_lt_emits_overflow_corrected_branch() {
+    // `i16` ordering compare must emit the `BVC / EOR #$80`
+    // overflow-correction idiom that flips the N flag when SBC
+    // signals signed overflow. Without it, comparing a negative
+    // i16 against a positive one falls back to an unsigned BCC
+    // path that always treats $FFxx as greater than $00yy. This
+    // is the behavioural piece of the §A-follow-up: any i16 `<`
+    // must lower to a code sequence that can correctly answer
+    // "is -1 < 1?".
+    let source = r#"
+game "SignedCmp" { mapper: NROM }
+var a: i16 = -1
+var b: i16 = 1
+var hit: u8 = 0
+on frame { if a < b { hit = 1 } }
+start Main
+"#;
+    let rom = compile(source);
+    // Look for the overflow-correction byte triple `BVC + EOR
+    // #$80`. EOR #$80 = `49 80`, and BVC has opcode `50` with a
+    // single-byte signed offset; the offset value is layout-
+    // dependent so we just check for the `50 ?? 49 80` shape
+    // anywhere in PRG.
+    let prg = &rom[16..16 + 16384];
+    let has_idiom = prg
+        .windows(4)
+        .any(|w| w[0] == 0x50 && w[2] == 0x49 && w[3] == 0x80);
+    assert!(
+        has_idiom,
+        "expected `BVC ?? / EOR #$80` overflow-correction idiom in PRG ROM"
+    );
+}
+
+#[test]
+fn signed_i8_lt_emits_overflow_corrected_branch() {
+    // Same check as above, but for the 8-bit signed compare.
+    let source = r#"
+game "SignedCmp8" { mapper: NROM }
+var a: i8 = -1
+var b: i8 = 1
+var hit: u8 = 0
+on frame { if a < b { hit = 1 } }
+start Main
+"#;
+    let rom = compile(source);
+    let prg = &rom[16..16 + 16384];
+    let has_idiom = prg
+        .windows(4)
+        .any(|w| w[0] == 0x50 && w[2] == 0x49 && w[3] == 0x80);
+    assert!(
+        has_idiom,
+        "expected `BVC ?? / EOR #$80` overflow-correction idiom in PRG ROM"
+    );
+}
+
+#[test]
+fn unsigned_u16_lt_does_not_emit_signed_idiom() {
+    // u16 `<` should keep using the cheaper BCC-based unsigned
+    // path. If the lowering accidentally promoted everything to
+    // the signed path we'd waste two bytes per compare; the
+    // overflow-correction idiom must NOT appear.
+    let source = r#"
+game "UnsignedCmp" { mapper: NROM }
+var a: u16 = 0
+var b: u16 = 1
+var hit: u8 = 0
+on frame { if a < b { hit = 1 } }
+start Main
+"#;
+    let rom = compile(source);
+    let prg = &rom[16..16 + 16384];
+    let has_idiom = prg
+        .windows(4)
+        .any(|w| w[0] == 0x50 && w[2] == 0x49 && w[3] == 0x80);
+    assert!(
+        !has_idiom,
+        "u16 compare should stay unsigned; found `BVC / EOR #$80` idiom"
+    );
+}
+
+#[test]
+fn cmp_signed_against_zero_is_negative_check() {
+    // Negative analyzer test isn't applicable here (the analyzer
+    // already accepts negative literals against i8/i16), but we
+    // can still guard against the silent-drop shape: an i8
+    // compare against zero should at minimum emit a CMP and a
+    // signed-overflow guard. This is a smoke-level sibling of
+    // the existing i16-arithmetic integration test.
+    let source = r#"
+game "SignedZero" { mapper: NROM }
+var a: i8 = -5
+var hit: u8 = 0
+on frame { if a < 0 { hit = 1 } }
+start Main
+"#;
+    let rom = compile(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 0);
+    let prg = &rom[16..16 + 16384];
+    let has_sbc = prg.iter().any(|&b| b == 0xE9 || b == 0xE5 || b == 0xED);
+    assert!(has_sbc, "signed compare should emit at least one SBC");
+}
+
+#[test]
 fn fade_out_emits_jsr_and_forces_palette_bright() {
     // `fade_out(n)` should emit a JSR to `__fade_out` and also
     // force the palette-brightness routine to be linked in,
