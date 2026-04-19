@@ -607,6 +607,7 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         | IrOp::Rand16(_, _)
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
+        | IrOp::PaintRoom(_)
         | IrOp::SourceLoc(_) => {}
         IrOp::SeedRand(lo, hi) => {
             used.insert(*lo);
@@ -637,6 +638,10 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
             used.insert(*y);
             used.insert(*len);
             used.insert(*tile);
+        }
+        IrOp::CollidesAt { x, y, .. } => {
+            used.insert(*x);
+            used.insert(*y);
         }
     }
 }
@@ -672,6 +677,7 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         IrOp::ReadInput(d, _) => Some(*d),
         IrOp::ReadInputEdge { dest, .. } => Some(*dest),
         IrOp::Peek(d, _) => Some(*d),
+        IrOp::CollidesAt { dest, .. } => Some(*dest),
         // Rand8 / Rand16 have an observable side effect — advancing
         // the PRNG state — so a statement-level call like
         // `rand8()` (result discarded) must NOT be dropped by DCE.
@@ -705,6 +711,7 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::NtFillH { .. }
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
+        | IrOp::PaintRoom(_)
         | IrOp::SourceLoc(_) => None,
         // 16-bit ops have two destinations; the simple single-dest
         // DCE below would incorrectly drop a 16-bit op whose low

@@ -60,6 +60,49 @@ impl BackgroundData {
     }
 }
 
+/// Resolved level data for a `room Name { ... }` declaration. The
+/// compiler expands each room (16×15 metatile grid) at compile time
+/// into three fixed-size blobs that the linker embeds in PRG ROM:
+///
+/// - `tiles` (960 bytes): the 32×30 nametable the room paints into.
+///   Each of the 240 metatile cells produces 2×2 CHR tile indices,
+///   row-major.
+/// - `attrs` (64 bytes): the 8×8 attribute table. v1 writes zeros
+///   (sub-palette 0 for every quadrant); a future revision can
+///   derive this from per-metatile palette hints.
+/// - `collision` (240 bytes): one byte per metatile, mirroring the
+///   `layout` array but carrying the metatileset's `collide` flag
+///   instead of the metatile ID. `collides_at(x, y)` indexes into
+///   this by `(y / 16) * 16 + (x / 16)`.
+///
+/// Labels used downstream: `__room_tiles_<name>`, `__room_attrs_<name>`,
+/// `__room_col_<name>`. `paint_room <name>` queues the first two
+/// through the same vblank-safe update machinery as `load_background`,
+/// and installs the third's address into the room-pointer ZP slots
+/// so subsequent `collides_at` queries read from this room's map.
+#[derive(Debug, Clone)]
+pub struct RoomData {
+    pub name: String,
+    pub tiles: [u8; 960],
+    pub attrs: [u8; 64],
+    pub collision: [u8; 240],
+}
+
+impl RoomData {
+    #[must_use]
+    pub fn tiles_label(&self) -> String {
+        format!("__room_tiles_{}", self.name)
+    }
+    #[must_use]
+    pub fn attrs_label(&self) -> String {
+        format!("__room_attrs_{}", self.name)
+    }
+    #[must_use]
+    pub fn collision_label(&self) -> String {
+        format!("__room_col_{}", self.name)
+    }
+}
+
 /// Resolve sprite declarations in a program into concrete CHR byte blobs and
 /// assign each one a tile index in CHR ROM.
 ///
@@ -225,6 +268,51 @@ pub fn resolve_backgrounds(
     Ok(out)
 }
 
+/// Resolve every `room Name { ... }` declaration in `program` into
+/// expanded [`RoomData`] blobs. The analyzer has already validated
+/// layout length, metatile IDs, and metatileset references, so this
+/// is a straightforward 16×15 → 32×30 unpack plus a parallel
+/// collision-byte copy.
+pub fn resolve_rooms(program: &Program) -> Vec<RoomData> {
+    let mut out = Vec::with_capacity(program.rooms.len());
+    let mts_by_name: std::collections::HashMap<&str, &crate::parser::ast::MetatilesetDecl> =
+        program
+            .metatilesets
+            .iter()
+            .map(|m| (m.name.as_str(), m))
+            .collect();
+    for room in &program.rooms {
+        let mut tiles = [0u8; 960];
+        let mut collision = [0u8; 240];
+        if let Some(mts) = mts_by_name.get(room.metatileset.as_str()) {
+            for (cell_idx, &mt_id) in room.layout.iter().enumerate().take(240) {
+                let mt_x = cell_idx % 16;
+                let mt_y = cell_idx / 16;
+                let entry = &mts.metatiles[usize::from(mt_id)];
+                // Expand 2×2 metatile into its four nametable cells.
+                // Each nametable row is 32 cells wide; each metatile
+                // row is 15 metatiles tall × 2 = 30 rows (a full
+                // playfield height).
+                let tl_x = mt_x * 2;
+                let tl_y = mt_y * 2;
+                let tl_idx = tl_y * 32 + tl_x;
+                tiles[tl_idx] = entry.tiles[0]; // TL
+                tiles[tl_idx + 1] = entry.tiles[1]; // TR
+                tiles[tl_idx + 32] = entry.tiles[2]; // BL
+                tiles[tl_idx + 33] = entry.tiles[3]; // BR
+                collision[cell_idx] = u8::from(entry.collide);
+            }
+        }
+        out.push(RoomData {
+            name: room.name.clone(),
+            tiles,
+            attrs: [0u8; 64],
+            collision,
+        });
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -253,6 +341,8 @@ mod tests {
             palettes: Vec::new(),
             backgrounds: Vec::new(),
             metasprites: Vec::new(),
+            metatilesets: Vec::new(),
+            rooms: Vec::new(),
             sfx: Vec::new(),
             music: Vec::new(),
             banks: Vec::new(),
@@ -335,6 +425,8 @@ mod tests {
             palettes: Vec::new(),
             backgrounds: Vec::new(),
             metasprites: Vec::new(),
+            metatilesets: Vec::new(),
+            rooms: Vec::new(),
             sfx: Vec::new(),
             music: Vec::new(),
             banks: Vec::new(),

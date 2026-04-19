@@ -182,9 +182,39 @@ on the next `wait_frame`.
 ### Register allocator
 
 All IR temps currently spill to a recycled zero-page slot (`$80-$FF`). The
-peephole pass mops up the most obvious waste, but a real CFG-aware allocator
-that holds short-lived temps in `A`/`X`/`Y` would cut a noticeable number of
-LDA/STA pairs.
+peephole pass already handles most obvious waste via its copy-propagation,
+dead-store, and dead-load passes; a real CFG-aware allocator that holds
+short-lived temps in `A`/`X`/`Y` would cut more LDA/STA pairs, but there's
+a subtle constraint worth recording before anyone tackles it:
+
+**Any cycle-saving optimization shifts audio timing.** The audio output is
+a deterministic function of the byte stream — frame counters advance at
+fixed NMI offsets, and the SFX/music driver reads those counters on every
+tick. An optimization that shortens the main-loop pass between two `wait_frame`
+calls changes how many poll iterations land before the next NMI, which
+shifts the exact sample boundary of any one-shot SFX trigger relative to
+the captured audio. The emulator harness (`tests/emulator/run_examples.mjs`)
+captures a sample-exact audio hash at frame 180, so **any such change flips
+the audio goldens of every audio-emitting example**. The visual PNG goldens
+are stable — PPU writes land in the same vblank — but the audio churn is
+real.
+
+A workable register allocator therefore needs one of:
+
+1. An acceptance that every code-density improvement comes with a
+   re-baselined audio golden set, explained in the commit message.
+2. A pass that saves ROM bytes but preserves cycle counts (hard on 6502 —
+   most short-form ops cost the same cycles as their long forms).
+3. An opt-in flag (`--O2`) so default builds stay cycle-identical and only
+   size-hungry users pay the churn.
+
+Exploration during the §H-priorities branch confirmed (1): a single
+`remove_dead_loads` extension that stepped past `LDX`/`LDY` (which don't
+clobber A) dropped one LDA per `draw` statement — but flipped audio
+goldens for audio_demo, friendly_assets, noise_triangle_sfx, platformer,
+pong, and war. The PNG goldens were unchanged. The work was reverted to
+keep the §A + §H commits churn-free; see the commit log on the
+`claude/prioritize-allocator-signedness` branch.
 
 ### State-local memory overlay follow-ups
 
@@ -248,22 +278,16 @@ into the top of the file with a "ships today" note.
 
 ### A. Numeric types beyond `u8 / i8 / u16 / i16 / bool`
 
-`i16` ships today; see `examples/i16_demo.ne`. Two known limitations
-match the existing `i8` behaviour and will be tackled together when
-proper signedness tracking lands in the IR:
+`i16` ships today; see `examples/i16_demo.ne` and `examples/signed_compare.ne`.
+Signed ordering comparisons and narrow-to-wide sign-extension both ship
+too — `Cmp{Lt,Gt,LtEq,GtEq}` and their 16-bit siblings carry a
+`Signedness` field that drives the canonical `CMP / SBC / BVC / EOR #$80`
+overflow-correction idiom in `gen_cmp_signed_set_n`, and `widen()` emits
+`IrOp::SignExtend` for signed narrow values instead of the zero-extended
+`LoadImm 0` it used to. Casts to `u8`/`u16` strip the signed flag so
+explicit `as` opt-outs stay unsigned.
 
-- **Comparisons are unsigned.** `CmpLt16`/`CmpGt16` use `BCC`/`BCS`,
-  so `i16` compares against negative values give wrong results. The
-  fix is a `Signedness` field on `Cmp16Kind` (and `CmpKind` for
-  `i8`) plus signed branch lowering — `BMI`/`BPL` after an
-  XOR-on-sign-bit prologue.
-- **Narrow-to-wide widening zero-extends.** Assigning a runtime
-  `i8` expression to an `i16` does not sign-extend the high byte.
-  Negative literals are folded to the correct wide form by the
-  lowerer's existing constant-fold path; only runtime expressions
-  hit the bug.
-
-Lower-priority numeric follow-ups:
+Lower-priority numeric follow-up:
 
 - **`u32` / `i32`.** Realistically needed only for score totals and
   frame counters. A synthesizable pair of 16-bit halves is usually
@@ -369,36 +393,44 @@ Still TODO:
 
 ### H. Metatiles + collision as a first-class construct
 
-cc65/nesdoug treats 2×2 metatiles + a parallel collision map as
-the core room format. `docs/future-work.md` mentions "tilemap
-collision queries"; raise the scope to a single cohesive feature:
+`metatileset Name { metatiles: [...] }` and `room Name { metatileset:
+..., layout: [...] }` ship today — see `examples/metatiles_demo.ne`.
+Each metatile bundles four CHR tile indices (TL / TR / BL / BR) plus
+a `collide: true|false` flag; rooms lay them out as a 16×15 grid
+that the compiler expands at compile time into a 32×30 nametable,
+a 64-byte attribute table, and a 240-byte collision bitmap. All
+three blobs land as PRG ROM data blocks with per-room labels
+(`__room_tiles_N`, `__room_attrs_N`, `__room_col_N`).
 
-```
-metatileset DirtWorld {
-  source: @tiles("dirt.chr"),
-  metatiles: [
-    { id: 0, tiles: [0, 1, 16, 17], collide: false },
-    { id: 1, tiles: [2, 3, 18, 19], collide: true  },
-    ...
-  ],
-}
+`paint_room Name` reuses the existing `load_background` vblank-safe
+update machinery against the room's tile/attribute blobs, and
+additionally installs the room's collision bitmap pointer into
+`ZP_ROOM_COL_LO` / `ZP_ROOM_COL_HI` (ZP `$18`/`$19`).
+`collides_at(x: u8, y: u8) -> bool` JSRs into a small runtime
+helper that reads `(room_col),Y` where `Y = (y & 0xF0) | (x >> 4)`
+and returns the 0/1 bit directly. The helper is gated on a
+`__collides_at_used` marker, so a program that declares a room but
+never queries it pays zero bytes for the subroutine.
 
-room Level1 {
-  metatileset: DirtWorld,
-  layout: @room("level1.nxt"),  // NEXXT exporter format
-}
+**Still TODO.**
 
-on_frame {
-  if collides_at(hero.x, hero.y) {
-    ...
-  }
-}
-```
-
-The compiler would expand each `room` into a packed `[(metatile_id
-<< 4 | collision_bits), ...]` blob in PRG ROM, emit a
-`collides_at(x: u16, y: u16) -> bool` helper, and stream the
-expanded tiles into the VRAM update buffer on a `paint_room()` call.
+- **NEXXT file import (`@room("file.nxt")`).** Today only inline
+  `layout: [...]` (or `[value; count]` for repeated fills) is
+  supported. The NEXXT exporter's `.nxt` format would let users
+  author rooms in a dedicated editor.
+- **Per-quadrant palette hints.** The generated attribute table
+  is currently all zeros (sub-palette 0 for every quadrant). A
+  `palette: 0..3` field on each metatile entry could drive the
+  attribute table expansion.
+- **`collides_at` against u16 coordinates.** The intrinsic takes
+  u8 x/y today, which covers the full 256×240 visible area but
+  can't address scrolling playfields bigger than one nametable.
+- **Multi-room streaming.** The ZP pointer model already supports
+  multiple rooms (each `paint_room` rewrites the collision
+  pointer), but the nametable blit still uses the
+  nametable-0-only `load_background` path. Streaming into a VRAM
+  update buffer would let rooms swap without the vblank-budget
+  risk.
 
 ### I. RLE + LZ4 nametable decompression
 
@@ -568,17 +600,18 @@ to a specific bank to avoid bank-switch cost on a hot path.
 
 Remaining gap items in order of user value:
 
-1. Register allocator (existing section) — compounding size win.
-2. Signedness on Cmp16/Cmp ops (§A follow-up) — closes the i16
-   correctness gap.
-3. Metatiles + collision (§H) — closes several items at once.
-4. Inline-asm format specifiers + directive list (§D follow-ups).
-5. VRAM buffer follow-ups (§G) — vertical writes, array copy,
+1. Register allocator (existing section) — compounding size win,
+   but with the audio-goldens caveat spelled out in that section.
+2. NEXXT `@room(...)` import + per-quadrant palette hints
+   (§H follow-ups) — most impactful extensions on top of the
+   shipped metatiles base.
+3. Inline-asm format specifiers + directive list (§D follow-ups).
+4. VRAM buffer follow-ups (§G) — vertical writes, array copy,
    overflow detection.
-6. Arrays-of-structs + bitfields (§C) + fn pointers (§B) —
+5. Arrays-of-structs + bitfields (§C) + fn pointers (§B) —
    turns NEScript into a general-purpose NES language.
-7. UNROM-512 + MMC5 (§V) — ecosystem fit.
-8. FamiStudio import (§Q) + DPCM (§O) + expansion audio (§P).
+6. UNROM-512 + MMC5 (§V) — ecosystem fit.
+7. FamiStudio import (§Q) + DPCM (§O) + expansion audio (§P).
 
 ---
 

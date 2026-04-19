@@ -1265,6 +1265,9 @@ impl LoweringContext {
             Statement::LoadBackground(name, _) => {
                 self.emit(IrOp::LoadBackground(name.clone()));
             }
+            Statement::PaintRoom(name, _) => {
+                self.emit(IrOp::PaintRoom(name.clone()));
+            }
             Statement::DebugLog(args, _) => {
                 let temps: Vec<_> = args.iter().map(|a| self.lower_expr(a)).collect();
                 self.emit(IrOp::DebugLog(temps));
@@ -1905,6 +1908,18 @@ impl LoweringContext {
                     self.make_wide(lo, hi);
                     return lo;
                 }
+                // `collides_at(x, y)` — a 2-arg bool-returning
+                // builtin. Both args are u8 screen coordinates; the
+                // result is 0 / 1. Codegen emits a JSR to a shared
+                // runtime helper that walks the current room's
+                // collision bitmap.
+                if name == "collides_at" && args.len() == 2 {
+                    let x = self.lower_expr(&args[0]);
+                    let y = self.lower_expr(&args[1]);
+                    let dest = self.fresh_temp();
+                    self.emit(IrOp::CollidesAt { dest, x, y });
+                    return dest;
+                }
                 // `inline fun` bodies captured by
                 // `capture_inline_bodies` expand in-place here:
                 // no JSR, no parameter transport, no prologue.
@@ -2289,6 +2304,7 @@ fn is_splicable_void_stmt(stmt: &Statement) -> bool {
             | Statement::Scroll(..)
             | Statement::SetPalette(..)
             | Statement::LoadBackground(..)
+            | Statement::PaintRoom(..)
             | Statement::WaitFrame(..)
             | Statement::CycleSprites(..)
             | Statement::Play(..)

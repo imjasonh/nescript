@@ -79,6 +79,14 @@ pub const ZP_PENDING_BG_TILES_LO: u8 = 0x14;
 pub const ZP_PENDING_BG_TILES_HI: u8 = 0x15;
 pub const ZP_PENDING_BG_ATTRS_LO: u8 = 0x16;
 pub const ZP_PENDING_BG_ATTRS_HI: u8 = 0x17;
+/// Pointer to the currently-painted room's collision bitmap. Set by
+/// `paint_room Name` (via the codegen); read by the `__collides_at`
+/// runtime helper to resolve each collision query against the
+/// active room. Only reserved when the program declares a `room`;
+/// otherwise the analyzer's user-ZP bump pointer starts at `$18` as
+/// before.
+pub const ZP_ROOM_COL_LO: u8 = 0x18;
+pub const ZP_ROOM_COL_HI: u8 = 0x19;
 
 // ── Debug instrumentation ──
 //
@@ -2061,6 +2069,67 @@ pub fn gen_vram_buf_drain() -> Vec<Instruction> {
     out.push(Instruction::new(STA, AM::Absolute(0x2006)));
     out.push(Instruction::new(STA, AM::Absolute(0x2005)));
     out.push(Instruction::new(STA, AM::Absolute(0x2005)));
+    out.push(Instruction::implied(RTS));
+    out
+}
+
+/// Emit the `__collides_at` runtime helper: a small subroutine
+/// that answers "does the pixel at `(x, y)` fall inside a solid
+/// metatile of the currently-painted room?". Spliced in whenever
+/// the codegen emits the `__collides_at_used` marker.
+///
+/// **Contract**
+/// - Input: `A = x` (screen pixel 0..255), `X = y` (screen pixel
+///   0..239). `(x >> 4, y >> 4)` addresses the 16×15 metatile
+///   grid; rooms span pixels `(0..255, 0..239)` exactly.
+/// - Output: `A = 1` if the covering metatile is marked
+///   `collide: true`, `A = 0` otherwise. Flags reflect the final
+///   LDA so callers can BEQ / BNE directly.
+/// - Clobbers: `A, X, Y`. Uses ZP `$04-$05` as a scratch pointer
+///   (the same byte pair runtime helpers like `gen_audio_tick`
+///   reuse as a temporary workspace), plus the room-pointer ZP
+///   slots populated by `paint_room` at `$18-$19`.
+/// - Out-of-range inputs (`y >= 240`) clamp to the last row
+///   because the division only keeps bits 4-7, giving row 14.
+///   Users can avoid the edge case by gating the query on their
+///   own screen bounds.
+///
+/// **Lookup**
+/// - Row = `y >> 4` (0..14, so fits in a single LSR-by-4).
+/// - Col = `x >> 4` (0..15).
+/// - Index = row * 16 + col = `(y & 0xF0) | (x >> 4)`. The `* 16`
+///   is exactly what `y >> 4 << 4` = `y & 0xF0` computes, so no
+///   multiply needed — that's why we laid out the bitmap at 16
+///   columns wide in the first place.
+/// - Load byte at `room_col_ptr + index`. The byte is 0 (no
+///   collide) or 1 (collide); we hand it back unchanged.
+pub fn gen_collides_at() -> Vec<Instruction> {
+    let mut out = Vec::new();
+    out.push(Instruction::new(NOP, AM::Label("__collides_at".into())));
+    // Save x on the stack — we need A for the y-based offset.
+    out.push(Instruction::implied(PHA));
+    // Compute `y & 0xF0`. Y is already in X from the caller's
+    // contract; transfer to A so we can mask it.
+    out.push(Instruction::implied(TXA));
+    out.push(Instruction::new(AND, AM::Immediate(0xF0)));
+    // Stash the masked y (= row * 16) in Y.
+    out.push(Instruction::implied(TAY));
+    // Pull x back, shift right 4 to get the column (0..15).
+    out.push(Instruction::implied(PLA));
+    out.push(Instruction::new(LSR, AM::Accumulator));
+    out.push(Instruction::new(LSR, AM::Accumulator));
+    out.push(Instruction::new(LSR, AM::Accumulator));
+    out.push(Instruction::new(LSR, AM::Accumulator));
+    // Combine col (A) with row*16 (Y), producing the linear
+    // metatile index in A.
+    out.push(Instruction::new(STA, AM::ZeroPage(0x04)));
+    out.push(Instruction::implied(TYA));
+    out.push(Instruction::new(ORA, AM::ZeroPage(0x04)));
+    // Use Y as the index into the room-pointer-relative bitmap.
+    out.push(Instruction::implied(TAY));
+    // Read `(ZP_ROOM_COL_LO),Y` — 0 or 1. The LDA sets Z and N;
+    // the caller's BNE / BEQ / STA picks up whichever it needs.
+    out.push(Instruction::new(LDA, AM::IndirectY(ZP_ROOM_COL_LO)));
     out.push(Instruction::implied(RTS));
     out
 }

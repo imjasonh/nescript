@@ -23,6 +23,21 @@ pub struct Program {
     pub palettes: Vec<PaletteDecl>,
     pub backgrounds: Vec<BackgroundDecl>,
     pub metasprites: Vec<MetaspriteDecl>,
+    /// Top-level `metatileset Name { metatiles: [...] }` declarations.
+    /// Each one is a packed library of 2×2 tile bundles plus a per-
+    /// metatile collision flag, used by `room` to assemble level
+    /// data and by `collides_at(x, y)` to answer the runtime
+    /// "is this pixel inside a solid metatile?" query. See
+    /// [`MetatilesetDecl`] for the data shape and the §H entry in
+    /// `docs/future-work.md` for the design.
+    pub metatilesets: Vec<MetatilesetDecl>,
+    /// Top-level `room Name { metatileset: ..., layout: [...] }`
+    /// declarations. Each room is a 16×15 grid of metatile IDs that
+    /// the compiler expands into a 32×30 nametable + 64-byte
+    /// attribute table + 240-byte collision bitmap, all PRG-resident.
+    /// `paint_room Name` paints the expanded nametable; `collides_at`
+    /// reads the collision bitmap.
+    pub rooms: Vec<RoomDecl>,
     pub sfx: Vec<SfxDecl>,
     pub music: Vec<MusicDecl>,
     pub banks: Vec<BankDecl>,
@@ -57,6 +72,61 @@ pub struct MetaspriteDecl {
     pub dx: Vec<u8>,
     pub dy: Vec<u8>,
     pub frame: Vec<u8>,
+    pub span: Span,
+}
+
+/// `metatileset Name { metatiles: [...] }` — a packed library of
+/// 2×2 metatile definitions. Each metatile bundles four CHR tile
+/// indices (top-left, top-right, bottom-left, bottom-right) plus a
+/// per-metatile collision bool. The analyzer caps the metatile
+/// count at 256 so a metatile ID fits in a single byte.
+///
+/// Pairs with [`RoomDecl`] (which references the metatileset by
+/// name and lays out rooms as a 16×15 grid of metatile IDs) and the
+/// `collides_at(x, y) -> bool` builtin (which reads the per-room
+/// collision bitmap derived from this `collide` flag).
+#[derive(Debug, Clone)]
+pub struct MetatilesetDecl {
+    pub name: String,
+    pub metatiles: Vec<MetatileEntry>,
+    pub span: Span,
+}
+
+/// One entry in a `metatileset { metatiles: [...] }` array. The
+/// `id` field is mostly informational — entries are stored in
+/// declaration order and looked up by index from `RoomDecl::layout`,
+/// so the analyzer rejects out-of-order or duplicate IDs to keep
+/// the source readable.
+#[derive(Debug, Clone)]
+pub struct MetatileEntry {
+    pub id: u8,
+    pub tiles: [u8; 4],
+    pub collide: bool,
+    pub span: Span,
+}
+
+/// `room Name { metatileset: M, layout: [16x15 metatile ids] }` — a
+/// concrete level. The compiler:
+///
+/// - validates every `layout` byte against the named metatileset's
+///   declared IDs (E0210);
+/// - expands the 240 cells into a 32×30 (=960 byte) nametable using
+///   each metatile's four tile indices;
+/// - emits a 64-byte attribute table (currently all sub-palette 0;
+///   a future revision can switch to per-quadrant palette hints);
+/// - emits a 30-byte (240-bit) collision bitmap so `collides_at`
+///   can answer in two indexed loads + a single shift.
+///
+/// At runtime, `paint_room Name` desugars to the existing
+/// `load_background` machinery against the synthesized nametable
+/// blob, and `collides_at(x, y)` JSRs into a small helper that
+/// reads the room's collision bitmap.
+#[derive(Debug, Clone)]
+pub struct RoomDecl {
+    pub name: String,
+    pub metatileset: String,
+    /// 240 bytes: row-major, row 0 = top of screen, x = column 0..15.
+    pub layout: Vec<u8>,
     pub span: Span,
 }
 
@@ -549,6 +619,13 @@ pub enum Statement {
     /// vblank-safe copy into nametable 0. Lowered to
     /// [`IrOp::LoadBackground`].
     LoadBackground(String, Span),
+    /// `paint_room Name` — the room-aware sibling of
+    /// `load_background`. The compiler synthesizes a background-
+    /// shaped blob for the room at compile time; at runtime,
+    /// `paint_room` queues that nametable update AND sets the
+    /// current-room ZP pointer so `collides_at(x, y)` queries hit
+    /// the right collision bitmap. Lowered to [`IrOp::PaintRoom`].
+    PaintRoom(String, Span),
     /// `set_palette Name` — queue the named palette for a
     /// vblank-safe copy into `$3F00-$3F1F`. Lowered to
     /// [`IrOp::SetPalette`].
@@ -594,6 +671,7 @@ impl Statement {
             | Self::CycleSprites(s)
             | Self::Call(_, _, s)
             | Self::LoadBackground(_, s)
+            | Self::PaintRoom(_, s)
             | Self::SetPalette(_, s)
             | Self::Scroll(_, _, s)
             | Self::DebugLog(_, s)

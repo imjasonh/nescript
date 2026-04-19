@@ -130,6 +130,8 @@ impl Parser {
         let mut palettes = Vec::new();
         let mut backgrounds = Vec::new();
         let mut metasprites = Vec::new();
+        let mut metatilesets = Vec::new();
+        let mut rooms = Vec::new();
         let mut sfx = Vec::new();
         let mut music = Vec::new();
         let mut saves: Vec<crate::parser::ast::VarDecl> = Vec::new();
@@ -175,6 +177,12 @@ impl Parser {
                 }
                 TokenKind::KwBackground => {
                     backgrounds.push(self.parse_background_decl()?);
+                }
+                TokenKind::KwMetatileset => {
+                    metatilesets.push(self.parse_metatileset_decl()?);
+                }
+                TokenKind::KwRoom => {
+                    rooms.push(self.parse_room_decl()?);
                 }
                 TokenKind::KwSfx => {
                     sfx.push(self.parse_sfx_decl()?);
@@ -288,6 +296,8 @@ impl Parser {
             palettes,
             backgrounds,
             metasprites,
+            metatilesets,
+            rooms,
             sfx,
             music,
             banks,
@@ -1053,6 +1063,212 @@ impl Parser {
             dx,
             dy,
             frame,
+            span: Span::new(start.file_id, start.start, self.current_span().end),
+        })
+    }
+
+    /// Parse `metatileset Name { metatiles: [{ id: N, tiles: [...],
+    /// collide: true|false }, ...] }`. The body is a single
+    /// `metatiles:` array of brace-delimited entries; each entry has
+    /// the three fixed properties `id`, `tiles`, and `collide`. The
+    /// analyzer enforces that each entry's `tiles:` array is exactly
+    /// 4 bytes (top-left, top-right, bottom-left, bottom-right) and
+    /// that the entries' IDs match their position in the array.
+    fn parse_metatileset_decl(&mut self) -> Result<MetatilesetDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwMetatileset)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut metatiles: Option<Vec<MetatileEntry>> = None;
+
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            let (key, key_span) = self.expect_ident()?;
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "metatiles" => {
+                    metatiles = Some(self.parse_metatile_array()?);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown metatileset property '{key}'"),
+                        key_span,
+                    ));
+                }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let metatiles = metatiles.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("metatileset '{name}' is missing the required 'metatiles:' array"),
+                start,
+            )
+        })?;
+        Ok(MetatilesetDecl {
+            name,
+            metatiles,
+            span: Span::new(start.file_id, start.start, self.current_span().end),
+        })
+    }
+
+    /// Parse the body of a `metatileset` declaration's `metatiles:`
+    /// array. Each entry is `{ id: N, tiles: [4 bytes], collide:
+    /// true|false }`.
+    fn parse_metatile_array(&mut self) -> Result<Vec<MetatileEntry>, Diagnostic> {
+        self.expect(&TokenKind::LBracket)?;
+        let mut out = Vec::new();
+        while *self.peek() != TokenKind::RBracket && *self.peek() != TokenKind::Eof {
+            let entry_start = self.current_span();
+            self.expect(&TokenKind::LBrace)?;
+
+            let mut id: Option<u8> = None;
+            let mut tiles: Option<Vec<u8>> = None;
+            let mut collide: Option<bool> = None;
+
+            while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+                let (key, key_span) = self.expect_ident()?;
+                self.expect(&TokenKind::Colon)?;
+                match key.as_str() {
+                    "id" => id = Some(self.parse_u8_literal("id")?),
+                    "tiles" => tiles = Some(self.parse_byte_array("tiles")?),
+                    "collide" => match self.peek().clone() {
+                        TokenKind::BoolLiteral(b) => {
+                            self.advance();
+                            collide = Some(b);
+                        }
+                        other => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!("expected `true` or `false` for 'collide', got '{other}'"),
+                                self.current_span(),
+                            ));
+                        }
+                    },
+                    _ => {
+                        return Err(Diagnostic::error(
+                            ErrorCode::E0201,
+                            format!("unknown metatile entry property '{key}'"),
+                            key_span,
+                        ));
+                    }
+                }
+                if *self.peek() == TokenKind::Comma {
+                    self.advance();
+                }
+            }
+            self.expect(&TokenKind::RBrace)?;
+
+            let id = id.ok_or_else(|| {
+                Diagnostic::error(
+                    ErrorCode::E0201,
+                    "metatile entry is missing 'id'".to_string(),
+                    entry_start,
+                )
+            })?;
+            let tiles = tiles.ok_or_else(|| {
+                Diagnostic::error(
+                    ErrorCode::E0201,
+                    "metatile entry is missing 'tiles'".to_string(),
+                    entry_start,
+                )
+            })?;
+            let collide = collide.unwrap_or(false);
+            if tiles.len() != 4 {
+                return Err(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "metatile entry 'tiles' must have exactly 4 elements (TL,TR,BL,BR), got {}",
+                        tiles.len()
+                    ),
+                    entry_start,
+                ));
+            }
+            out.push(MetatileEntry {
+                id,
+                tiles: [tiles[0], tiles[1], tiles[2], tiles[3]],
+                collide,
+                span: entry_start,
+            });
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBracket)?;
+        Ok(out)
+    }
+
+    /// Parse `room Name { metatileset: M, layout: [240 metatile ids] }`.
+    /// Both properties are required. The analyzer enforces that the
+    /// layout has exactly 240 entries (16 wide × 15 tall) and that
+    /// every ID is defined by the named metatileset.
+    fn parse_room_decl(&mut self) -> Result<RoomDecl, Diagnostic> {
+        let start = self.current_span();
+        self.expect(&TokenKind::KwRoom)?;
+        let (name, _) = self.expect_ident()?;
+        self.expect(&TokenKind::LBrace)?;
+
+        let mut metatileset: Option<String> = None;
+        let mut layout: Option<Vec<u8>> = None;
+
+        while *self.peek() != TokenKind::RBrace && *self.peek() != TokenKind::Eof {
+            // Accept the `metatileset` keyword in the property-name
+            // position so users can write the natural `metatileset:
+            // MTS` form. Everything else falls through to the
+            // standard identifier path.
+            let (key, key_span) = if *self.peek() == TokenKind::KwMetatileset {
+                let span = self.current_span();
+                self.advance();
+                ("metatileset".to_string(), span)
+            } else {
+                self.expect_ident()?
+            };
+            self.expect(&TokenKind::Colon)?;
+            match key.as_str() {
+                "metatileset" => {
+                    let (mts_name, _) = self.expect_ident()?;
+                    metatileset = Some(mts_name);
+                }
+                "layout" => {
+                    layout = Some(self.parse_byte_array("layout")?);
+                }
+                _ => {
+                    return Err(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!("unknown room property '{key}'"),
+                        key_span,
+                    ));
+                }
+            }
+            if *self.peek() == TokenKind::Comma {
+                self.advance();
+            }
+        }
+        self.expect(&TokenKind::RBrace)?;
+
+        let metatileset = metatileset.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("room '{name}' is missing the required 'metatileset:' property"),
+                start,
+            )
+        })?;
+        let layout = layout.ok_or_else(|| {
+            Diagnostic::error(
+                ErrorCode::E0201,
+                format!("room '{name}' is missing the required 'layout:' array"),
+                start,
+            )
+        })?;
+        Ok(RoomDecl {
+            name,
+            metatileset,
+            layout,
             span: Span::new(start.file_id, start.start, self.current_span().end),
         })
     }
@@ -2291,6 +2507,13 @@ impl Parser {
     /// Parse a `[byte, byte, ...]` array. Used by sfx/music property
     /// parsing — the main `parse_asset_source` also does this, but
     /// without the array-literal-only restriction we want here.
+    ///
+    /// Also accepts the repetition shortcut `[value; count]` as a
+    /// convenience for large arrays — room layouts (240 entries)
+    /// and similar constant-fill blobs get unwieldy to spell out
+    /// one byte at a time. `count` must be a u16 literal; `value`
+    /// must be a u8 literal. This matches Rust's `[v; n]` form so
+    /// the semantics should feel familiar.
     fn parse_byte_array(&mut self, prop: &str) -> Result<Vec<u8>, Diagnostic> {
         self.expect(&TokenKind::LBracket)?;
         let mut out = Vec::new();
@@ -2303,6 +2526,28 @@ impl Parser {
                         format!("'{prop}' entries must fit in a u8, got {v}"),
                         self.current_span(),
                     ));
+                }
+                // `[value; count]` repetition form. Only legal as
+                // the first (and only) element; entries + `;` in
+                // the same array don't compose.
+                if *self.peek() == TokenKind::Semicolon && out.is_empty() {
+                    self.advance();
+                    let count_span = self.current_span();
+                    let count = match self.peek().clone() {
+                        TokenKind::IntLiteral(c) => {
+                            self.advance();
+                            c
+                        }
+                        other => {
+                            return Err(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!("expected repetition count in '{prop}', found '{other}'"),
+                                count_span,
+                            ));
+                        }
+                    };
+                    self.expect(&TokenKind::RBracket)?;
+                    return Ok(vec![v as u8; count as usize]);
                 }
                 out.push(v as u8);
             } else {
@@ -2481,6 +2726,12 @@ impl Parser {
                 self.advance();
                 let (name, _) = self.expect_ident()?;
                 Ok(Statement::LoadBackground(name, span))
+            }
+            TokenKind::KwPaintRoom => {
+                let span = self.current_span();
+                self.advance();
+                let (name, _) = self.expect_ident()?;
+                Ok(Statement::PaintRoom(name, span))
             }
             TokenKind::KwSetPalette => {
                 let span = self.current_span();

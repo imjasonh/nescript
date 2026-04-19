@@ -37,7 +37,8 @@ use crate::runtime::{
     ZP_MUSIC_BASE_HI, ZP_MUSIC_BASE_LO, ZP_MUSIC_COUNTER, ZP_MUSIC_PTR_HI, ZP_MUSIC_PTR_LO,
     ZP_MUSIC_STATE, ZP_OAM_CURSOR, ZP_PENDING_BG_ATTRS_HI, ZP_PENDING_BG_ATTRS_LO,
     ZP_PENDING_BG_TILES_HI, ZP_PENDING_BG_TILES_LO, ZP_PENDING_PALETTE_HI, ZP_PENDING_PALETTE_LO,
-    ZP_PPU_UPDATE_FLAGS, ZP_SFX_COUNTER, ZP_SFX_PTR_HI, ZP_SFX_PTR_LO,
+    ZP_PPU_UPDATE_FLAGS, ZP_ROOM_COL_HI, ZP_ROOM_COL_LO, ZP_SFX_COUNTER, ZP_SFX_PTR_HI,
+    ZP_SFX_PTR_LO,
 };
 
 /// Base zero-page address for IR temp slots.
@@ -244,6 +245,11 @@ pub struct IrCodeGen<'a> {
     /// from NMI, and reserve the 256-byte buffer at `$0400-$04FF`
     /// from the analyzer's RAM allocator.
     vram_buf_used: bool,
+    /// Set to true the first time `gen_collides_at` runs. Drives
+    /// the `__collides_at_used` marker label emission in
+    /// `emit_trailing_markers`; the linker uses it to decide
+    /// whether to splice in `runtime::gen_collides_at`.
+    collides_at_used: bool,
     /// Source-location markers produced from [`IrOp::SourceLoc`].
     /// Each entry is a `(label_name, span)` pair — the codegen
     /// emits a unique label-definition pseudo-op at the current
@@ -475,6 +481,7 @@ impl<'a> IrCodeGen<'a> {
             fade_used: false,
             edge_input_used: false,
             vram_buf_used: false,
+            collides_at_used: false,
             source_locs: Vec::new(),
             next_source_loc: 0,
             emit_source_locs: false,
@@ -1998,6 +2005,8 @@ impl<'a> IrCodeGen<'a> {
             IrOp::StopMusic => self.gen_stop_music(),
             IrOp::SetPalette(name) => self.gen_set_palette(name),
             IrOp::LoadBackground(name) => self.gen_load_background(name),
+            IrOp::PaintRoom(name) => self.gen_paint_room(name),
+            IrOp::CollidesAt { dest, x, y } => self.gen_collides_at(*dest, *x, *y),
             IrOp::LoadVarHi(dest, var) => {
                 let base = self.var_addr(*var);
                 let addr = base.wrapping_add(1);
@@ -2565,6 +2574,60 @@ impl<'a> IrCodeGen<'a> {
         self.emit(STA, AM::ZeroPage(ZP_PPU_UPDATE_FLAGS));
     }
 
+    /// Emit `paint_room Name`. Two things happen per call:
+    ///
+    /// 1. Queue the room's expanded nametable for a vblank-safe
+    ///    copy into nametable 0 — identical to the
+    ///    `load_background` dance, just pointing at the room's
+    ///    `__room_tiles_<name>` / `__room_attrs_<name>` labels
+    ///    instead of the background equivalents.
+    /// 2. Install the room's 240-byte collision bitmap address
+    ///    into `ZP_ROOM_COL_LO` / `ZP_ROOM_COL_HI` so subsequent
+    ///    `collides_at(x, y)` calls read from this room's map.
+    ///
+    /// Programs that paint only one room never rewrite the
+    /// collision pointer after the first call; programs that
+    /// swap rooms see `collides_at` follow the last `paint_room`.
+    fn gen_paint_room(&mut self, name: &str) {
+        self.emit_ppu_update_marker();
+        let tiles_label = format!("__room_tiles_{name}");
+        let attrs_label = format!("__room_attrs_{name}");
+        let col_label = format!("__room_col_{name}");
+        self.emit(LDA, AM::SymbolLo(tiles_label.clone()));
+        self.emit(STA, AM::ZeroPage(ZP_PENDING_BG_TILES_LO));
+        self.emit(LDA, AM::SymbolHi(tiles_label));
+        self.emit(STA, AM::ZeroPage(ZP_PENDING_BG_TILES_HI));
+        self.emit(LDA, AM::SymbolLo(attrs_label.clone()));
+        self.emit(STA, AM::ZeroPage(ZP_PENDING_BG_ATTRS_LO));
+        self.emit(LDA, AM::SymbolHi(attrs_label));
+        self.emit(STA, AM::ZeroPage(ZP_PENDING_BG_ATTRS_HI));
+        self.emit(LDA, AM::ZeroPage(ZP_PPU_UPDATE_FLAGS));
+        self.emit(ORA, AM::Immediate(0x02));
+        self.emit(STA, AM::ZeroPage(ZP_PPU_UPDATE_FLAGS));
+        // Collision pointer install.
+        self.emit(LDA, AM::SymbolLo(col_label.clone()));
+        self.emit(STA, AM::ZeroPage(ZP_ROOM_COL_LO));
+        self.emit(LDA, AM::SymbolHi(col_label));
+        self.emit(STA, AM::ZeroPage(ZP_ROOM_COL_HI));
+    }
+
+    /// Emit a `collides_at(x, y)` call. Loads x into A and y into
+    /// X (matching `__collides_at`'s register contract), JSRs the
+    /// helper, and stores the 0/1 result in `dest`. Also flags
+    /// `__collides_at_used` so the linker splices the helper in.
+    fn gen_collides_at(&mut self, dest: IrTemp, x: IrTemp, y: IrTemp) {
+        self.collides_at_used = true;
+        // Load x into A, y into X. Do this from slot addresses
+        // directly so we don't need to stage through a third
+        // temp (both arguments are already in the temp region).
+        let x_addr = self.temp_addr(x);
+        let y_addr = self.temp_addr(y);
+        self.emit(LDX, AM::ZeroPage(y_addr));
+        self.emit(LDA, AM::ZeroPage(x_addr));
+        self.emit(JSR, AM::Label("__collides_at".into()));
+        self.store_temp(dest);
+    }
+
     /// Emit the `__ppu_update_used` marker label at most once per
     /// program. The linker scans for this label to decide whether
     /// to splice the PPU update helper into NMI. Programs that
@@ -2622,6 +2685,9 @@ impl<'a> IrCodeGen<'a> {
         }
         if self.vram_buf_used {
             self.emit_label("__vram_buf_used");
+        }
+        if self.collides_at_used {
+            self.emit_label("__collides_at_used");
         }
     }
 
@@ -3371,6 +3437,8 @@ fn function_is_leaf(func: &IrFunction) -> bool {
                 | IrOp::CmpGtEq16 { .. }
                 | IrOp::SetPalette(..)
                 | IrOp::LoadBackground(..)
+                | IrOp::PaintRoom(..)
+                | IrOp::CollidesAt { .. }
                 | IrOp::PlaySfx(..)
                 | IrOp::StartMusic(..)
                 | IrOp::StopMusic
@@ -3647,6 +3715,7 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
         | IrOp::Rand16(_, _)
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
+        | IrOp::PaintRoom(_)
         | IrOp::SourceLoc(_) => Vec::new(),
         IrOp::SeedRand(lo, hi) => vec![*lo, *hi],
         IrOp::SetPaletteBrightness(level) => vec![*level],
@@ -3655,6 +3724,7 @@ fn op_source_temps(op: &IrOp) -> Vec<IrTemp> {
         IrOp::NtSet { x, y, tile } => vec![*x, *y, *tile],
         IrOp::NtAttr { x, y, value } => vec![*x, *y, *value],
         IrOp::NtFillH { x, y, len, tile } => vec![*x, *y, *len, *tile],
+        IrOp::CollidesAt { x, y, .. } => vec![*x, *y],
     }
 }
 

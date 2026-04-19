@@ -192,6 +192,7 @@ pub fn compile_source(
     let next_sprite_tile: u8 = next_sprite_tile_u16.min(255) as u8;
     let backgrounds = assets::resolve_backgrounds(&program, source_dir, next_sprite_tile)
         .map_err(|e| CompileError::AssetResolution(format!("backgrounds: {e}")))?;
+    let rooms = assets::resolve_rooms(&program);
 
     // IR → 6502 codegen. We hold on to the codegen after
     // `generate()` because it carries the per-bank instruction
@@ -228,7 +229,8 @@ pub fn compile_source(
 
     let linker = Linker::with_mapper(program.game.mirroring, program.game.mapper)
         .with_header(program.game.header)
-        .with_battery(analysis.has_battery_saves);
+        .with_battery(analysis.has_battery_saves)
+        .with_rooms(rooms);
     let switchable_banks: Vec<PrgBank> = program
         .banks
         .iter()
