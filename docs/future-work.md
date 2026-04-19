@@ -181,40 +181,57 @@ on the next `wait_frame`.
 
 ### Register allocator
 
-All IR temps currently spill to a recycled zero-page slot (`$80-$FF`). The
-peephole pass already handles most obvious waste via its copy-propagation,
-dead-store, and dead-load passes; a real CFG-aware allocator that holds
-short-lived temps in `A`/`X`/`Y` would cut more LDA/STA pairs, but there's
-a subtle constraint worth recording before anyone tackles it:
+IR temps still spill to a recycled zero-page slot (`$80-$FF`). Most of
+the obvious waste is now handled:
 
-**Any cycle-saving optimization shifts audio timing.** The audio output is
-a deterministic function of the byte stream — frame counters advance at
-fixed NMI offsets, and the SFX/music driver reads those counters on every
-tick. An optimization that shortens the main-loop pass between two `wait_frame`
-calls changes how many poll iterations land before the next NMI, which
-shifts the exact sample boundary of any one-shot SFX trigger relative to
-the captured audio. The emulator harness (`tests/emulator/run_examples.mjs`)
-captures a sample-exact audio hash at frame 180, so **any such change flips
-the audio goldens of every audio-emitting example**. The visual PNG goldens
-are stable — PPU writes land in the same vblank — but the audio churn is
-real.
+- The `remove_dead_loads` peephole pass steps past opcodes that touch
+  neither A nor the flags A cares about — INC/DEC/STX/STY/LDX/LDY in
+  memory mode, INX/INY/DEX/DEY, and the flag ops
+  (CLC/SEC/CLI/SEI/CLD/SED/CLV). That lets a later `LDA` overwrite
+  kill a redundant earlier `LDA` even when an index-register load or
+  counter bump sits between them. The canonical
+  `LDA #imm / LDY oam_cursor / LDA #imm / STA $0200,Y` shape emitted
+  by every single-tile `draw` collapses to just
+  `LDY oam_cursor / LDA #imm / STA $0200,Y`, saving 2 bytes per draw.
+  Across the committed examples this shaved 4-9 % of the LDA count
+  in the larger programs (platformer, war, pong).
+- Copy propagation + dead-store elimination in the same pass handle
+  the `STA $80 / … / LDA $80` spill/reload pattern whenever the
+  source and destination aren't separated by a JSR or a label.
 
-A workable register allocator therefore needs one of:
+**Constraint worth recording.** Any cycle-saving optimization shifts
+audio timing: the SFX/music driver reads a frame counter on every NMI,
+and shortening the main-loop pass between two `wait_frame` calls
+changes how many poll iterations complete before the next NMI fires.
+The emulator harness captures a sample-exact audio hash at frame 180,
+so any such change flips the audio goldens for every audio-emitting
+example (audio_demo, friendly_assets, noise_triangle_sfx, platformer,
+pong, war). The visual PNG goldens stay stable — PPU writes still
+land in the same vblank — but the audio churn is real and has to be
+accepted on every pass that touches the codegen. The initial LDX/LDY
+extension on this branch went through that re-baseline once; future
+passes will too.
 
-1. An acceptance that every code-density improvement comes with a
-   re-baselined audio golden set, explained in the commit message.
-2. A pass that saves ROM bytes but preserves cycle counts (hard on 6502 —
-   most short-form ops cost the same cycles as their long forms).
-3. An opt-in flag (`--O2`) so default builds stay cycle-identical and only
-   size-hungry users pay the churn.
+**Remaining wins to chase** if someone wants to push density further:
 
-Exploration during the §H-priorities branch confirmed (1): a single
-`remove_dead_loads` extension that stepped past `LDX`/`LDY` (which don't
-clobber A) dropped one LDA per `draw` statement — but flipped audio
-goldens for audio_demo, friendly_assets, noise_triangle_sfx, platformer,
-pong, and war. The PNG goldens were unchanged. The work was reverted to
-keep the §A + §H commits churn-free; see the commit log on the
-`claude/prioritize-allocator-signedness` branch.
+- **Cross-block A-tracking.** `remove_redundant_loads` clears its
+  A-equivalence tracker on LDX/LDY because LDX/LDY clobber the N/Z
+  flags that an immediately-following branch might rely on. Splitting
+  the tracker into "value still valid" vs "flags still valid" lets it
+  keep the value-side equivalence across LDX/LDY for downstream STA
+  rewrites.
+- **CFG-aware allocation into X / Y.** The codegen never picks X or Y
+  as a temp slot today; they're used only in the specific shapes the
+  existing IR ops emit. A pass that takes a temp with ≤2 uses, lives
+  in a straight-line block, and picks X or Y would remove both the
+  STA and the matching LDA.
+- **Skipping the spill for temps consumed by the very next op.** The
+  IR codegen always emits `STA slot` after producing a temp; when the
+  next op's first source is that temp, the value could stay in A and
+  the consumer skips its `LDA`. The peephole's `remove_sta_then_lda`
+  + `remove_dead_temp_stores` already pick up most cases post-hoc,
+  but producing tighter code at codegen avoids the overhead and
+  handles cases where an intervening label blocks the peephole.
 
 ### State-local memory overlay follow-ups
 

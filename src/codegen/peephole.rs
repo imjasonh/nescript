@@ -264,12 +264,39 @@ fn remove_dead_loads(instructions: &mut Vec<Instruction>) {
                 j += 1;
                 continue;
             }
-            // Memory INC/DEC/STX/STY don't touch A.
-            if matches!(
+            // Step past every op that neither reads nor writes A,
+            // so a redundant LDA before the op gets dropped by its
+            // successor's overwrite. Stepping past LDX/LDY is the
+            // most impactful win — it kills one LDA per `draw`
+            // statement, because the IR codegen emits
+            // `LDA #imm / LDY oam_cursor / LDA #imm / STA $0200,Y`
+            // and copy propagation leaves the two `LDA #imm`s
+            // looking identical around the LDY. INX/INY/DEX/DEY
+            // and the flag ops (CLC/SEC/CLI/SEI/CLD/SED/CLV) are
+            // cheap additions — they don't touch A either, so the
+            // same scan picks them up. INC/DEC in memory mode
+            // (matched explicitly below) likewise leave A alone.
+            let skippable = matches!(
                 next.opcode,
-                Opcode::INC | Opcode::DEC | Opcode::STX | Opcode::STY
-            ) && !matches!(next.mode, AddressingMode::Accumulator)
-            {
+                Opcode::INC
+                    | Opcode::DEC
+                    | Opcode::STX
+                    | Opcode::STY
+                    | Opcode::LDX
+                    | Opcode::LDY
+                    | Opcode::INX
+                    | Opcode::INY
+                    | Opcode::DEX
+                    | Opcode::DEY
+                    | Opcode::CLC
+                    | Opcode::SEC
+                    | Opcode::CLI
+                    | Opcode::SEI
+                    | Opcode::CLD
+                    | Opcode::SED
+                    | Opcode::CLV
+            ) && !matches!(next.mode, AddressingMode::Accumulator);
+            if skippable {
                 j += 1;
                 continue;
             }
@@ -1072,6 +1099,56 @@ mod tests {
         let before = insts.len();
         optimize(&mut insts);
         assert_eq!(insts.len(), before);
+    }
+
+    #[test]
+    fn dead_load_elim_steps_past_ldx_ldy() {
+        // `LDA #16 / LDY oam_cursor / LDA #16 / STA $0200,Y` is the
+        // IR codegen's DrawSprite shape after copy propagation
+        // rewrites the y-position slot read into a fresh immediate.
+        // The first `LDA #16` is dead — the second one overwrites
+        // A and the intervening `LDY zp` doesn't touch A. Before
+        // the LDX/LDY step-past extension this pattern leaked
+        // through because `remove_dead_loads` bailed on any
+        // unexpected opcode; after the fix the first LDA is dropped,
+        // saving 2 bytes per draw.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::Immediate(16)),
+            Instruction::new(LDY, AM::ZeroPage(0x09)),
+            Instruction::new(LDA, AM::Immediate(16)),
+            Instruction::new(STA, AM::AbsoluteY(0x0200)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        optimize(&mut insts);
+        let lda_count = insts.iter().filter(|i| i.opcode == LDA).count();
+        assert_eq!(
+            lda_count, 1,
+            "expected one LDA after peephole; the `LDA #16` before \
+             `LDY $09` should be dropped as dead (next LDA \
+             overwrites): {insts:?}"
+        );
+    }
+
+    #[test]
+    fn dead_load_elim_preserves_lda_when_used_by_shift() {
+        // Counter case: an LDA whose value IS used (by ASL/LSR in
+        // accumulator mode) must survive the step-past extension.
+        // The ASL reads A, so the LDA isn't dead even though LDY
+        // sits between them.
+        let mut insts = vec![
+            Instruction::new(LDA, AM::ZeroPage(0x10)),
+            Instruction::new(LDY, AM::ZeroPage(0x09)),
+            Instruction::new(ASL, AM::Accumulator),
+            Instruction::new(STA, AM::ZeroPage(0x11)),
+            Instruction::new(RTS, AM::Implied),
+        ];
+        let before_lda = insts.iter().filter(|i| i.opcode == LDA).count();
+        optimize(&mut insts);
+        let after_lda = insts.iter().filter(|i| i.opcode == LDA).count();
+        assert_eq!(
+            before_lda, after_lda,
+            "LDA feeding an ASL must survive even with LDY in between: {insts:?}"
+        );
     }
 
     #[test]
