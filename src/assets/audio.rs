@@ -778,6 +778,8 @@ mod tests {
             palettes: Vec::new(),
             backgrounds: Vec::new(),
             metasprites: Vec::new(),
+            metatilesets: Vec::new(),
+            rooms: Vec::new(),
             sfx: Vec::new(),
             music: Vec::new(),
             banks: Vec::new(),

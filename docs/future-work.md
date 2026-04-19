@@ -181,10 +181,57 @@ on the next `wait_frame`.
 
 ### Register allocator
 
-All IR temps currently spill to a recycled zero-page slot (`$80-$FF`). The
-peephole pass mops up the most obvious waste, but a real CFG-aware allocator
-that holds short-lived temps in `A`/`X`/`Y` would cut a noticeable number of
-LDA/STA pairs.
+IR temps still spill to a recycled zero-page slot (`$80-$FF`). Most of
+the obvious waste is now handled:
+
+- The `remove_dead_loads` peephole pass steps past opcodes that touch
+  neither A nor the flags A cares about — INC/DEC/STX/STY/LDX/LDY in
+  memory mode, INX/INY/DEX/DEY, and the flag ops
+  (CLC/SEC/CLI/SEI/CLD/SED/CLV). That lets a later `LDA` overwrite
+  kill a redundant earlier `LDA` even when an index-register load or
+  counter bump sits between them. The canonical
+  `LDA #imm / LDY oam_cursor / LDA #imm / STA $0200,Y` shape emitted
+  by every single-tile `draw` collapses to just
+  `LDY oam_cursor / LDA #imm / STA $0200,Y`, saving 2 bytes per draw.
+  Across the committed examples this shaved 4-9 % of the LDA count
+  in the larger programs (platformer, war, pong).
+- Copy propagation + dead-store elimination in the same pass handle
+  the `STA $80 / … / LDA $80` spill/reload pattern whenever the
+  source and destination aren't separated by a JSR or a label.
+
+**Constraint worth recording.** Any cycle-saving optimization shifts
+audio timing: the SFX/music driver reads a frame counter on every NMI,
+and shortening the main-loop pass between two `wait_frame` calls
+changes how many poll iterations complete before the next NMI fires.
+The emulator harness captures a sample-exact audio hash at frame 180,
+so any such change flips the audio goldens for every audio-emitting
+example (audio_demo, friendly_assets, noise_triangle_sfx, platformer,
+pong, war). The visual PNG goldens stay stable — PPU writes still
+land in the same vblank — but the audio churn is real and has to be
+accepted on every pass that touches the codegen. The initial LDX/LDY
+extension on this branch went through that re-baseline once; future
+passes will too.
+
+**Remaining wins to chase** if someone wants to push density further:
+
+- **Cross-block A-tracking.** `remove_redundant_loads` clears its
+  A-equivalence tracker on LDX/LDY because LDX/LDY clobber the N/Z
+  flags that an immediately-following branch might rely on. Splitting
+  the tracker into "value still valid" vs "flags still valid" lets it
+  keep the value-side equivalence across LDX/LDY for downstream STA
+  rewrites.
+- **CFG-aware allocation into X / Y.** The codegen never picks X or Y
+  as a temp slot today; they're used only in the specific shapes the
+  existing IR ops emit. A pass that takes a temp with ≤2 uses, lives
+  in a straight-line block, and picks X or Y would remove both the
+  STA and the matching LDA.
+- **Skipping the spill for temps consumed by the very next op.** The
+  IR codegen always emits `STA slot` after producing a temp; when the
+  next op's first source is that temp, the value could stay in A and
+  the consumer skips its `LDA`. The peephole's `remove_sta_then_lda`
+  + `remove_dead_temp_stores` already pick up most cases post-hoc,
+  but producing tighter code at codegen avoids the overhead and
+  handles cases where an intervening label blocks the peephole.
 
 ### State-local memory overlay follow-ups
 
@@ -248,22 +295,16 @@ into the top of the file with a "ships today" note.
 
 ### A. Numeric types beyond `u8 / i8 / u16 / i16 / bool`
 
-`i16` ships today; see `examples/i16_demo.ne`. Two known limitations
-match the existing `i8` behaviour and will be tackled together when
-proper signedness tracking lands in the IR:
+`i16` ships today; see `examples/i16_demo.ne` and `examples/signed_compare.ne`.
+Signed ordering comparisons and narrow-to-wide sign-extension both ship
+too — `Cmp{Lt,Gt,LtEq,GtEq}` and their 16-bit siblings carry a
+`Signedness` field that drives the canonical `CMP / SBC / BVC / EOR #$80`
+overflow-correction idiom in `gen_cmp_signed_set_n`, and `widen()` emits
+`IrOp::SignExtend` for signed narrow values instead of the zero-extended
+`LoadImm 0` it used to. Casts to `u8`/`u16` strip the signed flag so
+explicit `as` opt-outs stay unsigned.
 
-- **Comparisons are unsigned.** `CmpLt16`/`CmpGt16` use `BCC`/`BCS`,
-  so `i16` compares against negative values give wrong results. The
-  fix is a `Signedness` field on `Cmp16Kind` (and `CmpKind` for
-  `i8`) plus signed branch lowering — `BMI`/`BPL` after an
-  XOR-on-sign-bit prologue.
-- **Narrow-to-wide widening zero-extends.** Assigning a runtime
-  `i8` expression to an `i16` does not sign-extend the high byte.
-  Negative literals are folded to the correct wide form by the
-  lowerer's existing constant-fold path; only runtime expressions
-  hit the bug.
-
-Lower-priority numeric follow-ups:
+Lower-priority numeric follow-up:
 
 - **`u32` / `i32`.** Realistically needed only for score totals and
   frame counters. A synthesizable pair of 16-bit halves is usually
@@ -369,36 +410,44 @@ Still TODO:
 
 ### H. Metatiles + collision as a first-class construct
 
-cc65/nesdoug treats 2×2 metatiles + a parallel collision map as
-the core room format. `docs/future-work.md` mentions "tilemap
-collision queries"; raise the scope to a single cohesive feature:
+`metatileset Name { metatiles: [...] }` and `room Name { metatileset:
+..., layout: [...] }` ship today — see `examples/metatiles_demo.ne`.
+Each metatile bundles four CHR tile indices (TL / TR / BL / BR) plus
+a `collide: true|false` flag; rooms lay them out as a 16×15 grid
+that the compiler expands at compile time into a 32×30 nametable,
+a 64-byte attribute table, and a 240-byte collision bitmap. All
+three blobs land as PRG ROM data blocks with per-room labels
+(`__room_tiles_N`, `__room_attrs_N`, `__room_col_N`).
 
-```
-metatileset DirtWorld {
-  source: @tiles("dirt.chr"),
-  metatiles: [
-    { id: 0, tiles: [0, 1, 16, 17], collide: false },
-    { id: 1, tiles: [2, 3, 18, 19], collide: true  },
-    ...
-  ],
-}
+`paint_room Name` reuses the existing `load_background` vblank-safe
+update machinery against the room's tile/attribute blobs, and
+additionally installs the room's collision bitmap pointer into
+`ZP_ROOM_COL_LO` / `ZP_ROOM_COL_HI` (ZP `$18`/`$19`).
+`collides_at(x: u8, y: u8) -> bool` JSRs into a small runtime
+helper that reads `(room_col),Y` where `Y = (y & 0xF0) | (x >> 4)`
+and returns the 0/1 bit directly. The helper is gated on a
+`__collides_at_used` marker, so a program that declares a room but
+never queries it pays zero bytes for the subroutine.
 
-room Level1 {
-  metatileset: DirtWorld,
-  layout: @room("level1.nxt"),  // NEXXT exporter format
-}
+**Still TODO.**
 
-on_frame {
-  if collides_at(hero.x, hero.y) {
-    ...
-  }
-}
-```
-
-The compiler would expand each `room` into a packed `[(metatile_id
-<< 4 | collision_bits), ...]` blob in PRG ROM, emit a
-`collides_at(x: u16, y: u16) -> bool` helper, and stream the
-expanded tiles into the VRAM update buffer on a `paint_room()` call.
+- **NEXXT file import (`@room("file.nxt")`).** Today only inline
+  `layout: [...]` (or `[value; count]` for repeated fills) is
+  supported. The NEXXT exporter's `.nxt` format would let users
+  author rooms in a dedicated editor.
+- **Per-quadrant palette hints.** The generated attribute table
+  is currently all zeros (sub-palette 0 for every quadrant). A
+  `palette: 0..3` field on each metatile entry could drive the
+  attribute table expansion.
+- **`collides_at` against u16 coordinates.** The intrinsic takes
+  u8 x/y today, which covers the full 256×240 visible area but
+  can't address scrolling playfields bigger than one nametable.
+- **Multi-room streaming.** The ZP pointer model already supports
+  multiple rooms (each `paint_room` rewrites the collision
+  pointer), but the nametable blit still uses the
+  nametable-0-only `load_background` path. Streaming into a VRAM
+  update buffer would let rooms swap without the vblank-budget
+  risk.
 
 ### I. RLE + LZ4 nametable decompression
 
@@ -568,17 +617,18 @@ to a specific bank to avoid bank-switch cost on a hot path.
 
 Remaining gap items in order of user value:
 
-1. Register allocator (existing section) — compounding size win.
-2. Signedness on Cmp16/Cmp ops (§A follow-up) — closes the i16
-   correctness gap.
-3. Metatiles + collision (§H) — closes several items at once.
-4. Inline-asm format specifiers + directive list (§D follow-ups).
-5. VRAM buffer follow-ups (§G) — vertical writes, array copy,
+1. Register allocator (existing section) — compounding size win,
+   but with the audio-goldens caveat spelled out in that section.
+2. NEXXT `@room(...)` import + per-quadrant palette hints
+   (§H follow-ups) — most impactful extensions on top of the
+   shipped metatiles base.
+3. Inline-asm format specifiers + directive list (§D follow-ups).
+4. VRAM buffer follow-ups (§G) — vertical writes, array copy,
    overflow detection.
-6. Arrays-of-structs + bitfields (§C) + fn pointers (§B) —
+5. Arrays-of-structs + bitfields (§C) + fn pointers (§B) —
    turns NEScript into a general-purpose NES language.
-7. UNROM-512 + MMC5 (§V) — ecosystem fit.
-8. FamiStudio import (§Q) + DPCM (§O) + expansion audio (§P).
+6. UNROM-512 + MMC5 (§V) — ecosystem fit.
+7. FamiStudio import (§Q) + DPCM (§O) + expansion audio (§P).
 
 ---
 

@@ -72,6 +72,25 @@ pub enum TokenKind {
     KwSfx,
     KwMusic,
     KwSave,
+    /// `metatileset Name { metatiles: [...] }` — a packed library of
+    /// 2×2 metatile definitions (4 CHR tile indices per metatile,
+    /// plus a `collide` flag). See `parse_metatileset_decl` in the
+    /// parser. Paired with `room` for the level-data feature pulled
+    /// from `docs/future-work.md` §H.
+    KwMetatileset,
+    /// `room Name { metatileset: Name, layout: [16x15 ids] }` — a
+    /// concrete level laid out as a 16×15 grid of metatile IDs from
+    /// the named metatileset. The compiler expands this into a
+    /// 32×30 nametable + collision bitmap at compile time so the
+    /// runtime cost matches the existing `background` path.
+    KwRoom,
+    /// `paint_room Name` — the room-flavoured sibling of
+    /// `load_background`. Queues a nametable update for the next
+    /// vblank using the room's compile-time-expanded tile grid, and
+    /// also sets the runtime's "current room collision map"
+    /// pointer so subsequent `collides_at(x, y)` queries answer
+    /// against this room.
+    KwPaintRoom,
     KwDraw,
     KwPlay,
     KwStopMusic,
@@ -185,6 +204,9 @@ impl std::fmt::Display for TokenKind {
             Self::KwSfx => write!(f, "sfx"),
             Self::KwMusic => write!(f, "music"),
             Self::KwSave => write!(f, "save"),
+            Self::KwMetatileset => write!(f, "metatileset"),
+            Self::KwRoom => write!(f, "room"),
+            Self::KwPaintRoom => write!(f, "paint_room"),
             Self::KwDraw => write!(f, "draw"),
             Self::KwPlay => write!(f, "play"),
             Self::KwStopMusic => write!(f, "stop_music"),

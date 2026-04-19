@@ -2707,3 +2707,161 @@ fn analyze_inline_fun_with_loop_body_trips_w0110() {
         result.diagnostics
     );
 }
+
+// ── Metatiles + rooms (§H) ──
+
+#[test]
+fn analyze_room_layout_wrong_size_errors() {
+    // A room's layout must be exactly 240 entries (16×15). A short
+    // layout is a user error caught by the analyzer; silently
+    // padding with zeros would produce a nametable with garbage in
+    // the uncovered rows and silently misalign `collides_at`
+    // queries.
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        metatileset MTS {
+            metatiles: [
+                { id: 0, tiles: [0, 0, 0, 0], collide: false },
+            ],
+        }
+        room Level1 {
+            metatileset: MTS,
+            layout: [0, 0, 0],
+        }
+        on frame { }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for short room layout, got {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_room_unknown_metatileset_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        room Level1 {
+            metatileset: Missing,
+            layout: [0; 240],
+        }
+        on frame { }
+        start Main
+    "#,
+    );
+    // We accept either the "unknown metatileset" error or (less
+    // specific but equally correct) a layout validation error that
+    // fires first. What matters is we don't silently accept the
+    // program.
+    assert!(
+        !errors.is_empty(),
+        "expected at least one diagnostic for unknown metatileset"
+    );
+}
+
+#[test]
+fn analyze_paint_room_unknown_room_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        on frame { paint_room Ghost }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0502),
+        "expected E0502 for paint_room of unknown room, got {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_room_with_valid_metatileset_accepts() {
+    // Full valid program — metatileset declared, room layout
+    // covers all 240 cells, paint_room + collides_at both used.
+    // The parser's `[expr; N]` literal is supported for byte
+    // arrays; we test that shortcut path here too.
+    analyze_ok(
+        r#"
+        game "Test" { mapper: NROM }
+        metatileset MTS {
+            metatiles: [
+                { id: 0, tiles: [0, 0, 0, 0], collide: false },
+                { id: 1, tiles: [1, 1, 1, 1], collide: true  },
+            ],
+        }
+        room Level1 {
+            metatileset: MTS,
+            layout: [0; 240],
+        }
+        on frame {
+            paint_room Level1
+            if collides_at(64, 64) { }
+        }
+        start Main
+    "#,
+    );
+}
+
+#[test]
+fn analyze_metatile_wrong_tile_count_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        metatileset MTS {
+            metatiles: [
+                { id: 0, tiles: [0, 0, 0], collide: false },
+            ],
+        }
+        on frame { }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for 3-tile metatile entry, got {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_room_layout_id_out_of_range_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        metatileset MTS {
+            metatiles: [
+                { id: 0, tiles: [0, 0, 0, 0], collide: false },
+            ],
+        }
+        room Level1 {
+            metatileset: MTS,
+            layout: [7; 240],
+        }
+        on frame { }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0201),
+        "expected E0201 for out-of-range metatile id, got {errors:?}"
+    );
+}
+
+#[test]
+fn analyze_collides_at_wrong_arg_count_errors() {
+    let errors = analyze_errors(
+        r#"
+        game "Test" { mapper: NROM }
+        on frame {
+            if collides_at(64) { }
+        }
+        start Main
+    "#,
+    );
+    assert!(
+        errors.contains(&ErrorCode::E0203),
+        "expected E0203 for collides_at arity mismatch, got {errors:?}"
+    );
+}

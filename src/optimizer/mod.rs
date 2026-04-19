@@ -3,7 +3,23 @@ mod tests;
 
 use std::collections::{HashMap, HashSet};
 
-use crate::ir::{IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator, VarId};
+use crate::ir::{
+    IrBasicBlock, IrFunction, IrOp, IrProgram, IrTemp, IrTerminator, Signedness, VarId,
+};
+
+/// Compare two byte-valued constants under the requested signedness.
+/// Used by the constant-folding paths for the ordering comparisons —
+/// when both operands have collapsed to compile-time constants, we
+/// can pre-compute the boolean and replace the IR op with a
+/// `LoadImm`. The signed branch reinterprets the byte through `i8`
+/// so that e.g. `LoadImm 0xFF < LoadImm 0x01` folds to `1` under
+/// signed semantics (-1 < 1) but `0` under unsigned (255 > 1).
+fn cmp_const_signed(a: u8, b: u8, signed: Signedness) -> std::cmp::Ordering {
+    match signed {
+        Signedness::Signed => a.cast_signed().cmp(&b.cast_signed()),
+        Signedness::Unsigned => a.cmp(&b),
+    }
+}
 
 /// Run all optimization passes on the IR program.
 pub fn optimize(program: &mut IrProgram) {
@@ -291,30 +307,34 @@ fn const_fold_block(block: &mut IrBasicBlock, func_used: &HashSet<IrTemp>) {
                     constants.insert(dest, result);
                 }
             }
-            IrOp::CmpLt(dest, a, b) => {
+            IrOp::CmpLt(dest, a, b, signed) => {
                 if let (Some(&va), Some(&vb)) = (constants.get(&a), constants.get(&b)) {
-                    let result = u8::from(va < vb);
+                    let result =
+                        u8::from(cmp_const_signed(va, vb, signed) == std::cmp::Ordering::Less);
                     *op = IrOp::LoadImm(dest, result);
                     constants.insert(dest, result);
                 }
             }
-            IrOp::CmpGt(dest, a, b) => {
+            IrOp::CmpGt(dest, a, b, signed) => {
                 if let (Some(&va), Some(&vb)) = (constants.get(&a), constants.get(&b)) {
-                    let result = u8::from(va > vb);
+                    let result =
+                        u8::from(cmp_const_signed(va, vb, signed) == std::cmp::Ordering::Greater);
                     *op = IrOp::LoadImm(dest, result);
                     constants.insert(dest, result);
                 }
             }
-            IrOp::CmpLtEq(dest, a, b) => {
+            IrOp::CmpLtEq(dest, a, b, signed) => {
                 if let (Some(&va), Some(&vb)) = (constants.get(&a), constants.get(&b)) {
-                    let result = u8::from(va <= vb);
+                    let result =
+                        u8::from(cmp_const_signed(va, vb, signed) != std::cmp::Ordering::Greater);
                     *op = IrOp::LoadImm(dest, result);
                     constants.insert(dest, result);
                 }
             }
-            IrOp::CmpGtEq(dest, a, b) => {
+            IrOp::CmpGtEq(dest, a, b, signed) => {
                 if let (Some(&va), Some(&vb)) = (constants.get(&a), constants.get(&b)) {
-                    let result = u8::from(va >= vb);
+                    let result =
+                        u8::from(cmp_const_signed(va, vb, signed) != std::cmp::Ordering::Less);
                     *op = IrOp::LoadImm(dest, result);
                     constants.insert(dest, result);
                 }
@@ -461,17 +481,17 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         | IrOp::ShiftRightVar(_, a, b)
         | IrOp::CmpEq(_, a, b)
         | IrOp::CmpNe(_, a, b)
-        | IrOp::CmpLt(_, a, b)
-        | IrOp::CmpGt(_, a, b)
-        | IrOp::CmpLtEq(_, a, b)
-        | IrOp::CmpGtEq(_, a, b) => {
+        | IrOp::CmpLt(_, a, b, _)
+        | IrOp::CmpGt(_, a, b, _)
+        | IrOp::CmpLtEq(_, a, b, _)
+        | IrOp::CmpGtEq(_, a, b, _) => {
             used.insert(*a);
             used.insert(*b);
         }
         IrOp::ShiftLeft(_, src, _) | IrOp::ShiftRight(_, src, _) => {
             used.insert(*src);
         }
-        IrOp::Negate(_, src) | IrOp::Complement(_, src) => {
+        IrOp::Negate(_, src) | IrOp::Complement(_, src) | IrOp::SignExtend(_, src) => {
             used.insert(*src);
         }
         IrOp::ArrayLoad(_, _, idx) => {
@@ -587,6 +607,7 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
         | IrOp::Rand16(_, _)
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
+        | IrOp::PaintRoom(_)
         | IrOp::SourceLoc(_) => {}
         IrOp::SeedRand(lo, hi) => {
             used.insert(*lo);
@@ -618,6 +639,10 @@ fn collect_source_temps(op: &IrOp, used: &mut HashSet<IrTemp>) {
             used.insert(*len);
             used.insert(*tile);
         }
+        IrOp::CollidesAt { x, y, .. } => {
+            used.insert(*x);
+            used.insert(*y);
+        }
     }
 }
 
@@ -640,17 +665,19 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::ShiftRightVar(d, _, _)
         | IrOp::Negate(d, _)
         | IrOp::Complement(d, _)
+        | IrOp::SignExtend(d, _)
         | IrOp::CmpEq(d, _, _)
         | IrOp::CmpNe(d, _, _)
-        | IrOp::CmpLt(d, _, _)
-        | IrOp::CmpGt(d, _, _)
-        | IrOp::CmpLtEq(d, _, _)
-        | IrOp::CmpGtEq(d, _, _)
+        | IrOp::CmpLt(d, _, _, _)
+        | IrOp::CmpGt(d, _, _, _)
+        | IrOp::CmpLtEq(d, _, _, _)
+        | IrOp::CmpGtEq(d, _, _, _)
         | IrOp::ArrayLoad(d, _, _) => Some(*d),
         IrOp::Call(dest, _, _) => *dest,
         IrOp::ReadInput(d, _) => Some(*d),
         IrOp::ReadInputEdge { dest, .. } => Some(*dest),
         IrOp::Peek(d, _) => Some(*d),
+        IrOp::CollidesAt { dest, .. } => Some(*dest),
         // Rand8 / Rand16 have an observable side effect — advancing
         // the PRNG state — so a statement-level call like
         // `rand8()` (result discarded) must NOT be dropped by DCE.
@@ -684,6 +711,7 @@ fn op_dest(op: &IrOp) -> Option<IrTemp> {
         | IrOp::NtFillH { .. }
         | IrOp::SetPalette(_)
         | IrOp::LoadBackground(_)
+        | IrOp::PaintRoom(_)
         | IrOp::SourceLoc(_) => None,
         // 16-bit ops have two destinations; the simple single-dest
         // DCE below would incorrectly drop a 16-bit op whose low

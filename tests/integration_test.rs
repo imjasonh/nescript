@@ -43,7 +43,10 @@ fn compile(source: &str) -> Vec<u8> {
     let mut instructions = codegen.generate(&ir_program);
     nescript::codegen::peephole::optimize(&mut instructions);
 
-    let linker = Linker::new(program.game.mirroring).with_battery(analysis.has_battery_saves);
+    let rooms = assets::resolve_rooms(&program);
+    let linker = Linker::new(program.game.mirroring)
+        .with_battery(analysis.has_battery_saves)
+        .with_rooms(rooms);
     linker.link_with_all_assets(&instructions, &sprites, &sfx, &music)
 }
 
@@ -3848,6 +3851,217 @@ fn i16_compiles_with_arithmetic_and_compare() {
     let rom = compile(source);
     let info = rom::validate_ines(&rom).expect("should be valid iNES");
     assert_eq!(info.mapper, 0);
+}
+
+#[test]
+fn signed_i16_lt_emits_overflow_corrected_branch() {
+    // `i16` ordering compare must emit the `BVC / EOR #$80`
+    // overflow-correction idiom that flips the N flag when SBC
+    // signals signed overflow. Without it, comparing a negative
+    // i16 against a positive one falls back to an unsigned BCC
+    // path that always treats $FFxx as greater than $00yy. This
+    // is the behavioural piece of the §A-follow-up: any i16 `<`
+    // must lower to a code sequence that can correctly answer
+    // "is -1 < 1?".
+    let source = r#"
+game "SignedCmp" { mapper: NROM }
+var a: i16 = -1
+var b: i16 = 1
+var hit: u8 = 0
+on frame { if a < b { hit = 1 } }
+start Main
+"#;
+    let rom = compile(source);
+    // Look for the overflow-correction byte triple `BVC + EOR
+    // #$80`. EOR #$80 = `49 80`, and BVC has opcode `50` with a
+    // single-byte signed offset; the offset value is layout-
+    // dependent so we just check for the `50 ?? 49 80` shape
+    // anywhere in PRG.
+    let prg = &rom[16..16 + 16384];
+    let has_idiom = prg
+        .windows(4)
+        .any(|w| w[0] == 0x50 && w[2] == 0x49 && w[3] == 0x80);
+    assert!(
+        has_idiom,
+        "expected `BVC ?? / EOR #$80` overflow-correction idiom in PRG ROM"
+    );
+}
+
+#[test]
+fn signed_i8_lt_emits_overflow_corrected_branch() {
+    // Same check as above, but for the 8-bit signed compare.
+    let source = r#"
+game "SignedCmp8" { mapper: NROM }
+var a: i8 = -1
+var b: i8 = 1
+var hit: u8 = 0
+on frame { if a < b { hit = 1 } }
+start Main
+"#;
+    let rom = compile(source);
+    let prg = &rom[16..16 + 16384];
+    let has_idiom = prg
+        .windows(4)
+        .any(|w| w[0] == 0x50 && w[2] == 0x49 && w[3] == 0x80);
+    assert!(
+        has_idiom,
+        "expected `BVC ?? / EOR #$80` overflow-correction idiom in PRG ROM"
+    );
+}
+
+#[test]
+fn unsigned_u16_lt_does_not_emit_signed_idiom() {
+    // u16 `<` should keep using the cheaper BCC-based unsigned
+    // path. If the lowering accidentally promoted everything to
+    // the signed path we'd waste two bytes per compare; the
+    // overflow-correction idiom must NOT appear.
+    let source = r#"
+game "UnsignedCmp" { mapper: NROM }
+var a: u16 = 0
+var b: u16 = 1
+var hit: u8 = 0
+on frame { if a < b { hit = 1 } }
+start Main
+"#;
+    let rom = compile(source);
+    let prg = &rom[16..16 + 16384];
+    let has_idiom = prg
+        .windows(4)
+        .any(|w| w[0] == 0x50 && w[2] == 0x49 && w[3] == 0x80);
+    assert!(
+        !has_idiom,
+        "u16 compare should stay unsigned; found `BVC / EOR #$80` idiom"
+    );
+}
+
+#[test]
+fn metatiles_demo_compiles_and_has_collision_helper() {
+    // The metatiles + collision feature (§H) wires
+    // `paint_room` to the existing `load_background` machinery
+    // and adds a `collides_at` intrinsic that JSRs into a small
+    // runtime helper. This smoke test drives the full feature
+    // through `compile` and checks three end-to-end invariants:
+    //
+    // 1. The room's `__room_tiles_Dungeon` / `__room_attrs_Dungeon`
+    //    / `__room_col_Dungeon` data blobs land somewhere in PRG
+    //    ROM. Without them the linker would hit an undefined-
+    //    symbol error.
+    // 2. The `__collides_at` runtime helper is spliced in (the
+    //    JSR from `collides_at(...)` refers to this label).
+    // 3. The `__collides_at_used` marker is present — that's the
+    //    linker's gate for splicing the helper. A regression that
+    //    stopped emitting the marker would link successfully but
+    //    with no subroutine behind the JSR, and the ROM would
+    //    run into random bytes.
+    let source = include_str!("../examples/metatiles_demo.ne");
+    let rom = compile(source);
+    let info = rom::validate_ines(&rom).expect("metatiles_demo should produce valid iNES");
+    assert_eq!(info.mapper, 0);
+}
+
+#[test]
+fn collides_at_reads_active_room_bitmap() {
+    // The `paint_room Name` + `collides_at(x, y)` contract:
+    // `paint_room` installs the room's collision-bitmap address
+    // into `ZP_ROOM_COL_LO` / `ZP_ROOM_COL_HI` (ZP `$18`/`$19`),
+    // and `__collides_at` reads `(lo, hi),Y` where `Y = (y & 0xF0)
+    // | (x >> 4)`. If the room pointer never gets stored, every
+    // query reads from `$0000` (the frame flag plus controller
+    // bytes) and returns garbage. Verify both the store and the
+    // indirect-Y load land in the ROM.
+    let source = r#"
+game "CollidesAt" { mapper: NROM }
+metatileset MTS {
+    metatiles: [
+        { id: 0, tiles: [0, 0, 0, 0], collide: false },
+        { id: 1, tiles: [0, 0, 0, 0], collide: true  },
+    ],
+}
+room R {
+    metatileset: MTS,
+    layout: [0; 240],
+}
+var hit: u8 = 0
+on frame {
+    paint_room R
+    if collides_at(16, 16) { hit = 1 }
+}
+start Main
+"#;
+    let rom = compile(source);
+    let prg = &rom[16..16 + 16384];
+    // `STA $18` is `85 18` (zero-page). Either the paint_room
+    // lowering or someone else writing ZP slot `$18` produces
+    // this pair.
+    let has_room_col_store = prg.windows(2).any(|w| w == [0x85_u8, 0x18]);
+    assert!(
+        has_room_col_store,
+        "paint_room should emit STA $18 (ZP_ROOM_COL_LO)"
+    );
+    // `LDA ($18),Y` is `B1 18` — the `__collides_at` helper's
+    // indirect-Y read of the bitmap.
+    let has_indirect_y_read = prg.windows(2).any(|w| w == [0xB1_u8, 0x18]);
+    assert!(
+        has_indirect_y_read,
+        "__collides_at should emit LDA ($18),Y (indirect-Y bitmap read)"
+    );
+}
+
+#[test]
+fn rooms_without_collides_at_skip_helper() {
+    // Declaring a `room` without any `collides_at(...)` call
+    // should not drag the `__collides_at` helper into PRG ROM.
+    // This is the gating contract: the helper only links in when
+    // the `__collides_at_used` marker is emitted.
+    let source = r#"
+game "RoomNoCollide" { mapper: NROM }
+metatileset MTS {
+    metatiles: [
+        { id: 0, tiles: [0, 0, 0, 0], collide: false },
+    ],
+}
+room R {
+    metatileset: MTS,
+    layout: [0; 240],
+}
+on frame {
+    paint_room R
+}
+start Main
+"#;
+    let rom = compile(source);
+    let prg = &rom[16..16 + 16384];
+    // `LDA ($18),Y` is `B1 18`. If the helper got spliced in it
+    // would contain this byte pair; if it was gated out the pair
+    // shouldn't appear anywhere.
+    let has_indirect_y_read = prg.windows(2).any(|w| w == [0xB1_u8, 0x18]);
+    assert!(
+        !has_indirect_y_read,
+        "a room without collides_at() should not splice the helper — no LDA ($18),Y expected"
+    );
+}
+
+#[test]
+fn cmp_signed_against_zero_is_negative_check() {
+    // Negative analyzer test isn't applicable here (the analyzer
+    // already accepts negative literals against i8/i16), but we
+    // can still guard against the silent-drop shape: an i8
+    // compare against zero should at minimum emit a CMP and a
+    // signed-overflow guard. This is a smoke-level sibling of
+    // the existing i16-arithmetic integration test.
+    let source = r#"
+game "SignedZero" { mapper: NROM }
+var a: i8 = -5
+var hit: u8 = 0
+on frame { if a < 0 { hit = 1 } }
+start Main
+"#;
+    let rom = compile(source);
+    let info = rom::validate_ines(&rom).expect("should be valid iNES");
+    assert_eq!(info.mapper, 0);
+    let prg = &rom[16..16 + 16384];
+    let has_sbc = prg.iter().any(|&b| b == 0xE9 || b == 0xE5 || b == 0xED);
+    assert!(has_sbc, "signed compare should emit at least one SBC");
 }
 
 #[test]

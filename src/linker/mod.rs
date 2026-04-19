@@ -50,6 +50,14 @@ pub struct Linker {
     /// header byte 6 bit 1 is set; emulators that respect it persist
     /// the `$6000-$7FFF` SRAM region across power cycles.
     has_battery: bool,
+    /// Resolved room level data. Populated via [`Linker::with_rooms`]
+    /// by the CLI / top-level compile. Each entry produces three
+    /// data blocks in PRG ROM (`__room_tiles_N`, `__room_attrs_N`,
+    /// `__room_col_N`) that `paint_room` and `collides_at` reference
+    /// by symbol. Kept as an owned `Vec` so `Linker` can carry the
+    /// data through the builder chain without threading yet another
+    /// parameter through every entry point.
+    rooms: Vec<crate::assets::RoomData>,
 }
 
 /// CHR data for a sprite, placed at a specific tile index in CHR ROM.
@@ -197,6 +205,7 @@ impl Linker {
             mapper: Mapper::NROM,
             header_format: HeaderFormat::Ines1,
             has_battery: false,
+            rooms: Vec::new(),
         }
     }
 
@@ -206,7 +215,19 @@ impl Linker {
             mapper,
             header_format: HeaderFormat::Ines1,
             has_battery: false,
+            rooms: Vec::new(),
         }
+    }
+
+    /// Supply the resolved `room` level data the CLI got back from
+    /// [`crate::assets::resolve_rooms`]. The linker emits one set of
+    /// tile / attribute / collision blobs per room and the codegen
+    /// references them by symbol from `paint_room` / `collides_at`
+    /// call sites.
+    #[must_use]
+    pub fn with_rooms(mut self, rooms: Vec<crate::assets::RoomData>) -> Self {
+        self.rooms = rooms;
+        self
     }
 
     /// Opt into the NES 2.0 header format for the emitted ROM.
@@ -618,6 +639,14 @@ impl Linker {
             all_instructions.extend(runtime::gen_vram_buf_drain());
         }
 
+        // `__collides_at` helper — spliced in when the codegen emits
+        // the `__collides_at_used` marker. Programs that declare a
+        // `room` but never call `collides_at(...)` skip the helper
+        // entirely.
+        if has_label(user_code, "__collides_at_used") {
+            all_instructions.extend(runtime::gen_collides_at());
+        }
+
         // Audio subsystem — linked in whenever user code touched
         // audio (detected via the `__audio_used` marker emitted by
         // the IR codegen). The driver body, period table, and
@@ -702,6 +731,25 @@ impl Linker {
                 bg.attrs.to_vec(),
             ));
         }
+        // Room data — one set of tile / attribute / collision blobs
+        // per declared `room`. `paint_room Name` references the
+        // first two through the same vblank update helper as
+        // backgrounds, and `collides_at` indexes into the third.
+        // Programs with no rooms emit nothing here.
+        for room in &self.rooms {
+            all_instructions.extend(runtime::gen_data_block(
+                &room.tiles_label(),
+                room.tiles.to_vec(),
+            ));
+            all_instructions.extend(runtime::gen_data_block(
+                &room.attrs_label(),
+                room.attrs.to_vec(),
+            ));
+            all_instructions.extend(runtime::gen_data_block(
+                &room.collision_label(),
+                room.collision.to_vec(),
+            ));
+        }
 
         // The NMI needs the palette/nametable update helper whenever
         // the program declared any palette or background, or the
@@ -712,6 +760,7 @@ impl Linker {
         // zero bytes.
         let has_ppu_updates = !palettes.is_empty()
             || !backgrounds.is_empty()
+            || !self.rooms.is_empty()
             || has_label(user_code, "__ppu_update_used");
 
         // NMI handler

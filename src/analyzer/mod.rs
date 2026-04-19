@@ -7,6 +7,13 @@ use crate::errors::{Diagnostic, ErrorCode, Label, Level};
 use crate::lexer::Span;
 use crate::parser::ast::*;
 
+/// A room's metatile grid is 16×15, giving 240 cells. The compiler
+/// expands each cell into a 2×2 CHR-tile block, covering a full
+/// 32×30 nametable (256×240 px, matching the NES visible area).
+pub const ROOM_GRID_WIDTH: usize = 16;
+pub const ROOM_GRID_HEIGHT: usize = 15;
+pub const ROOM_CELL_COUNT: usize = ROOM_GRID_WIDTH * ROOM_GRID_HEIGHT;
+
 /// Symbol information stored in the scope.
 #[derive(Debug, Clone)]
 pub struct Symbol {
@@ -82,6 +89,10 @@ pub fn analyze(program: &Program) -> AnalysisResult {
     for decl in &program.backgrounds {
         background_names.insert(decl.name.clone());
     }
+    let mut room_names = HashSet::new();
+    for decl in &program.rooms {
+        room_names.insert(decl.name.clone());
+    }
     // Programs that use palette or background declarations need 7
     // bytes of zero page for the vblank-safe update handshake
     // (`$11` flags + 2 × 3 pointer slots). Bump the user zero-page
@@ -100,8 +111,18 @@ pub fn analyze(program: &Program) -> AnalysisResult {
     // examples) keep the legacy layout because their fixed-bank
     // user code never invokes `__bank_select`.
     let needs_ppu_update_slots = !program.palettes.is_empty() || !program.backgrounds.is_empty();
+    // Rooms reserve two additional ZP bytes at `$18-$19` for the
+    // `paint_room` → `collides_at` room-pointer handoff, on top of
+    // whatever PPU-update slots are already reserved. Programs that
+    // use palettes/backgrounds AND rooms pay both bumps; programs
+    // with just rooms pay only the room bump (the PPU-update slot
+    // region is a prefix of the same block so rooms imply PPU
+    // updates via `paint_room`).
+    let needs_room_slots = !program.rooms.is_empty();
     let needs_bank_current_slot = program.functions.iter().any(|f| f.bank.is_some());
-    let next_zp_addr = if needs_ppu_update_slots {
+    let next_zp_addr = if needs_room_slots {
+        0x1A
+    } else if needs_ppu_update_slots {
         0x18
     } else if needs_bank_current_slot {
         0x11
@@ -124,6 +145,7 @@ pub fn analyze(program: &Program) -> AnalysisResult {
         music_names,
         palette_names,
         background_names,
+        room_names,
         next_ram_addr: initial_ram_addr,
         next_zp_addr,
         call_graph: HashMap::new(),
@@ -177,6 +199,9 @@ struct Analyzer {
     /// Set of background names declared in the program. Used to
     /// validate `load_background Name` targets.
     background_names: HashSet<String>,
+    /// Set of room names declared in the program. Used to validate
+    /// `paint_room Name` targets.
+    room_names: HashSet<String>,
     next_ram_addr: u16,
     next_zp_addr: u8,
     /// Bump-pointer for save-block (`save { var ... }`) variables.
@@ -559,6 +584,122 @@ impl Analyzer {
                     ),
                     ms.span,
                 ));
+            }
+        }
+
+        // Validate metatileset declarations: each tile array must
+        // have exactly 4 entries (TL/TR/BL/BR), entry IDs must
+        // match their position in the array, names are unique
+        // across metatilesets, and the count is capped at 256 so
+        // a metatile ID still fits in a u8. The compile-time
+        // expansion in `IrCodeGen::generate` reads from these
+        // tables, so anything that gets past the analyzer here
+        // produces a corrupt nametable rather than a panic.
+        let mut seen_metatilesets: HashSet<String> = HashSet::new();
+        for mts in &program.metatilesets {
+            if !seen_metatilesets.insert(mts.name.clone()) {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0501,
+                    format!("duplicate metatileset '{}'", mts.name),
+                    mts.span,
+                ));
+            }
+            if mts.metatiles.is_empty() {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "metatileset '{}' is empty — declare at least one metatile",
+                        mts.name
+                    ),
+                    mts.span,
+                ));
+            }
+            if mts.metatiles.len() > 256 {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "metatileset '{}' has {} metatiles; the limit is 256 (one byte of ID space)",
+                        mts.name,
+                        mts.metatiles.len()
+                    ),
+                    mts.span,
+                ));
+            }
+            for (i, mt) in mts.metatiles.iter().enumerate() {
+                if usize::from(mt.id) != i {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!(
+                            "metatile entry #{i} in metatileset '{}' has id={}; entries \
+                             must be declared in ascending order with consecutive IDs starting \
+                             at 0",
+                            mts.name, mt.id
+                        ),
+                        mt.span,
+                    ));
+                }
+            }
+        }
+
+        // Validate room declarations: must reference a known
+        // metatileset, the layout must be exactly 240 entries
+        // (16 wide × 15 tall — covers a 32×30 nametable when
+        // expanded to 2×2 tiles), and every layout byte must be
+        // a valid metatile ID for the referenced set.
+        let mts_by_name: std::collections::HashMap<&str, &MetatilesetDecl> = program
+            .metatilesets
+            .iter()
+            .map(|m| (m.name.as_str(), m))
+            .collect();
+        let mut seen_rooms: HashSet<String> = HashSet::new();
+        for room in &program.rooms {
+            if !seen_rooms.insert(room.name.clone()) {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0501,
+                    format!("duplicate room '{}'", room.name),
+                    room.span,
+                ));
+            }
+            if room.layout.len() != ROOM_CELL_COUNT {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0201,
+                    format!(
+                        "room '{}' layout has {} entries; expected exactly {ROOM_CELL_COUNT} \
+                         (a {ROOM_GRID_WIDTH}×{ROOM_GRID_HEIGHT} grid of metatile IDs)",
+                        room.name,
+                        room.layout.len()
+                    ),
+                    room.span,
+                ));
+            }
+            match mts_by_name.get(room.metatileset.as_str()) {
+                None => {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0201,
+                        format!(
+                            "room '{}' references unknown metatileset '{}'",
+                            room.name, room.metatileset
+                        ),
+                        room.span,
+                    ));
+                }
+                Some(mts) => {
+                    let max_id = mts.metatiles.len().saturating_sub(1);
+                    for (i, &b) in room.layout.iter().enumerate() {
+                        if usize::from(b) > max_id {
+                            self.diagnostics.push(Diagnostic::error(
+                                ErrorCode::E0201,
+                                format!(
+                                    "room '{}' layout cell {i} = {b} is out of range for \
+                                     metatileset '{}' (valid IDs are 0..={max_id})",
+                                    room.name, room.metatileset
+                                ),
+                                room.span,
+                            ));
+                            break;
+                        }
+                    }
+                }
             }
         }
 
@@ -2299,6 +2440,15 @@ impl Analyzer {
                     ));
                 }
             }
+            Statement::PaintRoom(name, span) => {
+                if !self.room_names.contains(name) {
+                    self.diagnostics.push(Diagnostic::error(
+                        ErrorCode::E0502,
+                        format!("unknown room '{name}'"),
+                        *span,
+                    ));
+                }
+            }
             Statement::DebugLog(args, _) => {
                 for arg in args {
                     self.walk_expr_reads(arg);
@@ -2467,6 +2617,7 @@ impl Analyzer {
                 // PRNG intrinsics: rand8 returns u8, rand16 returns u16.
                 "rand8" => Some(NesType::U8),
                 "rand16" => Some(NesType::U16),
+                "collides_at" => Some(NesType::Bool),
                 _ => Some(NesType::U8), // Simplified for M1
             },
             Expr::ArrayIndex(name, _, _) => {
@@ -2696,7 +2847,8 @@ fn collect_calls_stmt(stmt: &Statement, calls: &mut Vec<String>) {
         | Statement::StartMusic(_, _)
         | Statement::StopMusic(_)
         | Statement::SetPalette(_, _)
-        | Statement::LoadBackground(_, _) => {}
+        | Statement::LoadBackground(_, _)
+        | Statement::PaintRoom(_, _) => {}
     }
 }
 
@@ -2775,6 +2927,7 @@ fn is_intrinsic(name: &str) -> bool {
             | "nt_set"
             | "nt_attr"
             | "nt_fill_h"
+            | "collides_at"
     )
 }
 
@@ -2891,6 +3044,16 @@ impl Analyzer {
                     ErrorCode::E0203,
                     format!(
                         "`nt_fill_h` takes exactly 4 arguments (x: u8, y: u8, len: u8, tile: u8), got {}",
+                        args.len()
+                    ),
+                    span,
+                ));
+            }
+            "collides_at" if args.len() != 2 => {
+                self.diagnostics.push(Diagnostic::error(
+                    ErrorCode::E0203,
+                    format!(
+                        "`collides_at` takes exactly 2 arguments (x: u8, y: u8), got {}",
                         args.len()
                     ),
                     span,

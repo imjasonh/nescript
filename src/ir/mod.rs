@@ -15,6 +15,18 @@ pub struct VarId(pub u32);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct IrTemp(pub u32);
 
+/// Signedness of an arithmetic / comparison operand. The IR is
+/// otherwise untyped — temps carry no width or sign information by
+/// themselves — so ordering compares (`Lt`, `Gt`, `LtEq`, `GtEq`) and
+/// any future sign-aware op carry this enum to tell the codegen which
+/// branch lowering to emit. `Eq` / `Ne` and bitwise ops don't need it
+/// because their bytewise result is the same either way.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum Signedness {
+    Unsigned,
+    Signed,
+}
+
 impl fmt::Display for IrTemp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "t{}", self.0)
@@ -152,10 +164,21 @@ pub enum IrOp {
     // Comparison (sets a boolean temp)
     CmpEq(IrTemp, IrTemp, IrTemp),
     CmpNe(IrTemp, IrTemp, IrTemp),
-    CmpLt(IrTemp, IrTemp, IrTemp),
-    CmpGt(IrTemp, IrTemp, IrTemp),
-    CmpLtEq(IrTemp, IrTemp, IrTemp),
-    CmpGtEq(IrTemp, IrTemp, IrTemp),
+    /// `dest = (a < b)`. `signed` selects between unsigned (`BCC`) and
+    /// signed (`SBC` + `N XOR V`) branch lowering.
+    CmpLt(IrTemp, IrTemp, IrTemp, Signedness),
+    /// `dest = (a > b)`.
+    CmpGt(IrTemp, IrTemp, IrTemp, Signedness),
+    /// `dest = (a <= b)`.
+    CmpLtEq(IrTemp, IrTemp, IrTemp, Signedness),
+    /// `dest = (a >= b)`.
+    CmpGtEq(IrTemp, IrTemp, IrTemp, Signedness),
+
+    /// Sign-extend an 8-bit value into an 8-bit `dest` byte, producing
+    /// `$FF` if `src`'s bit 7 is set and `$00` otherwise. Used by the
+    /// IR lowering when a signed narrow value (i8) is widened to i16
+    /// — the unsigned path emits `LoadImm 0` for the high byte instead.
+    SignExtend(IrTemp, IrTemp),
 
     // Array access
     ArrayLoad(IrTemp, VarId, IrTemp),
@@ -247,39 +270,43 @@ pub enum IrOp {
         b_lo: IrTemp,
         b_hi: IrTemp,
     },
-    /// 16-bit unsigned less-than. `dest = (a < b) ? 1 : 0`.
-    /// Codegen compares high bytes first; falls through to compare
-    /// low bytes only when the high bytes are equal.
+    /// 16-bit less-than. `dest = (a < b) ? 1 : 0`. `signed` selects
+    /// between unsigned (high-byte `BCC` + low-byte fall-through) and
+    /// signed (`CMP lo / SBC hi` then `N XOR V`) branch lowering.
     CmpLt16 {
         dest: IrTemp,
         a_lo: IrTemp,
         a_hi: IrTemp,
         b_lo: IrTemp,
         b_hi: IrTemp,
+        signed: Signedness,
     },
-    /// 16-bit unsigned greater-than.
+    /// 16-bit greater-than.
     CmpGt16 {
         dest: IrTemp,
         a_lo: IrTemp,
         a_hi: IrTemp,
         b_lo: IrTemp,
         b_hi: IrTemp,
+        signed: Signedness,
     },
-    /// 16-bit unsigned less-or-equal.
+    /// 16-bit less-or-equal.
     CmpLtEq16 {
         dest: IrTemp,
         a_lo: IrTemp,
         a_hi: IrTemp,
         b_lo: IrTemp,
         b_hi: IrTemp,
+        signed: Signedness,
     },
-    /// 16-bit unsigned greater-or-equal.
+    /// 16-bit greater-or-equal.
     CmpGtEq16 {
         dest: IrTemp,
         a_lo: IrTemp,
         a_hi: IrTemp,
         b_lo: IrTemp,
         b_hi: IrTemp,
+        signed: Signedness,
     },
 
     /// `set_palette Name` — queues a palette update for the next
@@ -292,6 +319,24 @@ pub enum IrOp {
     /// label pointers into their ZP slots and sets a pending bit;
     /// the NMI handler applies the writes at the next vblank.
     LoadBackground(String),
+    /// `paint_room Name` — queues the room's compile-time-expanded
+    /// nametable for vblank-safe blitting (same machinery as
+    /// `LoadBackground`) AND installs the room's collision bitmap
+    /// address into `ZP_ROOM_COL_LO` / `ZP_ROOM_COL_HI`. Subsequent
+    /// `collides_at(x, y)` queries answer against that bitmap.
+    PaintRoom(String),
+    /// `collides_at(x, y)` — a boolean query against the currently-
+    /// painted room's collision bitmap. Zero-argument use
+    /// (`dest = collides_at(x, y)`) reads the pointed-to bitmap
+    /// for the metatile covering `(x, y)`; returns 0 (no collision)
+    /// or 1 (collision). Codegen lowers to a JSR into a shared
+    /// `__collides_at` runtime helper that's spliced in when the
+    /// `__collides_at_used` marker is present.
+    CollidesAt {
+        dest: IrTemp,
+        x: IrTemp,
+        y: IrTemp,
+    },
 
     // Audio ops — map to the minimal APU driver emitted by the linker.
     /// `play SfxName` — trigger a one-shot sound effect on pulse 1.
