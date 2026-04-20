@@ -228,6 +228,145 @@ cccccccc",
 ........
 ........",
     },
+    // ── HUD glyphs (sprite-only; palette sp0: a=red, c=white) ──
+    // Each digit is a 4-wide outline centred in an 8×8 cell and
+    // drawn in white ('c') so it reads crisply over the sky
+    // backdrop at the top of the playfield. The compiler treats
+    // '.' as transparent for sprites, so the sky shows through.
+    Tile {
+        name: "Digit 0",
+        art: "\
+........
+..cccc..
+..c..c..
+..c..c..
+..c..c..
+..c..c..
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 1",
+        art: "\
+........
+...cc...
+..ccc...
+...cc...
+...cc...
+...cc...
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 2",
+        art: "\
+........
+..cccc..
+.....c..
+....cc..
+...cc...
+..cc....
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 3",
+        art: "\
+........
+..cccc..
+.....c..
+...ccc..
+.....c..
+.....c..
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 4",
+        art: "\
+........
+..c..c..
+..c..c..
+..cccc..
+.....c..
+.....c..
+.....c..
+........",
+    },
+    Tile {
+        name: "Digit 5",
+        art: "\
+........
+..cccc..
+..c.....
+..cccc..
+.....c..
+..c..c..
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 6",
+        art: "\
+........
+..cccc..
+..c.....
+..cccc..
+..c..c..
+..c..c..
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 7",
+        art: "\
+........
+..cccc..
+.....c..
+....c...
+...c....
+..c.....
+..c.....
+........",
+    },
+    Tile {
+        name: "Digit 8",
+        art: "\
+........
+..cccc..
+..c..c..
+..cccc..
+..c..c..
+..c..c..
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 9",
+        art: "\
+........
+..cccc..
+..c..c..
+..cccc..
+.....c..
+.....c..
+..cccc..
+........",
+    },
+    // Small red heart for the lives readout. Uses 'a' (red) so the
+    // shape pops against the sky and matches the cap/brick red.
+    Tile {
+        name: "Heart",
+        art: "\
+........
+.aa..aa.
+aaaaaaaa
+aaaaaaaa
+.aaaaaa.
+..aaaa..
+...aa...
+........",
+    },
 ];
 
 // ── Named CHR tile indices used by the nametable layout below ──

@@ -4,12 +4,17 @@
 // with per-region attribute palettes, a multi-tile metasprite
 // player with gravity/jump physics, wrap-around horizontal
 // scrolling, moving enemies with stomp-or-die contact logic, a
-// coin HUD that tracks live score, collectible coins, user-declared
-// SFX envelopes, a user-declared music track, and a
-// title → playing → game-over state machine driven by both
-// controller input and an autopilot so the jsnes golden harness
-// (which runs headless with no simulated buttons) still captures
-// the full gameplay loop inside the first ~6 seconds of demo.
+// sprite-based status bar at the top of the viewport (coin icon +
+// two-digit score on the left, heart icon + lives counter on the
+// right) that rides along through the death screen, cross-state
+// life tracking that cycles GameOver → Playing while hearts last
+// and bounces back to Title when the last heart is spent,
+// collectible coins, user-declared SFX envelopes, a user-declared
+// music track, and a title → playing → game-over state machine
+// driven by both controller input and an autopilot so the jsnes
+// golden harness (which runs headless with no simulated buttons)
+// still captures the full gameplay loop inside the first ~6
+// seconds of demo.
 //
 // Controls (when played by a human):
 //     D-pad left/right  — walk
@@ -212,6 +217,105 @@ sprite Tileset {
         "........",
         "........",
         "........",
+        "........",
+        // tile 16: Digit 0
+        "........",
+        "..cccc..",
+        "..c..c..",
+        "..c..c..",
+        "..c..c..",
+        "..c..c..",
+        "..cccc..",
+        "........",
+        // tile 17: Digit 1
+        "........",
+        "...cc...",
+        "..ccc...",
+        "...cc...",
+        "...cc...",
+        "...cc...",
+        "..cccc..",
+        "........",
+        // tile 18: Digit 2
+        "........",
+        "..cccc..",
+        ".....c..",
+        "....cc..",
+        "...cc...",
+        "..cc....",
+        "..cccc..",
+        "........",
+        // tile 19: Digit 3
+        "........",
+        "..cccc..",
+        ".....c..",
+        "...ccc..",
+        ".....c..",
+        ".....c..",
+        "..cccc..",
+        "........",
+        // tile 20: Digit 4
+        "........",
+        "..c..c..",
+        "..c..c..",
+        "..cccc..",
+        ".....c..",
+        ".....c..",
+        ".....c..",
+        "........",
+        // tile 21: Digit 5
+        "........",
+        "..cccc..",
+        "..c.....",
+        "..cccc..",
+        ".....c..",
+        "..c..c..",
+        "..cccc..",
+        "........",
+        // tile 22: Digit 6
+        "........",
+        "..cccc..",
+        "..c.....",
+        "..cccc..",
+        "..c..c..",
+        "..c..c..",
+        "..cccc..",
+        "........",
+        // tile 23: Digit 7
+        "........",
+        "..cccc..",
+        ".....c..",
+        "....c...",
+        "...c....",
+        "..c.....",
+        "..c.....",
+        "........",
+        // tile 24: Digit 8
+        "........",
+        "..cccc..",
+        "..c..c..",
+        "..cccc..",
+        "..c..c..",
+        "..c..c..",
+        "..cccc..",
+        "........",
+        // tile 25: Digit 9
+        "........",
+        "..cccc..",
+        "..c..c..",
+        "..cccc..",
+        ".....c..",
+        ".....c..",
+        "..cccc..",
+        "........",
+        // tile 26: Heart
+        "........",
+        ".aa..aa.",
+        "aaaaaaaa",
+        "aaaaaaaa",
+        ".aaaaaa.",
+        "..aaaa..",
+        "...aa...",
         "........"
     ]
 }
@@ -223,6 +327,10 @@ const TILE_PLAYER_BL: u8 = 3
 const TILE_PLAYER_BR: u8 = 4
 const TILE_ENEMY: u8 = 5
 const TILE_COIN: u8 = 6
+// HUD glyphs (sprite-only — not referenced by the nametable). The
+// digit tiles are contiguous so `TILE_DIGIT_0 + n` picks digit `n`.
+const TILE_DIGIT_0: u8 = 16
+const TILE_HEART: u8 = 26
 
 // ── Background ──────────────────────────────────────────────
 // The 32×30 nametable is authored as ASCII art with a `legend`
@@ -378,6 +486,51 @@ const AUTOPILOT_JUMPS: u8 = 2
 // Cross-state scratch
 var frame_tick: u8 = 0     // free-running frame counter
 var stomp_count: u8 = 0    // successful enemy stomps this life
+var lives:       u8 = 3    // lives remaining; HUD heart readout
+
+// ── HUD helpers ─────────────────────────────────────────────
+// Paint the four-sprite status bar at the very top of the screen:
+// a coin icon followed by a two-digit stomp tally on the left, and
+// a heart icon followed by a single-digit lives counter on the
+// right. Everything is drawn as OAM sprites (never the nametable)
+// so the HUD stays pinned while the background scrolls under it.
+// y = 16 is above the brick row, so the white digits read cleanly
+// against the universal-sky backdrop.
+// Split a 0..99 count into its tens and ones decimal digits via
+// repeated subtraction — the runtime's software divide has a known
+// issue that scribbles over state-local memory (tracked in
+// docs/future-work.md §G), and the HUD is hot enough that the
+// miscompile sends the state machine spinning. Manual repeated
+// subtraction is two dozen cycles for the worst case of a two-digit
+// score, which is cheap for a once-per-frame call.
+fun tens_digit(n: u8) -> u8 {
+    var t: u8 = 0
+    var r: u8 = n
+    while r >= 10 {
+        r -= 10
+        t += 1
+    }
+    return t
+}
+
+fun ones_digit(n: u8) -> u8 {
+    var r: u8 = n
+    while r >= 10 {
+        r -= 10
+    }
+    return r
+}
+
+fun draw_hud() {
+    // Score side (left): coin + tens + ones.
+    draw Tileset at: (16, 16) frame: TILE_COIN
+    draw Tileset at: (28, 16) frame: TILE_DIGIT_0 + tens_digit(stomp_count)
+    draw Tileset at: (36, 16) frame: TILE_DIGIT_0 + ones_digit(stomp_count)
+
+    // Lives side (right): heart + digit.
+    draw Tileset at: (208, 16) frame: TILE_HEART
+    draw Tileset at: (224, 16) frame: TILE_DIGIT_0 + lives
+}
 
 // ── Helper functions ────────────────────────────────────────
 
@@ -486,6 +639,11 @@ state Title {
     on enter {
         blink = 0
         frame_tick = 0
+        // Fresh run — restore the full life bar so the HUD reads 3
+        // when Playing kicks in and the GameOver loop doesn't trap
+        // the game in a zero-lives state forever.
+        lives = 3
+        stomp_count = 0
         start_music Theme
     }
 
@@ -628,21 +786,10 @@ state Playing {
         draw Tileset at: (c1_sx, cy)       frame: TILE_COIN
         draw Tileset at: (c2_sx, COIN_Y)   frame: TILE_COIN
 
-        // Live HUD: draw one coin per stomp in the top-left. The
-        // background palette-1 region covers this strip so the
-        // sprite coins read correctly against the brick band.
-        if stomp_count >= 1 {
-            draw Tileset at: (16, 24) frame: TILE_COIN
-        }
-        if stomp_count >= 2 {
-            draw Tileset at: (28, 24) frame: TILE_COIN
-        }
-        if stomp_count >= 3 {
-            draw Tileset at: (40, 24) frame: TILE_COIN
-        }
-        if stomp_count >= 4 {
-            draw Tileset at: (52, 24) frame: TILE_COIN
-        }
+        // Status bar (score tally on the left, lives on the right).
+        // Drawn as sprites so it stays pinned while the nametable
+        // scrolls under it.
+        draw_hud()
 
         // Player is only drawn while alive — on the dying frame
         // we show the scene without the hero on top of the enemy
@@ -670,6 +817,12 @@ state GameOver {
 
     on enter {
         linger = 0
+        // Burn a life on entry so the HUD's heart counter ticks
+        // down visibly each death. Guard against underflow in case
+        // something transitions here with lives already at zero.
+        if lives > 0 {
+            lives -= 1
+        }
         stop_music
     }
 
@@ -686,26 +839,33 @@ state GameOver {
         draw Tileset at: (128, 112) frame: TILE_ENEMY
         draw Tileset at: (144, 112) frame: TILE_ENEMY
 
-        if stomp_count >= 1 {
-            draw Tileset at: (96,  128) frame: TILE_COIN
-        }
-        if stomp_count >= 2 {
-            draw Tileset at: (112, 128) frame: TILE_COIN
-        }
-        if stomp_count >= 3 {
-            draw Tileset at: (128, 128) frame: TILE_COIN
-        }
-        if stomp_count >= 4 {
-            draw Tileset at: (144, 128) frame: TILE_COIN
-        }
+        // Carry the status bar through the death screen so the
+        // final score and the remaining heart total are visible at
+        // the exact same position as in Playing — no awkward jump.
+        draw Tileset at: (16, 16) frame: TILE_COIN
+        draw Tileset at: (28, 16) frame: TILE_DIGIT_0 + tens_digit(stomp_count)
+        draw Tileset at: (36, 16) frame: TILE_DIGIT_0 + ones_digit(stomp_count)
+        draw Tileset at: (208, 16) frame: TILE_HEART
+        draw Tileset at: (224, 16) frame: TILE_DIGIT_0 + lives
 
         // Auto-retry after ~1 s so the headless harness sees the
-        // full loop. A human can hit Start to retry immediately.
+        // full loop. When the last life is spent, bounce back to
+        // the Title screen instead (Title's `on enter` refills the
+        // heart bar for the next run). A human can hit Start to
+        // skip the wait.
         if linger >= 60 {
-            transition Playing
+            if lives == 0 {
+                transition Title
+            } else {
+                transition Playing
+            }
         }
         if button.start {
-            transition Playing
+            if lives == 0 {
+                transition Title
+            } else {
+                transition Playing
+            }
         }
     }
 }

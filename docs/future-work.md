@@ -260,6 +260,42 @@ missing:
   call — would shave a few bytes more on programs with many deep
   handlers.
 
+### `u8 / 10` and `u8 % 10` miscompile near state transitions
+
+The `examples/platformer.ne` HUD originally rendered its two-digit
+stomp tally with `TILE_DIGIT_0 + (stomp_count / 10)` and
+`TILE_DIGIT_0 + (stomp_count % 10)`. Both expressions passed the
+parser, survived analysis, and emitted a W0101 "expensive
+multiply/divide" warning as expected — but the built ROM cycled
+Title → Playing → Title once per blink period, with the Playing
+state surviving for exactly one frame before something stomped the
+state-machine bookkeeping at `$1B` (Title's `blink` / Playing's
+`player_y` overlay slot) and kicked control back to Title. The
+divide has to be the culprit: swapping both calls for a manual
+`while r >= 10 { r -= 10; … }` in two helper functions makes the
+golden hold across every frame.
+
+The HUD's `draw_hud` workaround sits in `examples/platformer.ne`
+with a comment pointing here. Two guesses at the root cause:
+
+1. **Scratch overlap.** The divide routine's scratch may land
+   beyond the `$00-$0F` runtime reservation and stomp on the
+   state-local overlay base at `$1B`. A printout of the runtime's
+   actual zero-page footprint alongside the analyzer's allocator
+   snapshot would catch this.
+2. **Expression lowering.** The `BinaryOp::Div` / `Rem` path may
+   leave a dangling temp in a slot that a surrounding `draw`
+   statement later clobbers. The existing
+   `uninitialized_struct_field_store_emits_sta_to_allocated_address`
+   regression test exercises loads + stores but not divides; a
+   round-trip test along the lines of "compile `x / 10` into a
+   `var tens: u8`, wait a frame, assert `tens` still reads as the
+   pre-wait value" would pin this down.
+
+Either way the negative test is the priority — without one, the
+next person to reach for `/` or `%` in a state with overlaid
+locals hits the same PR #31-shaped silent drop.
+
 ### Cross-block temp live-range analysis
 
 The slot recycler is function-local per-block. Temps that flow across block
