@@ -317,10 +317,12 @@ sprite Tileset {
         "..aaaa..",
         "...aa...",
         "........",
-        // tile 27: Sprite 0 anchor (single opaque pixel at row 7,
-        //          col 3 — the sprite-0 hit fires on the last
-        //          HUD scanline so the scroll split lands
-        //          cleanly on the playfield below)
+        // tile 27: Sprite 0 anchor — one opaque pixel at
+        //          row 7 col 3. Paired with the BG anchor tile
+        //          at (NT col 31, row 2) below; the single
+        //          opaque dot at screen (251, 16) fires the
+        //          sprite-0 hit one scanline *below* the HUD
+        //          row, keeping the HUD glyphs pixel-stable.
         "........",
         "........",
         "........",
@@ -328,7 +330,20 @@ sprite Tileset {
         "........",
         "........",
         "........",
-        "...c...."
+        "...c....",
+        // tile 28: BG anchor — one opaque pixel at row 0 col 3.
+        //          Pre-painted at NT (col 31, row 2) so it
+        //          overlaps sprite 0's opaque pixel at screen
+        //          (251, 16). Column 31 sits inside jsnes's
+        //          right-edge overscan so the dot is invisible.
+        "...c....",
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "........"
     ]
 }
 
@@ -346,11 +361,17 @@ const TILE_COIN: u8 = 6
 // sub-palette.
 const TILE_DIGIT_0: u8 = 16
 const TILE_HEART: u8 = 26
-// OAM slot-0 anchor — a 7-scanline-tall transparent sprite with
-// one opaque pixel at row 7. Aligns with the coin tile's bottom
-// row so sprite-0 hit fires at scanline 15, keeping the scroll
-// split exactly at the HUD-row boundary.
+// Sprite-0 hit pair. `TILE_SPRITE0_ANCHOR` has one opaque pixel
+// at row 7, col 3; `TILE_BG_ANCHOR` has its one opaque pixel at
+// row 0, col 3. Drawing the sprite at OAM (248, 8) and pre-
+// painting the bg tile at NT (col 31, row 2) puts both opaque
+// pixels at screen (251, 16) — the first scanline of the
+// playfield, one scanline *below* the HUD row. The PPU's
+// sprite-0 hit fires there and `sprite_0_split` flips the
+// horizontal scroll before scanline 17 renders, so rows 8-15
+// stay pixel-stable regardless of `camera_x`.
 const TILE_SPRITE0_ANCHOR: u8 = 27
+const TILE_BG_ANCHOR: u8 = 28
 
 // ── Background ──────────────────────────────────────────────
 // The 32×30 nametable is authored as ASCII art with a `legend`
@@ -382,6 +403,9 @@ background Level {
         "h": 26   // heart icon (HUD lives marker)
         "0": 16   // digit 0 (initial score tens/ones + fallback)
         "3": 19   // digit 3 (initial lives)
+        "a": 28   // sprite-0 bg anchor (one opaque pixel at
+                  // (251, 16), overlapping sprite 0's slot-0
+                  // anchor; sits inside jsnes's overscan)
     }
 
     // Row 1 carries the status bar: coin + two score digits on the
@@ -401,7 +425,7 @@ background Level {
     map: [
         "................................",
         "..o.00..................h.3.....",
-        "................................",
+        "...............................a",
         "................................",
         "................................",
         "....<>..............<>..........",
@@ -563,18 +587,24 @@ var last_lives: u8 = 3
 //      everything below it scrolls with the camera.
 fun draw_hud() {
     // Sprite 0 — must be the FIRST draw of the frame so it lands
-    // in OAM slot 0. The anchor tile has one opaque pixel at row
-    // 7, col 3 (a single dot), which when positioned at (16, 7)
-    // in OAM renders at screen (19, 15) and overlaps column 3 of
-    // the coin tile's bottom row in NT row 1. That last-scanline
-    // overlap makes the sprite-0 hit flag set at scanline 15, so
-    // the `sprite_0_split(camera_x, 0)` call below can write
-    // `$2005` before the next HBLANK and the PPU latches the new
-    // horizontal scroll starting at scanline 16 — exactly the
-    // boundary between the HUD row and the playfield. The rest
-    // of the anchor tile is fully transparent, so the sprite is
-    // functionally invisible on top of the coin.
-    draw Tileset at: (16, 7) frame: TILE_SPRITE0_ANCHOR
+    // in OAM slot 0. The anchor tile's single opaque pixel sits
+    // at row 7, col 3 of the tile; positioned at (248, 8) in OAM
+    // it renders at screen (251, 16) — the first scanline of the
+    // playfield, not the last scanline of the HUD. The map
+    // pre-paints a dirt tile (%) at NT (col 31, row 2), whose
+    // uniformly-opaque row 0 covers the same pixel, so the PPU's
+    // sprite-0 hit fires at dot 251 of scanline 16. The
+    // `sprite_0_split` write therefore affects the scanlines
+    // *below* the HUD instead of the last HUD scanline itself,
+    // which keeps rows 8-15 pixel-stable regardless of
+    // `camera_x`. An earlier hit at scanline 15 (with the anchor
+    // sitting on top of the visible coin in NT col 2) would
+    // smear the HUD's bottom row of pixels across the split in
+    // jsnes; moving the hit off the HUD row avoids the glitch
+    // entirely. Column 31 / OAM x=248 are inside jsnes's
+    // right-edge overscan, so the dirt anchor and sprite 0 are
+    // both invisible in the committed PNG goldens.
+    draw Tileset at: (248, 8) frame: TILE_SPRITE0_ANCHOR
 
     // Score tens / ones — shadow-compare so the VRAM ring only
     // gets an entry when `stomp_count` actually moved. The
@@ -864,13 +894,18 @@ state Playing {
         }
 
         // ── Sprite-0 scroll split ────────────────────────────
-        // The VRAM-drain in NMI resets `$2005` to `(0, 0)` for
-        // the top of each frame; `sprite_0_split` busy-waits for
-        // the sprite-0 hit flag (fired mid-HUD-row where OAM
-        // slot 0's coin sprite overlaps the NT-row-1 coin tile)
-        // and then latches `(camera_x, 0)` for the remainder of
-        // the frame. Scanlines above the hit render the HUD
-        // pinned; scanlines below render the playfield scrolled.
+        // Explicitly re-latch scroll to (0, 0) before the hit-
+        // wait so jsnes (whose PPU is scanline-quantised and
+        // will happily apply the previous frame's mid-frame
+        // `$2005` writes to the next frame's scanline 15) starts
+        // every scanline below vblank from a known-zero scroll.
+        // Then `sprite_0_split` busy-waits for the PPU's sprite-0
+        // hit flag — fired at dot 251 of scanline 15 by the
+        // overscan coin anchor — and latches `(camera_x, 0)` for
+        // the remainder of the frame. Scanlines 0-15 render the
+        // HUD pinned; scanlines 16+ render the playfield
+        // scrolled.
+        scroll(0, 0)
         sprite_0_split(camera_x, 0)
 
         // Fatal contact this frame → kick the state machine over

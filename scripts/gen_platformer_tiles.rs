@@ -367,18 +367,22 @@ aaaaaaaa
 ...aa...
 ........",
     },
-    // Sprite-0 hit anchor — a single opaque pixel at row 7, col 3,
-    // everything else transparent. Sits behind the HUD row's coin
-    // tile as OAM slot 0 in every `on frame`; its one opaque pixel
-    // aligns with column 3 of the coin's row 7 (`...bb...`), so
-    // the PPU sets the sprite-0 hit flag at scanline 15 — the
-    // last scanline of the HUD row. Writing `$2005` the moment
-    // that flag sets means the horizontal scroll flip takes
-    // effect at scanline 16 (the PPU latches horizontal scroll at
-    // the next HBLANK), which pins NT rows 0-1 at scroll=0 and
-    // lets scanlines 16+ render at `camera_x`. A sprite that
-    // hit on its *top* row (e.g. using the coin as sprite 0)
-    // would flip the scroll mid-HUD-row and smear the glyphs.
+    // Sprite-0 hit pair — two single-pixel tiles whose one opaque
+    // pixel sits at row 7 col 3 (sprite side) and row 0 col 3 (bg
+    // side). OAM slot 0 gets `Sprite 0 anchor` at (248, 8) and NT
+    // (col 31, row 2) gets `BG anchor`, so both opaque pixels
+    // land at screen (251, 16) — the first scanline of the
+    // playfield, one scanline below the HUD row. The PPU's
+    // sprite-0 hit fires at dot 251 of scanline 16, `$2005`
+    // writes from `sprite_0_split` land in HBLANK, and the
+    // horizontal-scroll reload for scanline 17 latches the
+    // playfield's `camera_x` without touching scanlines 8-15
+    // (where the HUD glyphs live). A hit on scanline 15 itself
+    // would smear the bottom row of every HUD glyph across the
+    // split in jsnes. Both tiles are transparent everywhere
+    // except that one pixel, so the only BG footprint is a
+    // single dot at (251, 16) — inside jsnes's right-edge
+    // overscan, invisible in the committed golden.
     Tile {
         name: "Sprite 0 anchor",
         art: "\
@@ -390,6 +394,18 @@ aaaaaaaa
 ........
 ........
 ...c....",
+    },
+    Tile {
+        name: "BG anchor",
+        art: "\
+...c....
+........
+........
+........
+........
+........
+........
+........",
     },
 ];
 
