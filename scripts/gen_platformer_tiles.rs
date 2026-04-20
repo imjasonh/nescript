@@ -367,6 +367,30 @@ aaaaaaaa
 ...aa...
 ........",
     },
+    // Sprite-0 hit anchor — a single opaque pixel at row 7, col 3,
+    // everything else transparent. Sits behind the HUD row's coin
+    // tile as OAM slot 0 in every `on frame`; its one opaque pixel
+    // aligns with column 3 of the coin's row 7 (`...bb...`), so
+    // the PPU sets the sprite-0 hit flag at scanline 15 — the
+    // last scanline of the HUD row. Writing `$2005` the moment
+    // that flag sets means the horizontal scroll flip takes
+    // effect at scanline 16 (the PPU latches horizontal scroll at
+    // the next HBLANK), which pins NT rows 0-1 at scroll=0 and
+    // lets scanlines 16+ render at `camera_x`. A sprite that
+    // hit on its *top* row (e.g. using the coin as sprite 0)
+    // would flip the scroll mid-HUD-row and smear the glyphs.
+    Tile {
+        name: "Sprite 0 anchor",
+        art: "\
+........
+........
+........
+........
+........
+........
+........
+...c....",
+    },
 ];
 
 // ── Named CHR tile indices used by the nametable layout below ──

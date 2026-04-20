@@ -260,47 +260,6 @@ missing:
   call — would shave a few bytes more on programs with many deep
   handlers.
 
-### `examples/platformer.ne` HUD — move from sprites to sprite-0 hit
-
-The platformer currently renders its status bar as five OAM
-sprites re-emitted every frame inside `draw_hud()`. That works but
-burns 5/64 OAM slots on static UI and forces the redraw path to
-walk the HUD every tick even when `score` / `lives` haven't
-changed. The clean upgrade is to paint the HUD into the top row of
-the nametable and use a sprite-0 hit split (same pattern as
-`examples/sprite_0_split_demo.ne`) to reset the X-scroll at the
-HUD/playfield boundary so the rest of the screen can keep
-scrolling freely. Target shape:
-
-1. Pre-paint row 0 of the nametable with `Bar` + glyph tiles via
-   an `on enter` one-shot that drops `nt_set` / `nt_fill_h`
-   writes into the VRAM ring — same shape as
-   `examples/hud_demo.ne`.
-2. Place sprite 0 as a 1-pixel-wide invisible dot on the last
-   scanline of the HUD row; the PPU sets the sprite-0 hit flag
-   when rendering crosses it.
-3. Poll the flag in `on frame` and latch `scroll(camera_x, 0)`
-   only after the hit, leaving the HUD painted with scroll=0 for
-   the top rows.
-4. Replace the four in-frame `draw Tileset at: (…HUD…)` calls
-   with a shadow-compare `if score != last_score { nt_set(...) }`
-   pair (score digits) + `if lives != last_lives { nt_set(...) }`
-   (heart row). Most frames write nothing.
-5. The palette row at metatile y=0 needs a dedicated sub-palette
-   so the HUD doesn't inherit the sky/brick/ground attribute
-   zones — add it to `palette_map` in row 0.
-6. Shadow variables `last_score` / `last_lives` initialize to
-   `255` so the first frame paints unconditionally.
-
-Wins: 5 OAM slots back for enemies/particles, no per-frame HUD
-draw cost, and the flagship demo actually exercises sprite-0 hit
-in a real game (the standalone `sprite_0_split_demo.ne` stays as
-the minimal pedagogical example). Still NROM — no mapper change.
-
-Blocker to track: the HUD reads `stomp_count` as a u8 decimal;
-when this lands, plumb it through whatever digit-extraction path
-replaces the current `tens_digit` / `ones_digit` helpers.
-
 ### Cross-block temp live-range analysis
 
 The slot recycler is function-local per-block. Temps that flow across block
