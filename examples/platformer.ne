@@ -496,36 +496,11 @@ var lives:       u8 = 3    // lives remaining; HUD heart readout
 // so the HUD stays pinned while the background scrolls under it.
 // y = 16 is above the brick row, so the white digits read cleanly
 // against the universal-sky backdrop.
-// Split a 0..99 count into its tens and ones decimal digits via
-// repeated subtraction — the runtime's software divide has a known
-// issue that scribbles over state-local memory (tracked in
-// docs/future-work.md §G), and the HUD is hot enough that the
-// miscompile sends the state machine spinning. Manual repeated
-// subtraction is two dozen cycles for the worst case of a two-digit
-// score, which is cheap for a once-per-frame call.
-fun tens_digit(n: u8) -> u8 {
-    var t: u8 = 0
-    var r: u8 = n
-    while r >= 10 {
-        r -= 10
-        t += 1
-    }
-    return t
-}
-
-fun ones_digit(n: u8) -> u8 {
-    var r: u8 = n
-    while r >= 10 {
-        r -= 10
-    }
-    return r
-}
-
 fun draw_hud() {
     // Score side (left): coin + tens + ones.
     draw Tileset at: (16, 16) frame: TILE_COIN
-    draw Tileset at: (28, 16) frame: TILE_DIGIT_0 + tens_digit(stomp_count)
-    draw Tileset at: (36, 16) frame: TILE_DIGIT_0 + ones_digit(stomp_count)
+    draw Tileset at: (28, 16) frame: TILE_DIGIT_0 + (stomp_count / 10)
+    draw Tileset at: (36, 16) frame: TILE_DIGIT_0 + (stomp_count % 10)
 
     // Lives side (right): heart + digit.
     draw Tileset at: (208, 16) frame: TILE_HEART
@@ -843,8 +818,8 @@ state GameOver {
         // final score and the remaining heart total are visible at
         // the exact same position as in Playing — no awkward jump.
         draw Tileset at: (16, 16) frame: TILE_COIN
-        draw Tileset at: (28, 16) frame: TILE_DIGIT_0 + tens_digit(stomp_count)
-        draw Tileset at: (36, 16) frame: TILE_DIGIT_0 + ones_digit(stomp_count)
+        draw Tileset at: (28, 16) frame: TILE_DIGIT_0 + (stomp_count / 10)
+        draw Tileset at: (36, 16) frame: TILE_DIGIT_0 + (stomp_count % 10)
         draw Tileset at: (208, 16) frame: TILE_HEART
         draw Tileset at: (224, 16) frame: TILE_DIGIT_0 + lives
 

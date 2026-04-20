@@ -1514,11 +1514,18 @@ impl<'a> IrCodeGen<'a> {
             IrOp::ShiftRightVar(d, a, amt) => self.gen_shift_var(*d, *a, *amt, LSR),
             IrOp::Div(d, a, b) => {
                 // Software divide: dividend in A, divisor in $02.
-                // `__divide` returns quotient in A and leaves
-                // remainder in ZP $03. Flag the `__div_used` marker
-                // so the linker links the `__divide` subroutine in;
+                // `__divide` returns the quotient in ZP $04 and the
+                // remainder in A. Flag the `__div_used` marker so
+                // the linker links the `__divide` subroutine in;
                 // programs that don't divide skip ~70 bytes. The
-                // label is emitted at the end of generate().
+                // label itself is emitted at the end of generate().
+                //
+                // We deliberately read the quotient from $04 (not
+                // A) so the routine can keep the running remainder
+                // in the accumulator and leave `$03` alone — `$03`
+                // is `ZP_CURRENT_STATE`, and touching it would
+                // stomp the state-machine dispatch. See
+                // `runtime::gen_divide` for the contract.
                 self.div_used = true;
                 self.load_temp(*a);
                 self.emit(PHA, AM::Implied);
@@ -1527,13 +1534,14 @@ impl<'a> IrCodeGen<'a> {
                 self.emit(STA, AM::ZeroPage(0x02));
                 self.emit(PLA, AM::Implied);
                 self.emit(JSR, AM::Label("__divide".into()));
+                self.emit(LDA, AM::ZeroPage(0x04));
                 self.store_temp(*d);
             }
             IrOp::Mod(d, a, b) => {
-                // Modulo reuses __divide and reads the remainder out
-                // of ZP $03 afterwards. Same `__div_used` marker as
-                // `IrOp::Div` — modulo doesn't have a separate
-                // runtime routine.
+                // Modulo reuses __divide and picks up the remainder
+                // from the accumulator afterwards. Same `__div_used`
+                // marker as `IrOp::Div` — modulo doesn't have a
+                // separate runtime routine.
                 self.div_used = true;
                 self.load_temp(*a);
                 self.emit(PHA, AM::Implied);
@@ -1542,7 +1550,6 @@ impl<'a> IrCodeGen<'a> {
                 self.emit(STA, AM::ZeroPage(0x02));
                 self.emit(PLA, AM::Implied);
                 self.emit(JSR, AM::Label("__divide".into()));
-                self.emit(LDA, AM::ZeroPage(0x03));
                 self.store_temp(*d);
             }
             IrOp::Negate(d, src) => {

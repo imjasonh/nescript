@@ -663,6 +663,48 @@ fn divide_routine_assembles() {
     );
 }
 
+/// `$03` is `ZP_CURRENT_STATE` in the codegen — the byte the main
+/// dispatch loop reads every frame to pick the right `on_frame`
+/// handler. If the divide routine writes to `$03` at any point it
+/// zeroes the current-state value and kicks the state machine back
+/// to state 0 on the very next frame (see the PR that introduced
+/// the platformer HUD for the full repro). This test pins the
+/// routine to a `$03`-free implementation so any future refactor
+/// that reintroduces a ZP-3 write fails loudly instead of shipping
+/// a silent miscompile.
+#[test]
+fn divide_routine_does_not_touch_zp_03() {
+    for inst in gen_divide() {
+        let touches_03 = matches!(&inst.mode, AM::ZeroPage(0x03));
+        assert!(
+            !touches_03,
+            "gen_divide emitted an instruction touching $03 \
+             (collides with ZP_CURRENT_STATE): {:?} {:?}",
+            inst.opcode, inst.mode,
+        );
+    }
+}
+
+/// Same argument as `divide_routine_does_not_touch_zp_03`, applied
+/// to the multiplicand. The old `gen_multiply` accumulated the
+/// result in ZP `$03` even for `u8 * u8 → u8` (the high byte was
+/// simply discarded at the callsite), which silently corrupted
+/// `ZP_CURRENT_STATE` across every `*` operator in a multi-state
+/// program. Holding the running product in the accumulator instead
+/// keeps `$03` pristine.
+#[test]
+fn multiply_routine_does_not_touch_zp_03() {
+    for inst in gen_multiply() {
+        let touches_03 = matches!(&inst.mode, AM::ZeroPage(0x03));
+        assert!(
+            !touches_03,
+            "gen_multiply emitted an instruction touching $03 \
+             (collides with ZP_CURRENT_STATE): {:?} {:?}",
+            inst.opcode, inst.mode,
+        );
+    }
+}
+
 // ─── Bank switching ────────────────────────────────────────────────
 
 #[test]

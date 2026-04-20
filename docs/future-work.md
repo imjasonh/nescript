@@ -260,41 +260,46 @@ missing:
   call — would shave a few bytes more on programs with many deep
   handlers.
 
-### `u8 / 10` and `u8 % 10` miscompile near state transitions
+### `examples/platformer.ne` HUD — move from sprites to sprite-0 hit
 
-The `examples/platformer.ne` HUD originally rendered its two-digit
-stomp tally with `TILE_DIGIT_0 + (stomp_count / 10)` and
-`TILE_DIGIT_0 + (stomp_count % 10)`. Both expressions passed the
-parser, survived analysis, and emitted a W0101 "expensive
-multiply/divide" warning as expected — but the built ROM cycled
-Title → Playing → Title once per blink period, with the Playing
-state surviving for exactly one frame before something stomped the
-state-machine bookkeeping at `$1B` (Title's `blink` / Playing's
-`player_y` overlay slot) and kicked control back to Title. The
-divide has to be the culprit: swapping both calls for a manual
-`while r >= 10 { r -= 10; … }` in two helper functions makes the
-golden hold across every frame.
+The platformer currently renders its status bar as five OAM
+sprites re-emitted every frame inside `draw_hud()`. That works but
+burns 5/64 OAM slots on static UI and forces the redraw path to
+walk the HUD every tick even when `score` / `lives` haven't
+changed. The clean upgrade is to paint the HUD into the top row of
+the nametable and use a sprite-0 hit split (same pattern as
+`examples/sprite_0_split_demo.ne`) to reset the X-scroll at the
+HUD/playfield boundary so the rest of the screen can keep
+scrolling freely. Target shape:
 
-The HUD's `draw_hud` workaround sits in `examples/platformer.ne`
-with a comment pointing here. Two guesses at the root cause:
+1. Pre-paint row 0 of the nametable with `Bar` + glyph tiles via
+   an `on enter` one-shot that drops `nt_set` / `nt_fill_h`
+   writes into the VRAM ring — same shape as
+   `examples/hud_demo.ne`.
+2. Place sprite 0 as a 1-pixel-wide invisible dot on the last
+   scanline of the HUD row; the PPU sets the sprite-0 hit flag
+   when rendering crosses it.
+3. Poll the flag in `on frame` and latch `scroll(camera_x, 0)`
+   only after the hit, leaving the HUD painted with scroll=0 for
+   the top rows.
+4. Replace the four in-frame `draw Tileset at: (…HUD…)` calls
+   with a shadow-compare `if score != last_score { nt_set(...) }`
+   pair (score digits) + `if lives != last_lives { nt_set(...) }`
+   (heart row). Most frames write nothing.
+5. The palette row at metatile y=0 needs a dedicated sub-palette
+   so the HUD doesn't inherit the sky/brick/ground attribute
+   zones — add it to `palette_map` in row 0.
+6. Shadow variables `last_score` / `last_lives` initialize to
+   `255` so the first frame paints unconditionally.
 
-1. **Scratch overlap.** The divide routine's scratch may land
-   beyond the `$00-$0F` runtime reservation and stomp on the
-   state-local overlay base at `$1B`. A printout of the runtime's
-   actual zero-page footprint alongside the analyzer's allocator
-   snapshot would catch this.
-2. **Expression lowering.** The `BinaryOp::Div` / `Rem` path may
-   leave a dangling temp in a slot that a surrounding `draw`
-   statement later clobbers. The existing
-   `uninitialized_struct_field_store_emits_sta_to_allocated_address`
-   regression test exercises loads + stores but not divides; a
-   round-trip test along the lines of "compile `x / 10` into a
-   `var tens: u8`, wait a frame, assert `tens` still reads as the
-   pre-wait value" would pin this down.
+Wins: 5 OAM slots back for enemies/particles, no per-frame HUD
+draw cost, and the flagship demo actually exercises sprite-0 hit
+in a real game (the standalone `sprite_0_split_demo.ne` stays as
+the minimal pedagogical example). Still NROM — no mapper change.
 
-Either way the negative test is the priority — without one, the
-next person to reach for `/` or `%` in a state with overlaid
-locals hits the same PR #31-shaped silent drop.
+Blocker to track: the HUD reads `stomp_count` as a u8 decimal;
+when this lands, plumb it through whatever digit-extraction path
+replaces the current `tens_digit` / `ones_digit` helpers.
 
 ### Cross-block temp live-range analysis
 

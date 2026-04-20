@@ -979,31 +979,44 @@ pub fn gen_initial_background_load(tiles_label: &str, attrs_label: &str) -> Vec<
     out
 }
 
-/// Zero-page locations used by multiply/divide routines.
+/// Zero-page locations used by the multiply / divide routines.
+/// `$02` is the "second operand" input slot — the multiplier for
+/// `__multiply` and the divisor for `__divide`. `$04` is the
+/// routines' private scratch: it holds the working multiplicand
+/// (shifted left each iteration) for multiply and the running
+/// dividend-turning-into-quotient for divide. Both routines keep
+/// their running output in the accumulator, so `$03`
+/// (`ZP_CURRENT_STATE` in the codegen) stays untouched — aliasing
+/// `$03` across the divide routine used to zero it and hand
+/// control to state 0 on the next frame.
 const ZP_MUL_OPERAND: u8 = 0x02;
-const ZP_MUL_RESULT_HI: u8 = 0x03;
 const ZP_DIV_DIVISOR: u8 = 0x02;
-const ZP_DIV_REMAINDER: u8 = 0x03;
 
-/// Generate 8x8 -> 16 software multiply routine.
+/// Generate 8x8 -> 8 software multiply routine.
 ///
 /// Input: A = multiplicand, zero-page $02 = multiplier
-/// Output: A = result low byte, $03 = result high byte
+/// Output: A = product (low byte; high byte is discarded for
+/// unsigned u8 * u8 → u8 semantics)
 ///
 /// Algorithm: shift-and-add. For each bit of the multiplier, if set,
-/// add the (shifted) multiplicand to the result.
+/// add the (shifted) multiplicand to the running product. The
+/// product is kept in the accumulator — not in ZP `$03` — so the
+/// routine doesn't alias with `ZP_CURRENT_STATE`. `$02` is read-
+/// only at the callsite (the divisor/multiplier input slot) and is
+/// shifted in place here, which is fine because the caller re-
+/// populates it on every `__multiply` call.
 pub fn gen_multiply() -> Vec<Instruction> {
     let mut out = Vec::new();
 
     // Label for the subroutine entry
     out.push(Instruction::new(NOP, AM::Label("__multiply".into())));
 
-    // Store multiplicand in $04 (working copy)
+    // Store multiplicand in $04 (working copy; we shift it left
+    // each iteration to line up with the next multiplier bit).
     out.push(Instruction::new(STA, AM::ZeroPage(0x04)));
 
-    // Clear result: A (low) and $03 (high)
+    // Running product starts at 0 in A.
     out.push(Instruction::new(LDA, AM::Immediate(0x00)));
-    out.push(Instruction::new(STA, AM::ZeroPage(ZP_MUL_RESULT_HI)));
 
     // Loop counter: 8 bits
     out.push(Instruction::new(LDX, AM::Immediate(0x08)));
@@ -1011,24 +1024,24 @@ pub fn gen_multiply() -> Vec<Instruction> {
     // __mul_loop:
     out.push(Instruction::new(NOP, AM::Label("__mul_loop".into())));
 
-    // Shift multiplier right, check carry (current bit)
+    // Shift multiplier right, check carry (current bit).
     out.push(Instruction::new(LSR, AM::ZeroPage(ZP_MUL_OPERAND)));
     out.push(Instruction::new(
         BCC,
         AM::LabelRelative("__mul_no_add".into()),
     ));
 
-    // Carry set: add multiplicand to result
-    // Add low byte
+    // Carry set: add the current shifted multiplicand to the
+    // running product in A. CLC first because LSR sets carry to the
+    // shifted-out bit.
     out.push(Instruction::implied(CLC));
-    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_MUL_RESULT_HI)));
     out.push(Instruction::new(ADC, AM::ZeroPage(0x04)));
-    out.push(Instruction::new(STA, AM::ZeroPage(ZP_MUL_RESULT_HI)));
 
     // __mul_no_add:
     out.push(Instruction::new(NOP, AM::Label("__mul_no_add".into())));
 
-    // Shift multiplicand left (double it) for next bit position
+    // Shift multiplicand left (double it) for the next bit
+    // position.
     out.push(Instruction::new(ASL, AM::ZeroPage(0x04)));
 
     // Decrement counter
@@ -1038,11 +1051,7 @@ pub fn gen_multiply() -> Vec<Instruction> {
         AM::LabelRelative("__mul_loop".into()),
     ));
 
-    // Load low byte of result into A
-    // For 8-bit result, just use the high byte accumulation
-    // (since we shifted the multiplicand left, result is in $03)
-    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_MUL_RESULT_HI)));
-
+    // A already holds the product.
     out.push(Instruction::implied(RTS));
 
     out
@@ -1610,19 +1619,33 @@ pub fn gen_data_block(label: &str, bytes: Vec<u8>) -> Vec<Instruction> {
 /// Generate 8 / 8 -> 8 software divide routine (restoring division).
 ///
 /// Input: A = dividend, zero-page $02 = divisor
-/// Output: A = quotient, $03 = remainder
+/// Output: A = remainder, zero-page $04 = quotient
+///
+/// Keeps the running remainder in the accumulator (instead of ZP
+/// $03) so the routine doesn't alias with `ZP_CURRENT_STATE` at
+/// $03. Any program with a state machine reads $03 to dispatch
+/// `on_frame`; the old shape zeroed it on every divide call and
+/// kicked control back to state 0 (usually `Title`) on the very
+/// next frame. The only caller-visible change is that `IrOp::Div`
+/// now picks up the quotient from `$04` rather than `A` — see
+/// `ir_codegen.rs` for the Div/Mod callsite shape. `$04` stays
+/// inside the `$00-$0F` runtime reservation so it never collides
+/// with user variables (analyzer starts user ZP at `$10` minimum).
 pub fn gen_divide() -> Vec<Instruction> {
     let mut out = Vec::new();
 
     // Label for the subroutine entry
     out.push(Instruction::new(NOP, AM::Label("__divide".into())));
 
-    // Store dividend in $04
+    // Stash dividend in $04. Over the course of the loop we shift
+    // it left 8 times; the bits that fall out become the running
+    // remainder (in A), and the bits shifted in (via `INC $04`
+    // below) become the quotient, so $04 ends up holding exactly
+    // the quotient we want to return.
     out.push(Instruction::new(STA, AM::ZeroPage(0x04)));
 
-    // Clear remainder
+    // Running remainder starts at 0 in A.
     out.push(Instruction::new(LDA, AM::Immediate(0x00)));
-    out.push(Instruction::new(STA, AM::ZeroPage(ZP_DIV_REMAINDER)));
 
     // Loop counter: 8 bits
     out.push(Instruction::new(LDX, AM::Immediate(0x08)));
@@ -1630,25 +1653,27 @@ pub fn gen_divide() -> Vec<Instruction> {
     // __div_loop:
     out.push(Instruction::new(NOP, AM::Label("__div_loop".into())));
 
-    // Shift dividend left into remainder
+    // Shift the next bit of the dividend out of $04 into the carry,
+    // then rotate it into the remainder accumulator.
     out.push(Instruction::new(ASL, AM::ZeroPage(0x04)));
-    out.push(Instruction::new(ROL, AM::ZeroPage(ZP_DIV_REMAINDER)));
+    out.push(Instruction::new(ROL, AM::Accumulator));
 
-    // Try to subtract divisor from remainder
-    out.push(Instruction::new(LDA, AM::ZeroPage(ZP_DIV_REMAINDER)));
-    out.push(Instruction::implied(SEC));
-    out.push(Instruction::new(SBC, AM::ZeroPage(ZP_DIV_DIVISOR)));
-
-    // If remainder >= divisor (no borrow), keep subtraction
+    // Remainder >= divisor? CMP sets carry when A >= memory, clear
+    // when A < memory. On `>=` we do the subtraction for real with
+    // SBC (which still sees the same carry-set condition) and set
+    // the quotient bit for this iteration. On `<` we leave A alone.
+    out.push(Instruction::new(CMP, AM::ZeroPage(ZP_DIV_DIVISOR)));
     out.push(Instruction::new(
         BCC,
         AM::LabelRelative("__div_no_sub".into()),
     ));
 
-    // Store updated remainder
-    out.push(Instruction::new(STA, AM::ZeroPage(ZP_DIV_REMAINDER)));
+    // Accept the subtraction into the remainder. SBC with carry set
+    // performs a true subtract (no extra borrow).
+    out.push(Instruction::new(SBC, AM::ZeroPage(ZP_DIV_DIVISOR)));
 
-    // Set bit 0 of quotient (in $04, which we shifted left)
+    // Set bit 0 of the quotient (stored in $04, whose low bit is
+    // free because we just shifted left).
     out.push(Instruction::new(INC, AM::ZeroPage(0x04)));
 
     // __div_no_sub:
@@ -1661,9 +1686,7 @@ pub fn gen_divide() -> Vec<Instruction> {
         AM::LabelRelative("__div_loop".into()),
     ));
 
-    // Load quotient into A
-    out.push(Instruction::new(LDA, AM::ZeroPage(0x04)));
-
+    // A already holds the final remainder. $04 holds the quotient.
     out.push(Instruction::implied(RTS));
 
     out
