@@ -4,12 +4,17 @@
 // with per-region attribute palettes, a multi-tile metasprite
 // player with gravity/jump physics, wrap-around horizontal
 // scrolling, moving enemies with stomp-or-die contact logic, a
-// coin HUD that tracks live score, collectible coins, user-declared
-// SFX envelopes, a user-declared music track, and a
-// title → playing → game-over state machine driven by both
-// controller input and an autopilot so the jsnes golden harness
-// (which runs headless with no simulated buttons) still captures
-// the full gameplay loop inside the first ~6 seconds of demo.
+// sprite-based status bar at the top of the viewport (coin icon +
+// two-digit score on the left, heart icon + lives counter on the
+// right) that rides along through the death screen, cross-state
+// life tracking that cycles GameOver → Playing while hearts last
+// and bounces back to Title when the last heart is spent,
+// collectible coins, user-declared SFX envelopes, a user-declared
+// music track, and a title → playing → game-over state machine
+// driven by both controller input and an autopilot so the jsnes
+// golden harness (which runs headless with no simulated buttons)
+// still captures the full gameplay loop inside the first ~6
+// seconds of demo.
 //
 // Controls (when played by a human):
 //     D-pad left/right  — walk
@@ -52,7 +57,7 @@ palette Main {
     bg0: [white,        gray,       black]   // sky / clouds
     bg1: [red,          orange,     dk_red]  // bricks, Q-blocks
     bg2: [bright_green, dk_orange,  brown]   // grass, hills, bushes, dirt
-    bg3: [yellow,       orange,     dk_orange] // reserved
+    bg3: [red,          orange,     white]   // HUD chrome (matches sp0)
 
     // Sprite sub-palette 0 — every `draw` uses this one slot
     // because the OAM attribute byte is always 0 in v0.1.
@@ -212,6 +217,132 @@ sprite Tileset {
         "........",
         "........",
         "........",
+        "........",
+        // tile 16: Digit 0
+        "........",
+        "..cccc..",
+        "..c..c..",
+        "..c..c..",
+        "..c..c..",
+        "..c..c..",
+        "..cccc..",
+        "........",
+        // tile 17: Digit 1
+        "........",
+        "...cc...",
+        "..ccc...",
+        "...cc...",
+        "...cc...",
+        "...cc...",
+        "..cccc..",
+        "........",
+        // tile 18: Digit 2
+        "........",
+        "..cccc..",
+        ".....c..",
+        "....cc..",
+        "...cc...",
+        "..cc....",
+        "..cccc..",
+        "........",
+        // tile 19: Digit 3
+        "........",
+        "..cccc..",
+        ".....c..",
+        "...ccc..",
+        ".....c..",
+        ".....c..",
+        "..cccc..",
+        "........",
+        // tile 20: Digit 4
+        "........",
+        "..c..c..",
+        "..c..c..",
+        "..cccc..",
+        ".....c..",
+        ".....c..",
+        ".....c..",
+        "........",
+        // tile 21: Digit 5
+        "........",
+        "..cccc..",
+        "..c.....",
+        "..cccc..",
+        ".....c..",
+        "..c..c..",
+        "..cccc..",
+        "........",
+        // tile 22: Digit 6
+        "........",
+        "..cccc..",
+        "..c.....",
+        "..cccc..",
+        "..c..c..",
+        "..c..c..",
+        "..cccc..",
+        "........",
+        // tile 23: Digit 7
+        "........",
+        "..cccc..",
+        ".....c..",
+        "....c...",
+        "...c....",
+        "..c.....",
+        "..c.....",
+        "........",
+        // tile 24: Digit 8
+        "........",
+        "..cccc..",
+        "..c..c..",
+        "..cccc..",
+        "..c..c..",
+        "..c..c..",
+        "..cccc..",
+        "........",
+        // tile 25: Digit 9
+        "........",
+        "..cccc..",
+        "..c..c..",
+        "..cccc..",
+        ".....c..",
+        ".....c..",
+        "..cccc..",
+        "........",
+        // tile 26: Heart
+        "........",
+        ".aa..aa.",
+        "aaaaaaaa",
+        "aaaaaaaa",
+        ".aaaaaa.",
+        "..aaaa..",
+        "...aa...",
+        "........",
+        // tile 27: Sprite 0 anchor — one opaque pixel at
+        //          row 7 col 3. Paired with the BG anchor tile
+        //          at (NT col 31, row 2) below; the single
+        //          opaque dot at screen (251, 16) fires the
+        //          sprite-0 hit one scanline *below* the HUD
+        //          row, keeping the HUD glyphs pixel-stable.
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "...c....",
+        // tile 28: BG anchor — one opaque pixel at row 0 col 3.
+        //          Pre-painted at NT (col 31, row 2) so it
+        //          overlaps sprite 0's opaque pixel at screen
+        //          (251, 16). Column 31 sits inside jsnes's
+        //          right-edge overscan so the dot is invisible.
+        "...c....",
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
+        "........",
         "........"
     ]
 }
@@ -223,6 +354,24 @@ const TILE_PLAYER_BL: u8 = 3
 const TILE_PLAYER_BR: u8 = 4
 const TILE_ENEMY: u8 = 5
 const TILE_COIN: u8 = 6
+// HUD glyphs. The digit tiles are contiguous so
+// `TILE_DIGIT_0 + n` picks digit `n`. Digit + heart tiles are
+// shared between sprite rendering (v0.1 sprites) and background
+// rendering (the HUD row's `nt_set`s) via the matching `bg3`
+// sub-palette.
+const TILE_DIGIT_0: u8 = 16
+const TILE_HEART: u8 = 26
+// Sprite-0 hit pair. `TILE_SPRITE0_ANCHOR` has one opaque pixel
+// at row 7, col 3; `TILE_BG_ANCHOR` has its one opaque pixel at
+// row 0, col 3. Drawing the sprite at OAM (248, 8) and pre-
+// painting the bg tile at NT (col 31, row 2) puts both opaque
+// pixels at screen (251, 16) — the first scanline of the
+// playfield, one scanline *below* the HUD row. The PPU's
+// sprite-0 hit fires there and `sprite_0_split` flips the
+// horizontal scroll before scanline 17 renders, so rows 8-15
+// stay pixel-stable regardless of `camera_x`.
+const TILE_SPRITE0_ANCHOR: u8 = 27
+const TILE_BG_ANCHOR: u8 = 28
 
 // ── Background ──────────────────────────────────────────────
 // The 32×30 nametable is authored as ASCII art with a `legend`
@@ -247,12 +396,36 @@ background Level {
         "*": 13   // bush
         "=": 7    // grass top
         "%": 8    // dirt
+        // HUD chrome glyphs — row 0 only. Mapped to the sprite
+        // CHR tiles we already declared so sprites and background
+        // render identical glyphs under the matching bg3 palette.
+        "o": 6    // coin icon (HUD score marker)
+        "h": 26   // heart icon (HUD lives marker)
+        "0": 16   // digit 0 (initial score tens/ones + fallback)
+        "3": 19   // digit 3 (initial lives)
+        "a": 28   // sprite-0 bg anchor (one opaque pixel at
+                  // (251, 16), overlapping sprite 0's slot-0
+                  // anchor; sits inside jsnes's overscan)
     }
 
+    // Row 1 carries the status bar: coin + two score digits on the
+    // left, heart + single lives digit on the right. Row 0 stays
+    // sky because the jsnes golden harness (and many emulators)
+    // mask out the top 8 scanlines as overscan — anything painted
+    // there would never show in the committed PNG. Sprite 0
+    // (painted over column 2's coin tile every frame) overlaps the
+    // `o` glyph's opaque pixels so the sprite-0 hit flag fires on
+    // a scanline inside the HUD row; `sprite_0_split(camera_x, 0)`
+    // in `on frame` picks up that hit and swaps the horizontal
+    // scroll from 0 to `camera_x` for the rest of the frame,
+    // pinning the HUD while the playfield scrolls underneath. The
+    // digits and heart glyph sit at fixed columns so shadow-compare
+    // `nt_set` writes can tick the score / lives readouts without
+    // repainting the whole row.
     map: [
         "................................",
-        "................................",
-        "................................",
+        "..o.00..................h.3.....",
+        "...............................a",
         "................................",
         "................................",
         "....<>..............<>..........",
@@ -283,8 +456,9 @@ background Level {
     ]
 
     palette_map: [
-        "0000000000000000",   // metatile rows 0-5  → sky sub-palette
-        "0000000000000000",
+        "3333333333333333",   // metatile row 0 (NT rows 0-1)
+                              //   → bg3 (HUD chrome: red / orange / white)
+        "0000000000000000",   // metatile rows 1-5  → sky sub-palette
         "0000000000000000",
         "0000000000000000",
         "0000000000000000",
@@ -378,6 +552,78 @@ const AUTOPILOT_JUMPS: u8 = 2
 // Cross-state scratch
 var frame_tick: u8 = 0     // free-running frame counter
 var stomp_count: u8 = 0    // successful enemy stomps this life
+var lives:       u8 = 3    // lives remaining; HUD heart readout
+
+// HUD shadow-compare cache. The initial nametable already paints
+// "coin 00" / "heart 3" into row 0 with the bg3 palette, so the
+// shadow values here start matching the on-screen glyphs — every
+// frame where `stomp_count == last_score` skips the score repaint
+// entirely, and likewise for lives. 255 would also force a
+// guaranteed-initial-paint fallback on the first frame if the map
+// ever drifts from these defaults; we use the real starting values
+// so the harness's frame-180 golden doesn't capture a transient
+// paint flicker.
+var last_score: u8 = 0
+var last_lives: u8 = 3
+
+// ── HUD helpers ─────────────────────────────────────────────
+// Background-row HUD, pinned to the top of the viewport with a
+// sprite-0 hit split instead of burning five OAM slots every
+// frame. Two moving pieces:
+//
+//   1. The status glyphs — coin, two score digits, heart, lives
+//      digit — live in NT row 0 and are repainted via `nt_set`
+//      only when the backing state changes (`stomp_count`,
+//      `lives`). The initial map already contains the starting
+//      values so the first frame is already correct.
+//
+//   2. A single OAM sprite (slot 0) is drawn over the coin tile
+//      every frame. The PPU sets the sprite-0 hit flag when the
+//      sprite's opaque pixels overlap the coin tile's opaque
+//      pixels — guaranteed to fire on some scanline inside the
+//      HUD row — and a `sprite_0_split(camera_x, 0)` call picks
+//      up that hit to switch the horizontal scroll from 0 to
+//      `camera_x` for the rest of the frame. Row 0 stays pinned,
+//      everything below it scrolls with the camera.
+fun draw_hud() {
+    // Sprite 0 — must be the FIRST draw of the frame so it lands
+    // in OAM slot 0. The anchor tile's single opaque pixel sits
+    // at row 7, col 3 of the tile; positioned at (248, 8) in OAM
+    // it renders at screen (251, 16) — the first scanline of the
+    // playfield, not the last scanline of the HUD. The map
+    // pre-paints a dirt tile (%) at NT (col 31, row 2), whose
+    // uniformly-opaque row 0 covers the same pixel, so the PPU's
+    // sprite-0 hit fires at dot 251 of scanline 16. The
+    // `sprite_0_split` write therefore affects the scanlines
+    // *below* the HUD instead of the last HUD scanline itself,
+    // which keeps rows 8-15 pixel-stable regardless of
+    // `camera_x`. An earlier hit at scanline 15 (with the anchor
+    // sitting on top of the visible coin in NT col 2) would
+    // smear the HUD's bottom row of pixels across the split in
+    // jsnes; moving the hit off the HUD row avoids the glitch
+    // entirely. Column 31 / OAM x=248 are inside jsnes's
+    // right-edge overscan, so the dirt anchor and sprite 0 are
+    // both invisible in the committed PNG goldens.
+    draw Tileset at: (248, 8) frame: TILE_SPRITE0_ANCHOR
+
+    // Score tens / ones — shadow-compare so the VRAM ring only
+    // gets an entry when `stomp_count` actually moved. The
+    // comparison runs once per frame and most frames take the
+    // no-op path (score only ticks on a stomp).
+    if stomp_count != last_score {
+        last_score = stomp_count
+        nt_set(4, 1, TILE_DIGIT_0 + (stomp_count / 10))
+        nt_set(5, 1, TILE_DIGIT_0 + (stomp_count % 10))
+    }
+
+    // Lives digit — same shadow-compare. Only fires on a life
+    // transition (death in `GameOver.on_enter`, refill in
+    // `Title.on_enter`).
+    if lives != last_lives {
+        last_lives = lives
+        nt_set(26, 1, TILE_DIGIT_0 + lives)
+    }
+}
 
 // ── Helper functions ────────────────────────────────────────
 
@@ -486,6 +732,11 @@ state Title {
     on enter {
         blink = 0
         frame_tick = 0
+        // Fresh run — restore the full life bar so the HUD reads 3
+        // when Playing kicks in and the GameOver loop doesn't trap
+        // the game in a zero-lives state forever.
+        lives = 3
+        stomp_count = 0
         start_music Theme
     }
 
@@ -612,6 +863,13 @@ state Playing {
         resolve_enemy_hit(e2_sx)
 
         // ── Drawing ──────────────────────────────────────────
+        // `draw_hud()` runs FIRST so its coin sprite lands in OAM
+        // slot 0 — that's what makes the PPU's sprite-0 hit flag
+        // fire on the coin-tile overlap inside the HUD row, which
+        // we pick up with `sprite_0_split` at the end of the
+        // frame. Every other `draw` has to come after.
+        draw_hud()
+
         // Enemies and coins are always drawn so the scene stays
         // coherent even on the fatal-contact frame.
         var ey: u8 = ENEMY_Y
@@ -628,22 +886,6 @@ state Playing {
         draw Tileset at: (c1_sx, cy)       frame: TILE_COIN
         draw Tileset at: (c2_sx, COIN_Y)   frame: TILE_COIN
 
-        // Live HUD: draw one coin per stomp in the top-left. The
-        // background palette-1 region covers this strip so the
-        // sprite coins read correctly against the brick band.
-        if stomp_count >= 1 {
-            draw Tileset at: (16, 24) frame: TILE_COIN
-        }
-        if stomp_count >= 2 {
-            draw Tileset at: (28, 24) frame: TILE_COIN
-        }
-        if stomp_count >= 3 {
-            draw Tileset at: (40, 24) frame: TILE_COIN
-        }
-        if stomp_count >= 4 {
-            draw Tileset at: (52, 24) frame: TILE_COIN
-        }
-
         // Player is only drawn while alive — on the dying frame
         // we show the scene without the hero on top of the enemy
         // that killed them, which reads as "player got got".
@@ -651,11 +893,20 @@ state Playing {
             draw_player()
         }
 
-        // ── PPU scroll latch ─────────────────────────────────
-        // Write the scroll at the very end of the frame so it's
-        // the last $2005 pair before the implicit wait_frame /
-        // NMI handshake, minimizing mid-frame artifacts.
-        scroll(camera_x, 0)
+        // ── Sprite-0 scroll split ────────────────────────────
+        // Explicitly re-latch scroll to (0, 0) before the hit-
+        // wait so jsnes (whose PPU is scanline-quantised and
+        // will happily apply the previous frame's mid-frame
+        // `$2005` writes to the next frame's scanline 15) starts
+        // every scanline below vblank from a known-zero scroll.
+        // Then `sprite_0_split` busy-waits for the PPU's sprite-0
+        // hit flag — fired at dot 251 of scanline 15 by the
+        // overscan coin anchor — and latches `(camera_x, 0)` for
+        // the remainder of the frame. Scanlines 0-15 render the
+        // HUD pinned; scanlines 16+ render the playfield
+        // scrolled.
+        scroll(0, 0)
+        sprite_0_split(camera_x, 0)
 
         // Fatal contact this frame → kick the state machine over
         // to GameOver on the next frame.
@@ -670,42 +921,54 @@ state GameOver {
 
     on enter {
         linger = 0
+        // Burn a life on entry so the HUD's heart counter ticks
+        // down visibly each death. Guard against underflow in case
+        // something transitions here with lives already at zero.
+        if lives > 0 {
+            lives -= 1
+        }
         stop_music
     }
 
     on frame {
         linger += 1
 
+        // Sync the HUD row first (sprite 0 + shadow-compare
+        // `nt_set` for the digits) so the tens/ones glyphs tick
+        // down when `lives` decrements in `on_enter`. No
+        // `sprite_0_split` call here — GameOver doesn't scroll,
+        // so NMI's scroll-reset keeps the whole frame at
+        // `(0, 0)` and the HUD row renders normally. The sprite-
+        // 0 hit flag fires harmlessly and stays latched until the
+        // next Playing frame clears it.
+        draw_hud()
+
         // "GAME OVER" marker: a row of enemy tiles across the
-        // middle of the screen, plus a live readout of how many
-        // stomps the player racked up before dying (drawn as
-        // coins right underneath). The death-screen backdrop is
+        // middle of the screen. The death-screen backdrop is
         // whatever Playing last scrolled to — we don't clear it.
         draw Tileset at: (96,  112) frame: TILE_ENEMY
         draw Tileset at: (112, 112) frame: TILE_ENEMY
         draw Tileset at: (128, 112) frame: TILE_ENEMY
         draw Tileset at: (144, 112) frame: TILE_ENEMY
 
-        if stomp_count >= 1 {
-            draw Tileset at: (96,  128) frame: TILE_COIN
-        }
-        if stomp_count >= 2 {
-            draw Tileset at: (112, 128) frame: TILE_COIN
-        }
-        if stomp_count >= 3 {
-            draw Tileset at: (128, 128) frame: TILE_COIN
-        }
-        if stomp_count >= 4 {
-            draw Tileset at: (144, 128) frame: TILE_COIN
-        }
-
         // Auto-retry after ~1 s so the headless harness sees the
-        // full loop. A human can hit Start to retry immediately.
+        // full loop. When the last life is spent, bounce back to
+        // the Title screen instead (Title's `on enter` refills the
+        // heart bar for the next run). A human can hit Start to
+        // skip the wait.
         if linger >= 60 {
-            transition Playing
+            if lives == 0 {
+                transition Title
+            } else {
+                transition Playing
+            }
         }
         if button.start {
-            transition Playing
+            if lives == 0 {
+                transition Title
+            } else {
+                transition Playing
+            }
         }
     }
 }

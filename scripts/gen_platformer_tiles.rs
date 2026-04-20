@@ -228,6 +228,185 @@ cccccccc",
 ........
 ........",
     },
+    // ── HUD glyphs (sprite-only; palette sp0: a=red, c=white) ──
+    // Each digit is a 4-wide outline centred in an 8×8 cell and
+    // drawn in white ('c') so it reads crisply over the sky
+    // backdrop at the top of the playfield. The compiler treats
+    // '.' as transparent for sprites, so the sky shows through.
+    Tile {
+        name: "Digit 0",
+        art: "\
+........
+..cccc..
+..c..c..
+..c..c..
+..c..c..
+..c..c..
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 1",
+        art: "\
+........
+...cc...
+..ccc...
+...cc...
+...cc...
+...cc...
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 2",
+        art: "\
+........
+..cccc..
+.....c..
+....cc..
+...cc...
+..cc....
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 3",
+        art: "\
+........
+..cccc..
+.....c..
+...ccc..
+.....c..
+.....c..
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 4",
+        art: "\
+........
+..c..c..
+..c..c..
+..cccc..
+.....c..
+.....c..
+.....c..
+........",
+    },
+    Tile {
+        name: "Digit 5",
+        art: "\
+........
+..cccc..
+..c.....
+..cccc..
+.....c..
+..c..c..
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 6",
+        art: "\
+........
+..cccc..
+..c.....
+..cccc..
+..c..c..
+..c..c..
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 7",
+        art: "\
+........
+..cccc..
+.....c..
+....c...
+...c....
+..c.....
+..c.....
+........",
+    },
+    Tile {
+        name: "Digit 8",
+        art: "\
+........
+..cccc..
+..c..c..
+..cccc..
+..c..c..
+..c..c..
+..cccc..
+........",
+    },
+    Tile {
+        name: "Digit 9",
+        art: "\
+........
+..cccc..
+..c..c..
+..cccc..
+.....c..
+.....c..
+..cccc..
+........",
+    },
+    // Small red heart for the lives readout. Uses 'a' (red) so the
+    // shape pops against the sky and matches the cap/brick red.
+    Tile {
+        name: "Heart",
+        art: "\
+........
+.aa..aa.
+aaaaaaaa
+aaaaaaaa
+.aaaaaa.
+..aaaa..
+...aa...
+........",
+    },
+    // Sprite-0 hit pair — two single-pixel tiles whose one opaque
+    // pixel sits at row 7 col 3 (sprite side) and row 0 col 3 (bg
+    // side). OAM slot 0 gets `Sprite 0 anchor` at (248, 8) and NT
+    // (col 31, row 2) gets `BG anchor`, so both opaque pixels
+    // land at screen (251, 16) — the first scanline of the
+    // playfield, one scanline below the HUD row. The PPU's
+    // sprite-0 hit fires at dot 251 of scanline 16, `$2005`
+    // writes from `sprite_0_split` land in HBLANK, and the
+    // horizontal-scroll reload for scanline 17 latches the
+    // playfield's `camera_x` without touching scanlines 8-15
+    // (where the HUD glyphs live). A hit on scanline 15 itself
+    // would smear the bottom row of every HUD glyph across the
+    // split in jsnes. Both tiles are transparent everywhere
+    // except that one pixel, so the only BG footprint is a
+    // single dot at (251, 16) — inside jsnes's right-edge
+    // overscan, invisible in the committed golden.
+    Tile {
+        name: "Sprite 0 anchor",
+        art: "\
+........
+........
+........
+........
+........
+........
+........
+...c....",
+    },
+    Tile {
+        name: "BG anchor",
+        art: "\
+...c....
+........
+........
+........
+........
+........
+........
+........",
+    },
 ];
 
 // ── Named CHR tile indices used by the nametable layout below ──
