@@ -34,7 +34,7 @@ This includes things like language-level game state transitions (splash screen, 
 
 Sprites can be extracted from PNG files in the codebase, or defined inline in code. Same with sounds and music. Collision detection (i.e., when Mario stomps on a Goomba) is built in. Color palette definitions and changes are built in. When you need to, you can define an inline `asm { … }` block, and reference variables from inside that block.
 
-NES hardware limitations around the number of sprites that can be drawn on each scanline are accounted for by the compiler \-- the compiler will warn, and can automatically trigger flickering sprites so they don't just disappear entirely. This was always possible with cc65, and with raw Assembly before it, but it was difficult, brittle, time-consuming, and very un-fun to say the least.
+NES hardware limitations around the number of sprites that can be drawn on each scanline are accounted for by the compiler -- the compiler will warn, and can automatically trigger flickering sprites so they don't just disappear entirely. This was always possible with cc65, and with raw Assembly before it, but it was difficult, brittle, time-consuming, and very un-fun to say the least.
 
 I don't know nearly enough about the homebrew community's wants and needs to know whether this is compelling to anybody but me, but to me, this takes NES development from "it will take a long time for me to understand enough to draw a sprite" to "I can easily read and write the code to draw a sprite" and even "I can vibecode a real complex NES game", which includes being able to read the code well enough to know whether it's totally off-base.
 
@@ -54,7 +54,7 @@ Before we built more complex games with NEScript I wanted to make sure it wasn't
 
 To ensure this, I relied on [https://jsnes.org/](https://jsnes.org/), an NES emulator in pure JS. The reason I chose this was that Claude is pretty strong at writing and debugging [Puppeteer](https://pptr.dev/) tests, where it runs an HTML/CSS/JS page in a headless Chrome browser and pokes at it. Just loading the example ROMs in JSNES in a browser uncovered a number of correctness bugs in the output, and Claude easily understood how to close the gap.
 
-Puppeteer also takes screenshots, records audio and GIFs, which means that my tests can surface actual images of games being played, which Claude can then use to debug UI bugs like misaligned sprites. This was especially useful when handling more than the max number of sprites per scanline \-- our PNG screenshots were able to exhibit the behavior perfectly, and Claude used them to ensure sprites weren't just silently dropped.
+Puppeteer also takes screenshots, records audio and GIFs, which means that my tests can surface actual images of games being played, which Claude can then use to debug UI bugs like misaligned sprites. This was especially useful when handling more than the max number of sprites per scanline -- our PNG screenshots were able to exhibit the behavior perfectly, and Claude used them to ensure sprites weren't just silently dropped.
 
 The screenshots and GIF recordings are committed to the repo, so when some behavior changes the visible output, Claude can see that effect and either determine that change is expected, or use it as a signal that there might be some bug. Perhaps surprisingly, during code optimization passes, screenshots change slightly because frames may render quicker, meaning sprites move slightly faster.
 
@@ -83,10 +83,12 @@ This is, at a high level, what any software project does, the real only differen
 
 I think I got basically everything I wanted out of my original curiosity, and more: I learned a *lot* about the NES homebrew ecosystem, its constraints and difficulties, and was inspired as always to see what people were able to create within those constraints.
 
-I was also able to produce something a *lot* closer to a real playable game in a *lot* less time than it would have taken me otherwise \-- especially since prior experience tells me I probably would have given up long before writing anything meaningful to the screen.
+I was also able to produce something a *lot* closer to a real playable game in a *lot* less time than it would have taken me otherwise -- especially since prior experience tells me I probably would have given up long before writing anything meaningful to the screen.
 
-And in the process, I produced something that may be useful to others interested in traveling this road in the future. If NEScript is itself useful to someone, that's great, and even if it's just an experiment that proves that some higher-level development environment is within reach, even if it's not NEScript itself, that's great too.
+And in the process, I produced something that may be useful to others interested in traveling this road in the future. Anecdotally, it seems like Claude is better at writing NEScript than it is at writing NES Assembly, even thought it's a brand new language it's never seen before. NEScript is more token-dense, and harder to mess up than Assembly, and faster to give more targetted feedback when it does get messed up.
 
-If you're reading this and want to try it out, feel free to give it a shot and file bugs or issues as you find them. If you want to point an agent at addressing any of the future work, that's fine too \-- the bar for acceptance will be tests, runnable examples, and screenshots or recordings that show things working like you expect.
+If NEScript is itself useful to someone, that's great, and even if it's just an experiment that proves that some higher-level development environment is within reach, even if it's not NEScript itself, that's great too!
+
+If you're reading this and want to try it out, feel free to give it a shot and file bugs or issues as you find them. If you want to point an agent at addressing any of the future work, that's fine too -- the bar for acceptance will be tests, runnable examples, and screenshots or recordings that show things working like you expect.
 
 I probably won't continue developing NEScript except when the itch strikes, so if you want to take it in a new direction feel free to fork it.
