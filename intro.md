@@ -58,7 +58,9 @@ Puppeteer also takes screenshots, records audio and GIFs, which means that my te
 
 The screenshots and GIF recordings are committed to the repo, so when some behavior changes the visible output, Claude can see that effect and either determine that change is expected, or use it as a signal that there might be some bug. Perhaps surprisingly, during code optimization passes, screenshots change slightly because frames may render quicker, meaning sprites move slightly faster.
 
-The recorded GIFs are also great examples for the README, to give readers an idea of what's possible with NEScript.
+The recorded GIFs are also great examples for the README, to give readers an idea of what's possible with NEScript:
+
+![platformer screen recording gif](./docs/platformer.gif)
 
 In addition to tests using JSNES, since the NEScript compiler is also capable of emitting `.dbg` files for use with emulators like [Mesen](https://www.mesen.ca/), there are tests that run Mesen to ensure those outputs are valid and usable. JSNES and Mesen are the test of "ground truth" correctness: does the compiled program load, execute, and work as intended?
 
