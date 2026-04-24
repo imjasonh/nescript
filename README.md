@@ -1,5 +1,7 @@
 # NEScript
 
+For more background on the project, see [Introducing NEScript](./intro.md).
+
 A statically-typed, compiled programming language for NES game development.
 
 NEScript compiles `.ne` source files directly into playable iNES ROM files, with no external assembler or linker dependencies. The compiler handles everything from source text to a ROM you can run in any NES emulator.
