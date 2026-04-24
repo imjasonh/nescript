@@ -12,17 +12,17 @@ Eventually, I grew up and the NES didn't, and I got into other hobbies: more com
 
 As expected (and no doubt, planned) I watched [the latest Mario movie](https://en.wikipedia.org/wiki/The_Super_Mario_Galaxy_Movie) awash in a glow of nostalgia.
 
-I knew that there was a thriving community online, and in real life, of other NES enthusiasts, lovingly documenting and restoring hardware, maintaining and improving emulators, and even writing new games for a 40-year-old hardware platform, for pure love of the game (pun intended).
+I knew that there was a [thriving community online](https://forums.nesdev.org/viewforum.php?f=22), and [in real life](https://www.corgscon.com/), of other NES and retro gaming enthusiasts, lovingly documenting and restoring hardware, maintaining and improving emulators, and even writing new games for a 40-year-old hardware platform, for pure love of the game (pun intended).
 
-Being \~30 years removed from the most serious depths of my NES addiction, I was only tangentially aware of these lovable nerds. Sitting in the theater I wondered whether I could learn what they do, and maybe even become one myself. On the way out of the theater I asked Claude what it would take to get started.
+Being ~30 years removed from the most serious depths of my NES addiction, I was only tangentially aware of these lovable nerds. Sitting in the theater I wondered whether I could learn what they do, and maybe even become one myself. On the way out of the theater I asked Claude what it would take to get started.
 
 ### NES game development in 2026
 
 And there was a lot to learn. The NES hardware is very well understood, having 40 years of hackers to tear it apart and learn its secrets. Compared to modern computers, it's a heavily constrained environment: 2KB of RAM, a CPU running at about 1.79 MHz, a hard cap of 8 sprites per scanline, and cartridge ROMs that originally topped out at 40KB (that's *kilobytes*, or thousandths of a gigabyte, for you whippersnappers).
 
-The NES homebrew community has developed an impressive number of tools to make writing games easier. Instead of having to write raw 6502 Assembly, they have [cc65](https://en.wikipedia.org/wiki/Cc65), a C toolchain to produce the raw assembly instead. But even with this powerful tool in the toolbox, programmers still have to be aware of the specific hardware constraints; you have a tiny budget of time to do your work between frames. From what I could glean from the docs, setting up the toolchain itself requires more than a few steps. It was a lot to learn all at once, before you could even draw your first sprite to the screen, let alone make it move, jump, make sounds, and so on.
+The NES homebrew community has developed an impressive number of tools to make writing games easier. Instead of having to write raw 6502 Assembly, they have [cc65](https://en.wikipedia.org/wiki/Cc65), a C toolchain to produce the raw assembly instead. There's even a [powerful IDE available]([url](https://www.thenew8bitheroes.com/)) on Windows. But even with these tools in the toolbox, programmers still have to be aware of the specific hardware constraints, which steepens the learning curve quite a bit. From what I could glean from the docs, setting up the toolchain itself requires more than a few steps. It was a lot to learn all at once, before you could even draw your first sprite to the screen, let alone make it move, jump, make sounds, and so on. The path from idea to [phyiscal cartridge](https://theretroverse.com/product/blank-cartridge-mapper-30-reflashable/) felt long indeed.
 
-I wondered: what if I could make all of this easier for the uninitiated? Not only a simpler toolchain, but an easier language, designed from the beginning for one goal: to build games for the NES. Instead of repurposing a (granted, well-trodden and widely-known) general-purpose language like C and making programmers remember to live within the hardware constraints, I wondered if it might be possible to design a language and compiler to make it easier to live within the constraints, and importantly, keep you from going outside those constraints.
+I wondered: what if I could make all of this easier for the uninitiated, like me? Not only a simpler toolchain, but an easier *language*, designed from the beginning for one goal: to build games for the NES. Instead of repurposing a (granted, well-trodden and widely-known) general-purpose language like C and making programmers remember to live within the hardware constraints, I wondered if it might be possible to design a language and compiler to make it more pleasant to live within the constraints, and importantly, help keep you from going outside those constraints.
 
 ### NEScript
 
@@ -30,7 +30,7 @@ After a couple more hours of going back and forth with Claude to better understa
 
 NEScript attempts to learn from all of the patterns and ~~hacks~~ time-honored techniques adopted over time by the cc65 and homebrew NES communities, and [paves the cowpaths](https://en.wikipedia.org/wiki/Desire_path) all the way into the language where possible. 
 
-This includes things like language-level game state transitions (splash screen, followed by level 1, followed by level 2, followed by game over, etc.), native u16 and i16 types, a built-in method to get \~random values from the PRNG, and much more.
+This includes things like language-level game state transitions (splash screen, followed by level 1, followed by level 2, followed by game over, etc.), native u16 and i16 types, a built-in method to get ~random values from the PRNG, and much more.
 
 Sprites can be extracted from PNG files in the codebase, or defined inline in code. Same with sounds and music. Collision detection (i.e., when Mario stomps on a Goomba) is built in. Color palette definitions and changes are built in. When you need to, you can define an inline `asm { … }` block, and reference variables from inside that block.
 
