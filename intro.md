@@ -4,11 +4,11 @@ It started, like most things these days, with a prompt:
 
 > I want to learn how to write new games for the NES. What do I need to learn?
 
-The [Nintendo Entertainment System](https://en.wikipedia.org/wiki/Nintendo_Entertainment_System) was released in the US 1985, and was a staple of my childhood. I don't know exactly when our family got one, but I remember spending hours upon hours, for days on end, playing all the classics with my brother: Mario, Mega Man, Contra, Marble Madness, River City Ransom, Battletoads, and dozens more.
+The [Nintendo Entertainment System](https://en.wikipedia.org/wiki/Nintendo_Entertainment_System) was released to the US in 1985, and was a staple of my childhood. I don't know exactly when our family got one, but I remember spending hours upon hours, for days on end, playing all the classics with my brother: Mario, Mega Man, Contra, Marble Madness, River City Ransom, Battletoads, and dozens more.
 
-I remember pausing to go to bed, hoping the game would still be on when I woke up, since at that time you couldn't even save your game. I remember trading [Mega Man 2 passwords](https://www.mmhp.net/Passwords/MM2/) with friends. I remember endless ads for the [Game Genie](https://en.wikipedia.org/wiki/Game_Genie) in my comic books, and finally getting one for Christmas.
+I remember pausing to go to bed, hoping the game would still be on when I woke up, since at that time you couldn't even save your game. I remember trading [Mega Man 2 passwords](https://www.mmhp.net/Passwords/MM2/) with friends. I remember endless ads for the [Game Genie](https://en.wikipedia.org/wiki/Game_Genie) in my comic books.
 
-Eventually, I grew up and the NES didn't, and I got into other hobbies: more comic books, soccer, computers, and more. But every few years I'd keep coming back to play one of those classics on an emulator. Eventually I had kids and got to share my love of Mario with them. They prefer [the newer games](https://en.wikipedia.org/wiki/Super_Mario_Bros._Wonder), and seem to find the classics boring. There's no accounting for taste I guess.
+Eventually, I grew up and the NES didn't, and I got into other hobbies: more comic books, soccer, computers, and more. The rest is history. But every few years I'd keep coming back to play one of those classics on an emulator. Eventually I had kids and got to share my love of Mario with them. They prefer [the newer games](https://en.wikipedia.org/wiki/Super_Mario_Bros._Wonder), and seem to find the classics boring. There's no accounting for taste I guess.
 
 As expected (and no doubt, planned) I watched [the latest Mario movie](https://en.wikipedia.org/wiki/The_Super_Mario_Galaxy_Movie) awash in a glow of nostalgia.
 
