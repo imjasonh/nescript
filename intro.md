@@ -26,7 +26,7 @@ I wondered: what if I could make all of this easier for the uninitiated? Not onl
 
 ### NEScript
 
-After a couple more hours of going back and forth with Claude to better understand the problem, we eventually came up with a solution: **NEScript**, a new purpose-built programming language to develop NES games, and a compiler written in Rust to transform those programs into optimized NES-compatible 6502 Assembly.
+After a couple more hours of going back and forth with Claude to better understand the problem, we eventually came up with a solution: [**NEScript**](https://github.com/imjasonh/nescript), a new purpose-built programming language to develop NES games, and a compiler written in Rust to transform those programs into optimized NES-compatible 6502 Assembly.
 
 NEScript attempts to learn from all of the patterns and ~~hacks~~ time-honored techniques adopted over time by the cc65 and homebrew NES communities, and [paves the cowpaths](https://en.wikipedia.org/wiki/Desire_path) all the way into the language where possible. 
 
